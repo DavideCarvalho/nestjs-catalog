@@ -45,7 +45,9 @@ jobs:
       # Upgraded here rather than by moving .nvmrc to Node 24, so the toolchain
       # stays identical to the rest of Aviary and only the publish step differs.
       - name: Upgrade npm for OIDC trusted publishing
-        run: npm install -g npm@^11.5.1
+        run: |
+          npm install -g npm@^11.5.1
+          npm --version
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
