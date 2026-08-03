@@ -162,14 +162,14 @@ function build(
  */
 export function catalogDashboardMountPaths(
   options: Pick<CatalogDashboardOptions, 'path'> = {},
-): Array<{ path: string; method: number }> {
+): string[] {
   const base = normalise(options.path ?? '/catalog').replace(/^\//, '');
-  // `RequestMethod.ALL` is 7; spelled out so this helper does not drag in a
-  // Nest import for one enum a host already has.
-  return [
-    { path: base, method: 7 },
-    { path: `${base}/{*path}`, method: 7 },
-  ];
+  // Plain strings with a `{*splat}` wildcard, which is the shape `setGlobalPrefix`'s
+  // `exclude` matches and what every other Aviary console helper returns. An
+  // object form is accepted by the type but does NOT match here, and the symptom
+  // is subtle: the console mounts, logs itself as initialised, and answers on
+  // `/api/<path>` while 404ing at `/<path>`.
+  return [base, `${base}/{*splat}`];
 }
 
 /** Leading slash, no trailing one — the shape every consumer below assumes. */
