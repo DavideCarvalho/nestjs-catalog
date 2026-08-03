@@ -28,7 +28,7 @@ import { PublishService, type PublishedType } from './publish.service';
  * those two only matters once — which is the once that counts.
  *
  * The snapshot id is chosen by the caller, not by us. Passing something the
- * caller already has that identifies the load — for FLIP's ingestion, the
+ * caller already has that identifies the load — a durable run id, an import
  * durable run id — makes a retried batch land in the same snapshot instead of
  * creating a second one.
  */

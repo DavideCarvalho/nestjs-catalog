@@ -198,7 +198,7 @@ export function composePrincipalId(applicationId: string, actorId?: string): str
  *
  * Total, and lenient by design: every id ever written parses, including the
  * millions written before actors existed. This is what lets a governance query
- * keep asking "everything `flip-nestjs` did" — it matches on `applicationId`
+ * keep asking "everything this application did" — it matches on `applicationId`
  * and gets both the machine's own loads and anything a person did through it.
  *
  * Splits on the *first* separator, so an actor id that somehow contains one

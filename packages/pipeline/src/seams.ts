@@ -9,10 +9,10 @@ import type { EntityManager } from '@mikro-orm/mysql';
  * model from. Both were concrete imports in the two applications this package
  * was extracted from, and they disagreed:
  *
- * | | standalone flip-catalog | flip-nestjs |
+ * | | a multi-environment host | a single-connection host |
  * |---|---|---|
- * | EntityManager | `requireEnvironmentBundle().em` (per environment) | `CATALOG_STORE_ENTITY_MANAGER` (one connection) |
- * | registry | `RoutingCatalogRegistry` | `StoredCatalogRegistry` |
+ * | EntityManager | resolved per environment, from the active scope | one connection, resolved once |
+ * | registry | a routing registry over several environments | a stored registry over one |
  *
  * Neither difference reaches the engine's logic — both registries are used only
  * for `reload()` and `getType()`, and the EntityManager is only ever forked. So

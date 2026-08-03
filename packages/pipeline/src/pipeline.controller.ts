@@ -38,7 +38,7 @@ import { ConnectorRunnerService } from './connector-runner.service';
  * scope: a transform is code that decides what gets stored, so the person who
  * can change it can change the data as surely as anyone loading rows directly.
  */
-// No `api/` prefix: flip's main.ts sets a global one, so this is
+// No `api/` prefix: a host's global prefix, if it sets one, applies on top.
 // `/api/catalog-service/pipeline`.
 /**
  * Connectors, connections, transforms and runs.

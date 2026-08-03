@@ -47,7 +47,7 @@ const DEFAULT_POLL_MS = 30_000;
  * Whether this process should run the loop.
  *
  * A decision for the host, not for this package: it depends on how the host
- * splits its roles. flip gates on `APP_TYPE` so only its worker polls, and a
+ * splits its roles. A host with separate API and worker processes runs it on
  * single-process deployment wants it always on. Default on, because a host that
  * mounts the scheduler at all has said it wants schedules to fire.
  *
@@ -103,7 +103,7 @@ export class ConnectorScheduler implements OnApplicationBootstrap, OnApplication
   constructor(
     @Inject(CATALOG_PIPELINE_STORE)
     private readonly pipeline: CatalogPipelineStore,
-    // Optional even though flip's `DurableModule` is `@Global()` and binds a
+    // Optional because a host may mount this without a durable engine at all.
     // `WorkflowEngine` in both roles, so in practice this always resolves.
     // Kept optional because "no engine" is a state worth reporting rather than
     // a reason to fail the boot — and because the extracted service, which has
@@ -364,7 +364,7 @@ export class ConnectorScheduler implements OnApplicationBootstrap, OnApplication
           .map((connector) => connector.name)
           .join(
             ', ',
-          )}. No WorkflowEngine resolved here, which in flip means the durable module failed to bind rather than that it was turned off — check the boot log for DurableModule before clearing the schedules.`,
+          )}. No WorkflowEngine resolved here. Either this host mounts no durable engine, or its durable module failed to bind — check the boot log before clearing the schedules.`,
       );
     } catch (error) {
       this.logger.warn(`Could not check for orphaned schedules: ${say(error)}`);

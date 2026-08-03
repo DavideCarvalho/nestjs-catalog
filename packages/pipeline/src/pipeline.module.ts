@@ -61,11 +61,11 @@ export interface CatalogPipelineModuleOptions {
 /**
  * Fetch, transform, publish — the connector pipeline, as a module.
  *
- * This was application code in two places at once: the standalone catalog
- * service and the copy of it mounted inside flip. That is why it is a package
- * now. The two had already drifted — flip was missing the scheduler entirely, so
- * `connector.schedule` was a column nothing acted on until it was ported by
- * hand, which is the failure mode duplication always produces eventually.
+ * This was application code, copied between the applications that needed it,
+ * which is why it is a package now. The copies had already drifted: one of them
+ * had no scheduler at all, so `connector.schedule` was a column nothing acted on
+ * until it was ported across by hand. That is the failure duplication always
+ * produces eventually, and the reason the engine belongs in one place.
  *
  * Nothing here decides *when* a load runs; the scheduler starts runs and a human
  * can press the button. Two systems believing they decide when a load happens is
