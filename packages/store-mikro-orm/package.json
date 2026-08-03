@@ -1,0 +1,44 @@
+{
+  "name": "@dudousxd/nestjs-catalog-store-mikro-orm",
+  "version": "0.1.0",
+  "description": "MikroORM warehouse store for @dudousxd/nestjs-catalog: a stored model, append-only snapshot loads, and its own tables managed at boot.",
+  "license": "MIT",
+  "author": "Davide Carvalho",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/DavideCarvalho/nestjs-catalog.git",
+    "directory": "packages/store-mikro-orm"
+  },
+  "keywords": [
+    "nestjs",
+    "catalog",
+    "mikro-orm",
+    "warehouse",
+    "snapshots"
+  ],
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsc -p tsconfig.json --watch"
+  },
+  "peerDependencies": {
+    "@mikro-orm/core": ">=6",
+    "@mikro-orm/decorators": ">=7",
+    "@mikro-orm/mysql": ">=6",
+    "@nestjs/common": ">=10",
+    "@dudousxd/nestjs-catalog": ">=0.1.0"
+  },
+  "devDependencies": {
+    "@dudousxd/nestjs-catalog": "workspace:*",
+    "@mikro-orm/core": "7.0.17",
+    "@mikro-orm/decorators": "7.0.17",
+    "@mikro-orm/mysql": "7.0.17",
+    "@nestjs/common": "11.1.19",
+    "@types/node": "25.6.0",
+    "typescript": "5.9.3"
+  }
+}

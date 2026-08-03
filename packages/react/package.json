@@ -1,0 +1,148 @@
+{
+  "name": "@dudousxd/nestjs-catalog-react",
+  "version": "0.1.0",
+  "description": "Ready-made React screens for @dudousxd/nestjs-catalog — a model manager and a generic object explorer you can drop into your own app shell.",
+  "license": "MIT",
+  "author": "Davide Carvalho",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/DavideCarvalho/nestjs-catalog.git",
+    "directory": "packages/react"
+  },
+  "keywords": [
+    "nestjs",
+    "catalog",
+    "metadata",
+    "react",
+    "admin"
+  ],
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./recharts": {
+      "types": "./dist/charts/recharts.d.ts",
+      "default": "./dist/charts/recharts.js"
+    },
+    "./bklit": {
+      "types": "./dist/charts/bklit.d.ts",
+      "default": "./dist/charts/bklit.js"
+    },
+    "./workflow": {
+      "types": "./dist/workflow/index.d.ts",
+      "default": "./dist/workflow/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE-bklit"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsc -p tsconfig.json --watch"
+  },
+  "peerDependencies": {
+    "@base-ui/react": ">=1.6.0",
+    "@dnd-kit/core": ">=6",
+    "@dnd-kit/sortable": ">=10",
+    "@dnd-kit/utilities": ">=3",
+    "@tanstack/react-query": ">=5",
+    "@visx/curve": "4.0.1-alpha.0",
+    "@visx/event": "4.0.1-alpha.0",
+    "@visx/grid": "4.0.1-alpha.0",
+    "@visx/pattern": "4.0.1-alpha.0",
+    "@visx/responsive": "4.0.1-alpha.0",
+    "@visx/scale": "4.0.1-alpha.0",
+    "@visx/shape": "4.0.1-alpha.0",
+    "@xyflow/react": ">=12",
+    "d3-array": ">=3",
+    "d3-shape": ">=3",
+    "lucide-react": ">=0.400.0",
+    "motion": ">=11",
+    "prism-react-renderer": ">=2.4.0",
+    "react": ">=18",
+    "react-dom": ">=18",
+    "recharts": ">=2.12.0",
+    "@dudousxd/nestjs-catalog": ">=0.1.0"
+  },
+  "devDependencies": {
+    "@base-ui/react": "1.6.0",
+    "@dnd-kit/core": "6.3.1",
+    "@dnd-kit/sortable": "10.0.0",
+    "@dnd-kit/utilities": "3.2.2",
+    "@dudousxd/nestjs-catalog": "workspace:*",
+    "@tanstack/react-query": "5.99.2",
+    "@types/d3-array": "^3.2.2",
+    "@types/d3-shape": "^3.1.8",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "^19.2.4",
+    "@visx/curve": "4.0.1-alpha.0",
+    "@visx/event": "4.0.1-alpha.0",
+    "@visx/grid": "4.0.1-alpha.0",
+    "@visx/pattern": "4.0.1-alpha.0",
+    "@visx/responsive": "4.0.1-alpha.0",
+    "@visx/scale": "4.0.1-alpha.0",
+    "@visx/shape": "4.0.1-alpha.0",
+    "@xyflow/react": "12.11.2",
+    "clsx": "2.1.1",
+    "d3-array": "^3.2.4",
+    "d3-shape": "^3.2.0",
+    "lucide-react": "0.552.0",
+    "motion": "^12.43.0",
+    "prism-react-renderer": "2.4.1",
+    "react": "19.2.0",
+    "react-dom": "^19.2.8",
+    "recharts": "2.15.4",
+    "tailwind-merge": "3.4.1",
+    "typescript": "5.9.3"
+  },
+  "dependencies": {
+    "clsx": "2.1.1",
+    "tailwind-merge": "3.4.1"
+  },
+  "peerDependenciesMeta": {
+    "recharts": {
+      "optional": true
+    },
+    "@dnd-kit/core": {
+      "optional": false
+    },
+    "@visx/curve": {
+      "optional": true
+    },
+    "@visx/event": {
+      "optional": true
+    },
+    "@visx/grid": {
+      "optional": true
+    },
+    "@visx/responsive": {
+      "optional": true
+    },
+    "@visx/scale": {
+      "optional": true
+    },
+    "@visx/shape": {
+      "optional": true
+    },
+    "@visx/pattern": {
+      "optional": true
+    },
+    "d3-array": {
+      "optional": true
+    },
+    "d3-shape": {
+      "optional": true
+    },
+    "motion": {
+      "optional": true
+    },
+    "@xyflow/react": {
+      "optional": true
+    }
+  }
+}

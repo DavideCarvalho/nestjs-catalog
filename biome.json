@@ -1,0 +1,64 @@
+{
+  "$schema": "https://biomejs.dev/schemas/1.9.4/schema.json",
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": true
+  },
+  "files": {
+    "ignore": ["dist", "node_modules", "coverage", ".turbo", "website", "**/generated"]
+  },
+  "organizeImports": {
+    "enabled": true
+  },
+  "formatter": {
+    "enabled": true,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 100
+  },
+  "javascript": {
+    "parser": {
+      "unsafeParameterDecoratorsEnabled": true
+    },
+    "formatter": {
+      "quoteStyle": "single",
+      "trailingCommas": "all",
+      "semicolons": "always"
+    }
+  },
+  "json": {
+    "formatter": {
+      "enabled": false
+    }
+  },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "recommended": true,
+      "suspicious": {
+        "noExplicitAny": "warn",
+        "noArrayIndexKey": "warn",
+        "noShadowRestrictedNames": "warn"
+      },
+      "complexity": {
+        "noStaticOnlyClass": "off",
+        "noExcessiveCognitiveComplexity": "warn"
+      },
+      "style": {
+        "useImportType": "off",
+        "noUnusedTemplateLiteral": "warn"
+      },
+      "correctness": {
+        "useExhaustiveDependencies": "warn"
+      },
+      "performance": {
+        "noDelete": "warn"
+      },
+      "a11y": {
+        "useSemanticElements": "warn",
+        "noLabelWithoutControl": "warn"
+      }
+    }
+  }
+}

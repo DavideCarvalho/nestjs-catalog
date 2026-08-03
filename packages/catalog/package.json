@@ -1,0 +1,54 @@
+{
+  "name": "@dudousxd/nestjs-catalog",
+  "version": "0.1.0",
+  "description": "A metadata registry for NestJS: object types, properties and relations, derived from your ORM and enriched with decorators.",
+  "license": "MIT",
+  "author": "Davide Carvalho",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/DavideCarvalho/nestjs-catalog.git"
+  },
+  "keywords": [
+    "nestjs",
+    "catalog",
+    "metadata",
+    "schema",
+    "mikro-orm"
+  ],
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./client": {
+      "types": "./dist/client.d.ts",
+      "default": "./dist/client.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsc -p tsconfig.json --watch"
+  },
+  "peerDependencies": {
+    "@mikro-orm/core": ">=6",
+    "@nestjs/common": ">=10",
+    "@nestjs/core": ">=10",
+    "reflect-metadata": ">=0.1.13"
+  },
+  "devDependencies": {
+    "@mikro-orm/core": "7.0.17",
+    "@nestjs/common": "11.1.19",
+    "@nestjs/core": "11.1.19",
+    "@types/node": "25.6.0",
+    "typescript": "5.9.3",
+    "@dudousxd/nestjs-diagnostics": "0.7.0"
+  },
+  "dependencies": {
+    "@dudousxd/nestjs-diagnostics": "0.7.0"
+  }
+}

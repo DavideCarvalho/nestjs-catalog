@@ -1,0 +1,48 @@
+{
+  "name": "@dudousxd/nestjs-catalog-store-fanout",
+  "version": "0.1.0",
+  "description": "Fan-out store for @dudousxd/nestjs-catalog: one primary that decides, N followers kept in step, with a durable failure journal, snapshot replay and a comparison tool for migrating between engines without a big-bang cutover.",
+  "license": "MIT",
+  "author": "Davide Carvalho",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/DavideCarvalho/nestjs-catalog.git",
+    "directory": "packages/store-fanout"
+  },
+  "keywords": [
+    "nestjs",
+    "catalog",
+    "dual-write",
+    "migration",
+    "snapshots",
+    "warehouse"
+  ],
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsc -p tsconfig.json --watch"
+  },
+  "peerDependencies": {
+    "@dudousxd/nestjs-catalog": ">=0.1.0",
+    "@nestjs/common": ">=10"
+  },
+  "devDependencies": {
+    "@dudousxd/nestjs-catalog": "workspace:*",
+    "@nestjs/common": "11.1.19",
+    "@types/node": "25.6.0",
+    "typescript": "5.9.3"
+  },
+  "dependencies": {
+    "@dudousxd/nestjs-diagnostics": "0.7.0"
+  }
+}

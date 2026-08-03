@@ -1,0 +1,72 @@
+import { CATALOG_RESERVED_COLUMNS } from '@dudousxd/nestjs-catalog';
+
+/**
+ * Every table and column name in this service comes from another application
+ * over HTTP, and all of it ends up in DDL and in SELECT lists where no
+ * placeholder can stand in for it. So identifiers are not escaped, they are
+ * *rejected*: anything outside a narrow character set never becomes SQL.
+ */
+
+const SAFE = /^[A-Za-z_][A-Za-z0-9_]{0,62}$/;
+
+export class UnsafeIdentifierError extends Error {
+  constructor(value: string) {
+    super(
+      `Refusing to use "${value}" as a SQL identifier: letters, digits and underscore only, starting with a letter or underscore, 63 characters max.`,
+    );
+  }
+}
+
+/** Quote a value already known to be safe. Throws rather than sanitising. */
+export function ident(value: string): string {
+  if (!SAFE.test(value)) throw new UnsafeIdentifierError(value);
+  return `\`${value}\``;
+}
+
+/**
+ * Turn a publisher's name into a column we can create.
+ *
+ * Publishers name things for their own schema — `Asset NSN`, `Sub/Un Sub` — and
+ * those cannot be columns here. The mapping is stored on the property row, so
+ * the original is never lost and reads translate back.
+ */
+export function toPhysicalName(value: string, prefix = 'c'): string {
+  const cleaned = value
+    .replace(/[^A-Za-z0-9_]/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 60);
+  if (!cleaned) return `${prefix}_unnamed`;
+  return /^[A-Za-z_]/.test(cleaned) ? cleaned : `${prefix}_${cleaned}`;
+}
+
+/** Physical table for an object type. */
+export function tableFor(typeName: string): string {
+  return `obj_${toPhysicalName(typeName).toLowerCase()}`;
+}
+
+/** Reserved columns the warehouse adds to every object table. */
+export const SNAPSHOT_COLUMN = '_snapshot_id';
+export const PRINCIPAL_COLUMN = '_principal_id';
+export const LOADED_AT_COLUMN = '_loaded_at';
+/** Which batch of a load a row came from. Makes a re-sent batch replace itself. */
+export const BATCH_COLUMN = '_batch';
+/**
+ * The auto-increment primary key, and the default read order.
+ *
+ * Named here rather than written as a literal in the four statements that use
+ * it, because it is one of the reserved names and the list below is what a
+ * publisher's property is checked against. A copy of it hidden inside a SQL
+ * string is a copy the check cannot see, and `_row` was in fact missing from
+ * that list until this constant existed.
+ */
+export const ROW_COLUMN = '_row';
+/**
+ * Taken from the core package rather than restated.
+ *
+ * These names are part of what the catalog promises a reader — the SQL console
+ * lists them, ad-hoc queries filter on them — so they belong to the contract,
+ * and a per-adapter copy is a copy that can quietly stop matching the one a
+ * publisher was told about.
+ */
+export const RESERVED_COLUMNS: readonly string[] = CATALOG_RESERVED_COLUMNS;

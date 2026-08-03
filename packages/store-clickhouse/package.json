@@ -1,0 +1,46 @@
+{
+  "name": "@dudousxd/nestjs-catalog-store-clickhouse",
+  "version": "0.1.0",
+  "description": "ClickHouse warehouse store for @dudousxd/nestjs-catalog: one partition per snapshot batch, idempotent loads without mutations, and an atomic view cutover.",
+  "license": "MIT",
+  "author": "Davide Carvalho",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/DavideCarvalho/nestjs-catalog.git",
+    "directory": "packages/store-clickhouse"
+  },
+  "keywords": [
+    "nestjs",
+    "catalog",
+    "clickhouse",
+    "warehouse",
+    "snapshots"
+  ],
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsc -p tsconfig.json --watch"
+  },
+  "peerDependencies": {
+    "@clickhouse/client": ">=1",
+    "@dudousxd/nestjs-catalog": ">=0.1",
+    "@nestjs/common": ">=10"
+  },
+  "devDependencies": {
+    "@clickhouse/client": "1.23.1",
+    "@dudousxd/nestjs-catalog": "workspace:*",
+    "@nestjs/common": "11.1.19",
+    "@types/node": "25.6.0",
+    "typescript": "5.9.3"
+  }
+}

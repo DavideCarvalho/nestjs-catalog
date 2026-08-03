@@ -1,0 +1,1 @@
+export const CATALOG_OVERLAY_STORE = Symbol('CATALOG_OVERLAY_STORE');

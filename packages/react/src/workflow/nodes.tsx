@@ -1,0 +1,256 @@
+import { Handle, type NodeProps, Position } from '@xyflow/react';
+import {
+  CircleAlert,
+  CircleCheck,
+  Code2,
+  Database,
+  Loader2,
+  Plug,
+  Repeat,
+  TriangleAlert,
+} from 'lucide-react';
+import { type ReactNode, createContext, useContext } from 'react';
+import { cn } from '../cn';
+import { Tooltip } from '../ui/tooltip';
+import type { WorkflowFlowNode, WorkflowNodeData } from './graph';
+import type { WorkflowNodeKind } from './model';
+
+const RULE = 'border-zinc-200 dark:border-zinc-800';
+const PANEL = 'bg-white dark:bg-zinc-900';
+const MUTED = 'text-zinc-400 dark:text-zinc-500';
+
+/**
+ * What a node can reach without being handed a callback in its `data`.
+ *
+ * A context rather than props on the node data, because React Flow re-creates
+ * a node's props from `data` and compares them: a handler in `data` is a new
+ * function identity on every render of the screen, which invalidates every node
+ * at once and makes dragging one node re-render all of them.
+ *
+ * The default throws rather than no-oping. A node rendered outside the canvas
+ * would otherwise look completely normal and quietly ignore every click, which
+ * is a much worse bug to find than an error naming the missing provider.
+ */
+interface WorkflowNodeHandlers {
+  /** Open the inspector for this node. */
+  onInspect(nodeId: string): void;
+  /** Jump straight to the code editor for this node's transform. */
+  onEditCode(nodeId: string): void;
+  /** Whether editing is offered at all. */
+  canEdit: boolean;
+}
+
+const WorkflowNodeContext = createContext<WorkflowNodeHandlers | null>(null);
+
+export function WorkflowNodeProvider({
+  handlers,
+  children,
+}: {
+  handlers: WorkflowNodeHandlers;
+  children: ReactNode;
+}) {
+  return <WorkflowNodeContext.Provider value={handlers}>{children}</WorkflowNodeContext.Provider>;
+}
+
+function useWorkflowNodeHandlers(): WorkflowNodeHandlers {
+  const handlers = useContext(WorkflowNodeContext);
+  if (!handlers) {
+    throw new Error('A workflow node was rendered outside <WorkflowNodeProvider>.');
+  }
+  return handlers;
+}
+
+const KIND_STYLE: Record<
+  WorkflowNodeKind,
+  { accent: string; chip: string; icon: typeof Plug; noun: string }
+> = {
+  source: {
+    accent: 'bg-sky-500',
+    chip: 'text-sky-700 dark:text-sky-300',
+    icon: Plug,
+    noun: 'source',
+  },
+  transform: {
+    accent: 'bg-violet-500',
+    chip: 'text-violet-700 dark:text-violet-300',
+    icon: Repeat,
+    noun: 'transform',
+  },
+  sink: {
+    accent: 'bg-emerald-500',
+    chip: 'text-emerald-700 dark:text-emerald-300',
+    icon: Database,
+    noun: 'sink',
+  },
+};
+
+/**
+ * Handles are styled larger than React Flow's default 6px dot.
+ *
+ * A 6px target is fine for somebody with a mouse and a steady hand and awful
+ * for everybody else, and the whole interaction of this screen is landing a
+ * drag on one. `connectionRadius` on the canvas widens the drop zone; this
+ * widens what you can see to aim at.
+ */
+const HANDLE = cn(
+  '!h-3 !w-3 !rounded-full !border-2',
+  '!border-zinc-300 !bg-white dark:!border-zinc-600 dark:!bg-zinc-800',
+  // React Flow adds these while a connection is being dragged. Colouring them
+  // is what makes an illegal target — one that would close a loop, or a source
+  // that takes no input — visibly refuse *before* the mouse is released.
+  '[.react-flow__handle-connecting&]:!border-red-500',
+  '[.react-flow__handle-valid&]:!border-emerald-500 [.react-flow__handle-valid&]:!bg-emerald-500',
+);
+
+function RunBadge({ run }: { run: NonNullable<WorkflowNodeData['run']> }) {
+  if (run.status === 'running') {
+    return (
+      <Tooltip content="Running now.">
+        <span className="flex items-center">
+          <Loader2 size={11} className="animate-spin text-sky-500" />
+        </span>
+      </Tooltip>
+    );
+  }
+  if (run.status === 'failed') {
+    return (
+      <Tooltip content={run.error ?? 'This step failed.'}>
+        <span className="flex items-center">
+          <CircleAlert size={11} className="text-red-500" />
+        </span>
+      </Tooltip>
+    );
+  }
+  if (run.status === 'succeeded') {
+    return (
+      <Tooltip
+        content={
+          run.replayed
+            ? // The single most useful fact on a resumed run, and there is
+              // nowhere else on the screen to read it from.
+              'Replayed from a checkpoint — this step did not run again.'
+            : `Ran${typeof run.rows === 'number' ? `, ${run.rows} rows` : ''}.`
+        }
+      >
+        <span className="flex items-center">
+          <CircleCheck size={11} className={run.replayed ? 'text-zinc-400' : 'text-emerald-500'} />
+        </span>
+      </Tooltip>
+    );
+  }
+  return null;
+}
+
+export function WorkflowNodeBody({ id, data, selected }: NodeProps<WorkflowFlowNode>) {
+  const { onInspect, onEditCode, canEdit } = useWorkflowNodeHandlers();
+  const style = KIND_STYLE[data.kind];
+  const Icon = style.icon;
+
+  const errors = data.problems.filter((problem) => problem.level === 'error');
+  const warnings = data.problems.filter((problem) => problem.level === 'warning');
+
+  return (
+    <div
+      className={cn(
+        'relative w-56 overflow-hidden rounded-lg border shadow-sm transition-shadow',
+        RULE,
+        PANEL,
+        selected && 'ring-2 ring-violet-500/40',
+        errors.length > 0 && 'border-red-400 dark:border-red-800',
+        errors.length === 0 && warnings.length > 0 && 'border-amber-300 dark:border-amber-800',
+      )}
+    >
+      <span className={cn('absolute inset-y-0 left-0 w-1', style.accent)} />
+
+      {/* A source is fed by nothing and a sink feeds nothing, so those handles
+          simply do not exist. Rendering them and refusing the connection later
+          would offer somebody a target that can never be valid. */}
+      {data.kind !== 'source' && (
+        <Handle
+          type="target"
+          position={Position.Left}
+          className={HANDLE}
+          aria-label={`input of ${data.label}`}
+        />
+      )}
+      {data.kind !== 'sink' && (
+        <Handle
+          type="source"
+          position={Position.Right}
+          className={HANDLE}
+          aria-label={`output of ${data.label}`}
+        />
+      )}
+
+      <div className="pl-3 pr-2 py-2">
+        <div className="flex items-center gap-1.5">
+          <Icon size={12} className={style.chip} />
+          <span className={cn('font-mono text-[9px] uppercase tracking-[0.16em]', style.chip)}>
+            {style.noun}
+          </span>
+          <span className="ml-auto flex items-center gap-1">
+            {data.run && <RunBadge run={data.run} />}
+            {errors.length > 0 && (
+              <Tooltip content={errors.map((p) => p.message).join(' ')}>
+                <span className="flex items-center">
+                  <CircleAlert size={11} className="text-red-500" />
+                </span>
+              </Tooltip>
+            )}
+            {errors.length === 0 && warnings.length > 0 && (
+              <Tooltip content={warnings.map((p) => p.message).join(' ')}>
+                <span className="flex items-center">
+                  <TriangleAlert size={11} className="text-amber-500" />
+                </span>
+              </Tooltip>
+            )}
+          </span>
+        </div>
+
+        {/* The whole body is the button rather than a link in the corner: a
+            node is one target, and a click anywhere on it should open it. The
+            `nodrag` class is what keeps the click from being read as the start
+            of a drag by React Flow's pointer handling. */}
+        <button
+          type="button"
+          onClick={() => onInspect(id)}
+          className="nodrag mt-1 block w-full text-left"
+        >
+          <span className="block truncate text-[13px] font-medium">{data.label}</span>
+          <span className={cn('block truncate font-mono text-[10px]', MUTED)}>{data.subtitle}</span>
+        </button>
+
+        {data.kind === 'transform' && canEdit && (
+          <div className="mt-1.5 flex">
+            <Tooltip content="Open this transform's code. The canvas stays where it is.">
+              <button
+                type="button"
+                onClick={() => onEditCode(id)}
+                aria-label={`Edit the code behind ${data.label}`}
+                className={cn(
+                  'nodrag flex items-center gap-1 rounded border px-1.5 py-0.5 font-mono text-[9px]',
+                  RULE,
+                  MUTED,
+                  'hover:bg-zinc-50 dark:hover:bg-zinc-800',
+                )}
+              >
+                <Code2 size={9} />
+                code
+              </button>
+            </Tooltip>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Declared once, at module scope.
+ *
+ * React Flow compares `nodeTypes` by identity and warns — then remounts every
+ * node — when it changes. An object literal written inline in the screen is a
+ * new object on every render, so the canvas would tear down and rebuild the
+ * whole graph on each keystroke in the name field.
+ */
+export const workflowNodeTypes = { workflowNode: WorkflowNodeBody };

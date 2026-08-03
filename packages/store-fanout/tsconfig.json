@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    // Mirrors the host tsconfig's module settings on purpose. The root config
+    // has no `include`, so it typechecks this package too — and a package that
+    // resolves modules differently from the app compiling it produces errors in
+    // one run and not the other.
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "resolvePackageJsonExports": true,
+    "target": "ESNext",
+    "declaration": true,
+    "emitDecoratorMetadata": true,
+    "experimentalDecorators": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "strict": true,
+    "strictPropertyInitialization": false,
+    "skipLibCheck": true,
+    "types": ["node"]
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist"]
+}

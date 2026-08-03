@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    // Mirrors `@dudousxd/nestjs-catalog`'s tsconfig deliberately. A package that
+    // resolves modules differently from the package it imports types from, or
+    // from the app that compiles both, produces errors in one run and not the
+    // other — the class of failure where CI is green and the host build is red.
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "resolvePackageJsonExports": true,
+    "target": "ESNext",
+    "declaration": true,
+    "emitDecoratorMetadata": true,
+    "experimentalDecorators": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "strict": true,
+    "strictPropertyInitialization": false,
+    "skipLibCheck": true,
+    "types": ["node"]
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist"]
+}
