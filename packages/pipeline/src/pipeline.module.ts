@@ -5,6 +5,8 @@ import { ConnectorRunSteps } from './connector-run.steps';
 import { ConnectorRunWorkflow } from './connector-run.workflow';
 import { ConnectorRunnerService } from './connector-runner.service';
 import { CATALOG_SCHEDULER_ENABLED, ConnectorScheduler } from './connector-scheduler.service';
+import { createPipelineController } from './pipeline.controller';
+import { createPublishController } from './publish.controller';
 import { PublishService } from './publish.service';
 import {
   CATALOG_PIPELINE_EM,
@@ -17,6 +19,20 @@ import { CatalogWorkflowRunWorkflow } from './workflow-run.workflow';
 import { WorkflowRunnerService } from './workflow-runner.service';
 
 export interface CatalogPipelineModuleOptions {
+  /**
+   * Route prefix the controllers mount under, giving `<path>/pipeline` and
+   * `<path>/publish`. Omit to mount no controllers at all — a worker-only host
+   * wants the engine and the scheduler without an HTTP surface.
+   */
+  path?: string;
+  /**
+   * Guards for those controllers. Handed in rather than chosen here, because a
+   * library that picks the auth for routes which can rewrite a catalog's schema
+   * is deciding something only the host can. The routes still DECLARE what they
+   * need, with `RequireScopes`/`RequireHuman` from `@dudousxd/nestjs-catalog`;
+   * the guard is what reads those declarations.
+   */
+  guards?: Type<unknown>[];
   /**
    * Whatever the host needs in scope for `em`, `registry` and `scope` to resolve
    * — typically the module that exports its catalog store.
@@ -91,9 +107,19 @@ export class CatalogPipelineModule {
       CatalogWorkflowRunWorkflow,
     ];
 
+    // No path, no controllers: a worker-only host runs the engine and the
+    // scheduler and serves nothing.
+    const controllers = options.path
+      ? [
+          createPipelineController(options.path, options.guards ?? []),
+          createPublishController(options.path, options.guards ?? []),
+        ]
+      : [];
+
     return {
       module: CatalogPipelineModule,
       imports: options.imports,
+      controllers,
       providers,
       exports: [
         PublishService,

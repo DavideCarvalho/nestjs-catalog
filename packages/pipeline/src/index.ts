@@ -20,6 +20,8 @@ export {
   CATALOG_PIPELINE_TOKENS,
   type CatalogPipelineModuleOptions,
 } from './pipeline.module';
+export { createPipelineController } from './pipeline.controller';
+export { createPublishController } from './publish.controller';
 export { PublishService, type PublishedType } from './publish.service';
 export {
   CATALOG_PIPELINE_EM,

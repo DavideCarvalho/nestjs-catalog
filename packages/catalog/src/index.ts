@@ -172,3 +172,9 @@ export type {
   RelationKind,
   ScalarType,
 } from './catalog.types';
+export {
+  REQUIRED_SCOPES,
+  REQUIRES_HUMAN,
+  RequireHuman,
+  RequireScopes,
+} from './catalog.route-auth';
