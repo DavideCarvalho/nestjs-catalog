@@ -1,0 +1,45 @@
+@import "tailwindcss";
+
+/* The screens ship as compiled JS with their Tailwind classes inlined, and
+   Tailwind only emits what it can see. Without this the console renders
+   unstyled — the same reason flip-nestjs points @source at this package. */
+/* Recursive on purpose. The old glob stopped at `dist/*.js`, so every class
+   living in `dist/ui/` and `dist/charts/` was invisible to the scanner and
+   those components rendered unstyled — which does not error, so nothing says
+   so. */
+@source "../node_modules/@dudousxd/nestjs-catalog-react/dist/**/*.js";
+
+@plugin "tailwindcss-animate";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* The five variables shadcn/ui's charts read. Defined once here so a host that
+   already themed them keeps its own palette, and one that has not gets a
+   sensible default rather than an invisible chart. */
+:root {
+  --chart-1: oklch(0.646 0.222 41.116);
+  --chart-2: oklch(0.6 0.118 184.704);
+  --chart-3: oklch(0.398 0.07 227.392);
+  --chart-4: oklch(0.828 0.189 84.429);
+  --chart-5: oklch(0.769 0.188 70.08);
+}
+
+.dark {
+  --chart-1: oklch(0.488 0.243 264.376);
+  --chart-2: oklch(0.696 0.17 162.48);
+  --chart-3: oklch(0.769 0.188 70.08);
+  --chart-4: oklch(0.627 0.265 303.9);
+  --chart-5: oklch(0.645 0.246 16.439);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
