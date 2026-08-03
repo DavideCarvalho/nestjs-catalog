@@ -95,7 +95,19 @@ export class CatalogPipelineModule {
       module: CatalogPipelineModule,
       imports: options.imports,
       providers,
-      exports: [PublishService, ConnectorRunnerService, WorkflowRunnerService, ConnectionChecker],
+      exports: [
+        PublishService,
+        ConnectorRunnerService,
+        WorkflowRunnerService,
+        ConnectionChecker,
+        // Exported because a host's own controllers need it: this module owns the
+        // instance (it is the one configured with `pythonVenv`), and a host that
+        // provided a second one would be running transforms through a runner
+        // configured somewhere else. Nest resolves a controller's dependencies
+        // from the module that declares it, so without this the host fails at
+        // boot with "SubprocessTransformRunner is not available".
+        SubprocessTransformRunner,
+      ],
     };
   }
 }
