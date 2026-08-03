@@ -58,8 +58,19 @@ export interface CatalogDashboardOptions {
 export interface CatalogDashboardAsyncOptions extends Omit<CatalogDashboardOptions, 'auth'> {
   imports?: DynamicModule['imports'];
   inject?: FactoryProvider['inject'];
-  /** Builds the auth from DI. See {@link CatalogDashboardModule.forRootAsync}. */
-  useDashboardAuth: (...args: never[]) => DashboardAuthOptions | Promise<DashboardAuthOptions>;
+  /**
+   * Builds the auth from DI. See {@link CatalogDashboardModule.forRootAsync}.
+   *
+   * May return `undefined`, and that is the important case rather than an
+   * afterthought: a host whose signing secret is unset has no way to mint a
+   * session, and the honest answer is "no auth mechanism" — paired with a
+   * denying `guards` entry, which is what turns that into a CLOSED console
+   * instead of an open one. Forcing a return here would push hosts to invent an
+   * auth object around an absent secret, i.e. a cookie signed with nothing.
+   */
+  useDashboardAuth: (
+    ...args: never[]
+  ) => DashboardAuthOptions | undefined | Promise<DashboardAuthOptions | undefined>;
 }
 
 /**
