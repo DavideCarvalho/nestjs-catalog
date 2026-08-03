@@ -1,4 +1,11 @@
-import { type DynamicModule, Module, type Provider } from '@nestjs/common';
+import {
+  type DynamicModule,
+  type FactoryProvider,
+  Module,
+  type Provider,
+  type Type,
+  UseGuards,
+} from '@nestjs/common';
 import { DASHBOARD_AUTH, type DashboardAuthOptions } from './auth/dashboard-auth-config.js';
 import { CatalogAuthController } from './catalog-auth.controller.js';
 import {
@@ -35,6 +42,24 @@ export interface CatalogDashboardOptions {
    * host that means to leave it open should say so where someone will read it.
    */
   auth?: DashboardAuthOptions;
+  /**
+   * Guards fronting the console's own controllers.
+   *
+   * Separate from `auth`, and the reason is the failure it prevents: `auth`
+   * describes how a session is validated, so a host that has not configured it
+   * yet has an OPEN console. A host that would rather be shut than open passes a
+   * denying guard here — it needs no secret, no DI and no session to work.
+   *
+   * Bound at module-definition time, so it cannot come from `forRootAsync`.
+   */
+  guards?: Type<unknown>[];
+}
+
+export interface CatalogDashboardAsyncOptions extends Omit<CatalogDashboardOptions, 'auth'> {
+  imports?: DynamicModule['imports'];
+  inject?: FactoryProvider['inject'];
+  /** Builds the auth from DI. See {@link CatalogDashboardModule.forRootAsync}. */
+  useDashboardAuth: (...args: never[]) => DashboardAuthOptions | Promise<DashboardAuthOptions>;
 }
 
 /**
@@ -48,22 +73,54 @@ export interface CatalogDashboardOptions {
 @Module({})
 export class CatalogDashboardModule {
   static forRoot(options: CatalogDashboardOptions = {}): DynamicModule {
-    const path = normalise(options.path ?? '/catalog');
-    const apiPath = normalise(options.apiPath ?? '/api/catalog-service');
-
-    const providers: Provider[] = [
-      { provide: DASHBOARD_BASE_PATH, useValue: path },
-      { provide: DASHBOARD_API_PATH, useValue: apiPath },
-      { provide: DASHBOARD_AUTH, useValue: options.auth ?? null },
-    ];
-
-    return {
-      module: CatalogDashboardModule,
-      controllers: [CatalogUiController, CatalogAuthController],
-      providers,
-      exports: providers,
-    };
+    return build(options, { provide: DASHBOARD_AUTH, useValue: options.auth ?? null });
   }
+
+  /**
+   * Same mount, but the auth is built from DI.
+   *
+   * Needed whenever validating a session means asking something the host owns —
+   * a user store, a session service. `forRoot` cannot express that: `guards` and
+   * the router are bound at module-DEFINITION time, before any injector exists,
+   * which is why `guards` stays a static option on both forms.
+   */
+  static forRootAsync(options: CatalogDashboardAsyncOptions): DynamicModule {
+    const mounted = build(options, {
+      provide: DASHBOARD_AUTH,
+      useFactory: options.useDashboardAuth,
+      inject: options.inject ?? [],
+    });
+    return { ...mounted, imports: options.imports ?? [] };
+  }
+}
+
+function build(
+  options: CatalogDashboardOptions | CatalogDashboardAsyncOptions,
+  auth: Provider,
+): DynamicModule {
+  const path = normalise(options.path ?? '/catalog');
+  const apiPath = normalise(options.apiPath ?? '/api/catalog-service');
+
+  // Applied to the mounted controllers rather than asked for globally, so a host
+  // can shut this console without touching the rest of its app. `UseGuards` at
+  // definition time is why `guards` cannot come from DI.
+  for (const guard of options.guards ?? []) {
+    UseGuards(guard)(CatalogUiController);
+    UseGuards(guard)(CatalogAuthController);
+  }
+
+  const providers: Provider[] = [
+    { provide: DASHBOARD_BASE_PATH, useValue: path },
+    { provide: DASHBOARD_API_PATH, useValue: apiPath },
+    auth,
+  ];
+
+  return {
+    module: CatalogDashboardModule,
+    controllers: [CatalogUiController, CatalogAuthController],
+    providers,
+    exports: providers,
+  };
 }
 
 /**

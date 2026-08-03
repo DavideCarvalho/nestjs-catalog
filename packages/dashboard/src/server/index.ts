@@ -9,6 +9,7 @@ export { CatalogAuthController } from './catalog-auth.controller.js';
 export {
   CatalogDashboardModule,
   catalogDashboardMountPaths,
+  type CatalogDashboardAsyncOptions,
   type CatalogDashboardOptions,
 } from './catalog-dashboard.module.js';
 export {
