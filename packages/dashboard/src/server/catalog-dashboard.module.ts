@@ -6,6 +6,7 @@ import {
   type Type,
   UseGuards,
 } from '@nestjs/common';
+import { RouterModule } from '@nestjs/core';
 import { DASHBOARD_AUTH, type DashboardAuthOptions } from './auth/dashboard-auth-config.js';
 import { CatalogAuthController } from './catalog-auth.controller.js';
 import {
@@ -101,7 +102,12 @@ export class CatalogDashboardModule {
       useFactory: options.useDashboardAuth,
       inject: options.inject ?? [],
     });
-    return { ...mounted, imports: options.imports ?? [] };
+    // Appended, not replaced: `build` puts the RouterModule registration in
+    // `imports`, and overwriting it would leave the console unrouted.
+    return {
+      ...mounted,
+      imports: [...(mounted.imports ?? []), ...(options.imports ?? [])],
+    };
   }
 }
 
@@ -128,6 +134,16 @@ function build(
 
   return {
     module: CatalogDashboardModule,
+    // The controllers are `@Controller()` with no path of their own, and the
+    // prefix arrives here instead. That is what lets `path` be configurable at
+    // all: a decorator argument is fixed at class-definition time, so a
+    // hardcoded one would pin every host to the same mount point.
+    //
+    // Without this the controllers inherit whatever the host's global prefix is
+    // — they answered on `/api` — and the console 404s at its configured path
+    // while the module reports itself initialised, which is a confusing pair of
+    // symptoms to hold at once.
+    imports: [RouterModule.register([{ path, module: CatalogDashboardModule }])],
     controllers: [CatalogUiController, CatalogAuthController],
     providers,
     exports: providers,
