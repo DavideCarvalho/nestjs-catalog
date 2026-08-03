@@ -32,6 +32,21 @@ jobs:
           # `changeset publish` authenticates without a committed token.
           registry-url: "https://registry.npmjs.org"
 
+      # This repo publishes with npm trusted publishing (OIDC) rather than a
+      # long-lived NPM_TOKEN: the `id-token: write` permission above lets the job
+      # mint a short-lived credential, and each package names this repo +
+      # workflow as its trusted publisher on npmjs.com.
+      #
+      # npm only learned OIDC in 11.5.1, and .nvmrc pins Node 22, which ships
+      # 10.9.x. Without this step the publish fails as
+      # `E404 - PUT https://registry.npmjs.org/<pkg>` — npm answers 404 rather
+      # than 403 for an unauthorized package, so it reads as "no such package"
+      # rather than "not authenticated", which is a long way from the cause.
+      # Upgraded here rather than by moving .nvmrc to Node 24, so the toolchain
+      # stays identical to the rest of Aviary and only the publish step differs.
+      - name: Upgrade npm for OIDC trusted publishing
+        run: npm install -g npm@^11.5.1
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
@@ -46,5 +61,10 @@ jobs:
           title: "chore: version packages"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          # Deliberately no NODE_AUTH_TOKEN. `setup-node` writes
+          # `//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}` into ~/.npmrc,
+          # so passing an unset secret leaves an EMPTY credential there, and npm
+          # sends that instead of falling through to the OIDC exchange. Absent
+          # is not the same as empty. Add it back only if this repo ever moves
+          # off trusted publishing and onto a long-lived token.
           NPM_CONFIG_PROVENANCE: true
