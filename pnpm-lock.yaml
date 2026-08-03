@@ -64,6 +64,36 @@ importers:
         specifier: 5.9.3
         version: 5.9.3
 
+  packages/pipeline:
+    devDependencies:
+      '@dudousxd/nestjs-catalog':
+        specifier: workspace:*
+        version: link:../catalog
+      '@dudousxd/nestjs-catalog-store-mikro-orm':
+        specifier: workspace:*
+        version: link:../store-mikro-orm
+      '@dudousxd/nestjs-durable':
+        specifier: 0.39.1
+        version: 0.39.1(@dudousxd/nestjs-durable-core@0.62.1(reflect-metadata@0.2.2)(zod@3.25.76))(@nestjs/common@11.1.19(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.1.19(@nestjs/common@11.1.19(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(zod@3.25.76)
+      '@dudousxd/nestjs-durable-core':
+        specifier: 0.62.1
+        version: 0.62.1(reflect-metadata@0.2.2)(zod@3.25.76)
+      '@mikro-orm/core':
+        specifier: 7.0.17
+        version: 7.0.17
+      '@mikro-orm/mysql':
+        specifier: 7.0.17
+        version: 7.0.17(@mikro-orm/core@7.0.17)(@types/node@25.6.0)
+      '@nestjs/common':
+        specifier: 11.1.19
+        version: 11.1.19(reflect-metadata@0.2.2)(rxjs@7.8.2)
+      '@types/node':
+        specifier: 25.6.0
+        version: 25.6.0
+      typescript:
+        specifier: 5.9.3
+        version: 5.9.3
+
   packages/react:
     dependencies:
       clsx:
@@ -428,6 +458,40 @@ packages:
       '@nestjs/core':
         optional: true
       reflect-metadata:
+        optional: true
+
+  '@dudousxd/nestjs-durable-core@0.62.1':
+    resolution: {integrity: sha512-XvfeTlmahJZ8esYF8tZ+TFbPGriF2lsxgCZnuE0nDJrV9DGD37tXq5Gqk7chJbu9zPWnPLBm2LXfXaY+4teHCw==}
+    peerDependencies:
+      cron-parser: ^4.0.0 || ^5.0.0
+      reflect-metadata: ^0.2.0
+      zod: ^3.0.0 || ^4.0.0
+    peerDependenciesMeta:
+      cron-parser:
+        optional: true
+
+  '@dudousxd/nestjs-durable@0.39.1':
+    resolution: {integrity: sha512-Qh+wcuqobIedTVzBgr33B1sII367bh8KmQ+wnyJ1tBuJ4Cv6r/MjlkbuMHXjMh0ZVn/xT+ZsZjvwDwoCKn5kcw==}
+    peerDependencies:
+      '@dudousxd/durable-worker': '>=0.1.0 <1.0.0'
+      '@dudousxd/nestjs-context': '>=0.1.0 <1.0.0'
+      '@dudousxd/nestjs-durable-core': '>=0.1.0 <1.0.0'
+      '@nestjs/common': ^10.0.0 || ^11.0.0
+      '@nestjs/core': ^10.0.0 || ^11.0.0
+      class-transformer: ^0.5.0
+      class-validator: ^0.14.0
+      reflect-metadata: ^0.2.0
+      zod: ^3.0.0 || ^4.0.0
+    peerDependenciesMeta:
+      '@dudousxd/durable-worker':
+        optional: true
+      '@dudousxd/nestjs-context':
+        optional: true
+      class-transformer:
+        optional: true
+      class-validator:
+        optional: true
+      zod:
         optional: true
 
   '@dudousxd/nestjs-telescope@1.24.0':
@@ -2394,6 +2458,20 @@ snapshots:
       '@nestjs/common': 11.1.19(reflect-metadata@0.2.2)(rxjs@7.8.2)
       '@nestjs/core': 11.1.19(@nestjs/common@11.1.19(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2)
       reflect-metadata: 0.2.2
+
+  '@dudousxd/nestjs-durable-core@0.62.1(reflect-metadata@0.2.2)(zod@3.25.76)':
+    dependencies:
+      reflect-metadata: 0.2.2
+      zod: 3.25.76
+
+  '@dudousxd/nestjs-durable@0.39.1(@dudousxd/nestjs-durable-core@0.62.1(reflect-metadata@0.2.2)(zod@3.25.76))(@nestjs/common@11.1.19(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.1.19(@nestjs/common@11.1.19(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(zod@3.25.76)':
+    dependencies:
+      '@dudousxd/nestjs-durable-core': 0.62.1(reflect-metadata@0.2.2)(zod@3.25.76)
+      '@nestjs/common': 11.1.19(reflect-metadata@0.2.2)(rxjs@7.8.2)
+      '@nestjs/core': 11.1.19(@nestjs/common@11.1.19(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2)
+      reflect-metadata: 0.2.2
+    optionalDependencies:
+      zod: 3.25.76
 
   '@dudousxd/nestjs-telescope@1.24.0(@nestjs/common@11.1.19(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.1.19(@nestjs/common@11.1.19(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2)':
     dependencies:
