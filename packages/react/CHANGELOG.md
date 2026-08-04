@@ -1,5 +1,169 @@
 # @dudousxd/nestjs-catalog-react
 
+## 0.10.0
+
+### Minor Changes
+
+- 5cb78c8: A connector can report the schema of the source it reads
+
+  Pointing this catalog at a table nobody has written an entity for meant writing
+  the schema out by hand, column by column, from a database somebody had to open a
+  client against. `appendRowsAsSystem` refuses a type the registry does not carry,
+  and the only things that create one are a `@CatalogType` entity or a
+  `PUT /publish/:type/schema` body — so every table without an entity cost a
+  person a session with `information_schema` and a JSON document typed from it.
+
+  `POST pipeline/connectors/:id/discover` closes that from the other end. It runs
+  the connector's own configured read, reports the columns, and **creates
+  nothing**. For a SQL source the columns come from the driver describing the
+  result set of the author's query wrapped in `LIMIT 0`, so a billion-row table
+  costs what an empty one costs and no row is read at all; Postgres type oids and
+  MySQL column type ids are mapped to catalog scalars, including the two the ids
+  alone get wrong (`TINYINT(1)` is how MySQL spells a boolean, and a `TEXT` column
+  arrives under a blob type id with a non-binary character set). For `http`,
+  `file` and `s3` there is no schema to ask for, so the shape is inferred from a
+  bounded sample and the payload says so in as many words.
+
+  **A column it cannot type confidently is reported with no type at all.** Not
+  `string`, not `unknown` — `null`, which the console renders as "not typed" and
+  refuses to include until a person chooses. An unmapped oid, a sample that
+  disagrees with itself, a column that was null in every record sampled: each one
+  comes back with the reason. Guessing quietly is the failure that matters here,
+  because a wrong type becomes a wrong column in a lake nobody re-checks and the
+  load that fills it succeeds every night.
+
+  **Re-running discovery against a type that already exists reports drift** —
+  columns the source gained, columns it lost, columns whose type moved. That is
+  the part worth having. A first discovery happens once per source; drift happens
+  for as long as the connector exists, and all three are silent today: an added
+  column is dropped by the store, a removed one loads as null, and a retyped one
+  is coerced into whatever the catalog still believes.
+
+  The route is authorised exactly as running the connector is, against a grant on
+  its target type. Saving and running both require one, so without that check
+  discovery would have been the first route on this surface that let a principal
+  with no grants make the server read a source — and the answer is the column
+  names of a database it was never allowed near.
+
+  Property names take the source's spelling verbatim. The warehouse store matches
+  records to properties as `row[property.name]`, so a `first_name` column tidied
+  into a `firstName` property is a column that writes null on every run and
+  reports success; the tidying belongs in `displayName`, which is editable at
+  runtime and needs no migration.
+
+  In the console, the connector editor grows a "Discover schema" panel behind a
+  new optional `schemaDiscovery` prop on `<PipelineConsole />`. `CatalogClient`
+  carries neither a discovery call nor any publish call, so the two functions are
+  handed in rather than invented; a host that supplies discovery but no way to
+  create a type gets the confirmed `PUT` request printed instead of a button that
+  cannot work.
+
+- ad0219b: The console can reach schema discovery, and a host can bind load expectations
+
+  Two features shipped in this release were built and unreachable, for the same
+  reason in two places: the thing that would call them had no name to call.
+
+  **Schema discovery** returned a report the console could not ask for.
+  `CatalogClient` gained `discoverConnectorSchema`, and `pipelineRoutes` the path
+  behind it. The panel took a bridge as a prop and nothing supplied one.
+
+  **Creating the type from that report** had nowhere to go at all: this client had
+  no publish call, because publishing is the one write that does not go through
+  the catalog's own routes — there is deliberately no `POST /catalog/types`, since
+  structure follows a publisher and curation follows a person. `publishType` is
+  that call, and `CatalogTransport.put` is optional so a transport written before
+  this keeps compiling. A client handed one that cannot `PUT` refuses **by name**
+  rather than resolving having done nothing: a "Create type" button that returns
+  without creating a type is the exact failure the panel exists to prevent.
+
+  `publishBasePath` is its own option, defaulting to `/publish` — a sibling of the
+  pipeline's base, not a child, because that is how the library mounts the two.
+
+  **Load expectations** were exported from nothing. `CATALOG_LOAD_EXPECTATIONS` is
+  the token a host binds to declare how a type handles deleted rows and how far a
+  snapshot may shrink; a token nobody can name is a feature nobody can switch on,
+  and the refusals ship on by default. The whole module is exported with
+  `export *`, deliberately — a hand-maintained list is how the catalog package's
+  barrel came to export an interface without the two types its one method takes.
+
+- baacf22: The ontology has links.
+
+  `CatalogRelationDef` existed and the in-app registry read relations off the ORM, but the persisted
+  catalog — the one a real deployment runs — answered `relations: []`, `stats.relations: 0` and
+  `edges: []`, hardcoded. So two types could both be published and nothing recorded that one belonged
+  to the other. The graph drew nodes and no lines.
+
+  **Persisted.** `ObjectTypeRow` gains a `relations` column and a `mergeRelations()` that takes the
+  structure a publisher sends and keeps the labels a curator wrote, the same rule properties already
+  follow. A link the publisher stops sending is dropped, unlike a column: a column may still hold data
+  in the warehouse, a link holds nothing, and keeping one the schema no longer has means the ontology
+  asserts a join that will fail. Nullable, so rows written before this exist and read as no links.
+
+  **Served.** The stored registry reports relations on the type, counts them in `stats` and in the boot
+  line, and builds the graph. Nothing is guessed: there are no foreign keys in the warehouse, and a
+  `base_id` column beside a type called `Base` is a strong hint and a bad edge.
+
+  **One edge per link.** The graph de-duplicated relations by property name, which only catches the
+  accident of both ends being spelled alike — `Mvr.base` with `Base.mvrs` is the ordinary shape of a
+  foreign key and it drew two lines between the same pair of nodes. Links are now paired through the
+  new `owner` and `inverseName` fields on `CatalogRelationDef`, and the surviving edge is the one that
+  holds the key, so the arrow points the way a join is written.
+
+  **A link whose target is not published** is kept on the type and marked with the new
+  `targetPublished` — dropping it leaves a type looking less connected than it is — but draws no edge,
+  because an edge promises a node the reader can open. `CatalogManager` no longer renders it as a
+  button that silently selected an unrelated type.
+
+  **Both directions on screen.** A type carries one row per link it declares, so a `@ManyToOne` left
+  the target with an empty list and the catalog screen said nothing linked to or from it. The inbound
+  half is now derived from the snapshot the screen already holds — nothing stored, nothing counted
+  twice — and a link can be renamed in place through the existing property route. `FlowView` flags the
+  links that cross a publisher boundary, or land on a type nobody has loaded.
+
+  No new endpoints and no new decorator. A relation is a property to whoever is looking, so
+  `@CatalogProperty` labels one and `PATCH .../properties/:name` curates one, in both registries.
+
+  `CatalogRelationDef` gains four required fields (`owner`, `targetPublished`, `enriched`, and the
+  optional `inverseName`). Code that constructs one by hand — chiefly test fixtures — has to fill them
+  in; code that only reads relations is unaffected.
+
+- 04f09a3: A type now says when its data was last committed
+
+  A type whose publisher was deleted six months ago and a type loaded ten minutes
+  ago produced byte-identical payloads. `CatalogObjectTypeDef` carried a name, a
+  table and its properties, and nothing at all about the data — the only
+  timestamps in the snapshot were `generatedAt`, which is when the MODEL was
+  assembled, and `stats`, which counts types and properties. Every screen
+  downstream inherited that blindness, and the failure is somebody reading a
+  number off a type in June that stopped being updated in January.
+
+  Nothing deletes a type when its publisher goes away, and that is deliberate: a
+  failed deploy, a service that is down and a renamed entity all look like an
+  absent publisher, and a lake that dropped data on that evidence is not a lake
+  anybody trusts. But keeping the data and keeping quiet about its age are
+  different decisions, and only the first was made.
+
+  `lastCommittedAt`, `rowCount` and `lastPrincipalId` are filled from the newest
+  COMMITTED snapshot per type — `committedAt`, not `createdAt`, because a load
+  that was written and never committed is not what readers are served, and dating
+  a type by one reports freshness that does not exist. One query for all types,
+  not one per type: this runs on every reload.
+
+  **Absent means never committed**, and that is a third state the old shape could
+  not express. A schema published and never loaded is not a pipeline that stopped;
+  the fixes differ, and collapsing them is how the second gets ignored.
+
+  `rowCount` is there for a failure the timestamp cannot show: a connector that
+  starts returning 12 rows where it returned 40,000 produces data that is wrong
+  and _fresh_, so every staleness signal reports it healthy.
+
+  The Model screen shows the age beside the table name, marks what has not
+  committed in a week, and puts the count and the publisher in the tooltip. It is
+  not a health verdict — the catalog cannot tell a deleted publisher from a
+  monthly load, and a type labelled "orphaned" is a type somebody deletes on the
+  strength of a guess. `freshnessOf` and `isWorthFlagging` are exported for hosts
+  that want the same words elsewhere.
+
 ## 0.9.0
 
 ### Minor Changes

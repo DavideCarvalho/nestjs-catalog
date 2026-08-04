@@ -1,5 +1,217 @@
 # @dudousxd/nestjs-catalog
 
+## 0.7.0
+
+### Minor Changes
+
+- 8d58f9f: Links survive publishing, and survive a promotion
+
+  Relations shipped end to end — discovered from ORM metadata, stored as a column
+  on the object type row, merged by a rule that knows what a publisher owns and
+  what a curator owns, served on the type and drawn in the graph — with nothing
+  writing the column. `PublishedType` had no `relations`, so the one route an
+  application publishes its shape through dropped every link at the door, and the
+  whole feature was inert in any deployment that had not hand-edited the database.
+  `PUT /publish/:type/schema` now carries them, through the row's own
+  `mergeRelations` rather than a second copy of that judgement.
+
+  **Absent and empty are different statements on that wire.** A publisher that
+  sends no `relations` key has said nothing about links and its stored ones are
+  left alone — an application on a client that predates this field re-publishes its
+  whole shape on every deploy, and reading silence as "no links" would delete the
+  ontology, and every label curated onto it, the next time somebody shipped an
+  unrelated change. A publisher that sends an empty array has said there are none,
+  and the merge drops them.
+
+  **A promotion between environments carried none of it.** The promoted type
+  arrived complete in every visible way — right properties, right table, right
+  owner — and sat in the target's graph as an island, with nothing erroring at any
+  point, because the plan could not see the difference either: a promotion whose
+  only content was a link reported "nothing to promote". The promotable shape now
+  carries relations, the diff reports `relations.added` / `.changed` / `.removed`,
+  and the apply writes them.
+
+  **`relations.removed`, not `relations.absentFromSource`.** A property that
+  disappears from the source keeps its column and its rows in the target, because
+  `ensureType` never drops anything; a link that disappears is deleted there. The
+  apply ASSIGNS the source's links rather than merging them — a promotion is
+  somebody approving a fingerprinted plan of what the source holds, and a link the
+  source deliberately dropped surviving in the target would mean the plan says
+  `relations.removed` while the apply does not remove it. It is safe in a way
+  dropping a column is not: a column may still hold rows, a link holds nothing.
+  The removed names are carried in the diff's `to` value, because the fingerprint
+  an approval is compared against hashes exactly that — empty, dropping the link to
+  `Base` and dropping the link to `Depot` would hash identically.
+
+  `StoredRelation`, `PublishedRelation` and `relationsOf` are exported from the
+  store package's entry point, along with `catalogConnectionProviders`, which had
+  fallen behind the same hand-maintained list: both connection tokens were exported
+  and the only supported way to satisfy them was not.
+
+- baacf22: The ontology has links.
+
+  `CatalogRelationDef` existed and the in-app registry read relations off the ORM, but the persisted
+  catalog — the one a real deployment runs — answered `relations: []`, `stats.relations: 0` and
+  `edges: []`, hardcoded. So two types could both be published and nothing recorded that one belonged
+  to the other. The graph drew nodes and no lines.
+
+  **Persisted.** `ObjectTypeRow` gains a `relations` column and a `mergeRelations()` that takes the
+  structure a publisher sends and keeps the labels a curator wrote, the same rule properties already
+  follow. A link the publisher stops sending is dropped, unlike a column: a column may still hold data
+  in the warehouse, a link holds nothing, and keeping one the schema no longer has means the ontology
+  asserts a join that will fail. Nullable, so rows written before this exist and read as no links.
+
+  **Served.** The stored registry reports relations on the type, counts them in `stats` and in the boot
+  line, and builds the graph. Nothing is guessed: there are no foreign keys in the warehouse, and a
+  `base_id` column beside a type called `Base` is a strong hint and a bad edge.
+
+  **One edge per link.** The graph de-duplicated relations by property name, which only catches the
+  accident of both ends being spelled alike — `Mvr.base` with `Base.mvrs` is the ordinary shape of a
+  foreign key and it drew two lines between the same pair of nodes. Links are now paired through the
+  new `owner` and `inverseName` fields on `CatalogRelationDef`, and the surviving edge is the one that
+  holds the key, so the arrow points the way a join is written.
+
+  **A link whose target is not published** is kept on the type and marked with the new
+  `targetPublished` — dropping it leaves a type looking less connected than it is — but draws no edge,
+  because an edge promises a node the reader can open. `CatalogManager` no longer renders it as a
+  button that silently selected an unrelated type.
+
+  **Both directions on screen.** A type carries one row per link it declares, so a `@ManyToOne` left
+  the target with an empty list and the catalog screen said nothing linked to or from it. The inbound
+  half is now derived from the snapshot the screen already holds — nothing stored, nothing counted
+  twice — and a link can be renamed in place through the existing property route. `FlowView` flags the
+  links that cross a publisher boundary, or land on a type nobody has loaded.
+
+  No new endpoints and no new decorator. A relation is a property to whoever is looking, so
+  `@CatalogProperty` labels one and `PATCH .../properties/:name` curates one, in both registries.
+
+  `CatalogRelationDef` gains four required fields (`owner`, `targetPublished`, `enriched`, and the
+  optional `inverseName`). Code that constructs one by hand — chiefly test fixtures — has to fill them
+  in; code that only reads relations is unaffected.
+
+- 04f09a3: A type now says when its data was last committed
+
+  A type whose publisher was deleted six months ago and a type loaded ten minutes
+  ago produced byte-identical payloads. `CatalogObjectTypeDef` carried a name, a
+  table and its properties, and nothing at all about the data — the only
+  timestamps in the snapshot were `generatedAt`, which is when the MODEL was
+  assembled, and `stats`, which counts types and properties. Every screen
+  downstream inherited that blindness, and the failure is somebody reading a
+  number off a type in June that stopped being updated in January.
+
+  Nothing deletes a type when its publisher goes away, and that is deliberate: a
+  failed deploy, a service that is down and a renamed entity all look like an
+  absent publisher, and a lake that dropped data on that evidence is not a lake
+  anybody trusts. But keeping the data and keeping quiet about its age are
+  different decisions, and only the first was made.
+
+  `lastCommittedAt`, `rowCount` and `lastPrincipalId` are filled from the newest
+  COMMITTED snapshot per type — `committedAt`, not `createdAt`, because a load
+  that was written and never committed is not what readers are served, and dating
+  a type by one reports freshness that does not exist. One query for all types,
+  not one per type: this runs on every reload.
+
+  **Absent means never committed**, and that is a third state the old shape could
+  not express. A schema published and never loaded is not a pipeline that stopped;
+  the fixes differ, and collapsing them is how the second gets ignored.
+
+  `rowCount` is there for a failure the timestamp cannot show: a connector that
+  starts returning 12 rows where it returned 40,000 produces data that is wrong
+  and _fresh_, so every staleness signal reports it healthy.
+
+  The Model screen shows the age beside the table name, marks what has not
+  committed in a week, and puts the count and the publisher in the tooltip. It is
+  not a health verdict — the catalog cannot tell a deleted publisher from a
+  monthly load, and a type labelled "orphaned" is a type somebody deletes on the
+  strength of a guess. `freshnessOf` and `isWorthFlagging` are exported for hosts
+  that want the same words elsewhere.
+
+### Patch Changes
+
+- b4410bb: A load now has to be plausible before it becomes the data everybody reads
+
+  Two failures, and they are the same failure from two ends: a load that is
+  **fresh and wrong**. Every signal this catalog publishes about a type —
+  `lastCommittedAt`, the age badge on the Model screen, a green run in the runs
+  list — reports whether a load HAPPENED. None of them reports whether what it
+  loaded resembles the dataset it replaced, and a snapshot commit is atomic, so
+  from the moment a wrong load commits it is indistinguishable from a right one
+  until somebody counts rows by hand.
+
+  **Deleted rows lived in the lake forever.** An incremental connector asks its
+  source for what changed since a watermark. A row physically removed from the
+  source never changes again, so it is never returned again, so `carryForward`
+  copies it into every subsequent snapshot indefinitely. Nothing goes wrong at
+  any step; the catalog simply never finds out. There was no reconciliation, no
+  tombstone, and no mention of the limitation anywhere.
+
+  `PublishService.carryForwardAsSystem` — the one method every incremental load
+  passes through, whether it came from a connector, a workflow sink or an
+  application — now **refuses a type for which no reconciliation strategy has
+  been declared**. `ConnectorRunSteps` asks the same question before a scheduled
+  connector reads its source, so a misconfigured connector is refused without
+  pulling forty thousand rows first and without burning three durable retries on
+  something that will be exactly as wrong in fifteen minutes.
+
+  **A collapsed load committed as though it were healthy.** A connector that
+  starts returning 12 rows where it returned 40,000 — a source-side filter
+  change, a broken `WHERE`, a partial outage — committed successfully. Both
+  commit paths now compare the pending snapshot against the one being served and
+  refuse a load that lost more of it than the type allows. A refusal leaves the
+  snapshot written and uncommitted, so readers keep the previous one and the rows
+  are still there to be looked at; a connector run reports it through
+  `connector.run.finished` with `status: "failed"`, the same event both outcomes
+  have always come out of.
+
+  **Both are refusals a host will meet.** What to do about it:
+
+  Bind `CATALOG_LOAD_EXPECTATIONS` from a module you already pass in
+  `CatalogPipelineModule.forRoot({ imports })`, exporting the token:
+
+  ```ts
+  {
+    provide: CATALOG_LOAD_EXPECTATIONS,
+    useValue: {
+      default: { rowCount: { maxShrink: 0.5, minRows: 100 } },
+      byType: {
+        AuditEvent: { deletes: { strategy: 'accepted', because: 'append-only ledger' } },
+        Employee: {
+          deletes: {
+            strategy: 'soft-deleted-at-source',
+            because: 'HR sets deleted_at, so the watermark sees the removal',
+            column: 'deleted_at',
+          },
+        },
+        Mvr: {
+          deletes: { strategy: 'periodic-full-reload', because: 'nightly full read', withinMs: 86_400_000 },
+          rowCount: { maxShrink: 0.3 },
+        },
+      },
+    },
+  }
+  ```
+
+  - **Every type loaded by an `incremental` connector needs a `deletes` entry**,
+    or its next load is refused. The reason is a required field: it is the only
+    part of the decision still legible in six months. `periodic-full-reload` is
+    the one that is policed — once the last full snapshot is older than
+    `withinMs`, incremental loads of that type stop committing.
+  - **The row-count bound applies with no configuration at all**, defaulting to
+    `maxShrink: 0.5` above `minRows: 100`, plus an absolute rule at any size: a
+    snapshot of zero rows never replaces a non-empty one. Growth is unbounded
+    unless a type sets `maxGrowth` — a type that doubles has usually had a good
+    day, a type that loses 90% has not. A load that is legitimately smaller is
+    admitted by setting `_expectShrink` in its labels (the publish API passes
+    labels through) or by raising `rowCount.maxShrink` for that type.
+
+  Two limitations stated rather than glossed. A connector run cannot set
+  `_expectShrink` today — the runner labels its snapshots `{ source, connector }`
+  and takes no input for the rest — so a connector whose truncation is deliberate
+  is unblocked by raising the bound for that type. And a store that implements
+  neither `currentSnapshot` nor `listSnapshots` has no baseline to compare
+  against; the row-count check logs a warning naming the type and stands aside
+  rather than refusing an adapter for recording less than the bundled one does.
+
 ## 0.6.0
 
 ### Minor Changes

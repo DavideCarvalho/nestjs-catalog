@@ -1,5 +1,219 @@
 # @dudousxd/nestjs-catalog-pipeline
 
+## 0.5.0
+
+### Minor Changes
+
+- 5cb78c8: A connector can report the schema of the source it reads
+
+  Pointing this catalog at a table nobody has written an entity for meant writing
+  the schema out by hand, column by column, from a database somebody had to open a
+  client against. `appendRowsAsSystem` refuses a type the registry does not carry,
+  and the only things that create one are a `@CatalogType` entity or a
+  `PUT /publish/:type/schema` body — so every table without an entity cost a
+  person a session with `information_schema` and a JSON document typed from it.
+
+  `POST pipeline/connectors/:id/discover` closes that from the other end. It runs
+  the connector's own configured read, reports the columns, and **creates
+  nothing**. For a SQL source the columns come from the driver describing the
+  result set of the author's query wrapped in `LIMIT 0`, so a billion-row table
+  costs what an empty one costs and no row is read at all; Postgres type oids and
+  MySQL column type ids are mapped to catalog scalars, including the two the ids
+  alone get wrong (`TINYINT(1)` is how MySQL spells a boolean, and a `TEXT` column
+  arrives under a blob type id with a non-binary character set). For `http`,
+  `file` and `s3` there is no schema to ask for, so the shape is inferred from a
+  bounded sample and the payload says so in as many words.
+
+  **A column it cannot type confidently is reported with no type at all.** Not
+  `string`, not `unknown` — `null`, which the console renders as "not typed" and
+  refuses to include until a person chooses. An unmapped oid, a sample that
+  disagrees with itself, a column that was null in every record sampled: each one
+  comes back with the reason. Guessing quietly is the failure that matters here,
+  because a wrong type becomes a wrong column in a lake nobody re-checks and the
+  load that fills it succeeds every night.
+
+  **Re-running discovery against a type that already exists reports drift** —
+  columns the source gained, columns it lost, columns whose type moved. That is
+  the part worth having. A first discovery happens once per source; drift happens
+  for as long as the connector exists, and all three are silent today: an added
+  column is dropped by the store, a removed one loads as null, and a retyped one
+  is coerced into whatever the catalog still believes.
+
+  The route is authorised exactly as running the connector is, against a grant on
+  its target type. Saving and running both require one, so without that check
+  discovery would have been the first route on this surface that let a principal
+  with no grants make the server read a source — and the answer is the column
+  names of a database it was never allowed near.
+
+  Property names take the source's spelling verbatim. The warehouse store matches
+  records to properties as `row[property.name]`, so a `first_name` column tidied
+  into a `firstName` property is a column that writes null on every run and
+  reports success; the tidying belongs in `displayName`, which is editable at
+  runtime and needs no migration.
+
+  In the console, the connector editor grows a "Discover schema" panel behind a
+  new optional `schemaDiscovery` prop on `<PipelineConsole />`. `CatalogClient`
+  carries neither a discovery call nor any publish call, so the two functions are
+  handed in rather than invented; a host that supplies discovery but no way to
+  create a type gets the confirmed `PUT` request printed instead of a button that
+  cannot work.
+
+- 8d58f9f: Links survive publishing, and survive a promotion
+
+  Relations shipped end to end — discovered from ORM metadata, stored as a column
+  on the object type row, merged by a rule that knows what a publisher owns and
+  what a curator owns, served on the type and drawn in the graph — with nothing
+  writing the column. `PublishedType` had no `relations`, so the one route an
+  application publishes its shape through dropped every link at the door, and the
+  whole feature was inert in any deployment that had not hand-edited the database.
+  `PUT /publish/:type/schema` now carries them, through the row's own
+  `mergeRelations` rather than a second copy of that judgement.
+
+  **Absent and empty are different statements on that wire.** A publisher that
+  sends no `relations` key has said nothing about links and its stored ones are
+  left alone — an application on a client that predates this field re-publishes its
+  whole shape on every deploy, and reading silence as "no links" would delete the
+  ontology, and every label curated onto it, the next time somebody shipped an
+  unrelated change. A publisher that sends an empty array has said there are none,
+  and the merge drops them.
+
+  **A promotion between environments carried none of it.** The promoted type
+  arrived complete in every visible way — right properties, right table, right
+  owner — and sat in the target's graph as an island, with nothing erroring at any
+  point, because the plan could not see the difference either: a promotion whose
+  only content was a link reported "nothing to promote". The promotable shape now
+  carries relations, the diff reports `relations.added` / `.changed` / `.removed`,
+  and the apply writes them.
+
+  **`relations.removed`, not `relations.absentFromSource`.** A property that
+  disappears from the source keeps its column and its rows in the target, because
+  `ensureType` never drops anything; a link that disappears is deleted there. The
+  apply ASSIGNS the source's links rather than merging them — a promotion is
+  somebody approving a fingerprinted plan of what the source holds, and a link the
+  source deliberately dropped surviving in the target would mean the plan says
+  `relations.removed` while the apply does not remove it. It is safe in a way
+  dropping a column is not: a column may still hold rows, a link holds nothing.
+  The removed names are carried in the diff's `to` value, because the fingerprint
+  an approval is compared against hashes exactly that — empty, dropping the link to
+  `Base` and dropping the link to `Depot` would hash identically.
+
+  `StoredRelation`, `PublishedRelation` and `relationsOf` are exported from the
+  store package's entry point, along with `catalogConnectionProviders`, which had
+  fallen behind the same hand-maintained list: both connection tokens were exported
+  and the only supported way to satisfy them was not.
+
+- b4410bb: A load now has to be plausible before it becomes the data everybody reads
+
+  Two failures, and they are the same failure from two ends: a load that is
+  **fresh and wrong**. Every signal this catalog publishes about a type —
+  `lastCommittedAt`, the age badge on the Model screen, a green run in the runs
+  list — reports whether a load HAPPENED. None of them reports whether what it
+  loaded resembles the dataset it replaced, and a snapshot commit is atomic, so
+  from the moment a wrong load commits it is indistinguishable from a right one
+  until somebody counts rows by hand.
+
+  **Deleted rows lived in the lake forever.** An incremental connector asks its
+  source for what changed since a watermark. A row physically removed from the
+  source never changes again, so it is never returned again, so `carryForward`
+  copies it into every subsequent snapshot indefinitely. Nothing goes wrong at
+  any step; the catalog simply never finds out. There was no reconciliation, no
+  tombstone, and no mention of the limitation anywhere.
+
+  `PublishService.carryForwardAsSystem` — the one method every incremental load
+  passes through, whether it came from a connector, a workflow sink or an
+  application — now **refuses a type for which no reconciliation strategy has
+  been declared**. `ConnectorRunSteps` asks the same question before a scheduled
+  connector reads its source, so a misconfigured connector is refused without
+  pulling forty thousand rows first and without burning three durable retries on
+  something that will be exactly as wrong in fifteen minutes.
+
+  **A collapsed load committed as though it were healthy.** A connector that
+  starts returning 12 rows where it returned 40,000 — a source-side filter
+  change, a broken `WHERE`, a partial outage — committed successfully. Both
+  commit paths now compare the pending snapshot against the one being served and
+  refuse a load that lost more of it than the type allows. A refusal leaves the
+  snapshot written and uncommitted, so readers keep the previous one and the rows
+  are still there to be looked at; a connector run reports it through
+  `connector.run.finished` with `status: "failed"`, the same event both outcomes
+  have always come out of.
+
+  **Both are refusals a host will meet.** What to do about it:
+
+  Bind `CATALOG_LOAD_EXPECTATIONS` from a module you already pass in
+  `CatalogPipelineModule.forRoot({ imports })`, exporting the token:
+
+  ```ts
+  {
+    provide: CATALOG_LOAD_EXPECTATIONS,
+    useValue: {
+      default: { rowCount: { maxShrink: 0.5, minRows: 100 } },
+      byType: {
+        AuditEvent: { deletes: { strategy: 'accepted', because: 'append-only ledger' } },
+        Employee: {
+          deletes: {
+            strategy: 'soft-deleted-at-source',
+            because: 'HR sets deleted_at, so the watermark sees the removal',
+            column: 'deleted_at',
+          },
+        },
+        Mvr: {
+          deletes: { strategy: 'periodic-full-reload', because: 'nightly full read', withinMs: 86_400_000 },
+          rowCount: { maxShrink: 0.3 },
+        },
+      },
+    },
+  }
+  ```
+
+  - **Every type loaded by an `incremental` connector needs a `deletes` entry**,
+    or its next load is refused. The reason is a required field: it is the only
+    part of the decision still legible in six months. `periodic-full-reload` is
+    the one that is policed — once the last full snapshot is older than
+    `withinMs`, incremental loads of that type stop committing.
+  - **The row-count bound applies with no configuration at all**, defaulting to
+    `maxShrink: 0.5` above `minRows: 100`, plus an absolute rule at any size: a
+    snapshot of zero rows never replaces a non-empty one. Growth is unbounded
+    unless a type sets `maxGrowth` — a type that doubles has usually had a good
+    day, a type that loses 90% has not. A load that is legitimately smaller is
+    admitted by setting `_expectShrink` in its labels (the publish API passes
+    labels through) or by raising `rowCount.maxShrink` for that type.
+
+  Two limitations stated rather than glossed. A connector run cannot set
+  `_expectShrink` today — the runner labels its snapshots `{ source, connector }`
+  and takes no input for the rest — so a connector whose truncation is deliberate
+  is unblocked by raising the bound for that type. And a store that implements
+  neither `currentSnapshot` nor `listSnapshots` has no baseline to compare
+  against; the row-count check logs a warning naming the type and stands aside
+  rather than refusing an adapter for recording less than the bundled one does.
+
+- ad0219b: The console can reach schema discovery, and a host can bind load expectations
+
+  Two features shipped in this release were built and unreachable, for the same
+  reason in two places: the thing that would call them had no name to call.
+
+  **Schema discovery** returned a report the console could not ask for.
+  `CatalogClient` gained `discoverConnectorSchema`, and `pipelineRoutes` the path
+  behind it. The panel took a bridge as a prop and nothing supplied one.
+
+  **Creating the type from that report** had nowhere to go at all: this client had
+  no publish call, because publishing is the one write that does not go through
+  the catalog's own routes — there is deliberately no `POST /catalog/types`, since
+  structure follows a publisher and curation follows a person. `publishType` is
+  that call, and `CatalogTransport.put` is optional so a transport written before
+  this keeps compiling. A client handed one that cannot `PUT` refuses **by name**
+  rather than resolving having done nothing: a "Create type" button that returns
+  without creating a type is the exact failure the panel exists to prevent.
+
+  `publishBasePath` is its own option, defaulting to `/publish` — a sibling of the
+  pipeline's base, not a child, because that is how the library mounts the two.
+
+  **Load expectations** were exported from nothing. `CATALOG_LOAD_EXPECTATIONS` is
+  the token a host binds to declare how a type handles deleted rows and how far a
+  snapshot may shrink; a token nobody can name is a feature nobody can switch on,
+  and the refusals ship on by default. The whole module is exported with
+  `export *`, deliberately — a hand-maintained list is how the catalog package's
+  barrel came to export an interface without the two types its one method takes.
+
 ## 0.4.0
 
 ### Minor Changes
