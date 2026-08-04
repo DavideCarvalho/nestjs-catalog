@@ -37,6 +37,67 @@ export interface QueryConsoleProps {
   maxRows?: number;
 }
 
+/**
+ * Turn a sentence into SQL, and say what the assistant was shown.
+ *
+ * The note about relation and column names is not decoration: somebody typing a
+ * question here is entitled to know that the rows never left the database, and
+ * that what comes back is a draft to read rather than a result to trust.
+ */
+function AskAssistantPanel({
+  prompt,
+  onPromptChange,
+  pending,
+  error,
+  onSubmit,
+}: {
+  prompt: string;
+  onPromptChange: (value: string) => void;
+  pending: boolean;
+  error: unknown;
+  onSubmit: () => void;
+}) {
+  return (
+    <div className={cn('shrink-0 border-b bg-sky-50/60 px-4 py-3 dark:bg-sky-950/20', RULE)}>
+      <form
+        className="flex gap-2"
+        onSubmit={(e) => {
+          e.preventDefault();
+          onSubmit();
+        }}
+      >
+        <input
+          value={prompt}
+          onChange={(e) => onPromptChange(e.target.value)}
+          placeholder="Which vehicles gained the most work orders since the last load?"
+          aria-label="Describe the query"
+          className={cn(
+            'flex-1 rounded-md border px-3 py-1.5 text-sm outline-none',
+            RULE,
+            PANEL,
+            'focus:border-sky-500 focus:ring-2 focus:ring-sky-500/15',
+          )}
+        />
+        <button
+          type="submit"
+          disabled={pending || prompt.trim().length === 0}
+          className="rounded-md bg-sky-600 px-3 py-1.5 text-xs text-white disabled:opacity-40"
+        >
+          {pending ? 'Writing…' : 'Write the SQL'}
+        </button>
+      </form>
+      <p className={cn('mt-1.5 text-[11px]', MUTED)}>
+        It sees the relation and column names above, never the rows. Read the SQL before running it.
+      </p>
+      {error ? (
+        <p className="mt-1 text-[11px] text-red-600">
+          {error instanceof Error ? error.message : 'The assistant could not write that.'}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
 export function QueryConsole({ onGenerate, maxRows = 500 }: QueryConsoleProps) {
   const client = useCatalogClient();
   const [sql, setSql] = useState(STARTER);
@@ -175,48 +236,13 @@ export function QueryConsole({ onGenerate, maxRows = 500 }: QueryConsoleProps) {
           </div>
 
           {askOpen && onGenerate && (
-            <div
-              className={cn('shrink-0 border-b bg-sky-50/60 px-4 py-3 dark:bg-sky-950/20', RULE)}
-            >
-              <form
-                className="flex gap-2"
-                onSubmit={(e) => {
-                  e.preventDefault();
-                  generate.mutate();
-                }}
-              >
-                <input
-                  value={prompt}
-                  onChange={(e) => setPrompt(e.target.value)}
-                  placeholder="Which vehicles gained the most work orders since the last load?"
-                  aria-label="Describe the query"
-                  className={cn(
-                    'flex-1 rounded-md border px-3 py-1.5 text-sm outline-none',
-                    RULE,
-                    PANEL,
-                    'focus:border-sky-500 focus:ring-2 focus:ring-sky-500/15',
-                  )}
-                />
-                <button
-                  type="submit"
-                  disabled={generate.isPending || prompt.trim().length === 0}
-                  className="rounded-md bg-sky-600 px-3 py-1.5 text-xs text-white disabled:opacity-40"
-                >
-                  {generate.isPending ? 'Writing…' : 'Write the SQL'}
-                </button>
-              </form>
-              <p className={cn('mt-1.5 text-[11px]', MUTED)}>
-                It sees the relation and column names above, never the rows. Read the SQL before
-                running it.
-              </p>
-              {generate.error && (
-                <p className="mt-1 text-[11px] text-red-600">
-                  {generate.error instanceof Error
-                    ? generate.error.message
-                    : 'The assistant could not write that.'}
-                </p>
-              )}
-            </div>
+            <AskAssistantPanel
+              prompt={prompt}
+              onPromptChange={setPrompt}
+              pending={generate.isPending}
+              error={generate.error}
+              onSubmit={() => generate.mutate()}
+            />
           )}
 
           <SqlEditor

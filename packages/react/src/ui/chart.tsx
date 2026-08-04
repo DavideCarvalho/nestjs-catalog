@@ -116,6 +116,143 @@ ${colorConfig
 
 export const ChartTooltip = RechartsPrimitive.Tooltip;
 
+type TooltipProps = React.ComponentProps<typeof RechartsPrimitive.Tooltip>;
+type TooltipPayloadItem = NonNullable<TooltipProps['payload']>[number];
+
+/** The swatch to the left of a tooltip row — a dot, a bar, or a dashed rule. */
+function ChartTooltipIndicator({
+  color,
+  indicator,
+  nestLabel,
+}: {
+  color: string | undefined;
+  indicator: 'line' | 'dot' | 'dashed';
+  nestLabel: boolean;
+}) {
+  return (
+    <div
+      className={cn('shrink-0 rounded-[2px] border-(--color-border) bg-(--color-bg)', {
+        'h-2.5 w-2.5': indicator === 'dot',
+        'w-1': indicator === 'line',
+        'w-0 border-[1.5px] border-dashed bg-transparent': indicator === 'dashed',
+        'my-0.5': nestLabel && indicator === 'dashed',
+      })}
+      style={
+        {
+          '--color-bg': color,
+          '--color-border': color,
+        } as React.CSSProperties
+      }
+    />
+  );
+}
+
+/**
+ * The right-hand side of a tooltip row: the series name, then its value.
+ *
+ * When the tooltip holds a single non-dot series the shared label is nested in
+ * here instead of sitting above the rows, so it reads as part of the one entry
+ * rather than as a heading over a list of one.
+ */
+function ChartTooltipNameAndValue({
+  name,
+  value,
+  nestLabel,
+  tooltipLabel,
+}: {
+  name: React.ReactNode;
+  value: TooltipPayloadItem['value'];
+  nestLabel: boolean;
+  tooltipLabel: React.ReactNode;
+}) {
+  return (
+    <div
+      className={cn(
+        'flex flex-1 justify-between leading-none',
+        nestLabel ? 'items-end' : 'items-center',
+      )}
+    >
+      <div className="grid gap-1.5">
+        {nestLabel ? tooltipLabel : null}
+        <span className="text-zinc-500 dark:text-zinc-400">{name}</span>
+      </div>
+      {value !== undefined && (
+        <span className="font-mono font-medium tabular-nums">
+          {typeof value === 'number' ? value.toLocaleString() : String(value)}
+        </span>
+      )}
+    </div>
+  );
+}
+
+/**
+ * One series inside the tooltip: swatch, name, value.
+ *
+ * A caller's `formatter` replaces the whole row rather than any part of it,
+ * which is why it short-circuits everything below it.
+ */
+function ChartTooltipRow({
+  item,
+  index,
+  config,
+  color,
+  formatter,
+  indicator,
+  hideIndicator,
+  nestLabel,
+  nameKey,
+  tooltipLabel,
+}: {
+  item: TooltipPayloadItem;
+  index: number;
+  config: ChartConfig;
+  color: string | undefined;
+  formatter: TooltipProps['formatter'];
+  indicator: 'line' | 'dot' | 'dashed';
+  hideIndicator: boolean;
+  nestLabel: boolean;
+  nameKey: string | undefined;
+  tooltipLabel: React.ReactNode;
+}) {
+  const key = `${nameKey || item.name || item.dataKey || 'value'}`;
+  const itemConfig = getPayloadConfigFromPayload(config, item, key);
+  const indicatorColor = color || item.payload?.fill || item.color;
+
+  return (
+    <div
+      className={cn(
+        'flex w-full flex-wrap items-stretch gap-2',
+        '[&>svg]:h-2.5 [&>svg]:w-2.5 [&>svg]:text-zinc-400',
+        indicator === 'dot' && 'items-center',
+      )}
+    >
+      {formatter && item?.value !== undefined && item.name ? (
+        formatter(item.value, item.name, item, index, item.payload)
+      ) : (
+        <>
+          {itemConfig?.icon ? (
+            <itemConfig.icon />
+          ) : (
+            !hideIndicator && (
+              <ChartTooltipIndicator
+                color={indicatorColor}
+                indicator={indicator}
+                nestLabel={nestLabel}
+              />
+            )
+          )}
+          <ChartTooltipNameAndValue
+            name={itemConfig?.label || item.name}
+            value={item.value}
+            nestLabel={nestLabel}
+            tooltipLabel={tooltipLabel}
+          />
+        </>
+      )}
+    </div>
+  );
+}
+
 export function ChartTooltipContent({
   active,
   payload,
@@ -173,74 +310,21 @@ export function ChartTooltipContent({
     >
       {!nestLabel ? tooltipLabel : null}
       <div className="grid gap-1.5">
-        {payload.map((item, index) => {
-          const key = `${nameKey || item.name || item.dataKey || 'value'}`;
-          const itemConfig = getPayloadConfigFromPayload(config, item, key);
-          const indicatorColor = color || item.payload?.fill || item.color;
-
-          return (
-            <div
-              // biome-ignore lint/suspicious/noArrayIndexKey: payload items have no id
-              key={item.dataKey ?? index}
-              className={cn(
-                'flex w-full flex-wrap items-stretch gap-2',
-                '[&>svg]:h-2.5 [&>svg]:w-2.5 [&>svg]:text-zinc-400',
-                indicator === 'dot' && 'items-center',
-              )}
-            >
-              {formatter && item?.value !== undefined && item.name ? (
-                formatter(item.value, item.name, item, index, item.payload)
-              ) : (
-                <>
-                  {itemConfig?.icon ? (
-                    <itemConfig.icon />
-                  ) : (
-                    !hideIndicator && (
-                      <div
-                        className={cn(
-                          'shrink-0 rounded-[2px] border-(--color-border) bg-(--color-bg)',
-                          {
-                            'h-2.5 w-2.5': indicator === 'dot',
-                            'w-1': indicator === 'line',
-                            'w-0 border-[1.5px] border-dashed bg-transparent':
-                              indicator === 'dashed',
-                            'my-0.5': nestLabel && indicator === 'dashed',
-                          },
-                        )}
-                        style={
-                          {
-                            '--color-bg': indicatorColor,
-                            '--color-border': indicatorColor,
-                          } as React.CSSProperties
-                        }
-                      />
-                    )
-                  )}
-                  <div
-                    className={cn(
-                      'flex flex-1 justify-between leading-none',
-                      nestLabel ? 'items-end' : 'items-center',
-                    )}
-                  >
-                    <div className="grid gap-1.5">
-                      {nestLabel ? tooltipLabel : null}
-                      <span className="text-zinc-500 dark:text-zinc-400">
-                        {itemConfig?.label || item.name}
-                      </span>
-                    </div>
-                    {item.value !== undefined && (
-                      <span className="font-mono font-medium tabular-nums">
-                        {typeof item.value === 'number'
-                          ? item.value.toLocaleString()
-                          : String(item.value)}
-                      </span>
-                    )}
-                  </div>
-                </>
-              )}
-            </div>
-          );
-        })}
+        {payload.map((item, index) => (
+          <ChartTooltipRow
+            key={item.dataKey ?? index}
+            item={item}
+            index={index}
+            config={config}
+            color={color}
+            formatter={formatter}
+            indicator={indicator}
+            hideIndicator={hideIndicator}
+            nestLabel={nestLabel}
+            nameKey={nameKey}
+            tooltipLabel={tooltipLabel}
+          />
+        ))}
       </div>
     </div>
   );

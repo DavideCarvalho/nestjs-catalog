@@ -46,7 +46,6 @@ export function useChartPhaseOrchestrator({
   const phaseRef = useRef(chartPhase);
   phaseRef.current = chartPhase;
 
-  // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: status transition branches for animation durations
   useEffect(() => {
     const prevStatus = prevStatusRef.current;
     if (prevStatus === chartStatus) {
@@ -85,7 +84,6 @@ export function useChartPhaseOrchestrator({
     }
   }, [animationDuration, chartStatus, skeletonData, targetData, yDomainTweenDuration]);
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: revealSignature replays enter
   useEffect(() => {
     if (skipEnterReveal) {
       return;

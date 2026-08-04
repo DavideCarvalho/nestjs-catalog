@@ -99,6 +99,46 @@ interface Lane {
  * most important thing on this screen, and collapsing by type would hide
  * exactly that.
  */
+/** An empty lane for one (publisher, type) pair, named from the type when it is known. */
+function newLane(
+  principalId: string,
+  typeName: string,
+  def: CatalogObjectTypeDef | undefined,
+): Lane {
+  return {
+    principalId,
+    typeName,
+    displayName: def?.displayName ?? typeName,
+    icon: def?.icon,
+    loads: [],
+    schemaChanges: 0,
+  };
+}
+
+/**
+ * Fold one snapshot event into a lane's loads.
+ *
+ * A snapshot is written and then committed — two events for one load — so a
+ * second event updates the load already recorded rather than adding another bar
+ * beside it. Capped at 12 because a lane is a sparkline, not a log.
+ */
+function recordSnapshot(lane: Lane, event: CatalogAuditEvent): void {
+  if (!event.snapshotId || !event.event.startsWith('snapshot.')) return;
+
+  const committed = event.event === 'snapshot.committed';
+  const rows = Number(event.detail?.rowCount ?? event.detail?.rows ?? 0);
+  const existing = lane.loads.find((load) => load.snapshotId === event.snapshotId);
+
+  if (existing) {
+    existing.committed = existing.committed || committed;
+    existing.rows = Math.max(existing.rows, rows);
+    return;
+  }
+  if (lane.loads.length < 12) {
+    lane.loads.push({ snapshotId: event.snapshotId, rows, committed, at: event.occurredAt });
+  }
+}
+
 function buildLanes(types: CatalogObjectTypeDef[], events: CatalogAuditEvent[]): Lane[] {
   const byType = new Map(types.map((t) => [t.name, t]));
   const lanes = new Map<string, Lane>();
@@ -109,36 +149,10 @@ function buildLanes(types: CatalogObjectTypeDef[], events: CatalogAuditEvent[]):
     if (!event.typeName) continue;
     const principalId = event.principalId ?? 'curated by hand';
     const key = `${principalId}:${event.typeName}`;
-
-    const lane =
-      lanes.get(key) ??
-      ({
-        principalId,
-        typeName: event.typeName,
-        displayName: byType.get(event.typeName)?.displayName ?? event.typeName,
-        icon: byType.get(event.typeName)?.icon,
-        loads: [],
-        schemaChanges: 0,
-      } satisfies Lane);
+    const lane = lanes.get(key) ?? newLane(principalId, event.typeName, byType.get(event.typeName));
 
     if (event.event === 'schema.changed') lane.schemaChanges += 1;
-
-    if (event.snapshotId && event.event.startsWith('snapshot.')) {
-      const existing = lane.loads.find((l) => l.snapshotId === event.snapshotId);
-      const committed = event.event === 'snapshot.committed';
-      const rows = Number(event.detail?.rowCount ?? event.detail?.rows ?? 0);
-      if (existing) {
-        existing.committed = existing.committed || committed;
-        existing.rows = Math.max(existing.rows, rows);
-      } else if (lane.loads.length < 12) {
-        lane.loads.push({
-          snapshotId: event.snapshotId,
-          rows,
-          committed,
-          at: event.occurredAt,
-        });
-      }
-    }
+    recordSnapshot(lane, event);
 
     lane.lastAt = lane.lastAt ?? event.occurredAt;
     lanes.set(key, lane);

@@ -10,8 +10,8 @@ import {
   keyProperties,
 } from './compare';
 import { emitFanout } from './events';
-import { CatalogFanoutError, FanoutCatalogStore } from './fanout.store';
-import type { FanoutJournalEntry, FanoutStage } from './journal';
+import { CatalogFanoutError, FanoutCatalogStore, type FanoutFollower } from './fanout.store';
+import type { FanoutCommitMark, FanoutJournalEntry, FanoutStage } from './journal';
 import type { FollowerStrictness } from './options';
 
 /**
@@ -333,28 +333,12 @@ export class CatalogFanoutMigration {
     const size = Math.max(1, options.batchSize ?? DEFAULT_REPLAY_BATCH_SIZE);
     const principalId = await this.principalFor(resolved, snapshotId);
 
-    let batches = 0;
-    let rows = 0;
-    for (let page = 1; ; page += 1) {
-      const result = await primary.store.read(resolved, fields, {
-        page,
-        size,
-        sort,
-        dir: 'asc',
-        snapshot: snapshotId,
-      });
-      if (result.rows.length === 0) break;
-      await follower.store.write(resolved, result.rows, {
-        snapshotId,
-        principalId,
-        batch: batches,
-        labels: { _replayedFrom: primary.name, _replayedAt: new Date().toISOString() },
-      });
-      batches += 1;
-      rows += result.rows.length;
-      if (rows >= result.total) break;
-      if (page > Math.ceil(result.total / size) + 1) break;
-    }
+    const { batches, rows } = await this.copyPages(resolved, snapshotId, follower, {
+      fields,
+      sort,
+      size,
+      principalId,
+    });
 
     const cleared = await this.fanout.clearDebt(
       resolved.name,
@@ -363,20 +347,14 @@ export class CatalogFanoutMigration {
       REPLAYED_STAGES,
     );
 
-    const shouldCommit =
-      options.commit ?? (current === undefined ? false : current.snapshotId === snapshotId);
-    if (options.commit === undefined && current === undefined) {
-      notes.push(
-        `This journal has no record of which snapshot ${primary.name} is serving — it was empty when the fan-out started, or the commit happened before this package was installed — so the rows were staged on ${followerName} and not committed. Pass \`commit: true\` once you have checked that ${snapshotId} is the current snapshot.`,
-      );
-    }
-    if (shouldCommit) {
-      await this.fanout.commitFollower(resolved, snapshotId, followerName);
-    } else if (options.commit !== true && current !== undefined) {
-      notes.push(
-        `${snapshotId} is not the snapshot ${primary.name} is serving (${current.snapshotId}), so the rows were staged on ${followerName} without being committed. Committing an older snapshot there would point the follower at data the catalog has moved on from.`,
-      );
-    }
+    const shouldCommit = await this.commitReplayIfCurrent(
+      resolved,
+      snapshotId,
+      followerName,
+      current,
+      options.commit,
+      notes,
+    );
 
     const [comparison] = await this.compare(resolved, {
       snapshotId,
@@ -406,6 +384,86 @@ export class CatalogFanoutMigration {
       notes,
       comparison,
     };
+  }
+
+  /**
+   * Step 4 of {@link replay}: page the primary's snapshot into the follower.
+   *
+   * Batch numbers start at zero and count this copy's own pages, not the failed
+   * attempt's — {@link clearFollowerCopy} has already dropped that, and `write`
+   * replaces per batch, so continuing someone else's numbering is exactly what
+   * would leave a longer failed attempt's tail behind a shorter replay.
+   */
+  private async copyPages(
+    type: CatalogObjectTypeDef,
+    snapshotId: string,
+    follower: FanoutFollower,
+    plan: { fields: string[]; sort: string | undefined; size: number; principalId: string },
+  ): Promise<{ batches: number; rows: number }> {
+    const primary = this.fanout.primary;
+    let batches = 0;
+    let rows = 0;
+
+    for (let page = 1; ; page += 1) {
+      const result = await primary.store.read(type, plan.fields, {
+        page,
+        size: plan.size,
+        sort: plan.sort,
+        dir: 'asc',
+        snapshot: snapshotId,
+      });
+      if (result.rows.length === 0) break;
+      await follower.store.write(type, result.rows, {
+        snapshotId,
+        principalId: plan.principalId,
+        batch: batches,
+        labels: { _replayedFrom: primary.name, _replayedAt: new Date().toISOString() },
+      });
+      batches += 1;
+      rows += result.rows.length;
+      if (rows >= result.total) break;
+      if (page > Math.ceil(result.total / plan.size) + 1) break;
+    }
+
+    return { batches, rows };
+  }
+
+  /**
+   * Step 6 of {@link replay}: commit on the follower, but only when this
+   * snapshot is the one the primary is currently serving.
+   *
+   * The default is deliberately "stage, do not commit", and the two ways of
+   * declining say different things — an unknown current snapshot is a journal
+   * that cannot answer, while a known and different one is a caller asking to
+   * repoint a follower at older data. Both append a note rather than throwing,
+   * because the rows did land and a staged snapshot is a useful outcome.
+   */
+  private async commitReplayIfCurrent(
+    type: CatalogObjectTypeDef,
+    snapshotId: string,
+    followerName: string,
+    current: FanoutCommitMark | undefined,
+    requested: boolean | undefined,
+    notes: string[],
+  ): Promise<boolean> {
+    const primaryName = this.fanout.primary.name;
+    const shouldCommit =
+      requested ?? (current === undefined ? false : current.snapshotId === snapshotId);
+
+    if (requested === undefined && current === undefined) {
+      notes.push(
+        `This journal has no record of which snapshot ${primaryName} is serving — it was empty when the fan-out started, or the commit happened before this package was installed — so the rows were staged on ${followerName} and not committed. Pass \`commit: true\` once you have checked that ${snapshotId} is the current snapshot.`,
+      );
+    }
+    if (shouldCommit) {
+      await this.fanout.commitFollower(type, snapshotId, followerName);
+    } else if (requested !== true && current !== undefined) {
+      notes.push(
+        `${snapshotId} is not the snapshot ${primaryName} is serving (${current.snapshotId}), so the rows were staged on ${followerName} without being committed. Committing an older snapshot there would point the follower at data the catalog has moved on from.`,
+      );
+    }
+
+    return shouldCommit;
   }
 
   /**

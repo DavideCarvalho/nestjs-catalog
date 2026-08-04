@@ -409,6 +409,113 @@ const SPAN: Record<number, string> = {
   4: '@2xl:col-span-2 @5xl:col-span-4',
 };
 
+/**
+ * How many of the four columns this card spans.
+ *
+ * A pressed-state button group rather than a select: there are exactly four
+ * choices, the current one has to be visible at a glance while arranging a
+ * board, and a closed dropdown shows nothing.
+ */
+function CardWidthPicker({
+  width,
+  onWidth,
+}: {
+  width: number;
+  onWidth: (width: 1 | 2 | 3 | 4) => void;
+}) {
+  return (
+    <span
+      // A group of toggle buttons, not form fields, so `role="group"` is the
+      // accurate semantic — it is what the ARIA authoring practices give a
+      // toolbar toggle group and what Base UI's own ToggleGroup renders. A
+      // `<fieldset>` here would claim these are form controls and drag its
+      // user-agent sizing into a component the host styles.
+      // biome-ignore lint/a11y/useSemanticElements: fieldset is for grouping form controls; these are toggle buttons
+      className={cn('mr-1 flex overflow-hidden rounded-md border', RULE)}
+      role="group"
+      aria-label="Card width"
+    >
+      {([1, 2, 3, 4] as const).map((size) => (
+        <Tooltip key={size} content={`${size} of 4 columns wide`}>
+          <button
+            type="button"
+            onClick={() => onWidth(size)}
+            aria-pressed={width === size}
+            className={cn(
+              'px-1.5 py-0.5 font-mono text-[10px] transition-colors',
+              width === size
+                ? 'bg-zinc-950 text-zinc-50 dark:bg-zinc-100 dark:text-zinc-950'
+                : 'hover:bg-zinc-100 dark:hover:bg-zinc-800',
+            )}
+          >
+            {size}
+          </button>
+        </Tooltip>
+      ))}
+    </span>
+  );
+}
+
+/**
+ * The controls in a card's top-right: width, refresh, export, remove.
+ *
+ * Export appears only once there is a result, because the URL exports what the
+ * query returns and offering it before the first run promises a file that does
+ * not exist yet.
+ */
+function CardToolbar({
+  width,
+  onWidth,
+  cached,
+  fetching,
+  exportHref,
+  onRefresh,
+  onRemove,
+}: {
+  width: number;
+  onWidth?: (width: 1 | 2 | 3 | 4) => void;
+  cached: boolean;
+  fetching: boolean;
+  exportHref: string | undefined;
+  onRefresh: () => void;
+  onRemove: () => void;
+}) {
+  return (
+    <div className="flex shrink-0 items-center gap-0.5">
+      {onWidth && <CardWidthPicker width={width} onWidth={onWidth} />}
+      <Tooltip content={cached ? 'Cached — refetch anyway' : 'Run again'}>
+        <button
+          type="button"
+          onClick={onRefresh}
+          className={cn('rounded-sm p-1 hover:bg-zinc-100 dark:hover:bg-zinc-800', MUTED)}
+          aria-label="Refresh card"
+        >
+          <RefreshCw size={11} className={fetching ? 'animate-spin' : undefined} />
+        </button>
+      </Tooltip>
+      {exportHref && (
+        <Tooltip content="Download as CSV">
+          <a
+            href={exportHref}
+            className={cn('rounded-sm p-1 hover:bg-zinc-100 dark:hover:bg-zinc-800', MUTED)}
+            aria-label="Export card"
+          >
+            <Download size={11} />
+          </a>
+        </Tooltip>
+      )}
+      <button
+        type="button"
+        onClick={onRemove}
+        className={cn('rounded-sm p-1 hover:text-red-600', MUTED)}
+        aria-label="Remove card"
+      >
+        <Trash2 size={11} />
+      </button>
+    </div>
+  );
+}
+
 function Card({
   savedQueryId,
   width,
@@ -457,62 +564,15 @@ function Card({
             </p>
           )}
         </div>
-        <div className="flex shrink-0 items-center gap-0.5">
-          {onWidth && (
-            <span
-              className={cn('mr-1 flex overflow-hidden rounded-md border', RULE)}
-              role="group"
-              aria-label="Card width"
-            >
-              {([1, 2, 3, 4] as const).map((size) => (
-                <Tooltip key={size} content={`${size} of 4 columns wide`}>
-                  <button
-                    type="button"
-                    onClick={() => onWidth(size)}
-                    aria-pressed={width === size}
-                    className={cn(
-                      'px-1.5 py-0.5 font-mono text-[10px] transition-colors',
-                      width === size
-                        ? 'bg-zinc-950 text-zinc-50 dark:bg-zinc-100 dark:text-zinc-950'
-                        : 'hover:bg-zinc-100 dark:hover:bg-zinc-800',
-                    )}
-                  >
-                    {size}
-                  </button>
-                </Tooltip>
-              ))}
-            </span>
-          )}
-          <Tooltip content={data?.result.cached ? 'Cached — refetch anyway' : 'Run again'}>
-            <button
-              type="button"
-              onClick={() => refetch()}
-              className={cn('rounded-sm p-1 hover:bg-zinc-100 dark:hover:bg-zinc-800', MUTED)}
-              aria-label="Refresh card"
-            >
-              <RefreshCw size={11} className={isFetching ? 'animate-spin' : undefined} />
-            </button>
-          </Tooltip>
-          {data && (
-            <Tooltip content="Download as CSV">
-              <a
-                href={client.exportUrl(savedQueryId)}
-                className={cn('rounded-sm p-1 hover:bg-zinc-100 dark:hover:bg-zinc-800', MUTED)}
-                aria-label="Export card"
-              >
-                <Download size={11} />
-              </a>
-            </Tooltip>
-          )}
-          <button
-            type="button"
-            onClick={onRemove}
-            className={cn('rounded-sm p-1 hover:text-red-600', MUTED)}
-            aria-label="Remove card"
-          >
-            <Trash2 size={11} />
-          </button>
-        </div>
+        <CardToolbar
+          width={width}
+          onWidth={onWidth}
+          cached={data?.result.cached === true}
+          fetching={isFetching}
+          exportHref={data ? client.exportUrl(savedQueryId) : undefined}
+          onRefresh={() => refetch()}
+          onRemove={onRemove}
+        />
       </div>
 
       <div className="mt-3">

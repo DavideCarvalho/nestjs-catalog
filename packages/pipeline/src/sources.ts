@@ -160,8 +160,6 @@ export const fetchS3: SourceFetcher = async ({ connector, secret, state, mode })
 
   const prefix = String(connector.config.prefix ?? '');
   const suffix = String(connector.config.suffix ?? '');
-  const region = String(connector.config.region ?? '').trim();
-  const endpoint = String(connector.config.endpoint ?? '').trim();
   const limit = positiveInteger(connector.config.maxObjectsPerRun);
 
   // A full run reads the whole prefix by definition, so it ignores the stored
@@ -177,101 +175,36 @@ export const fetchS3: SourceFetcher = async ({ connector, secret, state, mode })
   );
 
   const s3 = await importOptional<S3Module>('@aws-sdk/client-s3', 'S3');
-  const credentials = parseS3Credentials(secret, connector.secretEnvVar);
-  const client = new s3.S3Client({
-    // Each key is absent rather than present-and-empty. `region: undefined` and
-    // `credentials: undefined` are not the same thing as an unset key to every
-    // SDK release, and an empty endpoint is a URL parse error rather than "use
-    // the AWS one".
-    ...(region ? { region } : {}),
-    ...(endpoint ? { endpoint } : {}),
-    // MinIO addresses buckets as a path segment. The virtual-host style the SDK
-    // prefers resolves to a `bucket.localhost` that does not exist.
-    ...(connector.config.forcePathStyle === true ? { forcePathStyle: true } : {}),
-    ...(credentials ? { credentials } : {}),
-  });
+  const client = createS3Client(s3, connector, secret);
 
   try {
-    // Every run lists the whole prefix, because S3 has no "modified since"
-    // filter — the only server-side narrowing it offers is `StartAfter`, which
-    // is lexicographic on the key, and keys almost never sort in the order the
-    // objects arrived. The listing is what the watermark costs; `prefix` is the
-    // lever that keeps it cheap, so point a connector at a partition rather
-    // than at the root of a bucket that has been collecting drops for years.
-    const candidates: S3Object[] = [];
-    let token: string | undefined;
-    do {
-      const page = readListing(
-        await client.send(
-          new s3.ListObjectsV2Command({
-            Bucket: bucket,
-            ...(prefix ? { Prefix: prefix } : {}),
-            ...(token ? { ContinuationToken: token } : {}),
-          }),
-        ),
-      );
-      for (const object of page.objects) {
-        if (suffix && !object.key.endsWith(suffix)) continue;
-        if (object.size === 0) continue;
-        if (previousWatermark !== undefined) {
-          if (object.lastModified < previousWatermark) continue;
-          // The tie set. Two objects can share a `LastModified` to the
-          // millisecond, so a strict `>` would drop the second one forever and
-          // a `>=` would re-read the first one every run. Only the keys sitting
-          // at exactly the watermark are remembered, which is why that list
-          // cannot grow without bound the way "every key ever seen" would.
-          if (object.lastModified === previousWatermark && previousKeys.has(object.key)) {
-            continue;
-          }
-        }
-        candidates.push(object);
-      }
-      token = page.nextToken;
-    } while (token);
+    const candidates = await listUnreadObjects({
+      client,
+      s3,
+      bucket,
+      prefix,
+      suffix,
+      previousWatermark,
+      previousKeys,
+    });
 
     // Oldest first, and ties broken by key so the order is the same on every
     // run. Without that, `maxObjectsPerRun` would cut a tie group in a
     // different place each time and the keys recorded at the watermark would
     // not be the ones actually read.
-    candidates.sort((a, b) =>
-      a.lastModified === b.lastModified
-        ? a.key.localeCompare(b.key)
-        : a.lastModified < b.lastModified
-          ? -1
-          : 1,
-    );
+    candidates.sort(byOldestThenKey);
     const consumed = limit === undefined ? candidates : candidates.slice(0, limit);
     // Nothing new. Returning no state leaves the previous watermark exactly
     // where it was, which is what "nothing happened" should mean.
     if (consumed.length === 0) return [];
 
-    const records: unknown[] = [];
-    for (const object of consumed) {
-      const text = await readObjectText(
-        await client.send(new s3.GetObjectCommand({ Bucket: bucket, Key: object.key })),
-        `s3://${bucket}/${object.key}`,
-      );
-      if (!text.trim()) continue;
-      // The same format logic a file connector uses, per object: the extension
-      // decides unless the connector overrides it, which is what a prefix full
-      // of `part-00000` files needs.
-      //
-      // Appended one at a time rather than spread into `push`, because a spread
-      // becomes one argument per row and a CSV drop with a few hundred thousand
-      // of them overflows the call stack — a failure that only shows up on the
-      // large files this connector exists to read.
-      for (const record of parseRecords(text, object.key, connector.config)) {
-        records.push(record);
-      }
-    }
-
-    const watermark = consumed[consumed.length - 1].lastModified;
-    const keys = new Set(
-      consumed.filter((object) => object.lastModified === watermark).map((object) => object.key),
-    );
-    if (watermark === previousWatermark) {
-      for (const key of previousKeys) keys.add(key);
-    }
+    const records = await readObjectRecords({
+      client,
+      s3,
+      bucket,
+      objects: consumed,
+      config: connector.config,
+    });
 
     // State is returned even on a full run. It is a fact about what this run
     // read, true whichever mode asked for it, and recording it means switching
@@ -279,7 +212,7 @@ export const fetchS3: SourceFetcher = async ({ connector, secret, state, mode })
     // loading the whole prefix a second time.
     return {
       records,
-      state: { objectWatermark: watermark, objectWatermarkKeys: [...keys] },
+      state: nextObjectState(consumed, previousWatermark, previousKeys),
     };
   } finally {
     // The SDK keeps sockets alive for reuse, which keeps the process alive too
@@ -386,9 +319,30 @@ function boundStatement(
   };
 }
 
+/**
+ * As much of `pg`'s client as this file actually calls.
+ *
+ * The rows stay `unknown[]`: they are whatever the author's query selected out
+ * of somebody else's database, which is the one thing here that genuinely has
+ * no type at this boundary. Declaring the *methods* is not the same claim — a
+ * driver without them fails at the call either way.
+ */
+interface PostgresClientLike {
+  connect(): Promise<void>;
+  query(sql: string, params?: unknown[]): Promise<{ rows?: unknown[] }>;
+  end(): Promise<void>;
+}
+
+/** The same, for `mysql2/promise`. `query`/`execute` resolve to `[rows, fields]`. */
+interface MysqlConnectionLike {
+  query(sql: string): Promise<[unknown, unknown]>;
+  execute(sql: string, params: unknown[]): Promise<[unknown, unknown]>;
+  end(): Promise<void>;
+}
+
 async function queryPostgres(url: string, sql: string, params: unknown[]): Promise<unknown[]> {
   const pg = await importOptional<{
-    Client: new (c: { connectionString: string }) => any;
+    Client: new (c: { connectionString: string }) => PostgresClientLike;
   }>('pg', 'postgres');
   const client = new pg.Client({ connectionString: url });
   await client.connect();
@@ -404,7 +358,7 @@ async function queryPostgres(url: string, sql: string, params: unknown[]): Promi
 
 async function queryMysql(url: string, sql: string, params: unknown[]): Promise<unknown[]> {
   const mysql = await importOptional<{
-    createConnection: (url: string) => Promise<any>;
+    createConnection: (url: string) => Promise<MysqlConnectionLike>;
   }>('mysql2/promise', 'mysql');
   const connection = await mysql.createConnection(url);
   try {
@@ -593,6 +547,8 @@ interface S3Module {
   GetObjectCommand: new (input: Record<string, unknown>) => unknown;
 }
 
+type S3ClientLike = InstanceType<S3Module['S3Client']>;
+
 interface S3Object {
   key: string;
   /** ISO-8601, so a string comparison agrees with a comparison of instants. */
@@ -625,6 +581,153 @@ function parseS3Credentials(
 }
 
 /**
+ * An S3 client configured from the connector, and nothing else.
+ *
+ * Every key is absent rather than present-and-empty. `region: undefined` and
+ * `credentials: undefined` are not the same thing as an unset key to every SDK
+ * release, and an empty endpoint is a URL parse error rather than "use the AWS
+ * one" — which is why this is a pile of conditional spreads rather than an
+ * object literal with some undefined values in it.
+ */
+function createS3Client(
+  s3: S3Module,
+  connector: CatalogConnector,
+  secret: string | undefined,
+): S3ClientLike {
+  const region = String(connector.config.region ?? '').trim();
+  const endpoint = String(connector.config.endpoint ?? '').trim();
+  const credentials = parseS3Credentials(secret, connector.secretEnvVar);
+
+  return new s3.S3Client({
+    ...(region ? { region } : {}),
+    ...(endpoint ? { endpoint } : {}),
+    // MinIO addresses buckets as a path segment. The virtual-host style the SDK
+    // prefers resolves to a `bucket.localhost` that does not exist.
+    ...(connector.config.forcePathStyle === true ? { forcePathStyle: true } : {}),
+    ...(credentials ? { credentials } : {}),
+  });
+}
+
+/**
+ * Every object under the prefix this run has not already read.
+ *
+ * Every run lists the whole prefix, because S3 has no "modified since" filter —
+ * the only server-side narrowing it offers is `StartAfter`, which is
+ * lexicographic on the key, and keys almost never sort in the order the objects
+ * arrived. The listing is what the watermark costs; `prefix` is the lever that
+ * keeps it cheap, so point a connector at a partition rather than at the root of
+ * a bucket that has been collecting drops for years.
+ *
+ * Unordered: the caller sorts, because the order is what `maxObjectsPerRun` cuts
+ * against and that belongs next to the slice.
+ */
+async function listUnreadObjects(input: {
+  client: S3ClientLike;
+  s3: S3Module;
+  bucket: string;
+  prefix: string;
+  suffix: string;
+  previousWatermark: string | undefined;
+  previousKeys: Set<string>;
+}): Promise<S3Object[]> {
+  const { client, s3, bucket, prefix, suffix, previousWatermark, previousKeys } = input;
+  const candidates: S3Object[] = [];
+  let token: string | undefined;
+
+  do {
+    const page = readListing(
+      await client.send(
+        new s3.ListObjectsV2Command({
+          Bucket: bucket,
+          ...(prefix ? { Prefix: prefix } : {}),
+          ...(token ? { ContinuationToken: token } : {}),
+        }),
+      ),
+    );
+    for (const object of page.objects) {
+      if (isUnread(object, suffix, previousWatermark, previousKeys)) candidates.push(object);
+    }
+    token = page.nextToken;
+  } while (token);
+
+  return candidates;
+}
+
+/** Whether one listed object is in scope and was not already read by an earlier run. */
+function isUnread(
+  object: S3Object,
+  suffix: string,
+  previousWatermark: string | undefined,
+  previousKeys: Set<string>,
+): boolean {
+  if (suffix && !object.key.endsWith(suffix)) return false;
+  if (object.size === 0) return false;
+  if (previousWatermark === undefined) return true;
+  if (object.lastModified < previousWatermark) return false;
+  // The tie set. Two objects can share a `LastModified` to the millisecond, so a
+  // strict `>` would drop the second one forever and a `>=` would re-read the
+  // first one every run. Only the keys sitting at exactly the watermark are
+  // remembered, which is why that list cannot grow without bound the way "every
+  // key ever seen" would.
+  return !(object.lastModified === previousWatermark && previousKeys.has(object.key));
+}
+
+/** Oldest first, ties broken by key, so every run reads in the same order. */
+function byOldestThenKey(a: S3Object, b: S3Object): number {
+  if (a.lastModified === b.lastModified) return a.key.localeCompare(b.key);
+  return a.lastModified < b.lastModified ? -1 : 1;
+}
+
+/** Read each object and parse it into rows, in the order given. */
+async function readObjectRecords(input: {
+  client: S3ClientLike;
+  s3: S3Module;
+  bucket: string;
+  objects: readonly S3Object[];
+  config: Record<string, unknown>;
+}): Promise<unknown[]> {
+  const { client, s3, bucket, objects, config } = input;
+  const records: unknown[] = [];
+
+  for (const object of objects) {
+    const text = await readObjectText(
+      await client.send(new s3.GetObjectCommand({ Bucket: bucket, Key: object.key })),
+      `s3://${bucket}/${object.key}`,
+    );
+    if (!text.trim()) continue;
+    // The same format logic a file connector uses, per object: the extension
+    // decides unless the connector overrides it, which is what a prefix full of
+    // `part-00000` files needs.
+    //
+    // Appended one at a time rather than spread into `push`, because a spread
+    // becomes one argument per row and a CSV drop with a few hundred thousand of
+    // them overflows the call stack — a failure that only shows up on the large
+    // files this connector exists to read.
+    for (const record of parseRecords(text, object.key, config)) {
+      records.push(record);
+    }
+  }
+
+  return records;
+}
+
+/** Where this run got to, carrying the tie set forward when it did not advance. */
+function nextObjectState(
+  consumed: readonly S3Object[],
+  previousWatermark: string | undefined,
+  previousKeys: Set<string>,
+): { objectWatermark: string; objectWatermarkKeys: string[] } {
+  const watermark = consumed[consumed.length - 1].lastModified;
+  const keys = new Set(
+    consumed.filter((object) => object.lastModified === watermark).map((object) => object.key),
+  );
+  if (watermark === previousWatermark) {
+    for (const key of previousKeys) keys.add(key);
+  }
+  return { objectWatermark: watermark, objectWatermarkKeys: [...keys] };
+}
+
+/**
  * One page of a listing, narrowed rather than trusted.
  *
  * An entry with no `LastModified` is refused instead of skipped: it cannot be
@@ -644,31 +747,42 @@ function readListing(value: unknown): {
 
   if (Array.isArray(contents)) {
     for (const entry of contents) {
-      if (!entry || typeof entry !== 'object') continue;
-      const key: unknown = Reflect.get(entry, 'Key');
-      const modified: unknown = Reflect.get(entry, 'LastModified');
-      const size: unknown = Reflect.get(entry, 'Size');
-      if (typeof key !== 'string') continue;
-      // A key ending in a slash is the console's idea of a folder. There is no
-      // object behind it.
-      if (key.endsWith('/')) continue;
-      if (!(modified instanceof Date)) {
-        throw new Error(
-          `The listing entry for "${key}" has no LastModified, so this run cannot tell whether it is new. Refusing rather than skipping it, because a skipped object is one nobody notices is missing.`,
-        );
-      }
-      objects.push({
-        key,
-        lastModified: modified.toISOString(),
-        // Absent size means "read it and find out" rather than "it is empty".
-        size: typeof size === 'number' ? size : 1,
-      });
+      const object = readListingEntry(entry);
+      if (object) objects.push(object);
     }
   }
 
   return {
     objects,
     nextToken: typeof token === 'string' && token.length > 0 ? token : undefined,
+  };
+}
+
+/**
+ * One entry of a listing, or nothing if it does not describe an object.
+ *
+ * Nothing means "not an object": a malformed entry, or a key ending in a slash,
+ * which is the console's idea of a folder with no object behind it. An entry
+ * that *is* an object but cannot be placed against the watermark throws instead
+ * — see {@link readListing}.
+ */
+function readListingEntry(entry: unknown): S3Object | undefined {
+  if (!entry || typeof entry !== 'object') return undefined;
+  const key: unknown = Reflect.get(entry, 'Key');
+  const modified: unknown = Reflect.get(entry, 'LastModified');
+  const size: unknown = Reflect.get(entry, 'Size');
+  if (typeof key !== 'string') return undefined;
+  if (key.endsWith('/')) return undefined;
+  if (!(modified instanceof Date)) {
+    throw new Error(
+      `The listing entry for "${key}" has no LastModified, so this run cannot tell whether it is new. Refusing rather than skipping it, because a skipped object is one nobody notices is missing.`,
+    );
+  }
+  return {
+    key,
+    lastModified: modified.toISOString(),
+    // Absent size means "read it and find out" rather than "it is empty".
+    size: typeof size === 'number' ? size : 1,
   };
 }
 
@@ -731,31 +845,38 @@ function guessFormat(source: string): string {
  * which is worse than failing, because nobody notices.
  */
 function parseCsv(text: string, config: Record<string, unknown>): unknown[] {
-  const delimiter = String(config.delimiter ?? ',');
+  const rows = splitCsvRows(text, String(config.delimiter ?? ','));
+
+  const [header, ...body] = rows.filter((r) => r.some((c) => c.length > 0));
+  if (!header) return [];
+
+  return body.map((cells) =>
+    Object.fromEntries(header.map((name, index) => [name, cells[index] ?? null])),
+  );
+}
+
+/**
+ * The scanner half of {@link parseCsv}: text in, rows of raw cells out.
+ *
+ * Split from the record shaping because it is the part that carries state
+ * across characters, and it reads far better without the header logic sitting
+ * under it. It knows nothing about headers and makes no judgement about which
+ * rows are worth keeping.
+ */
+function splitCsvRows(text: string, delimiter: string): string[][] {
   const rows: string[][] = [];
   let row: string[] = [];
   let field = '';
-  let quoted = false;
 
   for (let index = 0; index < text.length; index += 1) {
     const char = text[index];
 
-    if (quoted) {
-      if (char === '"') {
-        if (text[index + 1] === '"') {
-          field += '"';
-          index += 1;
-        } else {
-          quoted = false;
-        }
-      } else {
-        field += char;
-      }
-      continue;
-    }
-
     if (char === '"') {
-      quoted = true;
+      // Appended rather than assigned, because a quoted run is part of the
+      // field and not necessarily the whole of it: `ab"c,d"ef` is one field.
+      const quoted = readQuotedField(text, index + 1);
+      field += quoted.value;
+      index = quoted.end;
     } else if (char === delimiter) {
       row.push(field);
       field = '';
@@ -773,10 +894,38 @@ function parseCsv(text: string, config: Record<string, unknown>): unknown[] {
     rows.push(row);
   }
 
-  const [header, ...body] = rows.filter((r) => r.some((c) => c.length > 0));
-  if (!header) return [];
+  return rows;
+}
 
-  return body.map((cells) =>
-    Object.fromEntries(header.map((name, index) => [name, cells[index] ?? null])),
-  );
+/**
+ * The contents of a quoted run, starting just past the opening quote.
+ *
+ * Returns where the closing quote sat, so the scanner resumes after it. Inside
+ * the quotes a delimiter and a newline are ordinary characters — which is the
+ * whole reason this reader exists rather than a split on commas — and a doubled
+ * quote is the CSV escape for one literal quote.
+ *
+ * An unterminated quote yields the rest of the text rather than throwing, which
+ * is what the previous inline scanner did: a truncated export is far more
+ * common than a deliberately malformed one, and the row count is what makes it
+ * noticed.
+ */
+function readQuotedField(text: string, start: number): { value: string; end: number } {
+  let value = '';
+  let index = start;
+
+  while (index < text.length) {
+    const char = text[index];
+    if (char !== '"') {
+      value += char;
+      index += 1;
+    } else if (text[index + 1] === '"') {
+      value += '"';
+      index += 2;
+    } else {
+      return { value, end: index };
+    }
+  }
+
+  return { value, end: index };
 }

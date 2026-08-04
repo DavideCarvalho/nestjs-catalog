@@ -196,6 +196,51 @@ export function toFlowEdges(
   });
 }
 
+/** Who feeds each node, by node id. Every node gets an entry, most of them empty. */
+function feedersByNode(nodes: WorkflowNode[], edges: WorkflowEdge[]): Map<string, string[]> {
+  const incoming = new Map<string, string[]>();
+  for (const node of nodes) incoming.set(node.id, []);
+  for (const edge of edges) {
+    const list = incoming.get(edge.to);
+    if (list) list.push(edge.from);
+  }
+  return incoming;
+}
+
+/**
+ * Move one node to one column past the deepest thing feeding it, never left.
+ *
+ * Only ever increasing is what makes it safe to call repeatedly on the same
+ * node, which is what the relaxation below relies on.
+ */
+function placeAfterFeeders(id: string, column: Map<string, number>, feeders: string[]): void {
+  const depth =
+    feeders.length === 0 ? 0 : Math.max(...feeders.map((from) => (column.get(from) ?? 0) + 1));
+  column.set(id, Math.max(depth, column.get(id) ?? 0));
+}
+
+/**
+ * Layer a graph that has no usable run order, by longest path.
+ *
+ * Relax every node repeatedly until nothing moves. With no cycle that settles in
+ * at most one pass per node; with a cycle the pass cap is what stops it, and the
+ * nodes on the cycle end up wherever the cap left them. So a graph with a loop
+ * still draws — badly — rather than hanging while somebody is trying to see the
+ * loop they need to remove.
+ */
+function relaxColumns(
+  nodes: WorkflowNode[],
+  incoming: Map<string, string[]>,
+  column: Map<string, number>,
+): void {
+  for (let pass = 0; pass < nodes.length + 1; pass += 1) {
+    const before = [...column.values()].join(',');
+    for (const node of nodes) placeAfterFeeders(node.id, column, incoming.get(node.id) ?? []);
+    if ([...column.values()].join(',') === before) break;
+  }
+  for (const node of nodes) if (!column.has(node.id)) column.set(node.id, 0);
+}
+
 /**
  * Which column each node belongs in, left to right.
  *
@@ -207,45 +252,23 @@ export function toFlowEdges(
  *
  * `workflowRunOrder` throws on a graph it will not run, which is a graph
  * somebody is in the middle of drawing — half-wired, or with a loop they are
- * about to remove. That is exactly when a canvas most needs to draw, so the
- * fallback below layers the graph by longest path anyway, capping the relaxation
- * at the node count so a cycle cannot spin it forever.
+ * about to remove. That is exactly when a canvas most needs to draw, so
+ * `relaxColumns` layers it by longest path anyway.
  */
 function columnsFor(nodes: WorkflowNode[], edges: WorkflowEdge[]): Map<string, number> {
-  const incoming = new Map<string, string[]>();
-  for (const node of nodes) incoming.set(node.id, []);
-  for (const edge of edges) {
-    const list = incoming.get(edge.to);
-    if (list) list.push(edge.from);
-  }
-
+  const incoming = feedersByNode(nodes, edges);
   const column = new Map<string, number>();
-  const place = (id: string) => {
-    const feeders = incoming.get(id) ?? [];
-    const depth =
-      feeders.length === 0 ? 0 : Math.max(...feeders.map((from) => (column.get(from) ?? 0) + 1));
-    column.set(id, Math.max(depth, column.get(id) ?? 0));
-  };
 
   try {
     // Topological order, so one pass is exact: everything feeding a node has
     // already been placed by the time the node is reached.
-    for (const entry of workflowRunOrder({ nodes, edges })) place(entry.node.id);
-    return column;
-  } catch {
-    // The graph is not runnable yet. Relax repeatedly instead; with no cycle
-    // this settles in at most one pass per node, and with a cycle the cap is
-    // what stops it. Nodes on the cycle end up wherever the cap left them, so a
-    // graph with a loop still draws — badly — rather than hanging while
-    // somebody is trying to see the loop they need to remove.
-    for (let pass = 0; pass < nodes.length + 1; pass += 1) {
-      const before = [...column.values()].join(',');
-      for (const node of nodes) place(node.id);
-      if ([...column.values()].join(',') === before) break;
+    for (const entry of workflowRunOrder({ nodes, edges })) {
+      placeAfterFeeders(entry.node.id, column, incoming.get(entry.node.id) ?? []);
     }
-    for (const node of nodes) if (!column.has(node.id)) column.set(node.id, 0);
-    return column;
+  } catch {
+    relaxColumns(nodes, incoming, column);
   }
+  return column;
 }
 
 /**

@@ -182,6 +182,41 @@ export async function applyPromotion(input: {
   // in which the target holds a connector that cannot run. Doing it in
   // dependency order means the target is never in a state it could not have
   // been put into by hand.
+  const step: PromotionStep = { source, target, changes, promotedBy, outcome };
+  await promoteObjectTypes(step);
+  await promoteTransforms(step);
+  await promoteWorkflows(step);
+  await promoteConnectors(step);
+
+  logger.log(
+    `Promoted ${plan.from} -> ${plan.to} by ${promotedBy}: ${outcome.objectTypes.length} types, ${outcome.transforms.length} transforms, ${outcome.connectors.length} connectors (${plan.fingerprint.slice(0, 12)}).`,
+  );
+  return outcome;
+}
+
+/**
+ * Everything one phase of {@link applyPromotion} needs.
+ *
+ * `outcome` is deliberately shared and mutated in place: the phases run in
+ * dependency order and an apply is not atomic, so what has already been written
+ * when a later phase throws is exactly the information the caller needs, and a
+ * phase that returned its own tally would lose it on the throw.
+ */
+interface PromotionStep {
+  source: CatalogPromotableSet;
+  target: CatalogEnvironmentBundle;
+  changes: ReturnType<typeof effectiveChanges>;
+  promotedBy: string;
+  outcome: PromotionOutcome;
+}
+
+/** Phase 1: the model, then the physical tables that hold it. */
+async function promoteObjectTypes({
+  source,
+  target,
+  changes,
+  outcome,
+}: PromotionStep): Promise<void> {
   for (const change of changes.filter((c) => c.kind === 'objectType')) {
     const type = source.objectTypes.find((t) => t.name === change.id);
     if (!type) continue;
@@ -193,21 +228,29 @@ export async function applyPromotion(input: {
   // Reloaded once, after all of the model writes, so `ensureType` below sees
   // every promoted type. Reloading per type would be the same answer computed
   // N times.
-  if (outcome.objectTypes.length > 0) {
-    await target.registry.reload();
-    for (const name of outcome.objectTypes) {
-      const def = target.registry.getType(name);
-      if (!def) {
-        throw new Error(
-          `${name} was written into ${target.environment.id} and then could not be read back. Refusing to continue: the physical table would not be created and the next load into it would fail.`,
-        );
-      }
-      // Additive DDL, the same call a publish makes. The table arrives empty —
-      // there is no data path here, by design.
-      await target.store.ensureType(def);
+  if (outcome.objectTypes.length === 0) return;
+  await target.registry.reload();
+  for (const name of outcome.objectTypes) {
+    const def = target.registry.getType(name);
+    if (!def) {
+      throw new Error(
+        `${name} was written into ${target.environment.id} and then could not be read back. Refusing to continue: the physical table would not be created and the next load into it would fail.`,
+      );
     }
+    // Additive DDL, the same call a publish makes. The table arrives empty —
+    // there is no data path here, by design.
+    await target.store.ensureType(def);
   }
+}
 
+/** Phase 2: the code, before the graphs and connectors that name it. */
+async function promoteTransforms({
+  source,
+  target,
+  changes,
+  promotedBy,
+  outcome,
+}: PromotionStep): Promise<void> {
   for (const change of changes.filter((c) => c.kind === 'transform')) {
     const transform = source.transforms.find((t) => t.id === change.id);
     if (!transform) continue;
@@ -226,11 +269,23 @@ export async function applyPromotion(input: {
     outcome.transforms.push(transform.id);
     outcome.applied += 1;
   }
+}
 
-  // Graphs after the code they name and before the connectors that run them,
-  // matching the order PROMOTABLE_KINDS declares. An apply is not atomic, so the
-  // order decides what a half-finished one leaves behind: a graph whose
-  // transforms are already there, rather than a connector pointing at nothing.
+/**
+ * Phase 3: graphs after the code they name and before the connectors that run
+ * them, matching the order PROMOTABLE_KINDS declares.
+ *
+ * An apply is not atomic, so the order decides what a half-finished one leaves
+ * behind: a graph whose transforms are already there, rather than a connector
+ * pointing at nothing.
+ */
+async function promoteWorkflows({
+  source,
+  target,
+  changes,
+  promotedBy,
+  outcome,
+}: PromotionStep): Promise<void> {
   for (const change of changes.filter((c) => c.kind === 'workflow')) {
     const workflow = source.workflows.find((w) => w.id === change.id);
     if (!workflow) continue;
@@ -255,7 +310,16 @@ export async function applyPromotion(input: {
     outcome.workflows.push(workflow.id);
     outcome.applied += 1;
   }
+}
 
+/** Phase 4: the connectors, last, once everything they reference exists. */
+async function promoteConnectors({
+  source,
+  target,
+  changes,
+  promotedBy,
+  outcome,
+}: PromotionStep): Promise<void> {
   for (const change of changes.filter((c) => c.kind === 'connector')) {
     const connector = source.connectors.find((c) => c.id === change.id);
     if (!connector) continue;
@@ -292,11 +356,6 @@ export async function applyPromotion(input: {
     outcome.connectors.push(connector.id);
     outcome.applied += 1;
   }
-
-  logger.log(
-    `Promoted ${plan.from} -> ${plan.to} by ${promotedBy}: ${outcome.objectTypes.length} types, ${outcome.transforms.length} transforms, ${outcome.connectors.length} connectors (${plan.fingerprint.slice(0, 12)}).`,
-  );
-  return outcome;
 }
 
 /**

@@ -25,6 +25,11 @@ export function Switch({
   disabled?: boolean;
 }) {
   return (
+    // Base UI's Switch renders a hidden native input inside its root, so the
+    // implicit association a wrapping label gives DOES resolve here — verified
+    // by `switch.spec.tsx`, which asks for the control by its accessible name.
+    // The rule cannot see through the component boundary to know that.
+    // biome-ignore lint/a11y/noLabelWithoutControl: see above
     <label className="flex items-start gap-2.5">
       <BaseSwitch.Root
         checked={checked}

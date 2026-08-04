@@ -48,14 +48,18 @@ export function clearDevKey(): void {
 
 export class UnauthorizedError extends Error {}
 
-async function request<T>(
-  path: string,
-  init: RequestInit & { params?: Record<string, unknown> } = {},
-): Promise<T> {
-  const { params, ...rest } = init;
-  // The host decides where the API lives and injects it; hardcoding `/api` here
-  // sent every call to the wrong place the moment this was mounted anywhere but
-  // the standalone app — `/api/auth/me` instead of `<apiPath>/auth/me`.
+/**
+ * Where a call goes, and what query string it carries.
+ *
+ * The host decides where the API lives and injects it; hardcoding `/api` here
+ * sent every call to the wrong place the moment this was mounted anywhere but
+ * the standalone app — `/api/auth/me` instead of `<apiPath>/auth/me`.
+ *
+ * `undefined`, `null` and `''` are dropped rather than sent, so a cleared filter
+ * box and an unset one produce the same request — otherwise every control that
+ * empties to `''` would send `?q=` and ask the server to match nothing.
+ */
+function buildUrl(path: string, params: Record<string, unknown> | undefined): URL {
   const apiBase = (window as { __CATALOG_API__?: string }).__CATALOG_API__ ?? '/api';
   const url = new URL(`${apiBase}${path}`, window.location.origin);
   for (const [name, value] of Object.entries(params ?? {})) {
@@ -63,6 +67,38 @@ async function request<T>(
       url.searchParams.set(name, String(value));
     }
   }
+  return url;
+}
+
+/**
+ * The most useful `Error` a failed response can be turned into.
+ *
+ * Surfaces the server's own words wherever there are any. For the query console
+ * especially, "Unknown column 'foo'" is the entire value of the error — a status
+ * code tells the person typing nothing they can act on. The method-and-status
+ * line is only what is left when the body carries nothing better, and a body
+ * that is not JSON is still preferred over it.
+ */
+async function errorForResponse(response: Response, path: string, method: string): Promise<Error> {
+  const detail = await response.text();
+  let message = `${method} ${path} → ${response.status}`;
+  try {
+    const parsed = JSON.parse(detail) as { message?: string | string[] };
+    if (parsed.message) {
+      message = Array.isArray(parsed.message) ? parsed.message.join(', ') : parsed.message;
+    }
+  } catch {
+    if (detail) message = detail;
+  }
+  return new Error(message);
+}
+
+async function request<T>(
+  path: string,
+  init: RequestInit & { params?: Record<string, unknown> } = {},
+): Promise<T> {
+  const { params, ...rest } = init;
+  const url = buildUrl(path, params);
 
   const devKey = getDevKey();
 
@@ -92,20 +128,7 @@ async function request<T>(
     throw new UnauthorizedError(await response.text());
   }
   if (!response.ok) {
-    // Surface the server's own words. For the query console especially, "Unknown
-    // column 'foo'" is the entire value of the error — a status code tells the
-    // person typing nothing they can act on.
-    const detail = await response.text();
-    let message = `${init.method ?? 'GET'} ${path} → ${response.status}`;
-    try {
-      const parsed = JSON.parse(detail) as { message?: string | string[] };
-      if (parsed.message) {
-        message = Array.isArray(parsed.message) ? parsed.message.join(', ') : parsed.message;
-      }
-    } catch {
-      if (detail) message = detail;
-    }
-    throw new Error(message);
+    throw await errorForResponse(response, path, init.method ?? 'GET');
   }
   const text = await response.text();
   return text ? (JSON.parse(text) as T) : (undefined as T);

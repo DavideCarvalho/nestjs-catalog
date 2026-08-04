@@ -12,6 +12,7 @@ import {
   type EdgeChange,
   MiniMap,
   type NodeChange,
+  type OnConnectEnd,
   ReactFlow,
   ReactFlowProvider,
   useReactFlow,
@@ -39,6 +40,7 @@ import {
   TriangleAlert,
   Unplug,
 } from 'lucide-react';
+import type { ReactNode } from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { TransformEditor } from './TransformEditor';
 import { cn } from './cn';
@@ -79,7 +81,9 @@ import {
   type WorkflowNode,
   type WorkflowNodeKind,
   type WorkflowRun,
+  type WorkflowSinkNode,
   type WorkflowSourceNode,
+  type WorkflowTransformNode,
   describeDurability,
   isWorkflowNodeKind,
   newLocalId,
@@ -235,10 +239,384 @@ export function WorkflowCanvas(props: WorkflowCanvasProps) {
   );
 }
 
+/**
+ * The selection after a batch of React Flow `select` changes.
+ *
+ * React Flow reports selection one id at a time, and both nodes and edges use
+ * the same shape for it, so folding the batch here keeps one description of what
+ * selecting means. Returns the array it was given when nothing selected,
+ * so an unrelated batch of changes does not re-render the canvas.
+ */
+function nextSelection(
+  current: string[],
+  changes: (NodeChange<WorkflowFlowNode> | EdgeChange<WorkflowFlowEdge>)[],
+): string[] {
+  let next = current;
+  for (const change of changes) {
+    if (change.type !== 'select') continue;
+    next = change.selected
+      ? [...new Set([...next, change.id])]
+      : next.filter((id) => id !== change.id);
+  }
+  return next;
+}
+
+/**
+ * A fresh node of one kind, carrying only the fields that kind has.
+ *
+ * Built per kind rather than as one shape with optional fields, because the
+ * executable model is a discriminated union: a source carries a source kind and
+ * a config, a transform carries a transform, a sink carries the type it commits,
+ * and nothing carries a field belonging to another kind.
+ */
+function newNodeOfKind(
+  kind: WorkflowNodeKind,
+  id: string,
+  position: { x: number; y: number },
+): WorkflowNode {
+  const name = defaultLabel(kind);
+  if (kind === 'source') {
+    return { id, name, kind: 'source', sourceKind: 'http', config: {}, position };
+  }
+  if (kind === 'transform') {
+    return { id, name, kind: 'transform', transformId: '', position };
+  }
+  return { id, name, kind: 'sink', targetType: '', position };
+}
+
+/**
+ * A server refusal, verbatim.
+ *
+ * The server knows things this canvas does not — which types exist, who may
+ * write to them, whether a transform's output fits the sink — so its wording is
+ * the useful one, not a generic "could not save".
+ */
+function RefusalNote({ lead, error }: { lead: string; error: unknown }) {
+  return (
+    <p className="mt-2 rounded-md border border-red-200 bg-red-50 px-3 py-1.5 text-[11px] text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300">
+      {lead} {error instanceof Error ? error.message : 'no reason given.'}
+    </p>
+  );
+}
+
+/**
+ * Save, run, delete.
+ *
+ * Save is deliberately **not** disabled when the local checks fail. Disabling
+ * would make this screen the gate, and the checks beside the canvas cannot see
+ * everything the server sees — a rule that is subtly wrong here would become a
+ * graph nobody can save at all, with no error to read. The button is coloured to
+ * warn and the tooltip says what will happen; the refusal, when it comes, comes
+ * from the server with its reasons.
+ */
+function CanvasActions({
+  draft,
+  canEdit,
+  blocked,
+  saving,
+  running,
+  durabilityDetail,
+  onSave,
+  onRun,
+  onAskDelete,
+}: {
+  draft: Draft;
+  canEdit: boolean;
+  blocked: boolean;
+  saving: boolean;
+  running: boolean;
+  durabilityDetail: string;
+  onSave: () => void;
+  onRun: () => void;
+  onAskDelete: () => void;
+}) {
+  return (
+    <div className="flex flex-wrap items-start gap-2 self-end pb-1">
+      <Tooltip
+        content={
+          blocked
+            ? 'There are errors listed beside the canvas, and the server will almost certainly refuse this. Sending it anyway is allowed — the server decides, not this screen.'
+            : 'Store it. The server checks it again, and its answer is the one that counts.'
+        }
+      >
+        <button
+          type="button"
+          onClick={onSave}
+          disabled={
+            !canEdit ||
+            saving ||
+            draft.name.trim().length === 0 ||
+            (!draft.dirty && Boolean(draft.id))
+          }
+          className={cn(
+            'flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs disabled:opacity-40',
+            blocked
+              ? 'bg-amber-600 text-white'
+              : 'bg-zinc-950 text-zinc-50 dark:bg-zinc-100 dark:text-zinc-950',
+          )}
+        >
+          {saving ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />}
+          {draft.dirty ? 'Save' : 'Saved'}
+        </button>
+      </Tooltip>
+      <Tooltip
+        content={
+          draft.dirty
+            ? 'Save first — a run executes the stored graph, not what is on screen.'
+            : durabilityDetail
+        }
+      >
+        <button
+          type="button"
+          onClick={onRun}
+          disabled={!canEdit || !draft.id || draft.dirty || running}
+          className={cn(
+            'flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs disabled:opacity-40',
+            RULE,
+            'hover:bg-zinc-50 dark:hover:bg-zinc-800',
+          )}
+        >
+          {running ? <Loader2 size={12} className="animate-spin" /> : <Play size={12} />}
+          Run
+        </button>
+      </Tooltip>
+      {draft.id && canEdit && (
+        <Tooltip content={`Delete this ${WORKFLOW_NAME.singular}.`}>
+          <button
+            type="button"
+            onClick={onAskDelete}
+            aria-label={`Delete this ${WORKFLOW_NAME.singular}`}
+            className={cn('rounded-md border p-1.5 text-zinc-400 hover:text-red-600', RULE)}
+          >
+            <Trash2 size={12} />
+          </button>
+        </Tooltip>
+      )}
+    </div>
+  );
+}
+
+/** The three things that can be put on the canvas, and the button that tidies them. */
+function AddNodeBar({
+  refreshing,
+  onAdd,
+  onTidy,
+}: {
+  refreshing: boolean;
+  onAdd: (kind: WorkflowNodeKind) => void;
+  onTidy: () => void;
+}) {
+  return (
+    <div className="flex shrink-0 flex-wrap items-center gap-2 px-6 pt-3">
+      <AddButton
+        icon={Plug}
+        label="Source"
+        hint="Reads records out of a system: a kind, an optional named connection, and a config."
+        onClick={() => onAdd('source')}
+      />
+      <AddButton
+        icon={Repeat}
+        label="Transform"
+        hint="Code that reshapes whatever is wired into it."
+        onClick={() => onAdd('transform')}
+      />
+      <AddButton
+        icon={Database}
+        label="Sink"
+        hint="Writes and commits one object type. Several are fine — each commits independently."
+        onClick={() => onAdd('sink')}
+      />
+      <Tooltip content="Lay the nodes out left to right by dependency, with every sink in the last column.">
+        <button
+          type="button"
+          onClick={onTidy}
+          className={cn(
+            'flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs',
+            RULE,
+            MUTED,
+            'hover:bg-zinc-50 dark:hover:bg-zinc-800',
+          )}
+        >
+          <LayoutGrid size={12} />
+          Tidy
+        </button>
+      </Tooltip>
+      {refreshing && (
+        // A background refetch says so without replacing anything: the graph on
+        // screen stays exactly where it is.
+        <span className={cn('ml-auto font-mono text-[10px]', MUTED)}>refreshing…</span>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Which workflow the screen should be showing.
+ *
+ * Falls through to the first stored one so an empty picker opens on something
+ * rather than on a blank canvas, and to the new-workflow sentinel when there is
+ * nothing stored at all.
+ */
+function wantedWorkflowId(list: CatalogWorkflow[], selected: string): string {
+  return selected || list[0]?.id || NEW_WORKFLOW;
+}
+
+/** The draft for a chosen id: the stored graph, or a blank one if there is none. */
+function draftForId(list: CatalogWorkflow[], wanted: string): Draft {
+  if (wanted === NEW_WORKFLOW) return blankDraft();
+  const found = list.find((workflow) => workflow.id === wanted);
+  return found ? draftFrom(found) : blankDraft();
+}
+
+/**
+ * The minimap dot colour for a node, by kind.
+ *
+ * Narrowed rather than asserted: MiniMap types `data` as an open record, and a
+ * bad `kind` here would be a thrown error inside React Flow's own render rather
+ * than a mis-coloured dot.
+ */
+function miniMapColor(data: { kind?: unknown } | undefined): string {
+  const kind = data?.kind;
+  if (!isWorkflowNodeKind(kind)) return '#a1a1aa';
+  if (kind === 'source') return '#0ea5e9';
+  if (kind === 'sink') return '#10b981';
+  return '#8b5cf6';
+}
+
+/**
+ * The graph itself, and the two states in which there is no graph to draw.
+ *
+ * Loading and failure are drawn inside the canvas's own frame rather than in
+ * place of the screen, so the header and its controls stay put while a refetch
+ * resolves — and a failed read never looks like an empty workflow.
+ */
+function GraphSurface({
+  loading,
+  failed,
+  error,
+  onRetry,
+  canEdit,
+  draft,
+  flowNodes,
+  flowEdges,
+  onInspect,
+  onEditCode,
+  onNodesChange,
+  onEdgesChange,
+  onConnect,
+  isValidConnection,
+  onConnectEnd,
+}: {
+  loading: boolean;
+  failed: boolean;
+  error: unknown;
+  onRetry: () => void;
+  canEdit: boolean;
+  draft: Draft;
+  flowNodes: WorkflowFlowNode[];
+  flowEdges: WorkflowFlowEdge[];
+  onInspect: (id: string) => void;
+  onEditCode: (id: string) => void;
+  onNodesChange: (changes: NodeChange<WorkflowFlowNode>[]) => void;
+  onEdgesChange: (changes: EdgeChange<WorkflowFlowEdge>[]) => void;
+  onConnect: (connection: Connection) => void;
+  isValidConnection: (candidate: { source: string | null; target: string | null }) => boolean;
+  onConnectEnd: OnConnectEnd;
+}) {
+  return (
+    <div
+      className={cn(
+        'relative h-[55vh] min-h-[15rem] shrink-0 overflow-hidden rounded-lg border',
+        'lg:h-auto lg:min-h-0 lg:flex-1 lg:shrink',
+        RULE,
+      )}
+    >
+      {loading && <CanvasSkeleton />}
+
+      {failed && <CanvasFailure error={error} onRetry={onRetry} />}
+
+      {!loading && !failed && (
+        <WorkflowNodeProvider handlers={{ onInspect, onEditCode, canEdit }}>
+          <ReactFlow
+            className={CANVAS_THEME}
+            nodes={flowNodes}
+            edges={flowEdges}
+            nodeTypes={workflowNodeTypes}
+            onNodesChange={onNodesChange}
+            onEdgesChange={onEdgesChange}
+            onConnect={onConnect}
+            isValidConnection={isValidConnection}
+            onConnectEnd={onConnectEnd}
+            connectionLineType={ConnectionLineType.SmoothStep}
+            nodesDraggable={canEdit}
+            nodesConnectable={canEdit}
+            elementsSelectable
+            nodesFocusable
+            edgesFocusable
+            deleteKeyCode={canEdit ? ['Delete', 'Backspace'] : null}
+            // A wider drop zone than the 20px default, because these handles are
+            // the only drop target on the screen and missing one reads as the
+            // canvas ignoring you.
+            connectionRadius={28}
+            proOptions={{ hideAttribution: false }}
+            ariaLabelConfig={ARIA_LABELS}
+            aria-label={`${WORKFLOW_NAME.title} canvas. ${draft.nodes.length} nodes, ${draft.edges.length} connections.`}
+            fitView
+          >
+            <Background variant={BackgroundVariant.Dots} gap={18} size={1} />
+            <Controls showInteractive={false} />
+            <MiniMap pannable zoomable nodeColor={(node) => miniMapColor(node.data)} />
+          </ReactFlow>
+        </WorkflowNodeProvider>
+      )}
+    </div>
+  );
+}
+
+/** A node's display name, falling back to its id when it is not in the graph. */
+function nodeLabelIn(nodes: WorkflowNode[], id: string): string {
+  const found = nodes.find((candidate) => candidate.id === id);
+  return found ? nodeName(found) : id;
+}
+
+/**
+ * What this graph commits, read off the sinks.
+ *
+ * A summary and never a control. The type is set on the sink that commits it,
+ * because a graph may have several sinks writing several types and a single
+ * field at the top of the screen could only ever name one of them.
+ */
+function CommitsBadge({ produces }: { produces: string[] }) {
+  if (produces.length === 0) return null;
+  return (
+    <Tooltip
+      content={`Read off the sinks. Each one commits its own type independently — a run that writes ${produces[0]} and fails on another is a failed run that committed ${produces[0]}, not a success.`}
+    >
+      <span className={cn('font-mono text-[10px]', MUTED)}>commits {produces.join(', ')}</span>
+    </Tooltip>
+  );
+}
+
+/** Where React Flow moved nodes to, and which it removed, out of one batch. */
+function nodeMovesAndRemovals(changes: NodeChange<WorkflowFlowNode>[]): {
+  positions: Map<string, { x: number; y: number }>;
+  removed: Set<string>;
+} {
+  const positions = new Map<string, { x: number; y: number }>();
+  const removed = new Set<string>();
+  for (const change of changes) {
+    if (change.type === 'position' && change.position) {
+      positions.set(change.id, change.position);
+    }
+    if (change.type === 'remove') removed.add(change.id);
+  }
+  return { positions, removed };
+}
+
 function Canvas({
   title = WORKFLOW_NAME.titlePlural,
   eyebrow = 'Ingestion',
-  intro = `Wire sources through transforms into sinks. Each sink commits its own object type independently, so one expensive read can feed several outputs.`,
+  intro = 'Wire sources through transforms into sinks. Each sink commits its own object type independently, so one expensive read can feed several outputs.',
   canEdit = true,
 }: WorkflowCanvasProps) {
   const client = useCatalogClient();
@@ -302,12 +680,11 @@ function Canvas({
   useEffect(() => {
     const list = workflows.data;
     if (!list) return;
-    const wanted = selected || list[0]?.id || NEW_WORKFLOW;
+    const wanted = wantedWorkflowId(list, selected);
     if (loadedRef.current === wanted) return;
     loadedRef.current = wanted;
     if (selected !== wanted) setSelected(wanted);
-    const found = wanted === NEW_WORKFLOW ? undefined : list.find((w) => w.id === wanted);
-    setDraft(found ? draftFrom(found) : blankDraft());
+    setDraft(draftForId(list, wanted));
     setSelectedNodeIds([]);
     setSelectedEdgeIds([]);
     setInspecting(null);
@@ -318,6 +695,10 @@ function Canvas({
   // out. Calling it in the same tick fits an empty canvas, because React Flow
   // has not measured anything yet.
   const draftId = draft.id;
+  // `draftId` is the trigger, not a value the body reads — which is exactly why
+  // the rule calls it unnecessary. Dropping it would fit the view once on mount
+  // and never again, leaving every workflow opened afterwards off-screen.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: draftId is what the effect watches for, not something its body uses
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => fitView({ padding: 0.25, duration: 200 }));
     return () => window.cancelAnimationFrame(frame);
@@ -381,24 +762,9 @@ function Canvas({
    */
   const onNodesChange = useCallback(
     (changes: NodeChange<WorkflowFlowNode>[]) => {
-      for (const change of changes) {
-        if (change.type === 'select') {
-          setSelectedNodeIds((current) =>
-            change.selected
-              ? [...new Set([...current, change.id])]
-              : current.filter((id) => id !== change.id),
-          );
-        }
-      }
+      setSelectedNodeIds((current) => nextSelection(current, changes));
 
-      const positions = new Map<string, { x: number; y: number }>();
-      const removed = new Set<string>();
-      for (const change of changes) {
-        if (change.type === 'position' && change.position) {
-          positions.set(change.id, change.position);
-        }
-        if (change.type === 'remove') removed.add(change.id);
-      }
+      const { positions, removed } = nodeMovesAndRemovals(changes);
       if (positions.size === 0 && removed.size === 0) return;
 
       edit((current) => ({
@@ -426,15 +792,7 @@ function Canvas({
 
   const onEdgesChange = useCallback(
     (changes: EdgeChange<WorkflowFlowEdge>[]) => {
-      for (const change of changes) {
-        if (change.type === 'select') {
-          setSelectedEdgeIds((current) =>
-            change.selected
-              ? [...new Set([...current, change.id])]
-              : current.filter((id) => id !== change.id),
-          );
-        }
-      }
+      setSelectedEdgeIds((current) => nextSelection(current, changes));
       const removed = new Set(
         changes.filter((change) => change.type === 'remove').map((c) => c.id),
       );
@@ -467,15 +825,13 @@ function Canvas({
         setAnnouncement(verdict.reason);
         return;
       }
-      const label = (id: string) => {
-        const node = draft.nodes.find((candidate) => candidate.id === id);
-        return node ? nodeName(node) : id;
-      };
       // Appended rather than inserted anywhere else: a node with several inbound
       // edges receives its inputs in the order the edges appear in this array,
       // and that order is part of what the graph produces.
       edit((current) => ({ ...current, edges: [...current.edges, { from, to }] }));
-      setAnnouncement(`${label(from)} now feeds ${label(to)}.`);
+      setAnnouncement(
+        `${nodeLabelIn(draft.nodes, from)} now feeds ${nodeLabelIn(draft.nodes, to)}.`,
+      );
     },
     [draft.nodes, draft.edges, edit],
   );
@@ -489,6 +845,25 @@ function Canvas({
       connect(connection.source, connection.target);
     },
     [connect],
+  );
+
+  /**
+   * Why a drag was refused, said once at the end of it.
+   *
+   * At the end rather than on every pointer move, which would set state dozens
+   * of times a second while somebody is still deciding where to drop. The
+   * boolean half of this lives in `isValidConnection` below.
+   */
+  const announceRefusedDrop = useCallback<OnConnectEnd>(
+    (_event, state) => {
+      if (state.isValid !== false) return;
+      const from = state.fromNode?.id;
+      const to = state.toNode?.id;
+      if (!from || !to) return;
+      const verdict = canConnect(draft.nodes, draft.edges, from, to);
+      if (!verdict.ok) setAnnouncement(verdict.reason);
+    },
+    [draft.nodes, draft.edges],
   );
 
   /**
@@ -556,36 +931,7 @@ function Canvas({
   const addNode = useCallback((kind: WorkflowNodeKind) => {
     const id = newLocalId(kind);
     setDraft((current) => {
-      const position = nextPosition(current.nodes);
-      // Built per kind rather than as one shape with optional fields, because
-      // the executable model is a discriminated union: a source carries a source
-      // kind and a config, a transform carries a transform, a sink carries the
-      // type it commits, and nothing carries a field belonging to another kind.
-      const node: WorkflowNode =
-        kind === 'source'
-          ? {
-              id,
-              name: defaultLabel(kind),
-              kind: 'source',
-              sourceKind: 'http',
-              config: {},
-              position,
-            }
-          : kind === 'transform'
-            ? {
-                id,
-                name: defaultLabel(kind),
-                kind: 'transform',
-                transformId: '',
-                position,
-              }
-            : {
-                id,
-                name: defaultLabel(kind),
-                kind: 'sink',
-                targetType: '',
-                position,
-              };
+      const node = newNodeOfKind(kind, id, nextPosition(current.nodes));
       return { ...current, nodes: [...current.nodes, node], dirty: true };
     });
     setInspecting(id);
@@ -634,13 +980,6 @@ function Canvas({
     [workflows.data],
   );
 
-  /**
-   * What this graph commits, read off the sinks.
-   *
-   * A summary and never a control. The type is set on the sink that commits it,
-   * because a graph may have several sinks writing several types and a single
-   * field at the top of the screen could only ever name one of them.
-   */
   const produces = producedTypes(draft.nodes);
 
   return (
@@ -663,15 +1002,7 @@ function Canvas({
             {eyebrow}
           </p>
           <h1 className="text-xl font-semibold tracking-tight">{title}</h1>
-          {produces.length > 0 && (
-            <Tooltip
-              content={`Read off the sinks. Each one commits its own type independently — a run that writes ${produces[0]} and fails on another is a failed run that committed ${produces[0]}, not a success.`}
-            >
-              <span className={cn('font-mono text-[10px]', MUTED)}>
-                commits {produces.join(', ')}
-              </span>
-            </Tooltip>
-          )}
+          <CommitsBadge produces={produces} />
         </div>
         <p className="mt-0.5 max-w-3xl text-xs text-zinc-500 dark:text-zinc-400">{intro}</p>
 
@@ -696,146 +1027,29 @@ function Canvas({
             placeholder="Fleet readiness"
             disabled={!canEdit}
           />
-          <div className="flex flex-wrap items-start gap-2 self-end pb-1">
-            <Tooltip
-              content={
-                blocked
-                  ? 'There are errors listed beside the canvas, and the server will almost certainly refuse this. Sending it anyway is allowed — the server decides, not this screen.'
-                  : 'Store it. The server checks it again, and its answer is the one that counts.'
-              }
-            >
-              {/*
-               * Not disabled when the local checks fail, and that is deliberate.
-               * Disabling would make this screen the gate, and the checks beside
-               * the canvas cannot see everything the server sees — a rule that is
-               * subtly wrong here would become a graph nobody can save at all,
-               * with no error to read. The button is coloured to warn and the
-               * tooltip says what will happen; the refusal, when it comes, comes
-               * from the server with its reasons.
-               */}
-              <button
-                type="button"
-                onClick={() => save.mutate()}
-                disabled={
-                  !canEdit ||
-                  save.isPending ||
-                  draft.name.trim().length === 0 ||
-                  (!draft.dirty && Boolean(draft.id))
-                }
-                className={cn(
-                  'flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs disabled:opacity-40',
-                  blocked
-                    ? 'bg-amber-600 text-white'
-                    : 'bg-zinc-950 text-zinc-50 dark:bg-zinc-100 dark:text-zinc-950',
-                )}
-              >
-                {save.isPending ? (
-                  <Loader2 size={12} className="animate-spin" />
-                ) : (
-                  <Save size={12} />
-                )}
-                {draft.dirty ? 'Save' : 'Saved'}
-              </button>
-            </Tooltip>
-            <Tooltip
-              content={
-                draft.dirty
-                  ? 'Save first — a run executes the stored graph, not what is on screen.'
-                  : durability.detail
-              }
-            >
-              <button
-                type="button"
-                onClick={() => draft.id && runIt.mutate(draft.id)}
-                disabled={!canEdit || !draft.id || draft.dirty || runIt.isPending}
-                className={cn(
-                  'flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs disabled:opacity-40',
-                  RULE,
-                  'hover:bg-zinc-50 dark:hover:bg-zinc-800',
-                )}
-              >
-                {runIt.isPending ? (
-                  <Loader2 size={12} className="animate-spin" />
-                ) : (
-                  <Play size={12} />
-                )}
-                Run
-              </button>
-            </Tooltip>
-            {draft.id && canEdit && (
-              <Tooltip content={`Delete this ${WORKFLOW_NAME.singular}.`}>
-                <button
-                  type="button"
-                  onClick={() => setConfirmingDelete(true)}
-                  aria-label={`Delete this ${WORKFLOW_NAME.singular}`}
-                  className={cn('rounded-md border p-1.5 text-zinc-400 hover:text-red-600', RULE)}
-                >
-                  <Trash2 size={12} />
-                </button>
-              </Tooltip>
-            )}
-          </div>
+          <CanvasActions
+            draft={draft}
+            canEdit={canEdit}
+            blocked={blocked}
+            saving={save.isPending}
+            running={runIt.isPending}
+            durabilityDetail={durability.detail}
+            onSave={() => save.mutate()}
+            onRun={() => draft.id && runIt.mutate(draft.id)}
+            onAskDelete={() => setConfirmingDelete(true)}
+          />
         </div>
 
-        {save.error && (
-          <p className="mt-2 rounded-md border border-red-200 bg-red-50 px-3 py-1.5 text-[11px] text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300">
-            {/* The server's refusal, verbatim. It knows things this canvas does
-                not — which types exist, who may write to them, whether a
-                transform's output fits the sink — so its wording is the useful
-                one, not a generic "could not save". */}
-            The server refused it:{' '}
-            {save.error instanceof Error ? save.error.message : 'no reason given.'}
-          </p>
-        )}
-        {runIt.error && (
-          <p className="mt-2 rounded-md border border-red-200 bg-red-50 px-3 py-1.5 text-[11px] text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300">
-            The run could not start:{' '}
-            {runIt.error instanceof Error ? runIt.error.message : 'no reason given.'}
-          </p>
-        )}
+        {save.error && <RefusalNote lead="The server refused it:" error={save.error} />}
+        {runIt.error && <RefusalNote lead="The run could not start:" error={runIt.error} />}
       </div>
 
       {canEdit && (
-        <div className="flex shrink-0 flex-wrap items-center gap-2 px-6 pt-3">
-          <AddButton
-            icon={Plug}
-            label="Source"
-            hint="Reads records out of a system: a kind, an optional named connection, and a config."
-            onClick={() => addNode('source')}
-          />
-          <AddButton
-            icon={Repeat}
-            label="Transform"
-            hint="Code that reshapes whatever is wired into it."
-            onClick={() => addNode('transform')}
-          />
-          <AddButton
-            icon={Database}
-            label="Sink"
-            hint="Writes and commits one object type. Several are fine — each commits independently."
-            onClick={() => addNode('sink')}
-          />
-          <Tooltip content="Lay the nodes out left to right by dependency, with every sink in the last column.">
-            <button
-              type="button"
-              onClick={tidy}
-              className={cn(
-                'flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs',
-                RULE,
-                MUTED,
-                'hover:bg-zinc-50 dark:hover:bg-zinc-800',
-              )}
-            >
-              <LayoutGrid size={12} />
-              Tidy
-            </button>
-          </Tooltip>
-          {workflows.isFetching && !workflows.isPending && (
-            // A background refetch says so without replacing anything: the
-            // graph on screen stays exactly where it is.
-            <span className={cn('ml-auto font-mono text-[10px]', MUTED)}>refreshing…</span>
-          )}
-        </div>
+        <AddNodeBar
+          refreshing={workflows.isFetching && !workflows.isPending}
+          onAdd={addNode}
+          onTidy={tidy}
+        />
       )}
 
       {/*
@@ -849,84 +1063,23 @@ function Canvas({
        * the canvas is `flex-1 min-h-0` so it grows with the window.
        */}
       <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-6 pb-5 pt-3 lg:flex-row lg:overflow-hidden">
-        <div
-          className={cn(
-            'relative h-[55vh] min-h-[15rem] shrink-0 overflow-hidden rounded-lg border',
-            'lg:h-auto lg:min-h-0 lg:flex-1 lg:shrink',
-            RULE,
-          )}
-        >
-          {workflows.isPending && <CanvasSkeleton />}
-
-          {workflows.isError && (
-            <CanvasFailure error={workflows.error} onRetry={() => workflows.refetch()} />
-          )}
-
-          {!workflows.isPending && !workflows.isError && (
-            <WorkflowNodeProvider
-              handlers={{
-                onInspect: setInspecting,
-                onEditCode: setEditingCodeFor,
-                canEdit,
-              }}
-            >
-              <ReactFlow
-                className={CANVAS_THEME}
-                nodes={flowNodes}
-                edges={flowEdges}
-                nodeTypes={workflowNodeTypes}
-                onNodesChange={onNodesChange}
-                onEdgesChange={onEdgesChange}
-                onConnect={onConnect}
-                isValidConnection={isValidConnection}
-                onConnectEnd={(_event, state) => {
-                  // The reason, once, at the end of the drag — rather than on
-                  // every pointer move, which would set state dozens of times a
-                  // second while somebody is still deciding where to drop.
-                  if (state.isValid !== false) return;
-                  const from = state.fromNode?.id;
-                  const to = state.toNode?.id;
-                  if (!from || !to) return;
-                  const verdict = canConnect(draft.nodes, draft.edges, from, to);
-                  if (!verdict.ok) setAnnouncement(verdict.reason);
-                }}
-                connectionLineType={ConnectionLineType.SmoothStep}
-                nodesDraggable={canEdit}
-                nodesConnectable={canEdit}
-                elementsSelectable
-                nodesFocusable
-                edgesFocusable
-                deleteKeyCode={canEdit ? ['Delete', 'Backspace'] : null}
-                // A wider drop zone than the 20px default, because these
-                // handles are the only drop target on the screen and missing
-                // one reads as the canvas ignoring you.
-                connectionRadius={28}
-                proOptions={{ hideAttribution: false }}
-                ariaLabelConfig={ARIA_LABELS}
-                aria-label={`${WORKFLOW_NAME.title} canvas. ${draft.nodes.length} nodes, ${draft.edges.length} connections.`}
-                fitView
-              >
-                <Background variant={BackgroundVariant.Dots} gap={18} size={1} />
-                <Controls showInteractive={false} />
-                <MiniMap
-                  pannable
-                  zoomable
-                  nodeColor={(node) => {
-                    // Narrowed rather than asserted: MiniMap types `data` as an
-                    // open record, and a bad `kind` here would be a thrown
-                    // error inside React Flow's own render rather than a
-                    // mis-coloured dot.
-                    const kind = node.data?.kind;
-                    if (!isWorkflowNodeKind(kind)) return '#a1a1aa';
-                    if (kind === 'source') return '#0ea5e9';
-                    if (kind === 'sink') return '#10b981';
-                    return '#8b5cf6';
-                  }}
-                />
-              </ReactFlow>
-            </WorkflowNodeProvider>
-          )}
-        </div>
+        <GraphSurface
+          loading={workflows.isPending}
+          failed={workflows.isError}
+          error={workflows.error}
+          onRetry={() => workflows.refetch()}
+          canEdit={canEdit}
+          draft={draft}
+          flowNodes={flowNodes}
+          flowEdges={flowEdges}
+          onInspect={setInspecting}
+          onEditCode={setEditingCodeFor}
+          onNodesChange={onNodesChange}
+          onEdgesChange={onEdgesChange}
+          onConnect={onConnect}
+          isValidConnection={isValidConnection}
+          onConnectEnd={announceRefusedDrop}
+        />
 
         <WiringRail
           draft={draft}
@@ -1364,6 +1517,161 @@ function WiringRail({
   );
 }
 
+/**
+ * One end of a node's wiring — everything feeding it, or everything it feeds.
+ *
+ * Both directions render the same list off the same edges, so they share one
+ * description of it. Only which end of the edge to name, and how removing it is
+ * announced, differ; `children` carries whatever belongs under the list.
+ */
+function WiringList({
+  title,
+  edges,
+  otherEnd,
+  describeRemoval,
+  canEdit,
+  onDisconnect,
+  children,
+}: {
+  title: string;
+  edges: WorkflowEdge[];
+  otherEnd: (edge: WorkflowEdge) => string;
+  describeRemoval: (name: string) => string;
+  canEdit: boolean;
+  onDisconnect: (edge: WorkflowEdge) => void;
+  children?: ReactNode;
+}) {
+  return (
+    <section>
+      <h3 className={cn('font-mono text-[10px] uppercase tracking-[0.14em]', MUTED)}>{title}</h3>
+      {edges.length === 0 ? (
+        <p className={cn('mt-1 text-[11px]', MUTED)}>Nothing yet.</p>
+      ) : (
+        <ul className="mt-1 space-y-1">
+          {edges.map((edge) => (
+            <li key={edgeId(edge)} className="flex items-center gap-1.5 text-[11px]">
+              <span className="truncate">{otherEnd(edge)}</span>
+              {canEdit && (
+                <Tooltip content="Remove this connection.">
+                  <button
+                    type="button"
+                    onClick={() => onDisconnect(edge)}
+                    aria-label={describeRemoval(otherEnd(edge))}
+                    className="ml-auto rounded p-0.5 text-zinc-400 hover:text-red-600"
+                  >
+                    <Unplug size={11} />
+                  </button>
+                </Tooltip>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+      {children}
+    </section>
+  );
+}
+
+/** Which transform runs here, and a way into its code. */
+function TransformInspector({
+  node,
+  transforms,
+  canEdit,
+  onChange,
+  onEditCode,
+}: {
+  node: WorkflowTransformNode;
+  transforms: CatalogTransform[];
+  canEdit: boolean;
+  onChange: (node: WorkflowNode) => void;
+  onEditCode: (nodeId: string) => void;
+}) {
+  return (
+    <div className="space-y-2">
+      <SelectField
+        label="Transform"
+        ariaLabel="Which transform runs at this node"
+        value={node.transformId}
+        onValueChange={(transformId) => onChange({ ...node, transformId })}
+        options={transforms.map((transform) => ({
+          value: transform.id,
+          label: transform.name,
+          hint: `${transform.language} · v${transform.version}`,
+        }))}
+        placeholder="Choose a transform…"
+        disabled={!canEdit}
+      />
+      <button
+        type="button"
+        onClick={() => onEditCode(node.id)}
+        disabled={node.transformId.length === 0}
+        className={cn(
+          'flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs disabled:opacity-40',
+          RULE,
+          'hover:bg-zinc-50 dark:hover:bg-zinc-800',
+        )}
+      >
+        <Code2 size={12} />
+        Open the code
+      </button>
+    </div>
+  );
+}
+
+/**
+ * What this sink commits, and whether it replaces or merges.
+ *
+ * The type is set here, on the node that commits it, rather than once for the
+ * whole graph — several sinks may write several types.
+ */
+function SinkInspector({
+  node,
+  typeOptions,
+  canEdit,
+  onChange,
+}: {
+  node: WorkflowSinkNode;
+  typeOptions: SelectOption[];
+  canEdit: boolean;
+  onChange: (node: WorkflowNode) => void;
+}) {
+  return (
+    <div className="space-y-3">
+      <SelectField
+        label="Commits"
+        ariaLabel="Which object type this sink writes"
+        value={node.targetType}
+        onValueChange={(targetType) => onChange({ ...node, targetType })}
+        options={typeOptions}
+        placeholder="Choose one type…"
+        disabled={!canEdit}
+        hint="The type is set here, on the node that commits it, rather than once for the whole graph — several sinks may write several types."
+      />
+      <SelectField
+        label="Commit mode"
+        ariaLabel="Whether this sink replaces the dataset or merges into it"
+        value={node.mode ?? 'full'}
+        onValueChange={(mode) =>
+          onChange({
+            ...node,
+            mode: mode === 'incremental' ? 'incremental' : 'full',
+          })
+        }
+        options={[
+          { value: 'full', label: 'Full — replace the dataset' },
+          { value: 'incremental', label: 'Incremental — merge into it' },
+        ]}
+        disabled={!canEdit}
+      />
+      <p className={cn('text-[11px] leading-relaxed', MUTED)}>
+        This sink commits {node.targetType || 'its type'} on its own. Another sink in the same graph
+        committing a different type is a separate commit — one can succeed while this one fails, and
+        the run is reported as failed when any of them does.
+      </p>
+    </div>
+  );
+}
+
 function NodeInspector({
   node,
   draft,
@@ -1457,34 +1765,13 @@ function NodeInspector({
           />
 
           {node.kind === 'transform' && (
-            <div className="space-y-2">
-              <SelectField
-                label="Transform"
-                ariaLabel="Which transform runs at this node"
-                value={node.transformId}
-                onValueChange={(transformId) => onChange({ ...node, transformId })}
-                options={transforms.map((transform) => ({
-                  value: transform.id,
-                  label: transform.name,
-                  hint: `${transform.language} · v${transform.version}`,
-                }))}
-                placeholder="Choose a transform…"
-                disabled={!canEdit}
-              />
-              <button
-                type="button"
-                onClick={() => onEditCode(node.id)}
-                disabled={node.transformId.length === 0}
-                className={cn(
-                  'flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs disabled:opacity-40',
-                  RULE,
-                  'hover:bg-zinc-50 dark:hover:bg-zinc-800',
-                )}
-              >
-                <Code2 size={12} />
-                Open the code
-              </button>
-            </div>
+            <TransformInspector
+              node={node}
+              transforms={transforms}
+              canEdit={canEdit}
+              onChange={onChange}
+              onEditCode={onEditCode}
+            />
           )}
 
           {node.kind === 'source' && (
@@ -1501,104 +1788,38 @@ function NodeInspector({
           )}
 
           {node.kind === 'sink' && (
-            <div className="space-y-3">
-              <SelectField
-                label="Commits"
-                ariaLabel="Which object type this sink writes"
-                value={node.targetType}
-                onValueChange={(targetType) => onChange({ ...node, targetType })}
-                options={typeOptions}
-                placeholder="Choose one type…"
-                disabled={!canEdit}
-                hint="The type is set here, on the node that commits it, rather than once for the whole graph — several sinks may write several types."
-              />
-              <SelectField
-                label="Commit mode"
-                ariaLabel="Whether this sink replaces the dataset or merges into it"
-                value={node.mode ?? 'full'}
-                onValueChange={(mode) =>
-                  onChange({
-                    ...node,
-                    mode: mode === 'incremental' ? 'incremental' : 'full',
-                  })
-                }
-                options={[
-                  { value: 'full', label: 'Full — replace the dataset' },
-                  { value: 'incremental', label: 'Incremental — merge into it' },
-                ]}
-                disabled={!canEdit}
-              />
-              <p className={cn('text-[11px] leading-relaxed', MUTED)}>
-                This sink commits {node.targetType || 'its type'} on its own. Another sink in the
-                same graph committing a different type is a separate commit — one can succeed while
-                this one fails, and the run is reported as failed when any of them does.
-              </p>
-            </div>
+            <SinkInspector
+              node={node}
+              typeOptions={typeOptions}
+              canEdit={canEdit}
+              onChange={onChange}
+            />
           )}
 
-          <section>
-            <h3 className={cn('font-mono text-[10px] uppercase tracking-[0.14em]', MUTED)}>
-              Fed by
-            </h3>
-            {incoming.length === 0 ? (
-              <p className={cn('mt-1 text-[11px]', MUTED)}>Nothing yet.</p>
-            ) : (
-              <ul className="mt-1 space-y-1">
-                {incoming.map((edge) => (
-                  <li key={edgeId(edge)} className="flex items-center gap-1.5 text-[11px]">
-                    <span className="truncate">{label(edge.from)}</span>
-                    {canEdit && (
-                      <Tooltip content="Remove this connection.">
-                        <button
-                          type="button"
-                          onClick={() => onDisconnect(edge)}
-                          aria-label={`Stop ${label(edge.from)} feeding this node`}
-                          className="ml-auto rounded p-0.5 text-zinc-400 hover:text-red-600"
-                        >
-                          <Unplug size={11} />
-                        </button>
-                      </Tooltip>
-                    )}
-                  </li>
-                ))}
-              </ul>
-            )}
+          <WiringList
+            title="Fed by"
+            edges={incoming}
+            otherEnd={(edge) => label(edge.from)}
+            describeRemoval={(name) => `Stop ${name} feeding this node`}
+            canEdit={canEdit}
+            onDisconnect={onDisconnect}
+          >
             {incoming.length > 1 && (
               <p className={cn('mt-1 text-[11px] leading-relaxed', MUTED)}>
                 Inputs arrive in this order, and the order is part of what the graph produces — a
                 transform joining two feeds sees them exactly like this.
               </p>
             )}
-          </section>
+          </WiringList>
 
-          <section>
-            <h3 className={cn('font-mono text-[10px] uppercase tracking-[0.14em]', MUTED)}>
-              Feeds
-            </h3>
-            {outgoing.length === 0 ? (
-              <p className={cn('mt-1 text-[11px]', MUTED)}>Nothing yet.</p>
-            ) : (
-              <ul className="mt-1 space-y-1">
-                {outgoing.map((edge) => (
-                  <li key={edgeId(edge)} className="flex items-center gap-1.5 text-[11px]">
-                    <span className="truncate">{label(edge.to)}</span>
-                    {canEdit && (
-                      <Tooltip content="Remove this connection.">
-                        <button
-                          type="button"
-                          onClick={() => onDisconnect(edge)}
-                          aria-label={`Stop this node feeding ${label(edge.to)}`}
-                          className="ml-auto rounded p-0.5 text-zinc-400 hover:text-red-600"
-                        >
-                          <Unplug size={11} />
-                        </button>
-                      </Tooltip>
-                    )}
-                  </li>
-                ))}
-              </ul>
-            )}
-
+          <WiringList
+            title="Feeds"
+            edges={outgoing}
+            otherEnd={(edge) => label(edge.to)}
+            describeRemoval={(name) => `Stop this node feeding ${name}`}
+            canEdit={canEdit}
+            onDisconnect={onDisconnect}
+          >
             {canEdit && (
               <div className="mt-2 flex items-end gap-2">
                 <div className="min-w-0 flex-1">
@@ -1637,7 +1858,7 @@ function NodeInspector({
               Only nodes that can legally take this one's output are listed — anything that would
               close a loop, or feed a source, is left out.
             </p>
-          </section>
+          </WiringList>
 
           {canEdit && (
             <button

@@ -124,6 +124,20 @@ function durationToMs(ttl: string): number {
 }
 
 /**
+ * An optional `dashboardAuth` hook is either absent or callable.
+ *
+ * One function for all four so the four messages cannot drift apart — a host
+ * reading "dashboardAuth.revalidate must be a function" and then a differently
+ * worded one for `login` has to work out whether the difference means anything.
+ * `name` is this package's own literal at every call site, never user input.
+ */
+function assertOptionalHook(value: unknown, name: string): void {
+  if (value !== undefined && typeof value !== 'function') {
+    throw new Error(`CatalogDashboardModule: dashboardAuth.${name} must be a function.`);
+  }
+}
+
+/**
  * Validate + resolve the `dashboardAuth` option. Returns `null` when unconfigured (today's
  * unauthenticated behavior, unchanged). Throws at boot (fail closed) when configured but missing a
  * secret, or missing both a `session` and a `login` hook — the host learns immediately rather than
@@ -139,30 +153,17 @@ export function resolveDashboardAuth(
         '(HMAC-SHA256 signing key, 32+ bytes recommended). Failing closed.',
     );
   }
+  // Checked in declaration order, so the first thing a misconfigured host is
+  // told about is the first thing it got wrong.
+  assertOptionalHook(options.session, 'session');
+  assertOptionalHook(options.login, 'login');
+  assertOptionalHook(options.revalidate, 'revalidate');
+  assertOptionalHook(options.unauthenticatedPage, 'unauthenticatedPage');
+
   const modes: AuthMode[] = [];
-  if (options.session !== undefined) {
-    if (typeof options.session !== 'function') {
-      throw new Error('CatalogDashboardModule: dashboardAuth.session must be a function.');
-    }
-    modes.push('session');
-  }
-  if (options.login !== undefined) {
-    if (typeof options.login !== 'function') {
-      throw new Error('CatalogDashboardModule: dashboardAuth.login must be a function.');
-    }
-    modes.push('login');
-  }
-  if (options.revalidate !== undefined && typeof options.revalidate !== 'function') {
-    throw new Error('CatalogDashboardModule: dashboardAuth.revalidate must be a function.');
-  }
-  if (
-    options.unauthenticatedPage !== undefined &&
-    typeof options.unauthenticatedPage !== 'function'
-  ) {
-    throw new Error(
-      'CatalogDashboardModule: dashboardAuth.unauthenticatedPage must be a function.',
-    );
-  }
+  if (options.session !== undefined) modes.push('session');
+  if (options.login !== undefined) modes.push('login');
+
   if (modes.length === 0) {
     throw new Error(
       'CatalogDashboardModule: dashboardAuth needs at least one of `session` or `login` ' +

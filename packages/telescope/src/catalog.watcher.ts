@@ -93,10 +93,23 @@ export function buildCatalogEntry(
   // of that decision, and the copy is what goes stale when an event grows a
   // field. `error` is the exception because its contents come from outside the
   // catalog entirely. See `capError`.
-  const content: Record<string, unknown> = { event, ...source };
-  const error = capError(stringOrUndefined(Reflect.get(content, 'error')));
-  if (error !== undefined) content.error = error;
-  else if ('error' in content) delete content.error;
+  const copied: Record<string, unknown> = { event, ...source };
+  const error = capError(stringOrUndefined(Reflect.get(copied, 'error')));
+
+  // An `error` that does not survive `capError` is *removed*, not set to
+  // `undefined`. This object is handed to a host and to Telescope's storage
+  // verbatim, so `'error' in content` and `Object.keys(content)` are part of
+  // what it means — a key present with an `undefined` value would report a
+  // rejected error as an error that happened and was empty. Rest-destructuring
+  // drops the key without the `delete` that deoptimises the object's shape.
+  let content: Record<string, unknown>;
+  if (error === undefined) {
+    const { error: _rejected, ...rest } = copied;
+    content = rest;
+  } else {
+    copied.error = error;
+    content = copied;
+  }
 
   const status = stringOrUndefined(Reflect.get(source, 'status'));
   const failed = status === 'failed';

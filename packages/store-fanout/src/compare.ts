@@ -97,6 +97,40 @@ export function keyProperties(type: CatalogObjectTypeDef): CatalogPropertyDef[] 
 }
 
 /**
+ * Fold one page of rows into the four numbers a digest is made of.
+ *
+ * Split out from the paging loop precisely because it can be: the sum is taken
+ * mod 2^64 and the XOR is bitwise, so both are associative, and folding
+ * per-page then combining gives bit-for-bit what folding row-by-row across the
+ * whole snapshot would. That is the same property the digest relies on to let
+ * two stores page a snapshot in different orders and still agree.
+ */
+function digestPage(
+  rows: readonly Record<string, unknown>[],
+  keys: CatalogPropertyDef[],
+): { sum: bigint; xor: bigint; digested: number; unkeyed: number } {
+  let sum = 0n;
+  let xor = 0n;
+  let digested = 0;
+  let unkeyed = 0;
+
+  for (const row of rows) {
+    digested += 1;
+    if (keys.length === 0) continue;
+    const values = keys.map((property) => row[property.name]);
+    if (values.some((value) => value === null || value === undefined)) {
+      unkeyed += 1;
+      continue;
+    }
+    const hash = rowHash(keys, values);
+    sum = (sum + hash) & MASK64;
+    xor ^= hash;
+  }
+
+  return { sum, xor, digested, unkeyed };
+}
+
+/**
  * Walk one store's copy of a snapshot and reduce it to numbers.
  *
  * Paged rather than pulled whole, because these are datasets — the point of a
@@ -156,18 +190,11 @@ export async function digestSide(
     total = result.total;
     if (result.rows.length === 0) break;
 
-    for (const row of result.rows) {
-      digested += 1;
-      if (keys.length === 0) continue;
-      const values = keys.map((property) => row[property.name]);
-      if (values.some((value) => value === null || value === undefined)) {
-        unkeyed += 1;
-        continue;
-      }
-      const hash = rowHash(keys, values);
-      sum = (sum + hash) & MASK64;
-      xor ^= hash;
-    }
+    const folded = digestPage(result.rows, keys);
+    sum = (sum + folded.sum) & MASK64;
+    xor ^= folded.xor;
+    digested += folded.digested;
+    unkeyed += folded.unkeyed;
 
     if (digested >= total) break;
     // A snapshot is append-only and invisible until committed, so this loop is
@@ -189,6 +216,53 @@ export async function digestSide(
     unkeyed,
     readable: true,
   };
+}
+
+/**
+ * The reasons that exist only once both sides could actually be read.
+ *
+ * The readability check guards the whole group rather than each sentence: an
+ * unreadable side carries the zero values of a digest that was never taken, so
+ * every comparison below would "fail" and bury the one reason that matters —
+ * that there was nothing to compare against — under three that are artefacts of
+ * asking anyway.
+ */
+function agreementReasons(
+  type: CatalogObjectTypeDef,
+  snapshotId: string,
+  follower: string,
+  primary: FanoutSideDigest,
+  followerSide: FanoutSideDigest,
+  keyed: boolean,
+): string[] {
+  if (!primary.readable || !followerSide.readable) return [];
+  const reasons: string[] = [];
+
+  if (primary.rows !== followerSide.rows) {
+    const missing = primary.rows - followerSide.rows;
+    reasons.push(
+      missing > 0
+        ? `${follower} holds ${followerSide.rows} rows of ${type.name} snapshot ${snapshotId}; ${primary.store} holds ${primary.rows}. ${missing} row(s) never landed. Replay the snapshot to ${follower}.`
+        : `${follower} holds ${followerSide.rows} rows of ${type.name} snapshot ${snapshotId}; ${primary.store} holds only ${primary.rows}. The follower has ${-missing} row(s) too many, which means a batch was appended rather than replaced — a replay rewrites the snapshot from the primary and will clear it.`,
+    );
+  } else if (keyed && primary.keyDigest !== followerSide.keyDigest) {
+    reasons.push(
+      `Row counts agree at ${primary.rows}, but the primary-key digest differs (${primary.store}: ${primary.keyDigest}; ${follower}: ${followerSide.keyDigest}). The same number of rows carry different keys, so rows were replaced rather than lost — a count-only check would have called this identical. Replay the snapshot to ${follower}.`,
+    );
+  }
+
+  if (primary.digested !== primary.rows) {
+    reasons.push(
+      `${primary.store} reported ${primary.rows} rows for this snapshot and handed over ${primary.digested} while paging, so the snapshot moved during the comparison and the digest above describes nothing in particular. Run this again against a snapshot that is no longer being loaded.`,
+    );
+  }
+  if (followerSide.digested !== followerSide.rows) {
+    reasons.push(
+      `${follower} reported ${followerSide.rows} rows for this snapshot and handed over ${followerSide.digested} while paging, so the digest above describes nothing in particular.`,
+    );
+  }
+
+  return reasons;
 }
 
 /** Turn two digested sides into a verdict and the sentences that explain it. */
@@ -213,31 +287,7 @@ export function explainComparison(
     );
   }
 
-  if (primary.readable && followerSide.readable) {
-    if (primary.rows !== followerSide.rows) {
-      const missing = primary.rows - followerSide.rows;
-      reasons.push(
-        missing > 0
-          ? `${follower} holds ${followerSide.rows} rows of ${type.name} snapshot ${snapshotId}; ${primary.store} holds ${primary.rows}. ${missing} row(s) never landed. Replay the snapshot to ${follower}.`
-          : `${follower} holds ${followerSide.rows} rows of ${type.name} snapshot ${snapshotId}; ${primary.store} holds only ${primary.rows}. The follower has ${-missing} row(s) too many, which means a batch was appended rather than replaced — a replay rewrites the snapshot from the primary and will clear it.`,
-      );
-    } else if (keyed && primary.keyDigest !== followerSide.keyDigest) {
-      reasons.push(
-        `Row counts agree at ${primary.rows}, but the primary-key digest differs (${primary.store}: ${primary.keyDigest}; ${follower}: ${followerSide.keyDigest}). The same number of rows carry different keys, so rows were replaced rather than lost — a count-only check would have called this identical. Replay the snapshot to ${follower}.`,
-      );
-    }
-
-    if (primary.digested !== primary.rows) {
-      reasons.push(
-        `${primary.store} reported ${primary.rows} rows for this snapshot and handed over ${primary.digested} while paging, so the snapshot moved during the comparison and the digest above describes nothing in particular. Run this again against a snapshot that is no longer being loaded.`,
-      );
-    }
-    if (followerSide.digested !== followerSide.rows) {
-      reasons.push(
-        `${follower} reported ${followerSide.rows} rows for this snapshot and handed over ${followerSide.digested} while paging, so the digest above describes nothing in particular.`,
-      );
-    }
-  }
+  reasons.push(...agreementReasons(type, snapshotId, follower, primary, followerSide, keyed));
 
   if (!keyed) {
     reasons.push(

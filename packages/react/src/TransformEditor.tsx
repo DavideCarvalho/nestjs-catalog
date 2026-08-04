@@ -1,4 +1,8 @@
-import type { CatalogTransform, TransformLanguage } from '@dudousxd/nestjs-catalog/client';
+import type {
+  CatalogTransform,
+  TransformLanguage,
+  TransformResult,
+} from '@dudousxd/nestjs-catalog/client';
 import { isTransformLanguage } from '@dudousxd/nestjs-catalog/client';
 import { useMutation } from '@tanstack/react-query';
 import { ArrowLeft, Play } from 'lucide-react';
@@ -77,6 +81,99 @@ export interface TransformEditorProps {
  * transform you can iterate on and one you can only test in production is
  * whether you can see its output beside its input.
  */
+/**
+ * What the last run produced: its logs, its rows, or why it failed.
+ *
+ * An empty result is said out loud rather than shown as `[]`. Two characters in
+ * a scroll pane read as "nothing happened yet", and the run that produced no
+ * rows is exactly the one somebody needs to notice — a connector using this
+ * transform would commit an empty snapshot.
+ */
+function TryOutput({ result, error }: { result: TransformResult | undefined; error: unknown }) {
+  return (
+    <div className="max-h-64 overflow-auto p-3">
+      {error ? (
+        <p className="font-mono text-[11px] leading-relaxed text-red-600">
+          {error instanceof Error ? error.message : 'It failed.'}
+        </p>
+      ) : null}
+      {result && (
+        <>
+          {result.logs.length > 0 && (
+            <pre className={cn('mb-2 whitespace-pre-wrap font-mono text-[10px]', MUTED)}>
+              {result.logs.join('\n')}
+            </pre>
+          )}
+          {result.rows.length === 0 ? (
+            <p className="text-[11px] text-amber-600">
+              It ran and returned no rows. A connector using this would commit an empty snapshot.
+            </p>
+          ) : (
+            <pre className="whitespace-pre-wrap font-mono text-[11px]">
+              {JSON.stringify(result.rows, null, 2)}
+            </pre>
+          )}
+          <p className={cn('mt-2 font-mono text-[10px]', MUTED)}>
+            {result.rows.length} rows · {result.elapsedMs}ms
+          </p>
+        </>
+      )}
+      {!result && !error && (
+        <p className={cn('py-4 text-center text-[11px]', MUTED)}>Run it to see what it produces.</p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Save, and what saving will do.
+ *
+ * The version note is beside the button rather than in a confirmation, because
+ * saving new code always cuts a version — that is how a running connector keeps
+ * the code it was pinned to — and it should be visible before the click, not
+ * explained after it.
+ */
+function SaveBar({
+  transform,
+  nameIsEmpty,
+  pending,
+  error,
+  onSave,
+}: {
+  transform: CatalogTransform | undefined;
+  nameIsEmpty: boolean;
+  pending: boolean;
+  error: unknown;
+  onSave: () => void;
+}) {
+  return (
+    <div className="flex items-center gap-2">
+      <button
+        type="button"
+        onClick={onSave}
+        disabled={pending || nameIsEmpty}
+        className={cn(
+          'rounded-md border px-3 py-1.5 text-xs disabled:opacity-40',
+          RULE,
+          'hover:bg-zinc-50 dark:hover:bg-zinc-800',
+        )}
+      >
+        {pending ? 'Saving…' : transform ? 'Save changes' : 'Save transform'}
+      </button>
+      {transform && (
+        <span className={cn('font-mono text-[10px]', MUTED)}>
+          saving new code makes this v{transform.version + 1}
+        </span>
+      )}
+      {error ? (
+        <span className="text-[11px] text-red-600">
+          {error instanceof Error ? error.message : 'Could not save.'}
+        </span>
+      ) : null}
+    </div>
+  );
+}
+
 export function TransformEditor({
   transform,
   languages,
@@ -236,72 +333,18 @@ export function TransformEditor({
                 Output
               </span>
             </div>
-            <div className="max-h-64 overflow-auto p-3">
-              {tryIt.error && (
-                <p className="font-mono text-[11px] leading-relaxed text-red-600">
-                  {tryIt.error instanceof Error ? tryIt.error.message : 'It failed.'}
-                </p>
-              )}
-              {tryIt.data && (
-                <>
-                  {tryIt.data.logs.length > 0 && (
-                    <pre className={cn('mb-2 whitespace-pre-wrap font-mono text-[10px]', MUTED)}>
-                      {tryIt.data.logs.join('\n')}
-                    </pre>
-                  )}
-                  {/* An empty result said out loud. `[]` rendered as two
-                      characters in a scroll pane reads as "nothing happened
-                      yet", and the run that produced no rows is exactly the one
-                      somebody needs to notice. */}
-                  {tryIt.data.rows.length === 0 ? (
-                    <p className="text-[11px] text-amber-600">
-                      It ran and returned no rows. A connector using this would commit an empty
-                      snapshot.
-                    </p>
-                  ) : (
-                    <pre className="whitespace-pre-wrap font-mono text-[11px]">
-                      {JSON.stringify(tryIt.data.rows, null, 2)}
-                    </pre>
-                  )}
-                  <p className={cn('mt-2 font-mono text-[10px]', MUTED)}>
-                    {tryIt.data.rows.length} rows · {tryIt.data.elapsedMs}ms
-                  </p>
-                </>
-              )}
-              {!tryIt.data && !tryIt.error && (
-                <p className={cn('py-4 text-center text-[11px]', MUTED)}>
-                  Run it to see what it produces.
-                </p>
-              )}
-            </div>
+            <TryOutput result={tryIt.data} error={tryIt.error} />
           </div>
         </div>
       </div>
 
-      <div className="flex items-center gap-2">
-        <button
-          type="button"
-          onClick={() => save.mutate()}
-          disabled={save.isPending || name.trim().length === 0}
-          className={cn(
-            'rounded-md border px-3 py-1.5 text-xs disabled:opacity-40',
-            RULE,
-            'hover:bg-zinc-50 dark:hover:bg-zinc-800',
-          )}
-        >
-          {save.isPending ? 'Saving…' : transform ? 'Save changes' : 'Save transform'}
-        </button>
-        {transform && (
-          <span className={cn('font-mono text-[10px]', MUTED)}>
-            saving new code makes this v{transform.version + 1}
-          </span>
-        )}
-        {save.error && (
-          <span className="text-[11px] text-red-600">
-            {save.error instanceof Error ? save.error.message : 'Could not save.'}
-          </span>
-        )}
-      </div>
+      <SaveBar
+        transform={transform}
+        nameIsEmpty={name.trim().length === 0}
+        pending={save.isPending}
+        error={save.error}
+        onSave={() => save.mutate()}
+      />
     </div>
   );
 }

@@ -365,7 +365,6 @@ const ChartCore = memo(function ChartCore({
   }, [categoryScale, innerWidth, data.length]);
 
   // Animation timing — replay when motion settings change
-  // biome-ignore lint/correctness/useExhaustiveDependencies: revealSignature
   useEffect(() => {
     setRevealEpoch((n) => n + 1);
     setIsLoaded(false);

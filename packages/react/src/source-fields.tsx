@@ -143,6 +143,67 @@ export interface SourceConfigOptions {
   incremental: boolean;
 }
 
+/** The url unless a connection supplies it, plus the sub-path off it if there is one. */
+function httpConfig(draft: SourceDraft, viaConnection: boolean): Record<string, unknown> {
+  return {
+    ...(viaConnection ? {} : { url: draft.url }),
+    ...(draft.path ? { path: draft.path } : {}),
+  };
+}
+
+/** The query, the url unless a connection supplies it, and the watermark if it is in play. */
+function sqlConfig(
+  draft: SourceDraft,
+  viaConnection: boolean,
+  incremental: boolean,
+): Record<string, unknown> {
+  return {
+    query: draft.query,
+    ...(viaConnection || !draft.url ? {} : { url: draft.url }),
+    // Only when it will be used. A watermark column left on a source somebody
+    // switched back to full reads as a bound that is being applied, and it is
+    // not.
+    ...(incremental && draft.watermarkColumn ? { watermarkColumn: draft.watermarkColumn } : {}),
+  };
+}
+
+/** A path on disk — `url` doubles as the path here — and the format if it was picked. */
+function fileConfig(draft: SourceDraft): Record<string, unknown> {
+  return {
+    path: draft.path || draft.url,
+    ...(draft.format ? { format: draft.format } : {}),
+  };
+}
+
+/** Bucket and addressing, which a connection can supply, then the per-load narrowing. */
+function s3Config(draft: SourceDraft, viaConnection: boolean): Record<string, unknown> {
+  return {
+    ...(viaConnection
+      ? {}
+      : {
+          bucket: draft.bucket,
+          ...(draft.endpoint ? { endpoint: draft.endpoint } : {}),
+          ...(draft.region ? { region: draft.region } : {}),
+          ...(draft.forcePathStyle ? { forcePathStyle: true } : {}),
+        }),
+    ...(draft.prefix ? { prefix: draft.prefix } : {}),
+    ...(draft.suffix ? { suffix: draft.suffix } : {}),
+    ...(draft.format ? { format: draft.format } : {}),
+    ...(draft.maxObjectsPerRun ? { maxObjectsPerRun: Number(draft.maxObjectsPerRun) } : {}),
+  };
+}
+
+/**
+ * The pasted records, or none when the text will not parse.
+ *
+ * Unparseable text keeps the previous records rather than wiping them: the
+ * caller shows the message from `parseRecords` and refuses to save.
+ */
+function inlineConfig(draft: SourceDraft): Record<string, unknown> {
+  const parsed = parseRecords(draft.records);
+  return { records: parsed.ok ? parsed.records : [] };
+}
+
 /**
  * The stored config for one kind, and nothing else.
  *
@@ -155,48 +216,11 @@ export function sourceConfigFrom(
   draft: SourceDraft,
   { viaConnection, incremental }: SourceConfigOptions,
 ): Record<string, unknown> {
-  if (kind === 'http') {
-    return {
-      ...(viaConnection ? {} : { url: draft.url }),
-      ...(draft.path ? { path: draft.path } : {}),
-    };
-  }
-  if (kind === 'sql') {
-    return {
-      query: draft.query,
-      ...(viaConnection || !draft.url ? {} : { url: draft.url }),
-      // Only when it will be used. A watermark column left on a source somebody
-      // switched back to full reads as a bound that is being applied, and it is
-      // not.
-      ...(incremental && draft.watermarkColumn ? { watermarkColumn: draft.watermarkColumn } : {}),
-    };
-  }
-  if (kind === 'file') {
-    return {
-      path: draft.path || draft.url,
-      ...(draft.format ? { format: draft.format } : {}),
-    };
-  }
-  if (kind === 's3') {
-    return {
-      ...(viaConnection
-        ? {}
-        : {
-            bucket: draft.bucket,
-            ...(draft.endpoint ? { endpoint: draft.endpoint } : {}),
-            ...(draft.region ? { region: draft.region } : {}),
-            ...(draft.forcePathStyle ? { forcePathStyle: true } : {}),
-          }),
-      ...(draft.prefix ? { prefix: draft.prefix } : {}),
-      ...(draft.suffix ? { suffix: draft.suffix } : {}),
-      ...(draft.format ? { format: draft.format } : {}),
-      ...(draft.maxObjectsPerRun ? { maxObjectsPerRun: Number(draft.maxObjectsPerRun) } : {}),
-    };
-  }
-  const parsed = parseRecords(draft.records);
-  // Unparseable text keeps the previous records rather than wiping them: the
-  // caller shows the message from `parseRecords` and refuses to save.
-  return { records: parsed.ok ? parsed.records : [] };
+  if (kind === 'http') return httpConfig(draft, viaConnection);
+  if (kind === 'sql') return sqlConfig(draft, viaConnection, incremental);
+  if (kind === 'file') return fileConfig(draft);
+  if (kind === 's3') return s3Config(draft, viaConnection);
+  return inlineConfig(draft);
 }
 
 /**

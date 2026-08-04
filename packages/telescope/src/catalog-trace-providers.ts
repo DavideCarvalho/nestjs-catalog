@@ -324,7 +324,17 @@ export interface CatalogChangeTableRow {
  * unrecognised payload. An event this function has not been taught about could
  * carry anything, and guessing that it is safe to render is not a guess worth
  * making.
+ *
+ * **On the complexity suppression below.** The score is the sum of three
+ * independent per-event renderers, each reached by exactly one `case` and
+ * called from nowhere else. Giving each its own function would move the
+ * branches without removing one — the count of event shapes to render is what
+ * it is — and it would cost something real: the "emits only NAMES, never data"
+ * rule stated above is a property of *every* branch, and it is auditable in one
+ * screen precisely because the branches are adjacent. Four docblocks asserting
+ * it separately is how one of them quietly stops being true.
  */
+// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: flat dispatch — three one-call-site per-event renderers; extracting them relocates branches rather than removing them and splits the names-only-never-data invariant across four functions where it can no longer be read at once.
 export function summarizeChange(event: CatalogAuditEvent): string {
   const detail = isRecord(event.detail) ? event.detail : {};
   switch (event.event) {
