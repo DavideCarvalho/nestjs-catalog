@@ -56,6 +56,12 @@ Requires a `QueryClientProvider` from `@tanstack/react-query` above it.
 - **`<CoverageLedger />`**, **`<EditableField />`**, and the vendored primitives
   under `ui/` — the pieces, if you want to assemble something else.
 
+Rendering one of these charts inside *another* application is a server-side
+surface today: `GET /catalog/embed/*` serves shared charts and dashboards as
+rendered rows, documented in
+[`@dudousxd/nestjs-catalog`](../nestjs-catalog#embed-a-chart-in-someone-elses-application).
+React components for it are being built and are not part of this package yet.
+
 ## Endpoints it expects
 
 The catalog screens call paths the library's own controller serves, described by
