@@ -469,6 +469,50 @@ export interface EmbeddedDashboard {
   generatedAt: string;
 }
 
+/**
+ * What the *card* says about a chart, as opposed to what the saved query says.
+ *
+ * A card carries two kinds of statement and they are easy to conflate. Width
+ * and position are a hint about the grid, which a consumer may ignore. `title`
+ * and `library` are overrides — the board's answer to a question the query has
+ * already answered — and dropping them is not a hint being ignored, it is the
+ * embed disagreeing with the console about the same dashboard.
+ */
+export interface EmbeddedChartPlacement {
+  width: number;
+  position: number;
+  /** The card's title override. Blank or absent falls back to the query's name. */
+  title?: string;
+  /** The card's library override. Absent falls back to the query's own. */
+  library?: string;
+}
+
+/**
+ * Which library draws an embedded chart, given the two places that can say.
+ *
+ * The server twin of `visualizationFor` in the React package, and it must stay
+ * the same rule: the card wins, then the query, then the built-in renderer. Two
+ * different precedences for one field would mean the console and an embedding
+ * application draw the same board differently, which is exactly the bug the
+ * override exists to prevent.
+ *
+ * Restated here rather than imported, because a server package must not depend
+ * on a React one. Kept as a named function rather than two lines inside
+ * `embedChart` for the same reason the React side did: a precedence a test can
+ * hold by name cannot drift silently.
+ *
+ * When neither chose, the key is ABSENT rather than explicitly undefined — this
+ * shape is serialised to a consumer, and "the key is there and empty" is a
+ * different statement from "nobody chose".
+ */
+export function embeddedVisualization(
+  saved: QueryVisualization | undefined,
+  cardLibrary: string | undefined,
+): QueryVisualization {
+  const base = saved ?? { kind: 'table' };
+  return cardLibrary ? { ...base, library: cardLibrary } : base;
+}
+
 export interface CatalogWorkspaceStore {
   listSavedQueries(): Promise<SavedQuery[]>;
   getSavedQuery(id: string): Promise<SavedQuery | undefined>;

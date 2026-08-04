@@ -17,6 +17,7 @@ import {
 } from '@nestjs/common';
 import { toCsv } from './catalog.query-cache';
 import { CatalogRegistry } from './catalog.registry.base';
+import { RequireScopes } from './catalog.route-auth';
 import { CatalogService } from './catalog.service';
 import {
   CATALOG_TRACE_STORE,
@@ -232,6 +233,15 @@ export function createCatalogController(
       return this.service.listDashboards();
     }
 
+    /**
+     * `shared` is declared rather than merely passed through.
+     *
+     * It is the entire access boundary of the embed API — a board is
+     * embeddable because a person said so — and a field a body type does not
+     * name is a field a host's whitelisting `ValidationPipe` deletes. The
+     * failure is silent in the worst direction: the toggle appears to save and
+     * the dashboard is never actually shareable.
+     */
     @Post('dashboards')
     createDashboard(
       @Body()
@@ -239,6 +249,7 @@ export function createCatalogController(
         name: string;
         description?: string;
         cards?: DashboardCard[];
+        shared?: boolean;
         createdBy?: string;
       },
     ) {
@@ -258,6 +269,7 @@ export function createCatalogController(
         name: string;
         description: string;
         cards: DashboardCard[];
+        shared: boolean;
       }>,
     ) {
       return this.service.updateDashboard(id, body);
@@ -273,20 +285,37 @@ export function createCatalogController(
      *
      * A discovery endpoint so a consuming frontend can list what it is allowed
      * to render rather than being told the ids out of band.
+     *
+     * `catalog:embed` here as well as on the two fetches, and deliberately the
+     * SAME scope rather than a softer one. A caller that cannot fetch anything
+     * has no use for the list, and a discovery endpoint open to callers the
+     * fetches refuse is an inventory of this catalog's shared dashboards handed
+     * to whoever asks.
      */
     @Get('embed')
+    @RequireScopes('catalog:embed')
     embeddable() {
       return this.service.listEmbeddable();
     }
 
     /** A whole dashboard, every chart resolved and ready to draw. */
     @Get('embed/dashboards/:id')
+    @RequireScopes('catalog:embed')
     embedDashboard(@Param('id') id: string) {
       return this.service.embedDashboard(id);
     }
 
-    /** One chart, for a consumer that wants to place it itself. */
+    /**
+     * One chart, for a consumer that wants to place it itself.
+     *
+     * `catalog:embed` and not `catalog:read`: the whole reason the scope exists
+     * separately is that an application rendering one chart in its own UI needs
+     * nothing else, and a route that accepted `catalog:read` instead would make
+     * the narrow grant unusable — every embed consumer would be handed the
+     * whole catalog to draw one bar chart.
+     */
     @Get('embed/charts/:id')
+    @RequireScopes('catalog:embed')
     embedChart(@Param('id') id: string) {
       return this.service.embedChart(id);
     }
