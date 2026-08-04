@@ -1,0 +1,26 @@
+{
+  "//": "Typechecking for the specs, which every build config MUST exclude \u2014 they would otherwise be emitted into dist and published. Extends the SERVER config, not `tsconfig.json`: that one is solution-style (`files: []` + references) and carries no compilerOptions at all, so extending it silently drops decorators and every Nest spec fails to parse. The client and react specs live in the same package, so their DOM and jsx settings are added on top.",
+  "extends": "./tsconfig.server.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "declaration": false,
+    "rootDir": "../..",
+    "jsx": "react-jsx",
+    "lib": [
+      "ES2022",
+      "DOM",
+      "DOM.Iterable"
+    ]
+  },
+  "include": [
+    "src/**/*.spec.ts",
+    "src/**/*.spec.tsx",
+    "src/**/*.test.ts",
+    "src/**/*.test.tsx",
+    "test/**/*"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist"
+  ]
+}
