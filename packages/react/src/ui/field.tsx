@@ -17,7 +17,7 @@ const CONTROL = cn(
   'w-full rounded-md border px-2 py-1.5 text-xs outline-none',
   'border-zinc-200 bg-white text-zinc-900 placeholder:text-zinc-400',
   'dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-100 dark:placeholder:text-zinc-600',
-  'focus-visible:border-violet-500 focus-visible:ring-2 focus-visible:ring-violet-500/15',
+  'focus-visible:border-sky-500 focus-visible:ring-2 focus-visible:ring-sky-500/15',
 );
 
 function Label({ children }: { children: ReactNode }) {

@@ -129,7 +129,7 @@ function SignInForm({ onSignedIn }: { onSignedIn: () => void }) {
         placeholder="you@example.com"
         // biome-ignore lint/a11y/noAutofocus: this is a gate with one field and nothing else to reach, which is the case the rule's own docs exempt
         autoFocus
-        className="w-full rounded-md border border-zinc-200 bg-white px-3 py-2 text-sm outline-none focus:border-violet-500 focus:ring-2 focus:ring-violet-500/15 dark:border-zinc-800 dark:bg-zinc-900"
+        className="w-full rounded-md border border-zinc-200 bg-white px-3 py-2 text-sm outline-none focus:border-sky-500 focus:ring-2 focus:ring-sky-500/15 dark:border-zinc-800 dark:bg-zinc-900"
       />
       <input
         type="password"
@@ -138,7 +138,7 @@ function SignInForm({ onSignedIn }: { onSignedIn: () => void }) {
         autoComplete="current-password"
         aria-label="Password"
         placeholder="Password"
-        className="w-full rounded-md border border-zinc-200 bg-white px-3 py-2 text-sm outline-none focus:border-violet-500 focus:ring-2 focus:ring-violet-500/15 dark:border-zinc-800 dark:bg-zinc-900"
+        className="w-full rounded-md border border-zinc-200 bg-white px-3 py-2 text-sm outline-none focus:border-sky-500 focus:ring-2 focus:ring-sky-500/15 dark:border-zinc-800 dark:bg-zinc-900"
       />
 
       {signIn.isError && (

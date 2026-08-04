@@ -32,11 +32,11 @@ export function CoverageLedger({ types, selected, onSelect }: CoverageLedgerProp
             className={cn(
               'h-7 w-[7px] rounded-[1px] transition-all duration-150',
               'hover:h-9 focus-visible:h-9 focus-visible:outline-2',
-              'focus-visible:outline-offset-2 focus-visible:outline-violet-500',
+              'focus-visible:outline-offset-2 focus-visible:outline-sky-500',
               type.enriched
                 ? 'bg-emerald-500/85 hover:bg-emerald-500'
                 : 'bg-amber-400/55 hover:bg-amber-400/90',
-              selected === type.name && 'h-10 bg-violet-600 hover:bg-violet-600',
+              selected === type.name && 'h-10 bg-sky-600 hover:bg-sky-600',
             )}
           />
         ))}

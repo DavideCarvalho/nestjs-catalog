@@ -207,7 +207,7 @@ export function DashboardBoard() {
                 className={cn(
                   'flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-sm',
                   selected?.id === dashboard.id
-                    ? 'bg-violet-100 dark:bg-violet-950'
+                    ? 'bg-sky-100 dark:bg-sky-950'
                     : 'hover:bg-zinc-50 dark:hover:bg-zinc-800',
                 )}
               >
@@ -232,8 +232,8 @@ export function DashboardBoard() {
                   onClick={() => addCard(query.id)}
                   className={cn(
                     'w-full truncate rounded-md px-2 py-1 text-left text-[11px]',
-                    'transition-all hover:translate-x-0.5 hover:bg-violet-50',
-                    'dark:hover:bg-violet-950/40',
+                    'transition-all hover:translate-x-0.5 hover:bg-sky-50',
+                    'dark:hover:bg-sky-950/40',
                   )}
                 >
                   + {query.name}

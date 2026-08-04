@@ -142,8 +142,8 @@ export const CATALOG_EVENT_META: Record<
   },
   'transform.changed': {
     icon: ScrollText,
-    tone: 'text-violet-600',
-    bar: 'bg-violet-500/70',
+    tone: 'text-sky-600',
+    bar: 'bg-sky-500/70',
     label: 'Transform changed',
     meaning: 'Code that shapes stored data was edited. The first question about a surprising load.',
   },
@@ -184,8 +184,8 @@ export const CATALOG_EVENT_META: Record<
   },
   'type.curated': {
     icon: Pencil,
-    tone: 'text-violet-600',
-    bar: 'bg-violet-500/70',
+    tone: 'text-sky-600',
+    bar: 'bg-sky-500/70',
     label: 'Curated',
     meaning: 'A label, description or unit changed. No migration.',
   },

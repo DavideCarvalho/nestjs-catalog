@@ -24,7 +24,7 @@ import { Tooltip, TooltipProvider } from './ui/tooltip';
 
 const TYPE_TONE: Record<ScalarType, string> = {
   string: 'text-sky-700 dark:text-sky-300',
-  number: 'text-violet-700 dark:text-violet-300',
+  number: 'text-sky-700 dark:text-sky-300',
   date: 'text-amber-700 dark:text-amber-300',
   boolean: 'text-emerald-700 dark:text-emerald-300',
   json: 'text-zinc-600 dark:text-zinc-300',
@@ -232,7 +232,7 @@ export function CatalogManager({
                   className={cn(
                     'w-full rounded-md border bg-zinc-50 py-1.5 pl-8 pr-2 text-sm outline-none dark:bg-zinc-950',
                     RULE,
-                    'placeholder:text-zinc-400 focus:border-violet-500 focus:ring-2 focus:ring-violet-500/15',
+                    'placeholder:text-zinc-400 focus:border-sky-500 focus:ring-2 focus:ring-sky-500/15',
                   )}
                 />
               </div>
@@ -273,7 +273,7 @@ export function CatalogManager({
                       className={cn(
                         'group flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors',
                         selected?.name === type.name
-                          ? 'bg-violet-100 dark:bg-violet-950'
+                          ? 'bg-sky-100 dark:bg-sky-950'
                           : 'hover:bg-zinc-50 dark:hover:bg-zinc-800',
                       )}
                     >
@@ -394,7 +394,7 @@ function TypeDetail({
         )}
       </div>
 
-      <div className="mt-5 border-l-2 border-violet-200 pl-4 dark:border-violet-900">
+      <div className="mt-5 border-l-2 border-sky-200 pl-4 dark:border-sky-900">
         <EditableField
           label="description"
           multiline
@@ -454,7 +454,7 @@ function TypeDetail({
                       {property.name}
                       {property.primary && (
                         <Tooltip content="Primary key. Always fetched, even when hidden, so a row keeps a stable identity.">
-                          <span className="ml-1.5 cursor-help text-violet-600 dark:text-violet-400">
+                          <span className="ml-1.5 cursor-help text-sky-600 dark:text-sky-400">
                             pk
                           </span>
                         </Tooltip>
@@ -548,7 +548,7 @@ function TypeDetail({
                   'group flex items-center gap-2 rounded-md border px-3 py-2 text-left transition-colors',
                   RULE,
                   PANEL,
-                  'hover:border-violet-500 hover:bg-violet-100 dark:hover:bg-violet-950',
+                  'hover:border-sky-500 hover:bg-sky-100 dark:hover:bg-sky-950',
                 )}
               >
                 <span className={cn('font-mono text-[10px] uppercase tracking-wider', MUTED)}>

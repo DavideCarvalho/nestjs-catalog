@@ -33,8 +33,8 @@ export function Switch({
         className={cn(
           'relative mt-0.5 h-4 w-7 shrink-0 rounded-full border transition-colors outline-none',
           'border-zinc-300 bg-zinc-200 dark:border-zinc-700 dark:bg-zinc-800',
-          'data-[checked]:border-violet-600 data-[checked]:bg-violet-600',
-          'focus-visible:ring-2 focus-visible:ring-violet-500/30',
+          'data-[checked]:border-sky-600 data-[checked]:bg-sky-600',
+          'focus-visible:ring-2 focus-visible:ring-sky-500/30',
           'disabled:opacity-40',
         )}
       >

@@ -91,7 +91,7 @@ export function Sheet({
                 className={cn(
                   'rounded-md p-1 text-zinc-400 outline-none',
                   'hover:bg-zinc-100 hover:text-zinc-900',
-                  'focus-visible:ring-2 focus-visible:ring-violet-500/30',
+                  'focus-visible:ring-2 focus-visible:ring-sky-500/30',
                   'dark:hover:bg-zinc-800 dark:hover:text-zinc-100',
                 )}
               >

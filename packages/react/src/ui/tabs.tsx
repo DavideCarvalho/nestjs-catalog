@@ -69,8 +69,8 @@ export function TabsTab({
         'flex items-center gap-1.5 border-b-2 px-3 py-2 text-sm transition-colors outline-none',
         'border-transparent text-zinc-500',
         'hover:text-zinc-950 dark:hover:text-zinc-50',
-        'focus-visible:ring-2 focus-visible:ring-violet-500/30',
-        'data-[selected]:border-violet-600 data-[selected]:text-zinc-950',
+        'focus-visible:ring-2 focus-visible:ring-sky-500/30',
+        'data-[selected]:border-sky-600 data-[selected]:text-zinc-950',
         'dark:data-[selected]:text-zinc-50',
       )}
     >

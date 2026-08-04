@@ -213,7 +213,7 @@ export function ObjectExplorer({
                     className={cn(
                       'flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm',
                       t.name === typeName
-                        ? 'bg-violet-100 dark:bg-violet-950'
+                        ? 'bg-sky-100 dark:bg-sky-950'
                         : 'hover:bg-zinc-50 dark:hover:bg-zinc-800',
                     )}
                   >
@@ -243,7 +243,7 @@ export function ObjectExplorer({
               className={cn(
                 'w-72 rounded-md border bg-zinc-50 py-2 pl-8 pr-3 text-sm outline-none dark:bg-zinc-950',
                 RULE,
-                'placeholder:text-zinc-400 focus:border-violet-500 focus:ring-2 focus:ring-violet-500/15',
+                'placeholder:text-zinc-400 focus:border-sky-500 focus:ring-2 focus:ring-sky-500/15',
               )}
             />
           </div>
@@ -397,7 +397,7 @@ function EmptyState({
         <button
           type="button"
           onClick={onClear}
-          className="mt-2 text-sm text-violet-600 underline underline-offset-2 dark:text-violet-400"
+          className="mt-2 text-sm text-sky-600 underline underline-offset-2 dark:text-sky-400"
         >
           Clear the search
         </button>

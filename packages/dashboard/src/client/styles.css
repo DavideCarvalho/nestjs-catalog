@@ -38,6 +38,30 @@
   --chart-5: oklch(0.645 0.246 16.439);
 }
 
+/* ---------------------------------------------------------------------------
+   The Aviary console surface.
+   ---------------------------------------------------------------------------
+   Identical to `/durable`, `/media` and `/ai-gateway` down to the hex, because
+   the point of the set is that they are ONE product: same near-black ground,
+   same two fonts, same hairlines. What distinguishes a console is `--accent`
+   and nothing else.
+
+   `--accent` is sky here. Emerald belongs to durable and media, violet to the
+   agent gateway; a fourth console reusing one of those makes the tab strip stop
+   telling you where you are. Sky is also not a semantic colour anywhere in the
+   set — the others spend amber and red on warn/bad — so it can carry "selected"
+   without also implying a state.
+   --------------------------------------------------------------------------- */
+:root {
+  --bg: #09090b;
+  --panel: #0c0c0f;
+  --line: #1c1c22;
+  --line-soft: #16161a;
+  --text: #e7e7ea;
+  --muted: #76767f;
+  --accent: #38bdf8;
+}
+
 html,
 body,
 #root {
@@ -46,6 +70,18 @@ body,
 
 body {
   margin: 0;
-  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  /* Space Grotesk and JetBrains Mono are already linked in index.html; the
+     other consoles set exactly this pair, and the fallbacks matter because the
+     link is to Google Fonts and an air-gapped deployment will not get it. */
+  font-family: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
   -webkit-font-smoothing: antialiased;
+}
+
+code,
+kbd,
+pre,
+samp {
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
 }
