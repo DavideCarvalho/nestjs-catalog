@@ -254,6 +254,39 @@ principal's `readTypes` or `classifications`. Those are helpers (`mayRead`,
 query's SQL runs as written. The `shared` flag is the boundary — so what a query
 selects is what an embedding application sees.
 
+### What every route asks for
+
+Absence of a declaration is itself a declaration — it means "authenticated is
+enough" — so every route on the built-in controller names a scope:
+
+| Routes | Scope |
+| --- | --- |
+| the model and the rows under it: `GET /`, `graph`, `types/:name`, `objects/:name`, `objects/:name/snapshots`, `query/relations` | `catalog:read` |
+| reading the workspace: `workspace/capabilities`, `saved-queries`, `saved-queries/:id`, `saved-queries/:id/run`, `saved-queries/:id/export.csv`, `dashboards`, `dashboards/:id` | `catalog:read` |
+| the trail: `events`, `events/traces`, `events/traces/:id` | `catalog:read` |
+| curation: `PATCH types/:name`, `PATCH types/:name/properties/:property`, `POST reset` | `catalog:curate` |
+| workspace authoring that carries no SQL: `DELETE saved-queries/:id`, `POST`/`PATCH`/`DELETE dashboards` | `catalog:curate` |
+| anything that chooses what SQL runs: `POST query`, `POST saved-queries`, `PATCH saved-queries/:id` | `catalog:admin` |
+| `GET embed`, `embed/dashboards/:id`, `embed/charts/:id` | `catalog:embed` |
+
+Two of those need saying out loud.
+
+**Arbitrary SQL is `catalog:admin` because read-only is not the same as
+bounded.** `catalog:read` is "read object metadata and rows" — rows of a
+catalogued type, through a route that names one. `POST query` is whatever the
+store's read connection can reach, and with the bundled MikroORM store that is
+the catalog's own schema: `SELECT * FROM catalog_principal` returns every
+principal's scopes, grants and `keyHash`. `query/relations` lists only the
+catalogued types, but it is the editor's schema panel, not a restriction on the
+statement. If you want analysts writing SQL without the rest of admin, give the
+read connection a database role that cannot see the `catalog_*` tables and
+publish your own route with your own declaration.
+
+**Running a saved query is only `catalog:read`.** What the admin scope holds back
+is choosing what SQL runs, not seeing a result. Gating execution instead would
+stop an analyst opening a dashboard and would let an unprivileged caller plant a
+statement for a privileged one to run.
+
 ## Build your own endpoints, or use ours
 
 The built-in controller is a convenience, not the interface. Pass

@@ -37,7 +37,9 @@ export interface SavedQuery {
    * silently widens the day the parser meets a query it did not expect. Marking
    * it shared is a decision a person made, and it shows up in the audit trail as
    * one: `CatalogService` emits `query.shared` on the transition, in both
-   * directions, naming whoever made it.
+   * directions, naming whoever made it. Deleting a shared query is one of those
+   * directions — it revokes outside access as surely as the toggle does — and is
+   * emitted the same way, with `deleted: true` to say which ending it was.
    *
    * That last sentence was a claim before it was true — the event did not exist
    * and the one act that hands an outside application data left no trace at all.
@@ -528,6 +530,12 @@ export interface CatalogWorkspaceStore {
   getSavedQuery(id: string): Promise<SavedQuery | undefined>;
   saveQuery(input: SaveQueryInput, createdBy: string): Promise<SavedQuery>;
   updateSavedQuery(id: string, input: Partial<SaveQueryInput>): Promise<SavedQuery | undefined>;
+  /**
+   * Unchanged by the audit work above it: the *store* takes no actor, because a
+   * store that emitted would emit on every path into it and could not tell a
+   * revocation from a cascade. `CatalogService.deleteSavedQuery` reads the row
+   * first and decides.
+   */
   deleteSavedQuery(id: string): Promise<boolean>;
 
   listDashboards(): Promise<Dashboard[]>;

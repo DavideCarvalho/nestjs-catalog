@@ -213,6 +213,15 @@ export interface CatalogEventPayloads {
    * Emitted on the transition only. A save that leaves the flag where it was is
    * not a sharing decision, and a trail that logged every keystroke on a query
    * would be a trail nobody reads.
+   *
+   * **Deleting a shared query is one of those transitions**, and it emits here
+   * rather than under a name of its own. The question this event answers is
+   * "when did this stop being reachable from outside", and anybody asking it
+   * filters on `query.shared` and reads the last entry. A separate
+   * `query.deleted` would leave that filter reporting `shared: true` forever
+   * for something nobody can fetch — the revocation would be in a channel the
+   * asker did not subscribe to, which is the same absence this event exists to
+   * remove. {@link deleted} says which kind of ending it was.
    */
   'query.shared': {
     savedQueryId: string;
@@ -227,6 +236,20 @@ export interface CatalogEventPayloads {
      * attributed to nobody.
      */
     principalId: string;
+    /**
+     * Set only when the revocation was a deletion. Absent means the thing still
+     * exists and was merely un-shared.
+     *
+     * Typed as `true` rather than `boolean` so the flag cannot be written the
+     * other way round: "not a deletion" is the absence of this key, matching
+     * how the rest of these payloads treat a fact that did not happen.
+     *
+     * Worth carrying rather than leaving to be looked up, because after a
+     * deletion there is nothing left to look up. An entry that said only
+     * `shared: false` would send its reader to a row that is gone, and the
+     * empty result reads as a broken trail rather than as the answer.
+     */
+    deleted?: true;
   };
   /** The same decision, about a whole board. See {@link CatalogEventPayloads['query.shared']}. */
   'dashboard.shared': {
@@ -234,6 +257,7 @@ export interface CatalogEventPayloads {
     name: string;
     shared: boolean;
     principalId: string;
+    deleted?: true;
   };
 }
 

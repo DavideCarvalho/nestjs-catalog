@@ -288,7 +288,7 @@ export class CatalogService {
   }
 
   // ---------------------------------------------------------------------------
-  // Sharing is audited, and the four methods below are where.
+  // Sharing is audited, and the six methods below are where.
   //
   // `shared` on a saved query or a dashboard is the entire embed boundary: it is
   // the one field that hands another company's frontend rows out of this
@@ -296,7 +296,7 @@ export class CatalogService {
   // way every other governance decision here is — `type.curated`,
   // `transform.changed` — rather than being the one that is not.
   //
-  // Two rules hold across all four, and both are load-bearing:
+  // Two rules hold across all six, and both are load-bearing:
   //
   // *On the transition, never on the write.* A save that leaves the flag where
   // it was is not a sharing decision. A trail that recorded one per keystroke
@@ -308,6 +308,21 @@ export class CatalogService {
   // *Against what the store returned, never against what the caller asked for.*
   // A store that ignores `shared` must not produce an entry claiming access was
   // granted when nothing was.
+  //
+  // **Deleting is a transition.** For a while the first rule was applied only to
+  // the writes, so revoking access with the delete button — which is how it
+  // actually gets revoked — left nothing at all, and the only way to date the
+  // revocation was to notice that a thing had stopped appearing. Deleting
+  // something shared now emits `shared: false` with `deleted: true`, under the
+  // same event name, so the one filter anybody runs answers the whole question.
+  //
+  // Deleting something *un*shared emits nothing, and that is the first rule
+  // rather than an exception to it: an unshared query was not reachable from
+  // outside before and is not reachable after, so no access changed. Recording
+  // it would put entries carrying no grant and no revocation on the one channel
+  // whose entries all carry one. A host that wants every deletion in the trail
+  // wants a workspace-lifecycle event, which is a different event and not this
+  // one.
   // ---------------------------------------------------------------------------
 
   /**
@@ -365,8 +380,33 @@ export class CatalogService {
     return updated;
   }
 
-  deleteSavedQuery(id: string): Promise<boolean> {
-    return this.requireWorkspace().deleteSavedQuery(id);
+  /**
+   * @param deletedBy who deleted it, for the audit trail. Required rather than
+   * defaulted, matching `saveQuery` and `updateSavedQuery`: a default would
+   * quietly attribute revocations to nobody in every caller that was not
+   * updated, and the trail's whole value here is that it names somebody.
+   */
+  async deleteSavedQuery(id: string, deletedBy: string): Promise<boolean> {
+    // Read unconditionally, unlike `updateSavedQuery` which reads only when the
+    // flag is in play. A delete carries no statement of intent about `shared`,
+    // so there is nothing to branch on — whether this revokes access is a
+    // property of the row, and the row is about to stop existing.
+    const before = await this.requireWorkspace().getSavedQuery(id);
+    const deleted = await this.requireWorkspace().deleteSavedQuery(id);
+    // Only when the store says it went, and only when it was reachable from
+    // outside beforehand. A delete that removed nothing revoked nothing, and an
+    // unshared query's deletion is not an access event.
+    if (deleted && before?.shared) {
+      emitCatalog('query.shared', {
+        savedQueryId: before.id,
+        // The name as it last read. Nothing can look it up after this.
+        name: before.name,
+        shared: false,
+        principalId: deletedBy,
+        deleted: true,
+      });
+    }
+    return deleted;
   }
 
   /** Runs a saved query, honouring the TTL it was saved with. */
@@ -445,8 +485,20 @@ export class CatalogService {
     return updated;
   }
 
-  deleteDashboard(id: string): Promise<boolean> {
-    return this.requireWorkspace().deleteDashboard(id);
+  /** @param deletedBy who deleted it. See {@link deleteSavedQuery}. */
+  async deleteDashboard(id: string, deletedBy: string): Promise<boolean> {
+    const before = await this.requireWorkspace().getDashboard(id);
+    const deleted = await this.requireWorkspace().deleteDashboard(id);
+    if (deleted && before?.shared) {
+      emitCatalog('dashboard.shared', {
+        dashboardId: before.id,
+        name: before.name,
+        shared: false,
+        principalId: deletedBy,
+        deleted: true,
+      });
+    }
+    return deleted;
   }
 
   // ---------------------------------------------------------------------------

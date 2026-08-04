@@ -456,11 +456,17 @@ describe('Embed endpoints (integration)', () => {
       await request(server).get('/api/catalog/embed').expect(401);
     });
 
-    it('leaves the routes that declare no scope alone', async () => {
-      // The control. The guard is metadata-driven, so a test suite where
-      // everything 403s for a `catalog:read` principal would prove nothing
-      // about the embed routes in particular — this shows the same principal
-      // sailing through a route that declares nothing.
+    it('lets the same principal through the routes that ask for what it holds', async () => {
+      // The control. The guard is metadata-driven, so a suite where everything
+      // 403s for a `catalog:read` principal would prove nothing about the embed
+      // routes in particular — this shows the very same principal, refused
+      // above, sailing through the routes that ask for `catalog:read`.
+      //
+      // This used to reach for routes that declared nothing at all, which was
+      // the cleaner control and is no longer available: every route on the
+      // controller declares now. A route that declared nothing would be a route
+      // saying "authenticated is enough", which is not a thing this controller
+      // should have left to say.
       const server = (await embedApp()).getHttpServer();
 
       await request(server).get('/api/catalog').set('x-catalog-key', 'reader').expect(200);
@@ -650,8 +656,12 @@ describe('Embed endpoints (integration)', () => {
       const workspace = new StubWorkspace(QUERIES, DASHBOARDS);
       const server = (await embedApp(workspace)).getHttpServer();
 
+      // Presented as a curator, which is what the dashboard write routes
+      // declare. The key is not incidental: an unkeyed request reaches the
+      // guard, not the handler, and would assert nothing about `shared`.
       await request(server)
         .post('/api/catalog/dashboards')
+        .set('x-catalog-key', 'curator')
         .send({ name: 'New board', shared: true })
         .expect(201)
         .expect((response) => {
@@ -661,6 +671,7 @@ describe('Embed endpoints (integration)', () => {
 
       await request(server)
         .patch('/api/catalog/dashboards/d-ops')
+        .set('x-catalog-key', 'curator')
         .send({ shared: false })
         .expect(200);
       expect(workspace.writes.at(-1)?.input).toEqual({ shared: false });
@@ -674,7 +685,11 @@ describe('Embed endpoints (integration)', () => {
       const workspace = new StubWorkspace(QUERIES, DASHBOARDS);
       const server = (await embedApp(workspace)).getHttpServer();
 
-      await request(server).post('/api/catalog/dashboards').send({ name: 'Quiet' }).expect(201);
+      await request(server)
+        .post('/api/catalog/dashboards')
+        .set('x-catalog-key', 'curator')
+        .send({ name: 'Quiet' })
+        .expect(201);
 
       const written = workspace.writes.at(-1)?.input ?? {};
       expect('shared' in written).toBe(false);

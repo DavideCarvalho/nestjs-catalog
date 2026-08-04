@@ -35,6 +35,52 @@ import {
  * guards both come from `forRoot`. A library that hardcodes either one forces
  * every host app to accept its idea of auth, which for an endpoint that
  * enumerates every table in the database is not a reasonable default.
+ *
+ * ---------------------------------------------------------------------------
+ * Every route declares what it needs, and four of the choices are not obvious.
+ *
+ * Declaring is not enforcing — see `catalog.route-auth.ts` — but an *absent*
+ * declaration is a declaration too: it tells a host's guard that authenticated
+ * is enough. So a route left bare is not "undecided", it is "open", and for a
+ * long time this controller said that about arbitrary SQL and about every
+ * curation edit.
+ *
+ * **Arbitrary SQL is `catalog:admin`, not `catalog:read`.** `catalog:read` is
+ * "read object metadata and rows" — rows *of a catalogued type*, through a
+ * route that names one. `POST query` is not bounded by the model at all: it is
+ * whatever the store's read connection can select, and in the shipped MikroORM
+ * store that connection is the catalog's own schema. `SELECT * FROM
+ * catalog_principal` returns every principal's scopes, grants and `keyHash` —
+ * the SHA-256 of its static key — which is not something a reporting principal
+ * should be able to fetch, and is not reachable from any other route here. That
+ * is squarely the population `catalog:admin` ("manage principals and grants")
+ * describes.
+ *
+ * **So the two saved-query write routes are `catalog:admin` too.** They accept
+ * a `sql` field, and `POST saved-queries` + `POST saved-queries/:id/run` is
+ * `POST query` in two requests. Gating one and not the others would make the
+ * strict declaration decoration.
+ *
+ * **Running a saved query is only `catalog:read`.** The capability being held
+ * back is *choosing what SQL runs*, not *seeing a result*: a saved query is an
+ * artefact somebody with the authoring scope vetted, and running one is reading
+ * a report they wrote. Gating execution instead would be worse in both
+ * directions — it would stop an analyst opening a dashboard, and it would let an
+ * unprivileged caller plant a statement and wait for a privileged one to run it.
+ *
+ * **`POST reset` is `catalog:curate`, not `catalog:admin`.** It discards exactly
+ * what the two `PATCH`es write, catalog-wide, and a curator can already blank
+ * every label one request at a time. Requiring admin would deny nothing and
+ * would push a routine console action into the scope that manages principals.
+ *
+ * One consequence is worth stating rather than leaving to be discovered:
+ * `shared` rides on the dashboard write routes, so `catalog:curate` carries the
+ * power to hand a board to an outside application. That is not an oversight —
+ * it is one field on an authoring route, and splitting it would mean a route
+ * whose only job is to flip a boolean. What makes it accountable is that the
+ * act is audited, in both directions and including by deletion; see the
+ * sharing block in `catalog.service.ts`.
+ * ---------------------------------------------------------------------------
  */
 export function createCatalogController(
   path: string,
@@ -66,17 +112,20 @@ export function createCatalogController(
 
     /** The whole ontology, as data. */
     @Get()
+    @RequireScopes('catalog:read')
     snapshot() {
       return this.registry.getSnapshot();
     }
 
     /** Nodes and edges, for drawing it. */
     @Get('graph')
+    @RequireScopes('catalog:read')
     graph() {
       return this.registry.getGraph();
     }
 
     @Get('types/:name')
+    @RequireScopes('catalog:read')
     type(@Param('name') name: string) {
       const type = this.registry.getType(name);
       if (!type) throw new NotFoundException(`Unknown object type: ${name}`);
@@ -88,6 +137,7 @@ export function createCatalogController(
      * deploy, no engineer.
      */
     @Patch('types/:name')
+    @RequireScopes('catalog:curate')
     async patchType(
       @Param('name') name: string,
       @Body()
@@ -107,6 +157,7 @@ export function createCatalogController(
 
     /** Tier 0, one property at a time. */
     @Patch('types/:name/properties/:property')
+    @RequireScopes('catalog:curate')
     async patchProperty(
       @Param('name') name: string,
       @Param('property') property: string,
@@ -129,6 +180,7 @@ export function createCatalogController(
 
     /** Drops every tier-0 edit and falls back to what the ORM says. */
     @Post('reset')
+    @RequireScopes('catalog:curate')
     async reset() {
       await this.registry.resetOverlay();
       return this.registry.getSnapshot();
@@ -136,6 +188,7 @@ export function createCatalogController(
 
     /** One generic read endpoint for every type in the catalog. */
     @Get('objects/:name')
+    @RequireScopes('catalog:read')
     objects(
       @Param('name') name: string,
       @Query('page') page?: string,
@@ -158,20 +211,36 @@ export function createCatalogController(
       });
     }
 
-    /** What an ad-hoc query may select from, and whether it can run at all. */
+    /**
+     * What an ad-hoc query may select from, and whether it can run at all.
+     *
+     * `catalog:read` and not the scope the query route itself needs: this
+     * describes the catalogued types' physical relations and their columns,
+     * which is the same model `GET types/:name` already hands a reader. It is a
+     * schema panel, not an execution surface.
+     */
     @Get('query/relations')
+    @RequireScopes('catalog:read')
     queryRelations() {
       return this.service.queryRelations();
     }
 
-    /** Run one read-only statement. */
+    /**
+     * Run one read-only statement.
+     *
+     * `catalog:admin`. Read-only is not the same as bounded: this reaches
+     * whatever the store's connection reaches, which includes the catalog's own
+     * governance tables. See the block above the controller.
+     */
     @Post('query')
+    @RequireScopes('catalog:admin')
     runQuery(@Body() body: { sql: string; maxRows?: number }) {
       return this.service.runQuery(body ?? { sql: '' });
     }
 
     /** Everything a saved query or dashboard needs to know is here. */
     @Get('workspace/capabilities')
+    @RequireScopes('catalog:read')
     workspaceCapabilities() {
       return {
         workspace: this.service.workspaceAvailable(),
@@ -180,11 +249,14 @@ export function createCatalogController(
     }
 
     @Get('saved-queries')
+    @RequireScopes('catalog:read')
     savedQueries() {
       return this.service.listSavedQueries();
     }
 
+    /** Takes a `sql` field, so it is the SQL scope and not a workspace one. */
     @Post('saved-queries')
+    @RequireScopes('catalog:admin')
     saveSavedQuery(
       @Body() body: SaveQueryInput & { createdBy?: string },
       @Req() request: { principal?: CatalogPrincipal },
@@ -193,6 +265,7 @@ export function createCatalogController(
     }
 
     @Get('saved-queries/:id')
+    @RequireScopes('catalog:read')
     savedQuery(@Param('id') id: string) {
       return this.service.getSavedQuery(id);
     }
@@ -203,8 +276,12 @@ export function createCatalogController(
      * field. Here the only consumer of the name is the audit entry a `shared`
      * toggle produces, and a caller that can put any string into the audit trail
      * is worse than one the trail records as the console.
+     *
+     * `catalog:admin` because the body may carry `sql`. A patch that can rewrite
+     * the statement is the authoring capability whatever else it is used for.
      */
     @Patch('saved-queries/:id')
+    @RequireScopes('catalog:admin')
     patchSavedQuery(
       @Param('id') id: string,
       @Body() body: Partial<SaveQueryInput>,
@@ -213,13 +290,28 @@ export function createCatalogController(
       return this.service.updateSavedQuery(id, body, actorOf(request));
     }
 
+    /**
+     * `catalog:curate` and not the SQL scope: deleting takes a statement away
+     * rather than choosing one. It is the same workspace-authoring act as
+     * deleting a board.
+     *
+     * The principal is passed for the same reason the `PATCH` above takes one —
+     * deleting a shared query revokes outside access, and that is recorded.
+     */
     @Delete('saved-queries/:id')
-    removeSavedQuery(@Param('id') id: string) {
-      return this.service.deleteSavedQuery(id).then((deleted) => ({ deleted }));
+    @RequireScopes('catalog:curate')
+    removeSavedQuery(@Param('id') id: string, @Req() request: { principal?: CatalogPrincipal }) {
+      return this.service.deleteSavedQuery(id, actorOf(request)).then((deleted) => ({ deleted }));
     }
 
-    /** Run a saved query, honouring the cache TTL it was saved with. */
+    /**
+     * Run a saved query, honouring the cache TTL it was saved with.
+     *
+     * `catalog:read`, unlike writing one. What is held back upstream is
+     * choosing what SQL runs; this runs a statement somebody already vetted.
+     */
     @Post('saved-queries/:id/run')
+    @RequireScopes('catalog:read')
     runSavedQuery(@Param('id') id: string, @Body() body?: { maxRows?: number }) {
       return this.service.runSavedQuery(id, body?.maxRows);
     }
@@ -231,6 +323,7 @@ export function createCatalogController(
      * from JavaScript cannot be pasted into a mail or a scheduled job.
      */
     @Get('saved-queries/:id/export.csv')
+    @RequireScopes('catalog:read')
     async exportSavedQuery(
       @Param('id') id: string,
       @Res({ passthrough: true }) response: {
@@ -245,6 +338,7 @@ export function createCatalogController(
     }
 
     @Get('dashboards')
+    @RequireScopes('catalog:read')
     dashboards() {
       return this.service.listDashboards();
     }
@@ -257,8 +351,13 @@ export function createCatalogController(
      * name is a field a host's whitelisting `ValidationPipe` deletes. The
      * failure is silent in the worst direction: the toggle appears to save and
      * the dashboard is never actually shareable.
+     *
+     * `catalog:curate`: a board carries no SQL of its own, only cards pointing
+     * at queries somebody else vetted. `shared` rides along, which is why the
+     * flag is audited rather than merely stored.
      */
     @Post('dashboards')
+    @RequireScopes('catalog:curate')
     createDashboard(
       @Body()
       body: {
@@ -274,11 +373,13 @@ export function createCatalogController(
     }
 
     @Get('dashboards/:id')
+    @RequireScopes('catalog:read')
     dashboard(@Param('id') id: string) {
       return this.service.getDashboard(id);
     }
 
     @Patch('dashboards/:id')
+    @RequireScopes('catalog:curate')
     patchDashboard(
       @Param('id') id: string,
       @Body()
@@ -293,9 +394,11 @@ export function createCatalogController(
       return this.service.updateDashboard(id, body, actorOf(request));
     }
 
+    /** Deleting a shared board revokes outside access, so the actor is passed. */
     @Delete('dashboards/:id')
-    removeDashboard(@Param('id') id: string) {
-      return this.service.deleteDashboard(id).then((deleted) => ({ deleted }));
+    @RequireScopes('catalog:curate')
+    removeDashboard(@Param('id') id: string, @Req() request: { principal?: CatalogPrincipal }) {
+      return this.service.deleteDashboard(id, actorOf(request)).then((deleted) => ({ deleted }));
     }
 
     /**
@@ -338,8 +441,16 @@ export function createCatalogController(
       return this.service.embedChart(id);
     }
 
-    /** The audit trail: what happened, to what, by whom. */
+    /**
+     * The audit trail: what happened, to what, by whom.
+     *
+     * `catalog:read`, because attribution here is part of the data rather than a
+     * log — "who loaded these rows" is a question a reader asks months later,
+     * which is the whole reason the principal is recorded onto every snapshot.
+     * The trail carries ids and payloads, never a credential.
+     */
     @Get('events')
+    @RequireScopes('catalog:read')
     events(
       @Query('event') event?: string,
       @Query('type') typeName?: string,
@@ -370,6 +481,7 @@ export function createCatalogController(
      * pages missing that still looked complete.
      */
     @Get('events/traces')
+    @RequireScopes('catalog:read')
     traceList(
       @Query('type') typeName?: string,
       @Query('principal') principalId?: string,
@@ -395,6 +507,7 @@ export function createCatalogController(
 
     /** One story in full, by correlation id. */
     @Get('events/traces/:id')
+    @RequireScopes('catalog:read')
     async trace(@Param('id') id: string) {
       const found = await this.requireTraces().getTrace(id);
       if (!found) {
@@ -405,6 +518,7 @@ export function createCatalogController(
 
     /** Every load of this type: when, by whom, how many rows. */
     @Get('objects/:name/snapshots')
+    @RequireScopes('catalog:read')
     snapshots(@Param('name') name: string) {
       return this.service.listSnapshots(name);
     }

@@ -189,7 +189,18 @@ class MemoryWorkspace implements CatalogWorkspaceStore {
     this.queries.set(id, updated);
     return Promise.resolve(updated);
   }
+  /**
+   * Set to make every delete a no-op that still answers.
+   *
+   * A store that keeps the row and reports `false` is what "against what the
+   * store returned, never against what the caller asked for" is about, and it is
+   * not reachable by asking this one nicely — a caller cannot tell a store to
+   * refuse.
+   */
+  refuseDeletes = false;
+
   deleteSavedQuery(id: string): Promise<boolean> {
+    if (this.refuseDeletes) return Promise.resolve(false);
     return Promise.resolve(this.queries.delete(id));
   }
 
@@ -230,6 +241,7 @@ class MemoryWorkspace implements CatalogWorkspaceStore {
     return Promise.resolve(updated);
   }
   deleteDashboard(id: string): Promise<boolean> {
+    if (this.refuseDeletes) return Promise.resolve(false);
     return Promise.resolve(this.dashboards.delete(id));
   }
 
@@ -446,6 +458,156 @@ describe('Sharing leaves an audit trail (integration)', () => {
       .expect(200);
 
     expect(sharingEvents(workspace).map((event) => event.detail.shared)).toEqual([true, false]);
+  });
+
+  // -------------------------------------------------------------------------
+  // 2b. Deleting is a transition too.
+  //
+  // Revoking access with the delete button is how it actually gets revoked, and
+  // for a release it left nothing at all: the only way to date the revocation
+  // was to notice a thing had stopped appearing, which is the absence this whole
+  // event exists to remove.
+  // -------------------------------------------------------------------------
+
+  it('records deleting a shared saved query as a revocation, under the same event name', async () => {
+    // The same name specifically. "When did this stop being reachable from
+    // outside" is answered by filtering `query.shared` and reading the last
+    // entry, so a deletion recorded under a name of its own would leave that
+    // filter saying `shared: true` forever for something nobody can fetch.
+    const { server, workspace } = await boot();
+    const created = await request(server)
+      .post('/api/catalog/saved-queries')
+      .send({ name: 'Sales', sql: 'select 1', shared: true })
+      .expect(201);
+
+    await request(server).delete(`/api/catalog/saved-queries/${created.body.id}`).expect(200);
+
+    const listed = await request(server).get('/api/catalog/events?event=query.shared').expect(200);
+    expect(listed.body.map((event: CatalogAuditEvent) => event.detail.shared)).toEqual([
+      true,
+      false,
+    ]);
+    expect(sharingEvents(workspace).at(-1)?.detail).toMatchObject({
+      savedQueryId: created.body.id,
+      // The name as it last read: after this there is nothing left to look up.
+      name: 'Sales',
+      shared: false,
+      deleted: true,
+    });
+  });
+
+  it('records deleting a shared dashboard', async () => {
+    const { server, workspace } = await boot();
+    const created = await request(server)
+      .post('/api/catalog/dashboards')
+      .send({ name: 'Operations', shared: true })
+      .expect(201);
+
+    await request(server).delete(`/api/catalog/dashboards/${created.body.id}`).expect(200);
+
+    expect(sharingEvents(workspace).at(-1)).toMatchObject({
+      event: 'dashboard.shared',
+      detail: { dashboardId: created.body.id, name: 'Operations', shared: false, deleted: true },
+    });
+  });
+
+  it('marks the revocation as a deletion, distinguishably from un-sharing', async () => {
+    // Both entries say `shared: false`. Without the flag a reader cannot tell
+    // "revoked, still there" from "gone", and would go looking for a row that no
+    // longer exists — an empty result that reads as a broken trail rather than
+    // as the answer.
+    const { server, workspace } = await boot();
+    const kept = await request(server)
+      .post('/api/catalog/saved-queries')
+      .send({ name: 'Kept', sql: 'select 1', shared: true })
+      .expect(201);
+    const gone = await request(server)
+      .post('/api/catalog/saved-queries')
+      .send({ name: 'Gone', sql: 'select 1', shared: true })
+      .expect(201);
+
+    await request(server)
+      .patch(`/api/catalog/saved-queries/${kept.body.id}`)
+      .send({ shared: false })
+      .expect(200);
+    await request(server).delete(`/api/catalog/saved-queries/${gone.body.id}`).expect(200);
+
+    const revocations = sharingEvents(workspace).filter((event) => event.detail.shared === false);
+    expect(revocations.map((event) => event.detail.deleted)).toEqual([undefined, true]);
+  });
+
+  it('says nothing when an unshared query or dashboard is deleted', async () => {
+    // The transition rule, not an exception to it: something that was not
+    // reachable from outside before is not reachable after, so no access
+    // changed. Recording it would put entries carrying neither a grant nor a
+    // revocation on the one channel whose entries all carry one.
+    const { server, workspace } = await boot();
+    const query = await request(server)
+      .post('/api/catalog/saved-queries')
+      .send({ name: 'Private', sql: 'select 1' })
+      .expect(201);
+    const dashboard = await request(server)
+      .post('/api/catalog/dashboards')
+      .send({ name: 'Private board' })
+      .expect(201);
+
+    await request(server).delete(`/api/catalog/saved-queries/${query.body.id}`).expect(200);
+    await request(server).delete(`/api/catalog/dashboards/${dashboard.body.id}`).expect(200);
+
+    expect(sharingEvents(workspace)).toEqual([]);
+  });
+
+  it('says nothing when the delete removed nothing', async () => {
+    // Against what the store returned, never against what the caller asked for
+    // — the same rule the writes follow. A 200 saying `deleted: false` must not
+    // produce an entry claiming access was taken back.
+    const { server, workspace } = await boot();
+
+    await request(server)
+      .delete('/api/catalog/saved-queries/never-existed')
+      .expect(200)
+      .expect((response) => {
+        expect(response.body.deleted).toBe(false);
+      });
+
+    expect(sharingEvents(workspace)).toEqual([]);
+  });
+
+  it('says nothing when the row was shared and the store refused to delete it', async () => {
+    // The case the id above cannot reach, and the one the rule is actually
+    // about: the row exists, it is shared, and the store declines. Deciding from
+    // the row alone would file a revocation for something still fetchable
+    // through the embed API.
+    const { server, workspace } = await boot();
+    const created = await request(server)
+      .post('/api/catalog/saved-queries')
+      .send({ name: 'Sales', sql: 'select 1', shared: true })
+      .expect(201);
+    const shares = sharingEvents(workspace).length;
+
+    workspace.refuseDeletes = true;
+    await request(server)
+      .delete(`/api/catalog/saved-queries/${created.body.id}`)
+      .expect(200)
+      .expect((response) => {
+        expect(response.body.deleted).toBe(false);
+      });
+
+    expect(sharingEvents(workspace)).toHaveLength(shares);
+  });
+
+  it('names the host-resolved principal on a deletion, as on every other entry', async () => {
+    const { server, workspace } = await boot();
+    const created = await request(server)
+      .post('/api/catalog/dashboards')
+      .send({ name: 'Born public', shared: true })
+      .expect(201);
+
+    await request(server).delete(`/api/catalog/dashboards/${created.body.id}`).expect(200);
+
+    const revocation = sharingEvents(workspace).at(-1);
+    expect(revocation?.principalId).toBe('catalog-console#ana@example.com');
+    expect(revocation?.detail.principalId).toBe('catalog-console#ana@example.com');
   });
 
   it('says nothing when a query is created unshared', async () => {
