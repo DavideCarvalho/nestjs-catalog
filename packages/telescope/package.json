@@ -1,6 +1,6 @@
 {
   "name": "@dudousxd/nestjs-catalog-telescope",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Telescope watcher and \"Catalog\" dashboard for @dudousxd/nestjs-catalog: loads, connector runs, schema changes and curation edits, grouped by the snapshot that correlates them.",
   "license": "MIT",
   "author": "Davide Carvalho",
