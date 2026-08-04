@@ -8,6 +8,8 @@ import {
   ObjectExplorer,
   PipelineConsole,
   QueryConsole,
+  Tabs,
+  TabsPanel,
   cn,
 } from '@dudousxd/nestjs-catalog-react';
 import { WorkflowCanvas } from '@dudousxd/nestjs-catalog-react/workflow';
@@ -23,8 +25,9 @@ import {
   TerminalSquare,
   Workflow,
 } from 'lucide-react';
-import { useCallback, useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { IDENTITY_QUERY_KEY, KeyGate } from './KeyGate';
+import { TabStrip } from './TabStrip';
 
 /**
  * Whether the HOST already knows who this is.
@@ -180,18 +183,23 @@ export function App() {
     return () => window.removeEventListener('hashchange', sync);
   }, []);
 
-  // A ref callback rather than an effect: it fires exactly when the active
-  // button mounts or changes, which is the moment the strip needs to move.
-  // `nearest` so a tab already on screen is left alone — recentering on every
-  // click makes the whole strip jump under the cursor.
-  const scrollActiveIntoView = useCallback((node: HTMLButtonElement | null) => {
-    node?.scrollIntoView({ inline: 'nearest', block: 'nearest' });
-  }, []);
-
   return (
     <CatalogProvider transport={transport}>
       <IdentityGate>
-        <div className="flex h-full flex-col bg-zinc-50 dark:bg-zinc-950">
+        {/* One Tabs root around BOTH the strip and the panels, which is the
+            whole point of using it: the tabs were a row of `<button>`s as far
+            as a screen reader was concerned — no roving tabindex, no arrow-key
+            movement, and no `aria-controls` relationship to the screen they
+            reveal. Splitting the strip from the panels would keep the last of
+            those broken while looking correct. */}
+        <Tabs
+          value={tab}
+          onValueChange={(next) => {
+            window.location.hash = next;
+            setTab(next as Tab);
+          }}
+          className="flex h-full flex-col bg-zinc-50 dark:bg-zinc-950"
+        >
           {/* Nine tabs plus the brand and two controls need ~1150px. Below that
               the strip used to push the whole DOCUMENT sideways — `nav` is
               `shrink-0` inside a flex column, so nothing absorbed the excess and
@@ -207,58 +215,32 @@ export function App() {
             <span className="mr-4 flex shrink-0 items-center gap-2 py-3 text-sm font-semibold tracking-tight">
               <span className="text-base">◈</span> Catalog
             </span>
-            {/* `min-w-0` is what makes the overflow work at all: a flex item
-                defaults to `min-width: auto`, so without it this box refuses to
-                shrink below its content and pushes the parent wide instead of
-                scrolling.
-
-                The scrollbar is hidden, not the scrolling. A native horizontal
-                bar here is as tall as the tabs themselves and sits between them
-                and their underline — it reads as a broken layout rather than as
-                an affordance. The half-cut tab at the edge is the affordance,
-                same as every other tab strip that does this. */}
-            <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
-              {TABS.map(({ id, label, icon: Icon }) => (
-                <button
-                  key={id}
-                  // Selecting a tab that is scrolled out of sight would
-                  // otherwise change the screen and leave the strip showing a
-                  // different tab as if nothing had happened — and arriving on
-                  // `#access` directly opens the last tab with the strip parked
-                  // at the first.
-                  ref={id === tab ? scrollActiveIntoView : undefined}
-                  type="button"
-                  onClick={() => {
-                    window.location.hash = id;
-                    setTab(id);
-                  }}
-                  className={`flex shrink-0 items-center gap-1.5 whitespace-nowrap border-b-2 px-3 py-3 text-sm transition-colors ${
-                    tab === id
-                      ? 'border-sky-500 text-zinc-950 dark:text-zinc-50'
-                      : 'border-transparent text-zinc-500 hover:text-zinc-950 dark:hover:text-zinc-50'
-                  }`}
-                >
-                  <Icon size={14} />
-                  {label}
-                </button>
-              ))}
-            </div>
+            <TabStrip tabs={TABS} value={tab} />
+            {/* Outside the scrolling strip on purpose. Scrolling a tab strip is
+                ordinary; having the environment you are editing scroll off the
+                screen is not. */}
             <div className="flex shrink-0 items-center gap-1 pl-2">
               <EnvironmentPicker />
               <StoreBadge />
             </div>
           </nav>
 
+          {/* Panels rather than `tab === x &&`. Base UI unmounts the
+              unselected ones, so this keeps the exact behaviour the conditional
+              had — each screen owns a query, and keeping them all mounted means
+              every tab polls for as long as the console is open — while giving
+              each panel the `aria-labelledby` back to its tab that a bare
+              conditional cannot have. */}
           <main className="min-h-0 flex-1 overflow-hidden">
-            {tab === 'model' && (
+            <TabsPanel value="model" className="h-full">
               <CatalogManager
                 title="Model"
                 eyebrow="Published by your applications"
                 intro="Every object type published into this catalog. Structure follows the publisher; names, descriptions and units are yours, and survive its next deploy."
                 explorerHref={(type) => `#objects?type=${type}`}
               />
-            )}
-            {tab === 'objects' && (
+            </TabsPanel>
+            <TabsPanel value="objects" className="h-full">
               <ObjectExplorer
                 // Passed rather than left to the library to sniff: the host is
                 // the one that knows where its own router keeps parameters.
@@ -266,28 +248,34 @@ export function App() {
                 backHref="#model"
                 backLabel="Model"
               />
-            )}
-            {tab === 'query' && <QueryPane />}
-            {tab === 'dashboards' && <DashboardBoard />}
-            {tab === 'connectors' && (
-              <div className="h-full overflow-hidden">
-                <PipelineConsole />
-              </div>
-            )}
-            {tab === 'workflows' && <WorkflowCanvas />}
-            {tab === 'lineage' && <FlowView />}
-            {tab === 'activity' && <GovernanceTimeline />}
-            {tab === 'access' && (
-              <div className="h-full overflow-y-auto">
-                <AccessConsole
-                  identity={identity}
-                  onSignOut={() => signOut.mutate()}
-                  signOutPending={signOut.isPending}
-                />
-              </div>
-            )}
+            </TabsPanel>
+            <TabsPanel value="query" className="h-full">
+              <QueryPane />
+            </TabsPanel>
+            <TabsPanel value="dashboards" className="h-full">
+              <DashboardBoard />
+            </TabsPanel>
+            <TabsPanel value="connectors" className="h-full overflow-hidden">
+              <PipelineConsole />
+            </TabsPanel>
+            <TabsPanel value="workflows" className="h-full">
+              <WorkflowCanvas />
+            </TabsPanel>
+            <TabsPanel value="lineage" className="h-full">
+              <FlowView />
+            </TabsPanel>
+            <TabsPanel value="activity" className="h-full">
+              <GovernanceTimeline />
+            </TabsPanel>
+            <TabsPanel value="access" className="h-full overflow-y-auto">
+              <AccessConsole
+                identity={identity}
+                onSignOut={() => signOut.mutate()}
+                signOutPending={signOut.isPending}
+              />
+            </TabsPanel>
           </main>
-        </div>
+        </Tabs>
       </IdentityGate>
     </CatalogProvider>
   );
