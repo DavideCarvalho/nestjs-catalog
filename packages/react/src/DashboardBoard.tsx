@@ -744,6 +744,21 @@ function MiniTable({ result }: { result: CatalogQueryResult }) {
  * the host registered, so there is no fixed small set to lay out, and the
  * current value still has to be readable while arranging.
  */
+/**
+ * What the default option says, given what the query chose and what exists.
+ *
+ * Three cases, and the third is the one worth the function: a query naming a
+ * library nobody registered. The card falls back to the built-in, correctly and
+ * silently, so the label has to be the thing that says so.
+ */
+export function followsLabel(queryLibrary: string | undefined, available: string[]): string {
+  if (!queryLibrary) return 'follows query (built-in)';
+  if (!available.includes(queryLibrary)) {
+    return `follows query (${queryLibrary} — not installed, drawing built-in)`;
+  }
+  return `follows query (${queryLibrary})`;
+}
+
 function CardLibraryPicker({
   library,
   queryLibrary,
@@ -773,7 +788,12 @@ function CardLibraryPicker({
         )}
       >
         <option value="">
-          {queryLibrary ? `follows query (${queryLibrary})` : 'follows query (built-in)'}
+          {/* Says what will actually DRAW, not what the query asked for. A
+              saved query can name a library this app never registered — the
+              card then degrades to the built-in, which is the right behaviour
+              and an invisible one. "follows query (visx)" on a card drawing
+              built-in bars is the control lying about the thing it controls. */}
+          {followsLabel(queryLibrary, available)}
         </option>
         {available.map((name) => (
           <option key={name} value={name}>
