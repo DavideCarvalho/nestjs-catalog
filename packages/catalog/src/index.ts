@@ -135,15 +135,11 @@ export {
   mayWrite,
   StaticKeyPrincipalResolver,
 } from './catalog.principal';
-export {
-  CATALOG_DIRECTORY,
-  type CatalogApplicationSummary,
-  type CatalogDirectory,
-  type CatalogPersonInput,
-  type CatalogPersonRole,
-  type CatalogPersonSummary,
-  type CatalogPersonUpsertResult,
-} from './catalog.access';
+// Everything, deliberately. The last release exported the directory interface
+// but not the two types its one method takes and returns, so the seam could be
+// implemented only by a host willing to restate them — which nothing in this
+// repo would have caught: no consumer compiles against the built barrel here.
+export * from './catalog.access';
 export {
   assertNoColumnCollisions,
   CATALOG_RESERVED_COLUMNS,
