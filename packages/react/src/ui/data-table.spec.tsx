@@ -137,24 +137,24 @@ describe('DataTable', () => {
     it('marks an absent value rather than leaving the cell blank', () => {
       // "No value" and "a value that happens to be blank" look identical in an
       // empty cell, and they mean very different things in a query result.
-      const { container } = render(<>{renderUnknown(null)}</>);
+      const { container } = render(<span>{renderUnknown(null)}</span>);
       expect(container.textContent).toBe('—');
 
-      const undef = render(<>{renderUnknown(undefined)}</>);
+      const undef = render(<span>{renderUnknown(undefined)}</span>);
       expect(undef.container.textContent).toBe('—');
     });
 
     it('shows an object as JSON rather than as [object Object]', () => {
-      const { container } = render(<>{renderUnknown({ a: 1 })}</>);
+      const { container } = render(<span>{renderUnknown({ a: 1 })}</span>);
       expect(container.textContent).toBe('{"a":1}');
     });
 
     it('keeps a falsy value visible', () => {
       // `0` and `false` are answers. An implementation using `value || '—'`
       // erases both and nothing reports it.
-      expect(render(<>{renderUnknown(0)}</>).container.textContent).toBe('0');
-      expect(render(<>{renderUnknown(false)}</>).container.textContent).toBe('false');
-      expect(render(<>{renderUnknown('')}</>).container.textContent).toBe('');
+      expect(render(<span>{renderUnknown(0)}</span>).container.textContent).toBe('0');
+      expect(render(<span>{renderUnknown(false)}</span>).container.textContent).toBe('false');
+      expect(render(<span>{renderUnknown('')}</span>).container.textContent).toBe('');
     });
   });
 });
