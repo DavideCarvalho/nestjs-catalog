@@ -1,11 +1,11 @@
 import type { CatalogQueryRelation, CatalogQueryResult } from '@dudousxd/nestjs-catalog/client';
 import { useMutation, useQuery } from '@tanstack/react-query';
 import { AlertTriangle, History, Layers, Play, Sparkles, TableIcon } from 'lucide-react';
-import { Highlight, themes } from 'prism-react-renderer';
 import { type KeyboardEvent, useMemo, useRef, useState } from 'react';
 import { SavedQueryPanel } from './SavedQueryPanel';
 import { cn } from './cn';
 import { useCatalogClient } from './context';
+import { CodeEditor } from './ui/code-editor';
 import { Tooltip, TooltipProvider } from './ui/tooltip';
 
 const MUTED = 'text-zinc-400 dark:text-zinc-500';
@@ -319,55 +319,20 @@ function SqlEditor({
   onKeyDown: (event: KeyboardEvent<HTMLTextAreaElement>) => void;
   textareaRef: React.RefObject<HTMLTextAreaElement | null>;
 }) {
-  const shared = 'm-0 p-4 font-mono text-[13px] leading-[1.55] whitespace-pre-wrap break-words';
-
   return (
-    // Two boxes, and the division between them is the whole point.
-    //
-    // The outer one is the *only* thing that scrolls. The inner one has no
-    // height of its own, so it grows to whatever the highlighted code needs —
-    // which is what lets the textarea be `inset-0` and still cover every line
-    // rather than only the visible ones.
-    //
-    // Both used to scroll: the textarea was pinned to the outer box's visible
-    // area with `overflow: auto` of its own, so a long query produced two
-    // scrollbars, and scrolling the outer one left the caret sitting over the
-    // wrong line because the highlight moved and the input did not.
-    <div className={cn('relative h-56 shrink-0 overflow-auto border-b', RULE, PANEL)}>
-      <div className="relative min-h-full w-full">
-        <Highlight code={value} language="sql" theme={themes.github}>
-          {({ tokens, getLineProps, getTokenProps }) => (
-            <pre className={cn(shared, 'pointer-events-none min-h-full')} aria-hidden>
-              {tokens.map((line, i) => (
-                // biome-ignore lint/suspicious/noArrayIndexKey: lines have no id
-                <div key={i} {...getLineProps({ line })}>
-                  {line.map((token, key) => (
-                    // biome-ignore lint/suspicious/noArrayIndexKey: tokens have no id
-                    <span key={key} {...getTokenProps({ token })} />
-                  ))}
-                </div>
-              ))}
-            </pre>
-          )}
-        </Highlight>
-        <textarea
-          ref={textareaRef}
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          onKeyDown={onKeyDown}
-          spellCheck={false}
-          aria-label="SQL query"
-          className={cn(
-            shared,
-            // `overflow-hidden`, not `auto`: this layer is as tall as the code it
-            // holds, so it has nothing to scroll — and giving it the option back
-            // is what produced the second scrollbar.
-            'absolute inset-0 h-full w-full resize-none overflow-hidden bg-transparent',
-            'text-transparent caret-zinc-900 outline-none dark:caret-zinc-100',
-          )}
-        />
-      </div>
-    </div>
+    <CodeEditor
+      value={value}
+      onChange={onChange}
+      onKeyDown={onKeyDown}
+      textareaRef={textareaRef}
+      language="sql"
+      label="SQL query"
+      // Roomier than the transform pane: this is the screen's primary input,
+      // not a side panel.
+      className={cn('h-56 shrink-0 border-b', RULE, PANEL)}
+      padding="p-4"
+      fontSize="text-[13px]"
+    />
   );
 }
 

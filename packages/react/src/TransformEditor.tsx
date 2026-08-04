@@ -2,10 +2,10 @@ import type { CatalogTransform, TransformLanguage } from '@dudousxd/nestjs-catal
 import { isTransformLanguage } from '@dudousxd/nestjs-catalog/client';
 import { useMutation } from '@tanstack/react-query';
 import { ArrowLeft, Play } from 'lucide-react';
-import { Highlight, themes } from 'prism-react-renderer';
 import { type KeyboardEvent, type RefObject, useRef, useState } from 'react';
 import { cn } from './cn';
 import { useCatalogClient } from './context';
+import { CodeEditor } from './ui/code-editor';
 import { TextField } from './ui/field';
 import { SelectField } from './ui/select';
 
@@ -188,12 +188,14 @@ export function TransformEditor({
                 : '⌘↵ to try'}
             </span>
           </div>
-          <CodePane
+          <CodeEditor
             value={code}
             onChange={setCode}
             onKeyDown={onKeyDown}
             language={language === 'python' ? 'python' : 'tsx'}
+            label="Transform code"
             textareaRef={editorRef}
+            className="h-72"
           />
         </div>
 
@@ -204,12 +206,17 @@ export function TransformEditor({
                 Sample records
               </span>
             </div>
-            <textarea
+            {/* Highlighted like the code above it. This was the one pane
+                that stayed a bare textarea, so the sample you are debugging
+                against rendered as flat grey while the transform beside it was
+                coloured — and a missing brace in a sample is exactly the thing
+                highlighting finds for you. */}
+            <CodeEditor
               value={sample}
-              onChange={(event) => setSample(event.target.value)}
-              aria-label="Sample records"
-              spellCheck={false}
-              className="h-32 w-full resize-none bg-transparent p-3 font-mono text-[12px] outline-none"
+              onChange={setSample}
+              language="json"
+              label="Sample records"
+              className="h-32"
             />
           </div>
 
@@ -295,56 +302,6 @@ export function TransformEditor({
           </span>
         )}
       </div>
-    </div>
-  );
-}
-
-/** A textarea under a highlighted `<pre>`, the same shape the query editor uses. */
-function CodePane({
-  value,
-  onChange,
-  onKeyDown,
-  language,
-  textareaRef,
-}: {
-  value: string;
-  onChange: (next: string) => void;
-  onKeyDown: (event: KeyboardEvent<HTMLTextAreaElement>) => void;
-  language: string;
-  textareaRef: RefObject<HTMLTextAreaElement | null>;
-}) {
-  const shared = 'm-0 p-3 font-mono text-[12px] leading-[1.5] whitespace-pre-wrap break-words';
-
-  return (
-    <div className="relative h-72 overflow-auto">
-      <Highlight code={value} language={language} theme={themes.github}>
-        {({ tokens, getLineProps, getTokenProps }) => (
-          <pre className={cn(shared, 'pointer-events-none min-h-full')} aria-hidden>
-            {tokens.map((line, i) => (
-              // biome-ignore lint/suspicious/noArrayIndexKey: lines have no id
-              <div key={i} {...getLineProps({ line })}>
-                {line.map((token, key) => (
-                  // biome-ignore lint/suspicious/noArrayIndexKey: tokens have no id
-                  <span key={key} {...getTokenProps({ token })} />
-                ))}
-              </div>
-            ))}
-          </pre>
-        )}
-      </Highlight>
-      <textarea
-        ref={textareaRef}
-        value={value}
-        onChange={(event) => onChange(event.target.value)}
-        onKeyDown={onKeyDown}
-        spellCheck={false}
-        aria-label="Transform code"
-        className={cn(
-          shared,
-          'absolute inset-0 h-full w-full resize-none bg-transparent',
-          'text-transparent caret-zinc-900 outline-none dark:caret-zinc-100',
-        )}
-      />
     </div>
   );
 }
