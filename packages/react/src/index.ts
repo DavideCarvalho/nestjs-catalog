@@ -22,6 +22,23 @@ export {
 // The fallback every other renderer degrades to, and the guard that decides
 // when a time-scale chart cannot draw what a saved query asked for.
 export { CssBarChart, looksLikeTimeSeries } from './charts/css';
+// Embedding: the same charts, in an application that is not this one. Output
+// only — see src/embed/actions.ts for what an embed deliberately cannot do.
+export {
+  EMBED_ACTIONS,
+  type EmbedAction,
+  type EmbedActions,
+  EmbeddedChart,
+  type EmbeddedChartPayload,
+  type EmbeddedChartProps,
+  EmbeddedDashboard,
+  type EmbeddedDashboardPayload,
+  type EmbeddedDashboardProps,
+  type EmbedFailureSlot,
+  type EmbedLoadingSlot,
+  chartsInLayoutOrder,
+  resolveEmbedActions,
+} from './embed';
 export { FlowView } from './FlowView';
 export { GovernanceTimeline } from './GovernanceTimeline';
 export { QueryConsole, type QueryConsoleProps } from './QueryConsole';
@@ -133,6 +150,9 @@ export {
   accessRoutes,
   DEFAULT_ACCESS_BASE_PATH,
   DEFAULT_PIPELINE_BASE_PATH,
+  // The embed paths, which the catalog controller does serve — exported so a
+  // host writing its own embed consumer need not restate them. See routes.ts.
+  embedRoutes,
   type PipelineRoutes,
   pipelineRoutes,
 } from './routes';
