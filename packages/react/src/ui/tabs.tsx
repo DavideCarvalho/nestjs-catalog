@@ -66,14 +66,26 @@ export function TabsTab({
   value,
   children,
   className,
+  ref,
 }: {
   value: string;
   children: ReactNode;
   /** For a caller whose strip has its own metrics — the console nav is taller. */
   className?: string;
+  /**
+   * For a caller that has to bring the selected tab into view.
+   *
+   * Worth the prop rather than letting the caller render a marker element
+   * inside the tab: a zero-size `sr-only` marker is `position: absolute`, which
+   * escapes the strip's `overflow-x` clipping and reports the strip's full
+   * scroll extent as the DOCUMENT's width. The page then scrolls sideways —
+   * which is the bug this scrolling was introduced to fix.
+   */
+  ref?: Ref<HTMLButtonElement>;
 }) {
   return (
     <BaseTabs.Tab
+      ref={ref}
       value={value}
       className={cn(
         'flex items-center gap-1.5 border-b-2 px-3 py-2 text-sm transition-colors outline-none',
