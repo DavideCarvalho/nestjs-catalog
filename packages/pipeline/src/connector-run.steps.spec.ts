@@ -1,0 +1,106 @@
+import { FatalError, runStepHandler } from '@dudousxd/nestjs-durable-core';
+import { BadRequestException, NotFoundException } from '@nestjs/common';
+import { describe, expect, it, vi } from 'vitest';
+import { CONNECTOR_RUN_STEP, ConnectorRunSteps } from './connector-run.steps';
+import { passthroughScope } from './seams';
+
+/** See the note in `pipeline.module.integration.spec.ts`: the package cannot load here. */
+vi.mock('@dudousxd/nestjs-durable', () => ({
+  WorkflowEngine: class WorkflowEngine {},
+  Step: () => (_target: unknown, _key: unknown, descriptor: unknown) => descriptor,
+  Workflow: () => (target: unknown) => target,
+}));
+
+/**
+ * Only `run` is ever reached — the step calls nothing else on the runner — so
+ * the rest of `ConnectorRunnerService` is deliberately absent rather than
+ * stubbed into something that could quietly answer a call this test is not
+ * expecting.
+ */
+function steps(run: () => Promise<never>): ConnectorRunSteps {
+  const runner = { run };
+  return new ConnectorRunSteps(Object.assign(Object.create(null), runner), passthroughScope);
+}
+
+const task = {
+  runId: 'run-1',
+  seq: 1,
+  stepId: 'run-1:1',
+  name: CONNECTOR_RUN_STEP,
+  input: { connectorId: 'c1', principalId: 'p1', snapshotId: 'snap-1' },
+};
+
+/**
+ * The engine's own re-admission predicate, copied from durable core rather than
+ * described: `existing.error?.retryable !== false`. An absent field is
+ * retryable, which is the entire defect — `FatalError` carries `message` and
+ * `code` and no `retryable`, so a step that threw one was re-dispatched all
+ * three times.
+ */
+function wouldRetry(error: { retryable?: boolean } | undefined): boolean {
+  return error?.retryable !== false;
+}
+
+/**
+ * Serialise the throw the way the dispatch boundary does.
+ *
+ * `runStepHandler` is durable core's real function, not a re-implementation:
+ * the worker runs the handler through it and returns the `{message, code,
+ * retryable}` envelope it produces. Asserting on the thrown *class* instead
+ * would pass on the unfixed code, because `FatalError` is honoured only in the
+ * engine's local retry loop and every `ctx.step` here is dispatched.
+ */
+async function dispatch(subject: ConnectorRunSteps) {
+  const result = await runStepHandler(task, (input, log) => subject.runConnector(input, log));
+  if (result.status !== 'failed') throw new Error(`Expected a failed step, got ${result.status}.`);
+  return result.error;
+}
+
+describe('ConnectorRunSteps: a connector that is gone or switched off', () => {
+  it('tells the engine over the wire not to try a deleted connector again', async () => {
+    const error = await dispatch(
+      steps(() => Promise.reject(new NotFoundException('No connector c1'))),
+    );
+
+    expect(error?.retryable).toBe(false);
+    expect(wouldRetry(error)).toBe(false);
+  });
+
+  it('says the same about a disabled one', async () => {
+    const error = await dispatch(
+      steps(() => Promise.reject(new BadRequestException('"Nightly" is disabled.'))),
+    );
+
+    expect(wouldRetry(error)).toBe(false);
+  });
+
+  it('keeps the code and the message the operator has to read', async () => {
+    const error = await dispatch(
+      steps(() => Promise.reject(new NotFoundException('No connector c1'))),
+    );
+
+    expect(error?.code).toBe('connector_unavailable');
+    expect(error?.message).toBe('No connector c1');
+  });
+
+  // Extending `FatalError` rather than replacing it is what keeps the *local*
+  // retry loop — `err instanceof FatalError` — correct as well, so the step is
+  // right whichever way the engine chose to run it.
+  it('is still a FatalError, so the in-process path stops too', async () => {
+    await expect(
+      steps(() => Promise.reject(new NotFoundException('No connector c1'))).runConnector(
+        task.input,
+      ),
+    ).rejects.toBeInstanceOf(FatalError);
+  });
+
+  // The safer default, and the reason this is not simply `retries: 0`: a source
+  // that is briefly unreachable arrives as an ordinary `Error`, and those are
+  // exactly what the three attempts exist to survive.
+  it('leaves an ordinary failure retryable', async () => {
+    const error = await dispatch(steps(() => Promise.reject(new Error('ECONNREFUSED'))));
+
+    expect(error?.retryable).toBeUndefined();
+    expect(wouldRetry(error)).toBe(true);
+  });
+});

@@ -97,6 +97,8 @@ export class MySqlPipelineStore
 
     const existing = input.id ? await em.findOne(ConnectorRow, { id: input.id }) : null;
 
+    assertNoNewPlaintextCredential(input.config, existing?.config, `"${input.name}"`);
+
     const row =
       existing ??
       em.create(ConnectorRow, {
@@ -174,6 +176,8 @@ export class MySqlPipelineStore
   ): Promise<CatalogConnection> {
     const em = this.em.fork();
     const existing = input.id ? await em.findOne(ConnectionRow, { id: input.id }) : null;
+
+    assertNoNewPlaintextCredential(input.config, existing?.config, `"${input.name}"`);
 
     const row =
       existing ??
@@ -588,6 +592,77 @@ export class MySqlPipelineStore
       limit: Math.min(limit, 200),
     });
     return rows.map(toRun);
+  }
+}
+
+/**
+ * No new plaintext credential goes into `config`.
+ *
+ * `ConnectorRow.config` and `ConnectionRow.config` both promise, in their own
+ * docblocks, that what is stored is the *name* of an environment variable and
+ * "never the credential". That held for every source that authenticates with a
+ * token — those really do come from `secretEnvVar` — and did not hold for SQL,
+ * where `fetchSql` reads `connector.config.url` and a connection URL is a
+ * password with an address attached. So `postgres://user:pass@host/db` sat in a
+ * JSON column, and `GET pipeline/connections` served it under `catalog:read`.
+ *
+ * Refused **here**, in the store, rather than in the controller, for the reason
+ * the both-transform-and-workflow check above gives: a connector saved by curl,
+ * by a host's own code, or by `applyPromotion` reaches this method and nothing
+ * else. The route can only close the route.
+ *
+ * ## What is refused, precisely
+ *
+ * A password-bearing URL that is **not already the value stored under that key
+ * for this row**. Three consequences, all intended:
+ *
+ *  - A new connector carrying one is turned away. That is the point.
+ *  - An existing one is grandfathered, so a deployment with such URLs already
+ *    in its table keeps running and can still be renamed, re-pointed or
+ *    disabled. Refusing those would break working loads to no benefit — the
+ *    password is already in the database either way.
+ *  - Promoting such a connector into an environment that does not have it yet
+ *    is refused. `promoteConnectors` deliberately never carries `secretEnvVar`
+ *    across, so that a newly promoted connector "arrive[s] with no credential to
+ *    reach anything with" — this applies that same rule to the credential that
+ *    was hiding inside `config`, which promotion was otherwise copying verbatim.
+ *
+ * Compared as exact strings rather than by re-parsing: the value being
+ * grandfathered is the one that came out of this table, so byte equality is
+ * both sufficient and the only comparison that cannot be argued with later.
+ *
+ * The URL parse duplicates a few lines of `config-secrets.ts` in the pipeline
+ * package, knowingly. That package depends on this one, so the shared helper
+ * cannot live there, and moving it to `@dudousxd/nestjs-catalog` to save ten
+ * lines would put a rule about *storage* in the package that deliberately holds
+ * no storage.
+ */
+function assertNoNewPlaintextCredential(
+  incoming: Record<string, unknown> | undefined,
+  stored: Record<string, unknown> | undefined,
+  subject: string,
+): void {
+  const offending: string[] = [];
+  for (const [key, value] of Object.entries(incoming ?? {})) {
+    if (typeof value !== 'string' || !hasUrlPassword(value)) continue;
+    if (stored && stored[key] === value) continue;
+    offending.push(key);
+  }
+  if (offending.length === 0) return;
+  throw new BadRequestException(
+    `${subject} carries a password inside config.${offending.join(', config.')}. A connection URL is the credential, and this column is read by anyone holding catalog:read — put the URL in an environment variable and name it in "Credential env var" instead, which is where every fetcher already looks first.`,
+  );
+}
+
+/** Whether a string parses as a URL that carries a password. */
+function hasUrlPassword(value: string): boolean {
+  try {
+    // WHATWG `URL` handles non-special schemes, so `postgres:` and `mysql:`
+    // yield a real `password` rather than an opaque path — which is why this is
+    // a parse and not a regular expression.
+    return new URL(value).password.length > 0;
+  } catch {
+    return false;
   }
 }
 

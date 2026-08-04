@@ -12,6 +12,7 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { PublishService, type PublishedType } from './publish.service';
+import { requirePrincipal } from './write-grants';
 
 /**
  * How an application publishes into the catalog.
@@ -104,15 +105,4 @@ export function createPublishController(path: string, guards: Type<unknown>[] = 
   }
 
   return PublishController;
-}
-
-function requirePrincipal(request: {
-  principal?: CatalogPrincipal;
-}): CatalogPrincipal {
-  if (!request.principal) {
-    // The guard sets this on every route it protects, so reaching here means
-    // the guard was removed rather than that a caller did something clever.
-    throw new Error('CatalogPrincipalGuard did not run on a route that requires it.');
-  }
-  return request.principal;
 }

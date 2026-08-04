@@ -1,5 +1,13 @@
 export { ConnectionChecker } from './connection-checker.service';
 export {
+  REDACTED_SECRET,
+  carriesUrlPassword,
+  redactConfigSecrets,
+  redactConnection,
+  redactConnector,
+  restoreRedactedSecrets,
+} from './config-secrets';
+export {
   CONNECTOR_RUN_STEP,
   ConnectorRunSteps,
   type ConnectorRunStepInput,
@@ -65,3 +73,8 @@ export {
   type WorkflowFinishInput,
   type WorkflowPlanResult,
 } from './workflow-runner.service';
+export {
+  assertMayWriteTypes,
+  committedTypes,
+  requirePrincipal,
+} from './write-grants';

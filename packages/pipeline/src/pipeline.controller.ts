@@ -28,11 +28,13 @@ import {
   type Type,
   UseGuards,
 } from '@nestjs/common';
+import { redactConnection, redactConnector, restoreRedactedSecrets } from './config-secrets';
 import { ConnectionChecker } from './connection-checker.service';
 import { ConnectorRunnerService } from './connector-runner.service';
 import { WorkflowLauncher } from './workflow-launcher.service';
 import { WorkflowRunnerService } from './workflow-runner.service';
 import { type CanvasWorkflowInput, toGraph, toRunView } from './workflow-view';
+import { assertMayWriteTypes, committedTypes, requirePrincipal } from './write-grants';
 
 /**
  * Connectors, transforms and their runs.
@@ -77,29 +79,47 @@ export function createPipelineController(
       return { languages, pythonPackages: packages };
     }
 
+    /**
+     * Redacted, because this route asks only for `catalog:read`.
+     *
+     * A connection's `config.url` is the credential for every SQL source — see
+     * `config-secrets.ts` — and it was being served here verbatim to anyone who
+     * could read the catalog at all. The store still answers truthfully; the
+     * hiding happens at the boundary where the audience becomes a person.
+     */
     @Get('connections')
     @RequireScopes('catalog:read')
-    connections() {
-      return this.pipeline.listConnections();
+    async connections() {
+      return (await this.pipeline.listConnections()).map(redactConnection);
     }
 
     @Post('connections')
     @RequireScopes('catalog:write')
-    saveConnection(
+    async saveConnection(
       @Req() request: { principal?: CatalogPrincipal },
       @Body()
       body: Omit<CatalogConnection, 'id' | 'createdAt' | 'updatedAt' | 'createdBy'> & {
         id?: string;
       },
     ) {
+      const principal = requirePrincipal(request);
       if (!isConnectorKind(body.kind)) {
         throw new BadRequestException(
           `"${body.kind}" is not a connection kind. Accepted: ${CONNECTOR_KINDS.join(', ')}.`,
         );
       }
+      // What the caller was shown for a password is put back before it is
+      // written. Without this, a console that read this connection, changed its
+      // name and posted the object back would store the placeholder as the real
+      // credential — the classic way a redaction corrupts what it protects.
+      const stored = body.id ? await this.pipeline.getConnection(body.id) : undefined;
       return this.pipeline.saveConnection(
-        { ...body, kind: body.kind },
-        request.principal?.id ?? 'console',
+        {
+          ...body,
+          kind: body.kind,
+          config: restoreRedactedSecrets(body.config ?? {}, stored?.config),
+        },
+        principal.id,
       );
     }
 
@@ -121,8 +141,8 @@ export function createPipelineController(
 
     @Get('connections/:id/connectors')
     @RequireScopes('catalog:read')
-    connectionUsers(@Param('id') id: string) {
-      return this.pipeline.connectorsUsingConnection(id);
+    async connectionUsers(@Param('id') id: string) {
+      return (await this.pipeline.connectorsUsingConnection(id)).map(redactConnector);
     }
 
     @Delete('connections/:id')
@@ -131,20 +151,22 @@ export function createPipelineController(
       return this.pipeline.deleteConnection(id).then((deleted: boolean) => ({ deleted }));
     }
 
+    /** Redacted for the same reason as `connections` — see that route. */
     @Get('connectors')
     @RequireScopes('catalog:read')
-    connectors() {
-      return this.pipeline.listConnectors();
+    async connectors() {
+      return (await this.pipeline.listConnectors()).map(redactConnector);
     }
 
     @Post('connectors')
     @RequireScopes('catalog:write')
-    saveConnector(
+    async saveConnector(
       @Req() request: { principal?: CatalogPrincipal },
       @Body() body: Omit<CatalogConnector, 'id' | 'createdAt' | 'updatedAt' | 'createdBy'> & {
         id?: string;
       },
     ) {
+      const principal = requirePrincipal(request);
       // Validated here, at the edge, rather than narrowed on the way back out.
       // The store can only be strict about what it reads if nothing invalid ever
       // reached it, and a 400 naming the accepted kinds is a better answer than a
@@ -154,9 +176,20 @@ export function createPipelineController(
           `"${body.kind}" is not a connector kind. Accepted: ${CONNECTOR_KINDS.join(', ')}.`,
         );
       }
+      await this.assertMayCommit(
+        principal,
+        body.targetType,
+        body.workflowId,
+        `saving connector "${body.name}"`,
+      );
+      const stored = body.id ? await this.pipeline.getConnector(body.id) : undefined;
       return this.pipeline.saveConnector(
-        { ...body, kind: body.kind },
-        request.principal?.id ?? 'console',
+        {
+          ...body,
+          kind: body.kind,
+          config: restoreRedactedSecrets(body.config ?? {}, stored?.config),
+        },
+        principal.id,
       );
     }
 
@@ -175,14 +208,33 @@ export function createPipelineController(
      */
     @Post('connectors/:id/run')
     @RequireScopes('catalog:write')
-    run(
+    async run(
       @Req() request: { principal?: CatalogPrincipal },
       @Param('id') id: string,
       @Body() body?: { snapshotId?: string },
     ) {
+      const principal = requirePrincipal(request);
+      // Checked at the run and not only at the save, because a connector
+      // authored by somebody who could write its type may be run by somebody
+      // who cannot, and the run is what commits. `commitAsSystem` at the end of
+      // it takes a `principalId` string and checks nothing by design — that id
+      // is attribution, not an authorisation — so this is the last point where
+      // there are grants to consult at all.
+      //
+      // A connector that is not there is left to the runner's own 404: there is
+      // nothing to authorise when there is nothing to write with.
+      const connector = await this.pipeline.getConnector(id);
+      if (connector) {
+        await this.assertMayCommit(
+          principal,
+          connector.targetType,
+          connector.workflowId,
+          `running connector "${connector.name}"`,
+        );
+      }
       return this.runner.run(
         id,
-        request.principal?.id ?? 'console',
+        principal.id,
         body?.snapshotId ?? `manual-${randomUUID().slice(0, 8)}`,
       );
     }
@@ -212,15 +264,18 @@ export function createPipelineController(
         description?: string;
       },
     ) {
+      // No per-type check here, and that is not an oversight: a transform names
+      // no object type. It is code, and which type its output lands in is
+      // decided by the sink of whatever graph runs it — which is checked when
+      // that graph is saved and again when it is run. `catalog:write` remains
+      // the bar for writing code, as the note on this controller says.
+      const principal = requirePrincipal(request);
       if (!isTransformLanguage(body.language)) {
         throw new BadRequestException(
           `"${body.language}" is not a transform language. Accepted: ${TRANSFORM_LANGUAGES.join(', ')}.`,
         );
       }
-      return this.pipeline.saveTransform(
-        { ...body, language: body.language },
-        request.principal?.id ?? 'console',
-      );
+      return this.pipeline.saveTransform({ ...body, language: body.language }, principal.id);
     }
 
     @Delete('transforms/:id')
@@ -275,6 +330,7 @@ export function createPipelineController(
       @Req() request: { principal?: CatalogPrincipal },
       @Body() body: CanvasWorkflowInput,
     ) {
+      const principal = requirePrincipal(request);
       const store = this.workflows.requireStore();
       const name = typeof body.name === 'string' ? body.name.trim() : '';
       if (!name) {
@@ -283,6 +339,12 @@ export function createPipelineController(
       // No workflow-level target type: a sink carries the type it commits, and a
       // graph may now have several sinks writing different ones.
       const graph = toGraph(body);
+      // Authorised against every type the graph would commit, before it is
+      // stored. This is the check the scheduled path depends on: a cron-fired
+      // run carries `SCHEDULER_PRINCIPAL`, which is a synthetic id with no
+      // grants to consult, so if a graph committing somebody else's type can be
+      // written down at all, nothing downstream will ever object to it again.
+      assertMayWriteTypes(principal, committedTypes(graph.nodes), `saving workflow "${name}"`);
       const saved = await store.saveWorkflow(
         {
           id: body.id,
@@ -294,7 +356,7 @@ export function createPipelineController(
           nodes: graph.nodes,
           edges: graph.edges,
         },
-        request.principal?.id ?? 'console',
+        principal.id,
       );
       return saved;
     }
@@ -311,10 +373,18 @@ export function createPipelineController(
       @Param('id') id: string,
       @Body() body?: { snapshotId?: string },
     ) {
+      const principal = requirePrincipal(request);
       const workflow = await this.workflows.requireWorkflow(id);
+      // The case save time cannot see: a graph written last month by a
+      // principal that could commit this type, run today by one that cannot.
+      assertMayWriteTypes(
+        principal,
+        committedTypes(workflow.nodes),
+        `running workflow "${workflow.name}"`,
+      );
       const run = await this.launcher.run({
         workflowId: id,
-        principalId: request.principal?.id ?? 'console',
+        principalId: principal.id,
         // Almost always absent — the console posts an empty body. Present when
         // somebody is re-driving a load they already own the identity of.
         snapshotId: body?.snapshotId,
@@ -324,7 +394,41 @@ export function createPipelineController(
     @Get('workflows/:id/connectors')
     @RequireScopes('catalog:read')
     async workflowUsers(@Param('id') id: string) {
-      return this.workflows.requireStore().connectorsUsingWorkflow(id);
+      const using = await this.workflows.requireStore().connectorsUsingWorkflow(id);
+      return using.map(redactConnector);
+    }
+
+    /**
+     * Every type this connector would cause to be committed, authorised at once.
+     *
+     * Two sources, and both are needed. `targetType` is what a plain connector
+     * publishes on its own. A connector attached to a workflow publishes
+     * whatever that graph's **sinks** commit, which is not the same set: the
+     * store keeps `WorkflowRow.targetType` in step with the connector's, but
+     * that field records only the first sink found, while a graph may legally
+     * carry several as long as they commit different types. Authorising on the
+     * connector's field alone would clear a two-sink graph on the strength of
+     * its first sink.
+     *
+     * A workflow id that resolves to nothing is passed over rather than raised
+     * here: `saveConnector` in the store already refuses that, with a message
+     * that explains what a connector pointing at a missing graph does to a
+     * schedule, and answering 404 first would replace it with a worse one.
+     */
+    private async assertMayCommit(
+      principal: CatalogPrincipal,
+      targetType: string,
+      workflowId: string | undefined,
+      subject: string,
+    ): Promise<void> {
+      const types = [targetType];
+      if (workflowId) {
+        const workflow = await this.workflows.requireStore().getWorkflow(workflowId);
+        for (const type of committedTypes(workflow?.nodes ?? [])) {
+          if (!types.includes(type)) types.push(type);
+        }
+      }
+      assertMayWriteTypes(principal, types, subject);
     }
   }
   if (guards.length > 0) {

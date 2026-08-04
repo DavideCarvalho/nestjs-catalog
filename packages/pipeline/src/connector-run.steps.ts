@@ -80,7 +80,7 @@ export class ConnectorRunSteps {
       // a schedule that keeps firing at a deleted connector for fifteen minutes
       // is noise standing between somebody and the real failures.
       if (error instanceof NotFoundException || error instanceof BadRequestException) {
-        throw new FatalError(describe(error), 'connector_unavailable');
+        throw new UnavailableConnectorError(describe(error));
       }
       throw error;
     }
@@ -100,6 +100,36 @@ export class ConnectorRunSteps {
     }
 
     return { runId: run.id, fetched: run.fetched, written: run.written };
+  }
+}
+
+/**
+ * A connector that is gone or switched off, in the one form the engine reads.
+ *
+ * The comment above says these must not be retried, and until now the code did
+ * not achieve it. `FatalError` carries a `message` and a `code` and nothing
+ * else. Durable core honours the class itself only in `runStepHandler`'s
+ * **local** retry loop — the path a step takes when it runs inside the engine's
+ * own process. This step is dispatched: the worker serialises the throw into a
+ * `{message, code, retryable}` envelope, and only `retryable` is read on the
+ * way back in. The engine's own predicate is `existing.error?.retryable !==
+ * false`, so an absent field means retryable, and the serialiser only emits one
+ * at all when `typeof e.retryable === "boolean"`. A plain `FatalError` from a
+ * dispatched step therefore burns all three attempts — here, roughly fifteen
+ * minutes of a 60s exponential backoff capped at 900s — for a connector that
+ * somebody deleted on purpose.
+ *
+ * `workflow-run.steps.ts` had already worked this out and fixed it the same
+ * way; this is that fix, applied to the step that was left behind. Extending
+ * `FatalError` rather than replacing it keeps the local path correct too, so
+ * this is right whichever way the step is run.
+ */
+class UnavailableConnectorError extends FatalError {
+  /** The field the dispatch boundary serialises and the engine acts on. */
+  readonly retryable = false;
+
+  constructor(message: string) {
+    super(message, 'connector_unavailable');
   }
 }
 

@@ -152,11 +152,41 @@ beside the node that caused it. A connection that would close a loop refuses
 itself mid-drag rather than being accepted and reported afterwards.
 
 None of that is authoritative and none of it gates a save. `POST /workflows` is
-the only check that counts: it can see which types exist, who may write to them
-and whether a transform's output fits the sink, and its refusal is shown
-verbatim. The rules are exported (`validateWorkflow`, `canConnect`,
-`wouldCycle`) so a host can run the same checks — never so it can skip the
-server's.
+the only check that counts, and its refusal is shown verbatim. The rules are
+exported (`validateWorkflow`, `canConnect`, `wouldCycle`) so a host can run the
+same checks — never so it can skip the server's.
+
+What the server checks that the canvas cannot:
+
+- **Whether every transform the graph names still exists.** The canvas knows
+  what it last listed; the server reads the table.
+- **Whether the signed-in principal may write the types the graph's sinks
+  commit.** Every sink, not just the first — a graph may carry several as long
+  as they commit different types — and a refusal names each type it turned
+  down. The same check runs again on `POST /workflows/:id/run`, because a graph
+  saved by somebody who held the grant can be run by somebody who does not, and
+  the run is what actually commits. `POST /connectors` and
+  `POST /connectors/:id/run` are checked the same way, against the connector's
+  own target type *and* the sinks of any workflow it is attached to.
+
+These routes now require a principal: they read grants, not just a name to
+attribute the write to, so a deployment that mounts the pipeline without a
+principal guard will fail them rather than fall back to an anonymous identity
+with nothing to check against.
+
+What it still does **not** check, so the screen should not imply otherwise: that
+a sink's target type has been published yet, and that a transform's output fits
+the sink it feeds. The first surfaces when the run tries to commit; the second
+is not checked anywhere.
+
+One thing the canvas is shown but must not send back verbatim without care:
+`GET /connections` and `GET /connectors` **redact the password out of any
+connection URL in `config`**, because those routes need only `catalog:read`. The
+placeholder reads `REDACTED`. Posting an object straight back is safe — the
+server puts the stored credential back when the value it receives is exactly the
+redaction of what it holds — but an inspector that renders that field as an
+editable text box should say it is masked, or somebody will retype a password
+they cannot see.
 
 ### Keyboard and screen readers
 
