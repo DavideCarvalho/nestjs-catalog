@@ -122,7 +122,6 @@ function TooltipIndicatorInner({
     animatedLineX.set(lineX);
   }
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: we need to jump the animatedX when the visible prop changes
   useEffect(() => {
     animatedX.set(rectX);
     animatedLineX.set(lineX);

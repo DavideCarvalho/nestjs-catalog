@@ -1,6 +1,7 @@
 import type {
   CatalogConnection,
   CatalogConnector,
+  ConnectionCheck,
   ConnectorKind,
 } from '@dudousxd/nestjs-catalog/client';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
@@ -15,6 +16,7 @@ import {
   Trash2,
   Waypoints,
 } from 'lucide-react';
+import type { ReactNode } from 'react';
 import { useState } from 'react';
 import { cn } from './cn';
 import { type ConnectionInput, catalogQueryKeys, useCatalogClient } from './context';
@@ -210,6 +212,240 @@ export function ConnectionPanel({ canEdit = true }: ConnectionPanelProps) {
   );
 }
 
+/**
+ * Who this connection is: name, kind, who reads through it, what it addresses.
+ *
+ * The credential line names the variable and never its value — that is the
+ * property worth showing, so it is shown rather than described in a doc.
+ */
+function ConnectionIdentity({
+  connection,
+  users,
+}: {
+  connection: CatalogConnection;
+  users: CatalogConnector[];
+}) {
+  return (
+    <div className="min-w-0">
+      <div className="flex flex-wrap items-center gap-2">
+        <Plug size={13} className={MUTED} />
+        <span className="text-sm font-medium">{connection.name}</span>
+        <span className="rounded-sm bg-zinc-100 px-1.5 py-0.5 font-mono text-[10px] uppercase dark:bg-zinc-800">
+          {connection.kind}
+        </span>
+        {users.length > 0 && (
+          <Tooltip
+            content={`Read through by ${users.map((c) => c.name).join(', ')}. Moving this address moves all of them at once, which is the point.`}
+          >
+            <span
+              className={cn('flex cursor-help items-center gap-1 font-mono text-[10px]', MUTED)}
+            >
+              <Waypoints size={10} />
+              {users.length}
+            </span>
+          </Tooltip>
+        )}
+      </div>
+      <div className={cn('mt-1 font-mono text-[11px]', MUTED)}>
+        {describeConnection(connection)}
+      </div>
+      {connection.description && (
+        <p className={cn('mt-1 text-[11px]', MUTED)}>{connection.description}</p>
+      )}
+      {connection.secretEnvVar && (
+        <Tooltip content="The catalog stores the NAME of this variable, never its value. A leaked catalog database gives away the shape of the integration, not the keys to it.">
+          <div
+            className={cn(
+              'mt-1 flex w-fit cursor-help items-center gap-1 font-mono text-[10px]',
+              MUTED,
+            )}
+          >
+            <KeyRound size={10} />
+            {connection.secretEnvVar}
+          </div>
+        </Tooltip>
+      )}
+    </div>
+  );
+}
+
+/**
+ * What the last check found, from the stored fields.
+ *
+ * Recorded rather than probed on every page load, because a list that reaches
+ * every system it names on render turns opening a tab into a burst of outbound
+ * connections.
+ */
+function StoredCheckSummary({ connection }: { connection: CatalogConnection }) {
+  if (!connection.lastCheckedAt) return null;
+  return (
+    <div className={cn('mt-3 flex items-center gap-2 border-t pt-3 text-[11px]', RULE)}>
+      {connection.lastCheckOk ? (
+        <CircleCheck size={12} aria-hidden className="text-emerald-600" />
+      ) : (
+        <CircleX size={12} aria-hidden className="text-red-600" />
+      )}
+      <span className="sr-only">{connection.lastCheckOk ? 'Reachable: ' : 'Unreachable: '}</span>
+      <span className={MUTED}>
+        {connection.lastCheckOk ? 'Reached' : (connection.lastCheckError ?? 'Could not reach it')}
+      </span>
+      <span className={cn('ml-auto font-mono text-[10px]', MUTED)}>
+        {new Date(connection.lastCheckedAt).toLocaleString()}
+      </span>
+    </div>
+  );
+}
+
+/**
+ * What a check that just ran found, in the checker's own words.
+ *
+ * A server version, a bucket and whether anything is under the prefix, an HTTP
+ * status. That sentence is the whole product of the button; "OK" would prove
+ * only that something is listening on a port.
+ */
+function LiveCheckResult({ result }: { result: ConnectionCheck }) {
+  return (
+    <div
+      className={cn(
+        'mt-3 rounded-md border px-3 py-2 text-[11px]',
+        result.ok
+          ? 'border-emerald-200 bg-emerald-50 text-emerald-800 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-300'
+          : 'border-red-200 bg-red-50 text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300',
+      )}
+    >
+      <div className="flex items-start gap-2">
+        {result.ok ? (
+          <CircleCheck size={13} aria-hidden className="mt-px shrink-0" />
+        ) : (
+          <CircleX size={13} aria-hidden className="mt-px shrink-0" />
+        )}
+        <div className="min-w-0">
+          <div className="font-medium">{result.ok ? 'Reached it.' : 'Could not reach it.'}</div>
+          <div className="mt-0.5 font-mono leading-relaxed">{result.detail}</div>
+          {/*
+           * The error beside the detail, not instead of it. "Reachable but
+           * refused" and "unreachable" send an operator to completely
+           * different places, and only the raw message distinguishes them.
+           */}
+          {result.error && (
+            <div className="mt-1 font-mono leading-relaxed opacity-80">{result.error}</div>
+          )}
+          <div className="mt-1 font-mono text-[10px] opacity-70">{result.elapsedMs} ms</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Why a delete would be refused, said before it is attempted.
+ *
+ * `blockedBy` is the server's own answer to "who still reads through this",
+ * asked after it refused; it outranks `remove.error`, which is only the generic
+ * failure that came with it.
+ */
+function deleteRefusalMessage(blockedBy: CatalogConnector[] | null, error: unknown): ReactNode {
+  if (blockedBy && blockedBy.length > 0) {
+    return (
+      <>
+        Refused: still read through by {blockedBy.map((c) => c.name).join(', ')}. Point{' '}
+        {blockedBy.length === 1 ? 'it' : 'them'} elsewhere first.
+      </>
+    );
+  }
+  if (error && !blockedBy) {
+    return error instanceof Error ? error.message : 'Could not delete it.';
+  }
+  return undefined;
+}
+
+/**
+ * The buttons on a card: test it, and — with write access — edit or delete it.
+ *
+ * The delete tooltip says up front that a connection with readers will be
+ * refused, so the refusal is not the first time somebody hears about it.
+ */
+function ConnectionCardActions({
+  connection,
+  users,
+  canEdit,
+  testing,
+  onTest,
+  onEdit,
+  onAskDelete,
+}: {
+  connection: CatalogConnection;
+  users: CatalogConnector[];
+  canEdit: boolean;
+  testing: boolean;
+  onTest: () => void;
+  onEdit: () => void;
+  onAskDelete: () => void;
+}) {
+  return (
+    <div className="flex shrink-0 items-center gap-1">
+      <button
+        type="button"
+        onClick={onTest}
+        disabled={testing}
+        className={cn(
+          'flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs disabled:opacity-40',
+          RULE,
+          'hover:bg-zinc-50 dark:hover:bg-zinc-800',
+        )}
+      >
+        {testing ? <Loader2 size={12} className="animate-spin" /> : <Plug size={12} />}
+        {testing ? 'Reaching…' : 'Test connection'}
+      </button>
+      {canEdit && (
+        <>
+          <Tooltip content={`Edit ${connection.name}`}>
+            <button
+              type="button"
+              onClick={onEdit}
+              aria-label={`Edit ${connection.name}`}
+              className={cn('rounded-sm p-1.5 hover:text-sky-600', MUTED)}
+            >
+              <Pencil size={12} />
+            </button>
+          </Tooltip>
+          <Tooltip
+            content={
+              users.length > 0
+                ? `${users.length} connector${users.length === 1 ? '' : 's'} read through this. Deleting it is refused while that is true.`
+                : `Delete ${connection.name}`
+            }
+          >
+            <button
+              type="button"
+              onClick={onAskDelete}
+              aria-label={`Delete ${connection.name}`}
+              className={cn('rounded-sm p-1.5 hover:text-red-600', MUTED)}
+            >
+              <Trash2 size={12} />
+            </button>
+          </Tooltip>
+        </>
+      )}
+    </div>
+  );
+}
+
+/** What deleting would actually cost, named readers and all, before it is tried. */
+function deleteConsequence(users: CatalogConnector[]): ReactNode {
+  if (users.length === 0) {
+    return 'Nothing reads through it. The connectors that used to are unaffected; only this address and the name of its credential variable go.';
+  }
+  return (
+    <>
+      {users.length} connector{users.length === 1 ? '' : 's'} read through this connection —{' '}
+      {users.map((c) => c.name).join(', ')}. Deleting it would leave{' '}
+      {users.length === 1 ? 'it' : 'them'} without an address, and that is discovered on the next
+      scheduled run rather than now. The server refuses while this is true.
+    </>
+  );
+}
+
 function ConnectionCard({
   connection,
   users,
@@ -259,163 +495,27 @@ function ConnectionCard({
   return (
     <div className={cn('rounded-lg border p-4', RULE, PANEL)}>
       <div className="flex flex-wrap items-start justify-between gap-3">
-        <div className="min-w-0">
-          <div className="flex flex-wrap items-center gap-2">
-            <Plug size={13} className={MUTED} />
-            <span className="text-sm font-medium">{connection.name}</span>
-            <span className="rounded-sm bg-zinc-100 px-1.5 py-0.5 font-mono text-[10px] uppercase dark:bg-zinc-800">
-              {connection.kind}
-            </span>
-            {users.length > 0 && (
-              <Tooltip
-                content={`Read through by ${users.map((c) => c.name).join(', ')}. Moving this address moves all of them at once, which is the point.`}
-              >
-                <span
-                  className={cn('flex cursor-help items-center gap-1 font-mono text-[10px]', MUTED)}
-                >
-                  <Waypoints size={10} />
-                  {users.length}
-                </span>
-              </Tooltip>
-            )}
-          </div>
-          <div className={cn('mt-1 font-mono text-[11px]', MUTED)}>
-            {describeConnection(connection)}
-          </div>
-          {connection.description && (
-            <p className={cn('mt-1 text-[11px]', MUTED)}>{connection.description}</p>
-          )}
-          {connection.secretEnvVar && (
-            <Tooltip content="The catalog stores the NAME of this variable, never its value. A leaked catalog database gives away the shape of the integration, not the keys to it.">
-              <div
-                className={cn(
-                  'mt-1 flex w-fit cursor-help items-center gap-1 font-mono text-[10px]',
-                  MUTED,
-                )}
-              >
-                <KeyRound size={10} />
-                {connection.secretEnvVar}
-              </div>
-            </Tooltip>
-          )}
-        </div>
+        <ConnectionIdentity connection={connection} users={users} />
 
-        <div className="flex shrink-0 items-center gap-1">
-          <button
-            type="button"
-            onClick={() => check.mutate()}
-            disabled={check.isPending}
-            className={cn(
-              'flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs disabled:opacity-40',
-              RULE,
-              'hover:bg-zinc-50 dark:hover:bg-zinc-800',
-            )}
-          >
-            {check.isPending ? <Loader2 size={12} className="animate-spin" /> : <Plug size={12} />}
-            {check.isPending ? 'Reaching…' : 'Test connection'}
-          </button>
-          {canEdit && (
-            <>
-              <Tooltip content={`Edit ${connection.name}`}>
-                <button
-                  type="button"
-                  onClick={onEdit}
-                  aria-label={`Edit ${connection.name}`}
-                  className={cn('rounded-sm p-1.5 hover:text-sky-600', MUTED)}
-                >
-                  <Pencil size={12} />
-                </button>
-              </Tooltip>
-              <Tooltip
-                content={
-                  users.length > 0
-                    ? `${users.length} connector${users.length === 1 ? '' : 's'} read through this. Deleting it is refused while that is true.`
-                    : `Delete ${connection.name}`
-                }
-              >
-                <button
-                  type="button"
-                  onClick={() => {
-                    setBlockedBy(null);
-                    remove.reset();
-                    setConfirming(true);
-                  }}
-                  aria-label={`Delete ${connection.name}`}
-                  className={cn('rounded-sm p-1.5 hover:text-red-600', MUTED)}
-                >
-                  <Trash2 size={12} />
-                </button>
-              </Tooltip>
-            </>
-          )}
-        </div>
+        <ConnectionCardActions
+          connection={connection}
+          users={users}
+          canEdit={canEdit}
+          testing={check.isPending}
+          onTest={() => check.mutate()}
+          onEdit={onEdit}
+          onAskDelete={() => {
+            setBlockedBy(null);
+            remove.reset();
+            setConfirming(true);
+          }}
+        />
       </div>
 
-      {/*
-       * What the last check found, from the stored fields, when this session
-       * has not run one. Recorded rather than probed on every page load,
-       * because a list that reaches every system it names on render turns
-       * opening a tab into a burst of outbound connections.
-       */}
-      {!result && connection.lastCheckedAt && (
-        <div className={cn('mt-3 flex items-center gap-2 border-t pt-3 text-[11px]', RULE)}>
-          {connection.lastCheckOk ? (
-            <CircleCheck size={12} aria-hidden className="text-emerald-600" />
-          ) : (
-            <CircleX size={12} aria-hidden className="text-red-600" />
-          )}
-          <span className="sr-only">
-            {connection.lastCheckOk ? 'Reachable: ' : 'Unreachable: '}
-          </span>
-          <span className={MUTED}>
-            {connection.lastCheckOk
-              ? 'Reached'
-              : (connection.lastCheckError ?? 'Could not reach it')}
-          </span>
-          <span className={cn('ml-auto font-mono text-[10px]', MUTED)}>
-            {new Date(connection.lastCheckedAt).toLocaleString()}
-          </span>
-        </div>
-      )}
+      {/* The stored outcome only while this session has not run its own check. */}
+      {!result && <StoredCheckSummary connection={connection} />}
 
-      {/*
-       * A check that just ran says more than a stored flag can: what answered,
-       * in the checker's own words — a server version, a bucket and whether
-       * anything is under the prefix, an HTTP status. That sentence is the
-       * whole product of this button. "OK" would prove only that something is
-       * listening on a port.
-       */}
-      {result && (
-        <div
-          className={cn(
-            'mt-3 rounded-md border px-3 py-2 text-[11px]',
-            result.ok
-              ? 'border-emerald-200 bg-emerald-50 text-emerald-800 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-300'
-              : 'border-red-200 bg-red-50 text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300',
-          )}
-        >
-          <div className="flex items-start gap-2">
-            {result.ok ? (
-              <CircleCheck size={13} aria-hidden className="mt-px shrink-0" />
-            ) : (
-              <CircleX size={13} aria-hidden className="mt-px shrink-0" />
-            )}
-            <div className="min-w-0">
-              <div className="font-medium">{result.ok ? 'Reached it.' : 'Could not reach it.'}</div>
-              <div className="mt-0.5 font-mono leading-relaxed">{result.detail}</div>
-              {/*
-               * The error beside the detail, not instead of it. "Reachable but
-               * refused" and "unreachable" send an operator to completely
-               * different places, and only the raw message distinguishes them.
-               */}
-              {result.error && (
-                <div className="mt-1 font-mono leading-relaxed opacity-80">{result.error}</div>
-              )}
-              <div className="mt-1 font-mono text-[10px] opacity-70">{result.elapsedMs} ms</div>
-            </div>
-          </div>
-        </div>
-      )}
+      {result && <LiveCheckResult result={result} />}
 
       {check.error && !result && (
         <p className="mt-3 text-[11px] text-red-600">
@@ -430,38 +530,167 @@ function ConnectionCard({
           if (!open) setBlockedBy(null);
         }}
         title={`Delete ${connection.name}?`}
-        description={
-          users.length > 0 ? (
-            <>
-              {users.length} connector{users.length === 1 ? '' : 's'} read through this connection —{' '}
-              {users.map((c) => c.name).join(', ')}. Deleting it would leave{' '}
-              {users.length === 1 ? 'it' : 'them'} without an address, and that is discovered on the
-              next scheduled run rather than now. The server refuses while this is true.
-            </>
-          ) : (
-            'Nothing reads through it. The connectors that used to are unaffected; only this address and the name of its credential variable go.'
-          )
-        }
+        description={deleteConsequence(users)}
         confirmLabel={remove.isPending ? 'Deleting…' : 'Delete'}
         pending={remove.isPending}
         onConfirm={() => remove.mutate()}
-        error={
-          blockedBy && blockedBy.length > 0 ? (
-            <>
-              Refused: still read through by {blockedBy.map((c) => c.name).join(', ')}. Point{' '}
-              {blockedBy.length === 1 ? 'it' : 'them'} elsewhere first.
-            </>
-          ) : remove.error && !blockedBy ? (
-            remove.error instanceof Error ? (
-              remove.error.message
-            ) : (
-              'Could not delete it.'
-            )
-          ) : undefined
-        }
+        error={deleteRefusalMessage(blockedBy, remove.error)}
       />
     </div>
   );
+}
+
+/** Everything the form edits, before it is split into a name and a config. */
+interface ConnectionDraft {
+  name: string;
+  description: string;
+  url: string;
+  bucket: string;
+  endpoint: string;
+  region: string;
+  forcePathStyle: boolean;
+  secretEnvVar: string;
+}
+
+/** A patch onto the draft, so each field can name only what it changes. */
+type UpdateDraft = (patch: Partial<ConnectionDraft>) => void;
+
+/**
+ * Only the config fields the chosen kind actually reads.
+ *
+ * Carrying the rest would leave a stale bucket on an HTTP connection, which
+ * reads as configuration somebody meant rather than as a leftover from a
+ * dropdown they changed.
+ */
+function connectionConfigFor(
+  kind: ConnectableKind,
+  draft: ConnectionDraft,
+): Record<string, unknown> {
+  if (kind === 's3') {
+    return {
+      bucket: draft.bucket,
+      ...(draft.endpoint ? { endpoint: draft.endpoint } : {}),
+      ...(draft.region ? { region: draft.region } : {}),
+      ...(draft.forcePathStyle ? { forcePathStyle: true } : {}),
+    };
+  }
+  return draft.url ? { url: draft.url } : {};
+}
+
+/**
+ * Whether there is not yet enough here to save.
+ *
+ * A SQL connection needs one of its two addresses and neither is more correct:
+ * the variable is the right answer in a deployment, the inline URL is the one
+ * that gets somebody running locally in a minute.
+ */
+function connectionIsIncomplete(kind: ConnectableKind, draft: ConnectionDraft): boolean {
+  if (draft.name.trim().length === 0) return true;
+  if (kind === 's3') return draft.bucket.trim().length === 0;
+  if (kind === 'http') return draft.url.trim().length === 0;
+  return draft.url.trim().length === 0 && draft.secretEnvVar.trim().length === 0;
+}
+
+/** A base URL, and the token sent against it. */
+function HttpFields({ draft, update }: { draft: ConnectionDraft; update: UpdateDraft }) {
+  return (
+    <>
+      <TextField
+        label="URL"
+        value={draft.url}
+        onChange={(url) => update({ url })}
+        placeholder="https://api.example.mil/v1"
+        hint="The base the connectors reading through this will hang their paths off."
+      />
+      <TextField
+        label="Credential env var"
+        value={draft.secretEnvVar}
+        onChange={(secretEnvVar) => update({ secretEnvVar })}
+        placeholder="Optional — sent as a bearer token"
+      />
+    </>
+  );
+}
+
+/** Either an inline URL or the variable holding one. */
+function SqlFields({ draft, update }: { draft: ConnectionDraft; update: UpdateDraft }) {
+  return (
+    <FieldGroup
+      title="Address"
+      hint="Name the variable holding the connection URL — that is the whole credential for most databases, so the catalog stores its name and never its value. The inline URL is here for local work."
+    >
+      <div className="grid gap-3 sm:grid-cols-2">
+        <TextField
+          label="URL (optional)"
+          value={draft.url}
+          onChange={(url) => update({ url })}
+          placeholder="mysql://user:pass@host/db"
+        />
+        <TextField
+          label="Env var holding the URL"
+          value={draft.secretEnvVar}
+          onChange={(secretEnvVar) => update({ secretEnvVar })}
+          placeholder="FLEET_DATABASE_URL"
+        />
+      </div>
+    </FieldGroup>
+  );
+}
+
+/** A bucket, plus everything needed to address a non-AWS one. */
+function S3Fields({ draft, update }: { draft: ConnectionDraft; update: UpdateDraft }) {
+  return (
+    <FieldGroup title="Bucket">
+      <div className="grid gap-3 sm:grid-cols-2">
+        <TextField
+          label="Bucket"
+          value={draft.bucket}
+          onChange={(bucket) => update({ bucket })}
+          placeholder="fleet-drops"
+        />
+        <TextField
+          label="Region"
+          value={draft.region}
+          onChange={(region) => update({ region })}
+          placeholder="Blank uses the environment's"
+        />
+        <TextField
+          label="Endpoint"
+          value={draft.endpoint}
+          onChange={(endpoint) => update({ endpoint })}
+          placeholder="MinIO, e.g. http://localhost:9000"
+        />
+        <TextField
+          label="Env var holding accessKeyId:secretAccessKey"
+          value={draft.secretEnvVar}
+          onChange={(secretEnvVar) => update({ secretEnvVar })}
+          placeholder="Optional"
+          hint="Leave blank anywhere the pod has its own role — those credentials rotate, and a static pair named here would not."
+        />
+      </div>
+      <Switch
+        checked={draft.forcePathStyle}
+        onCheckedChange={(forcePathStyle) => update({ forcePathStyle })}
+        label="Path-style addressing"
+        hint="MinIO needs it; AWS does not."
+      />
+    </FieldGroup>
+  );
+}
+
+/** The address fields for whichever kind is selected, and only those. */
+function ConnectionKindFields({
+  kind,
+  draft,
+  update,
+}: {
+  kind: ConnectableKind;
+  draft: ConnectionDraft;
+  update: UpdateDraft;
+}) {
+  if (kind === 'http') return <HttpFields draft={draft} update={update} />;
+  if (kind === 'sql') return <SqlFields draft={draft} update={update} />;
+  return <S3Fields draft={draft} update={update} />;
 }
 
 /**
@@ -486,7 +715,7 @@ function ConnectionForm({
   const config = connection?.config ?? {};
 
   const [kind, setKind] = useState<ConnectableKind>(toConnectableKind(connection?.kind ?? 'http'));
-  const [draft, setDraft] = useState({
+  const [draft, setDraft] = useState<ConnectionDraft>({
     name: connection?.name ?? '',
     description: connection?.description ?? '',
     url: text(config, 'url'),
@@ -496,30 +725,16 @@ function ConnectionForm({
     forcePathStyle: config.forcePathStyle === true,
     secretEnvVar: connection?.secretEnvVar ?? '',
   });
+  const update: UpdateDraft = (patch) => setDraft({ ...draft, ...patch });
 
   const save = useMutation({
     mutationFn: () => {
-      // Only the fields this kind reads. Carrying the rest would leave a stale
-      // bucket on an HTTP connection, which reads as configuration somebody
-      // meant rather than a leftover from a dropdown they changed.
-      const next: Record<string, unknown> =
-        kind === 's3'
-          ? {
-              bucket: draft.bucket,
-              ...(draft.endpoint ? { endpoint: draft.endpoint } : {}),
-              ...(draft.region ? { region: draft.region } : {}),
-              ...(draft.forcePathStyle ? { forcePathStyle: true } : {}),
-            }
-          : draft.url
-            ? { url: draft.url }
-            : {};
-
       const input: ConnectionInput = {
         id: connection?.id,
         name: draft.name.trim(),
         description: draft.description.trim() || undefined,
         kind,
-        config: next,
+        config: connectionConfigFor(kind, draft),
         secretEnvVar: draft.secretEnvVar.trim() || undefined,
       };
       return client.saveConnection(input);
@@ -527,14 +742,7 @@ function ConnectionForm({
     onSuccess: onSaved,
   });
 
-  const incomplete =
-    draft.name.trim().length === 0 ||
-    (kind === 's3' && draft.bucket.trim().length === 0) ||
-    (kind === 'http' && draft.url.trim().length === 0) ||
-    // A SQL connection needs one of the two, and neither is more correct: the
-    // variable is the right answer in a deployment, the inline URL is the one
-    // that gets somebody running locally in a minute.
-    (kind === 'sql' && draft.url.trim().length === 0 && draft.secretEnvVar.trim().length === 0);
+  const incomplete = connectionIsIncomplete(kind, draft);
 
   return (
     <form
@@ -548,13 +756,13 @@ function ConnectionForm({
         <TextField
           label="Name"
           value={draft.name}
-          onChange={(name) => setDraft({ ...draft, name })}
+          onChange={(name) => update({ name })}
           placeholder="Fleet warehouse"
         />
         <TextField
           label="Description"
           value={draft.description}
-          onChange={(description) => setDraft({ ...draft, description })}
+          onChange={(description) => update({ description })}
           placeholder="What lives behind it (optional)"
         />
         <SelectField
@@ -566,84 +774,7 @@ function ConnectionForm({
         />
       </div>
 
-      {kind === 'http' && (
-        <TextField
-          label="URL"
-          value={draft.url}
-          onChange={(url) => setDraft({ ...draft, url })}
-          placeholder="https://api.example.mil/v1"
-          hint="The base the connectors reading through this will hang their paths off."
-        />
-      )}
-
-      {kind === 'sql' && (
-        <FieldGroup
-          title="Address"
-          hint="Name the variable holding the connection URL — that is the whole credential for most databases, so the catalog stores its name and never its value. The inline URL is here for local work."
-        >
-          <div className="grid gap-3 sm:grid-cols-2">
-            <TextField
-              label="URL (optional)"
-              value={draft.url}
-              onChange={(url) => setDraft({ ...draft, url })}
-              placeholder="mysql://user:pass@host/db"
-            />
-            <TextField
-              label="Env var holding the URL"
-              value={draft.secretEnvVar}
-              onChange={(secretEnvVar) => setDraft({ ...draft, secretEnvVar })}
-              placeholder="FLEET_DATABASE_URL"
-            />
-          </div>
-        </FieldGroup>
-      )}
-
-      {kind === 's3' && (
-        <FieldGroup title="Bucket">
-          <div className="grid gap-3 sm:grid-cols-2">
-            <TextField
-              label="Bucket"
-              value={draft.bucket}
-              onChange={(bucket) => setDraft({ ...draft, bucket })}
-              placeholder="fleet-drops"
-            />
-            <TextField
-              label="Region"
-              value={draft.region}
-              onChange={(region) => setDraft({ ...draft, region })}
-              placeholder="Blank uses the environment's"
-            />
-            <TextField
-              label="Endpoint"
-              value={draft.endpoint}
-              onChange={(endpoint) => setDraft({ ...draft, endpoint })}
-              placeholder="MinIO, e.g. http://localhost:9000"
-            />
-            <TextField
-              label="Env var holding accessKeyId:secretAccessKey"
-              value={draft.secretEnvVar}
-              onChange={(secretEnvVar) => setDraft({ ...draft, secretEnvVar })}
-              placeholder="Optional"
-              hint="Leave blank anywhere the pod has its own role — those credentials rotate, and a static pair named here would not."
-            />
-          </div>
-          <Switch
-            checked={draft.forcePathStyle}
-            onCheckedChange={(forcePathStyle) => setDraft({ ...draft, forcePathStyle })}
-            label="Path-style addressing"
-            hint="MinIO needs it; AWS does not."
-          />
-        </FieldGroup>
-      )}
-
-      {kind === 'http' && (
-        <TextField
-          label="Credential env var"
-          value={draft.secretEnvVar}
-          onChange={(secretEnvVar) => setDraft({ ...draft, secretEnvVar })}
-          placeholder="Optional — sent as a bearer token"
-        />
-      )}
+      <ConnectionKindFields kind={kind} draft={draft} update={update} />
 
       <div className="flex items-center gap-2">
         <button

@@ -170,7 +170,8 @@ export async function ensureCatalogClickHouseSchema(client: ClickHouseClient): P
   logger.log(`Schema ready for ${catalogClickHouseManagedTables().join(', ')}`);
 }
 
-const SNAPSHOT_COLUMNS = `\`type_name\`, \`snapshot_id\`, \`principal_id\`, \`row_count\`, \`committed\`, \`created_at\`, \`committed_at\`, \`labels\``;
+const SNAPSHOT_COLUMNS =
+  '`type_name`, `snapshot_id`, `principal_id`, `row_count`, `committed`, `created_at`, `committed_at`, `labels`';
 
 /**
  * Write the current state of a snapshot row.

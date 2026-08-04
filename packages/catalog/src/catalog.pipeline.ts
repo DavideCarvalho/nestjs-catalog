@@ -678,7 +678,51 @@ export function validateWorkflow(graph: WorkflowGraph): WorkflowValidationIssue[
     ];
   }
 
+  const byId = collectNodesById(nodes, issues);
+  checkEdges(edges, byId, issues);
+
+  // Reachability and cycles are only meaningful once the graph is structurally
+  // sound. See the note on this function.
+  if (issues.length > 0) return issues;
+
+  const { outgoing, incoming } = buildAdjacency(nodes, edges);
+  const sources = nodes.filter((node) => node.kind === 'source');
+  const sinks = nodes.filter((node): node is WorkflowSinkNode => node.kind === 'sink');
+
+  checkNodeWiring(nodes, incoming, outgoing, issues);
+  checkEndpoints(sources, sinks, issues);
+
+  const looped = findCycle(nodes, incoming, outgoing);
+  if (looped) {
+    issues.push({
+      code: 'cycle',
+      nodeIds: looped,
+      message: `These nodes form a cycle: ${looped.join(' → ')}. A graph that loops has no order to run in and no point at which the load is finished, so it is refused rather than run until something times out.`,
+    });
+    // Reachability over a cyclic graph reports nodes as unreachable that are
+    // only unreachable *because* of the cycle, which points at the wrong boxes.
+    return issues;
+  }
+
+  checkReachability(nodes, sources, sinks, incoming, outgoing, issues);
+
+  return issues;
+}
+
+/**
+ * Index the nodes by id, reporting the ids that cannot be used as one.
+ *
+ * A node with an unusable id is still indexed, deliberately. Leaving it out
+ * would make every edge touching it report a *missing node* as well, which
+ * sends the reader looking for a node they can see on the canvas. One problem,
+ * one message.
+ */
+function collectNodesById(
+  nodes: readonly WorkflowNode[],
+  issues: WorkflowValidationIssue[],
+): Map<string, WorkflowNode> {
   const byId = new Map<string, WorkflowNode>();
+
   for (const node of nodes) {
     if (!WORKFLOW_NODE_ID_PATTERN.test(node.id)) {
       issues.push({
@@ -686,9 +730,6 @@ export function validateWorkflow(graph: WorkflowGraph): WorkflowValidationIssue[
         nodeIds: [node.id],
         message: `Node id "${node.id}" is not usable. Ids may be 1-64 characters of letters, digits, underscore or hyphen: the id becomes a durable step name and part of the key its staged rows are stored under, and neither can carry arbitrary text safely.`,
       });
-      // Registered anyway, deliberately. Leaving it out would make every edge
-      // touching it report a *missing node* as well, which sends the reader
-      // looking for a node they can see on the canvas. One problem, one message.
     }
     if (byId.has(node.id)) {
       issues.push({
@@ -701,7 +742,17 @@ export function validateWorkflow(graph: WorkflowGraph): WorkflowValidationIssue[
     byId.set(node.id, node);
   }
 
+  return byId;
+}
+
+/** Wires that name a node which is not there, loop back on themselves, or repeat. */
+function checkEdges(
+  edges: readonly WorkflowEdge[],
+  byId: ReadonlyMap<string, WorkflowNode>,
+  issues: WorkflowValidationIssue[],
+): void {
   const seenEdges = new Set<string>();
+
   for (const edge of edges) {
     if (!byId.has(edge.from) || !byId.has(edge.to)) {
       const missing = byId.has(edge.from) ? edge.to : edge.from;
@@ -731,13 +782,16 @@ export function validateWorkflow(graph: WorkflowGraph): WorkflowValidationIssue[
     }
     seenEdges.add(key);
   }
+}
 
-  // Reachability and cycles are only meaningful once the graph is structurally
-  // sound. See the note on this function.
-  if (issues.length > 0) return issues;
-
+/** Both directions of the edge list, with an entry for every node. */
+function buildAdjacency(
+  nodes: readonly WorkflowNode[],
+  edges: readonly WorkflowEdge[],
+): { outgoing: Map<string, string[]>; incoming: Map<string, string[]> } {
   const outgoing = new Map<string, string[]>();
   const incoming = new Map<string, string[]>();
+
   for (const node of nodes) {
     outgoing.set(node.id, []);
     incoming.set(node.id, []);
@@ -747,12 +801,17 @@ export function validateWorkflow(graph: WorkflowGraph): WorkflowValidationIssue[
     incoming.get(edge.to)?.push(edge.from);
   }
 
-  const sources: WorkflowNode[] = [];
-  const sinks: WorkflowSinkNode[] = [];
-  for (const node of nodes) {
-    if (node.kind === 'source') sources.push(node);
-    if (node.kind === 'sink') sinks.push(node);
+  return { outgoing, incoming };
+}
 
+/** What each kind of node may and may not have wired to it. */
+function checkNodeWiring(
+  nodes: readonly WorkflowNode[],
+  incoming: ReadonlyMap<string, string[]>,
+  outgoing: ReadonlyMap<string, string[]>,
+  issues: WorkflowValidationIssue[],
+): void {
+  for (const node of nodes) {
     if (node.kind === 'source' && (incoming.get(node.id)?.length ?? 0) > 0) {
       issues.push({
         code: 'source-has-input',
@@ -775,7 +834,25 @@ export function validateWorkflow(graph: WorkflowGraph): WorkflowValidationIssue[
       });
     }
   }
+}
 
+/**
+ * That the graph has both ends, and that no two sinks claim the same type.
+ *
+ * Several sinks are allowed, and the reason is the point of having a graph at
+ * all: one expensive read feeding several outputs. Forbidding it would mean
+ * pulling the same ten million rows twice to derive two types from them.
+ *
+ * What is refused is two sinks writing the *same* type. Each sink commits its
+ * own type independently — there is no distributed transaction here and the
+ * model does not pretend otherwise — but two snapshots of one type in one run
+ * leaves nothing to say which of them the readers should get.
+ */
+function checkEndpoints(
+  sources: readonly WorkflowNode[],
+  sinks: readonly WorkflowSinkNode[],
+  issues: WorkflowValidationIssue[],
+): void {
   if (sources.length === 0) {
     issues.push({
       code: 'no-source',
@@ -794,14 +871,6 @@ export function validateWorkflow(graph: WorkflowGraph): WorkflowValidationIssue[
     });
   }
 
-  // Several sinks are allowed, and the reason is the point of having a graph at
-  // all: one expensive read feeding several outputs. Forbidding it would mean
-  // pulling the same ten million rows twice to derive two types from them.
-  //
-  // What is refused is two sinks writing the *same* type. Each sink commits its
-  // own type independently — there is no distributed transaction here and the
-  // model does not pretend otherwise — but two snapshots of one type in one run
-  // leaves nothing to say which of them the readers should get.
   const byTargetType = new Map<string, WorkflowSinkNode[]>();
   for (const sink of sinks) {
     const sharing = byTargetType.get(sink.targetType) ?? [];
@@ -820,15 +889,26 @@ export function validateWorkflow(graph: WorkflowGraph): WorkflowValidationIssue[
         )} both commit ${targetType}. Two snapshots of one type in a single run leaves nothing to say which one readers should get — wire these branches into one sink, or send them to different types.`,
     });
   }
+}
 
-  // Cycles, by Kahn's algorithm: whatever is left with a non-zero in-degree
-  // after the queue drains is on one.
+/**
+ * The nodes actually on a cycle, or nothing if the graph is acyclic.
+ *
+ * Kahn's algorithm: whatever is left with a non-zero in-degree after the queue
+ * drains is on one.
+ */
+function findCycle(
+  nodes: readonly WorkflowNode[],
+  incoming: ReadonlyMap<string, string[]>,
+  outgoing: ReadonlyMap<string, string[]>,
+): string[] | undefined {
   const indegree = new Map<string, number>();
   for (const node of nodes) {
     indegree.set(node.id, incoming.get(node.id)?.length ?? 0);
   }
   const queue = nodes.filter((node) => indegree.get(node.id) === 0).map((n) => n.id);
   const ordered: string[] = [];
+
   while (queue.length > 0) {
     const id = queue.shift();
     if (id === undefined) break;
@@ -839,37 +919,48 @@ export function validateWorkflow(graph: WorkflowGraph): WorkflowValidationIssue[
       if (remaining === 0) queue.push(next);
     }
   }
-  if (ordered.length !== nodes.length) {
-    // What Kahn's algorithm leaves behind is the cycle *plus* everything
-    // downstream of it, because those never had their in-degree resolved
-    // either. Naming all of it would point at nodes that are perfectly well
-    // wired and merely stuck behind the loop, and a message that names the
-    // wrong node is worse than a vague one. Peeling off nodes with no outgoing
-    // edge inside the leftover set, repeatedly, strips exactly those tails and
-    // leaves the nodes actually on the loop.
-    const stuck = new Set(
-      nodes.filter((node) => !ordered.includes(node.id)).map((node) => node.id),
-    );
-    for (let peeled = true; peeled; ) {
-      peeled = false;
-      for (const id of stuck) {
-        const continues = (outgoing.get(id) ?? []).some((next) => stuck.has(next));
-        if (continues) continue;
-        stuck.delete(id);
-        peeled = true;
-      }
-    }
-    const looped = [...stuck];
-    issues.push({
-      code: 'cycle',
-      nodeIds: looped,
-      message: `These nodes form a cycle: ${looped.join(' → ')}. A graph that loops has no order to run in and no point at which the load is finished, so it is refused rather than run until something times out.`,
-    });
-    // Reachability over a cyclic graph reports nodes as unreachable that are
-    // only unreachable *because* of the cycle, which points at the wrong boxes.
-    return issues;
-  }
+  if (ordered.length === nodes.length) return undefined;
 
+  const leftover = new Set(
+    nodes.filter((node) => !ordered.includes(node.id)).map((node) => node.id),
+  );
+  return [...peelTails(leftover, outgoing)];
+}
+
+/**
+ * Strip the nodes that are merely stuck behind a loop, leaving the loop itself.
+ *
+ * What Kahn's algorithm leaves behind is the cycle *plus* everything downstream
+ * of it, because those never had their in-degree resolved either. Naming all of
+ * it would point at nodes that are perfectly well wired and merely waiting on
+ * the loop, and a message that names the wrong node is worse than a vague one.
+ * Removing nodes with no outgoing edge *inside the set*, repeatedly, strips
+ * exactly those tails: a node on the cycle always has one.
+ *
+ * Mutates and returns the set it was given, which is a local built for this.
+ */
+function peelTails(leftover: Set<string>, outgoing: ReadonlyMap<string, string[]>): Set<string> {
+  for (let peeled = true; peeled; ) {
+    peeled = false;
+    for (const id of leftover) {
+      const continues = (outgoing.get(id) ?? []).some((next) => leftover.has(next));
+      if (continues) continue;
+      leftover.delete(id);
+      peeled = true;
+    }
+  }
+  return leftover;
+}
+
+/** Nodes that no source reaches, and nodes that reach no sink. */
+function checkReachability(
+  nodes: readonly WorkflowNode[],
+  sources: readonly WorkflowNode[],
+  sinks: readonly WorkflowSinkNode[],
+  incoming: Map<string, string[]>,
+  outgoing: Map<string, string[]>,
+  issues: WorkflowValidationIssue[],
+): void {
   const reachableFromSources = walk(
     sources.map((node) => node.id),
     outgoing,
@@ -896,8 +987,6 @@ export function validateWorkflow(graph: WorkflowGraph): WorkflowValidationIssue[
       });
     }
   }
-
-  return issues;
 }
 
 /** Breadth-first reachability over one adjacency map. */
@@ -939,16 +1028,13 @@ export function workflowRunOrder(
   }
 
   const byId = new Map(graph.nodes.map((node) => [node.id, node]));
-  const indegree = new Map<string, number>();
-  const outgoing = new Map<string, string[]>();
-  for (const node of graph.nodes) {
-    indegree.set(node.id, 0);
-    outgoing.set(node.id, []);
-  }
-  for (const edge of graph.edges) {
-    indegree.set(edge.to, (indegree.get(edge.to) ?? 0) + 1);
-    outgoing.get(edge.from)?.push(edge.to);
-  }
+  // The same adjacency the validator walks, from the same builder. Two copies of
+  // "what is wired into what" is exactly how a graph that validated comes out
+  // executing differently, which is the thing this function's contract rules out.
+  const { outgoing, incoming } = buildAdjacency(graph.nodes, graph.edges);
+  const indegree = new Map(
+    graph.nodes.map((node) => [node.id, incoming.get(node.id)?.length ?? 0]),
+  );
 
   const ready = graph.nodes.filter((node) => indegree.get(node.id) === 0).map((node) => node.id);
   const order: Array<{ node: WorkflowNode; inputs: string[] }> = [];
@@ -959,9 +1045,9 @@ export function workflowRunOrder(
     if (!node) continue;
     // Edge order, not node order: this is the array a merge reads its inputs
     // from, and it is part of the fingerprint precisely because it is visible in
-    // the output.
-    const inputs = graph.edges.filter((edge) => edge.to === id).map((edge) => edge.from);
-    order.push({ node, inputs });
+    // the output. `buildAdjacency` fills `incoming` by walking the edges in
+    // order, so that is what this already is.
+    order.push({ node, inputs: [...(incoming.get(id) ?? [])] });
     for (const next of outgoing.get(id) ?? []) {
       const remaining = (indegree.get(next) ?? 0) - 1;
       indegree.set(next, remaining);

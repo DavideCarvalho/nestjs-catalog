@@ -3,7 +3,11 @@ import type { EntityClass, EntityMetadata, EntityProperty } from '@mikro-orm/cor
 // the emitted `design:paramtypes`, which a type-only import erases.
 import { MikroORM } from '@mikro-orm/core';
 import { Inject, Injectable, Logger, type OnModuleInit } from '@nestjs/common';
-import { readPropertyOptions, readTypeOptions } from './catalog.decorators';
+import {
+  type CatalogPropertyOptions,
+  readPropertyOptions,
+  readTypeOptions,
+} from './catalog.decorators';
 import { emitCatalog } from './catalog.events';
 import { CATALOG_OPTIONS, type CatalogModuleOptions } from './catalog.options';
 import type { CatalogOverlayStore } from './catalog.overlay-store';
@@ -315,11 +319,12 @@ export class MikroOrmCatalogRegistry extends CatalogRegistry implements OnModule
 
       const fromDecorator = declaredProps[prop.name];
       const fromOverlay = overlayProps[prop.name];
-      const displayName =
-        fromOverlay?.displayName ?? fromDecorator?.displayName ?? humanize(prop.name);
-      const description = fromOverlay?.description ?? fromDecorator?.description;
-      const hidden = fromOverlay?.hidden ?? fromDecorator?.hidden ?? false;
-      const order = fromOverlay?.order ?? fromDecorator?.order ?? index;
+      const { displayName, description, hidden, order } = resolveFieldPresentation(
+        prop.name,
+        index,
+        fromDecorator,
+        fromOverlay,
+      );
 
       if (isRelationKind(prop.kind)) {
         relations.push({
@@ -376,4 +381,26 @@ export class MikroOrmCatalogRegistry extends CatalogRegistry implements OnModule
       relations,
     };
   }
+}
+
+/**
+ * How one field is presented, resolved across the tiers.
+ *
+ * Overlay beats decorator beats a derived default, the same precedence the
+ * type-level fields use. Split out of `buildType` because it is the one job in
+ * that loop which is identical whether the field turns out to be a scalar or a
+ * relation — both branches consume exactly this.
+ */
+function resolveFieldPresentation(
+  name: string,
+  index: number,
+  fromDecorator: CatalogPropertyOptions | undefined,
+  fromOverlay: CatalogPropertyOptions | undefined,
+): { displayName: string; description?: string; hidden: boolean; order: number } {
+  return {
+    displayName: fromOverlay?.displayName ?? fromDecorator?.displayName ?? humanize(name),
+    description: fromOverlay?.description ?? fromDecorator?.description,
+    hidden: fromOverlay?.hidden ?? fromDecorator?.hidden ?? false,
+    order: fromOverlay?.order ?? fromDecorator?.order ?? index,
+  };
 }

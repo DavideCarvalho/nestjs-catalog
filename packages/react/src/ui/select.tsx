@@ -143,14 +143,32 @@ export function Select({
 export function SelectField({
   label,
   hint,
+  ariaLabel,
   ...props
-}: Parameters<typeof Select>[0] & { label: string; hint?: ReactNode }) {
+}: Omit<Parameters<typeof Select>[0], 'ariaLabel'> & {
+  label: string;
+  hint?: ReactNode;
+  /**
+   * The accessible name, when it should differ from the visible one.
+   *
+   * Defaults to `label`, so the common case cannot forget it. Overriding is
+   * for the case the call sites already use deliberately: a visible "Kind"
+   * reads fine beside the fields around it, while a screen reader announcing
+   * "Kind" alone has nothing to go on and wants "Connection kind".
+   */
+  ariaLabel?: string;
+}) {
   return (
+    // `Select` renders a BUTTON, and a label does not implicitly name a button —
+    // which is why `Select` requires an accessible name of its own and is given
+    // one below. This element is the visible caption and the layout wrapper; the
+    // naming is done by `ariaLabel`.
+    // biome-ignore lint/a11y/noLabelWithoutControl: see above
     <label className="block">
       <span className="mb-1 block font-mono text-[10px] uppercase tracking-[0.14em] text-zinc-400 dark:text-zinc-500">
         {label}
       </span>
-      <Select {...props} />
+      <Select {...props} ariaLabel={ariaLabel ?? label} />
       {hint && (
         <span className="mt-1 block text-[11px] text-zinc-400 dark:text-zinc-500">{hint}</span>
       )}

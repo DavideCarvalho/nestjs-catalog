@@ -42,7 +42,7 @@ import {
 } from './source-fields';
 import { ConfirmDialog } from './ui/dialog';
 import { TextField } from './ui/field';
-import { SelectField } from './ui/select';
+import { SelectField, type SelectOption } from './ui/select';
 import { Switch } from './ui/switch';
 import { Tabs, TabsList, TabsPanel, TabsTab } from './ui/tabs';
 import { Tooltip, TooltipProvider } from './ui/tooltip';
@@ -285,37 +285,53 @@ function ConnectorList({ canEdit }: { canEdit: boolean }) {
  * with a blank subtitle — the card said a connector existed and nothing about
  * where it pointed, which is the one thing the list is for.
  */
+/** Read a string out of a stored config without believing it is one. */
+function configText(config: Record<string, unknown>, key: string): string {
+  const value = config[key];
+  return typeof value === 'string' ? value : '';
+}
+
+/** A prefix under a shared bucket, or a bucket of this connector's own. */
+function describeS3Source(config: Record<string, unknown>, via: string): string {
+  if (via) return `${via}${configText(config, 'prefix') || '(whole bucket)'}`;
+  const bucket = configText(config, 'bucket');
+  if (!bucket) return 'no bucket configured';
+  return `s3://${bucket}/${configText(config, 'prefix')}`;
+}
+
+/** The query, shortened to fit a line, plus the watermark when it reads incrementally. */
+function describeSqlSource(config: Record<string, unknown>, via: string): string {
+  const watermark = configText(config, 'watermarkColumn');
+  const query = configText(config, 'query').replace(/\s+/g, ' ').trim();
+  const shown = query.length > 70 ? `${query.slice(0, 70)}…` : query;
+  return `${via}${watermark ? `${shown} · since ${watermark}` : shown}`;
+}
+
+/** A path under a shared base URL, or a full URL of this connector's own. */
+function describeHttpSource(config: Record<string, unknown>, via: string): string {
+  const path = configText(config, 'path');
+  if (via) return `${via}${path || '/'}`;
+  return `${configText(config, 'url')}${path ? ` · ${path}` : ''}`;
+}
+
 function describeSource(connector: CatalogConnector, connection?: CatalogConnection): string {
   const config = connector.config ?? {};
-  const text = (key: string): string => (typeof config[key] === 'string' ? config[key] : '');
 
   // The connection's name first, because when one is in use it is the answer to
   // "where does this read from" and the connector's own config is only the part
   // specific to this load.
   const via = connection ? `${connection.name} · ` : '';
 
-  if (connector.kind === 's3') {
-    const bucket = text('bucket');
-    if (connection) return `${via}${text('prefix') || '(whole bucket)'}`;
-    if (!bucket) return 'no bucket configured';
-    return `s3://${bucket}/${text('prefix')}`;
-  }
-  if (connector.kind === 'sql') {
-    const watermark = text('watermarkColumn');
-    const query = text('query').replace(/\s+/g, ' ').trim();
-    const shown = query.length > 70 ? `${query.slice(0, 70)}…` : query;
-    return `${via}${watermark ? `${shown} · since ${watermark}` : shown}`;
-  }
+  if (connector.kind === 's3') return describeS3Source(config, via);
+  if (connector.kind === 'sql') return describeSqlSource(config, via);
   if (connector.kind === 'file') {
-    return text('path') || text('url') || 'no path configured';
+    return configText(config, 'path') || configText(config, 'url') || 'no path configured';
   }
   if (connector.kind === 'inline') {
     const records = config.records;
     return `${Array.isArray(records) ? records.length : 0} pasted records`;
   }
-  const path = text('path');
-  if (connection) return `${via}${path || '/'}`;
-  return `${text('url')}${path ? ` · ${path}` : ''}`;
+  return describeHttpSource(config, via);
 }
 
 function ConnectorCard({
@@ -514,6 +530,96 @@ function ConnectorCard({
   );
 }
 
+/**
+ * The connection picker, above the address fields it replaces.
+ *
+ * Offered rather than required: a one-off source does not deserve a second
+ * object to manage, and forcing one would make the quickest thing this screen
+ * can do — paste a URL, load it once — the slowest.
+ */
+function ConnectionPicker({
+  value,
+  options,
+  viaConnection,
+  onChange,
+}: {
+  value: string;
+  options: SelectOption[];
+  viaConnection: boolean;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <SelectField
+      label="Read through"
+      ariaLabel="Connection"
+      value={value}
+      onValueChange={onChange}
+      options={[
+        {
+          value: INLINE_CONNECTION,
+          label: 'Configure the address here',
+          hint: 'This connector alone',
+        },
+        ...options,
+      ]}
+      hint={connectionPickerHint(options.length, viaConnection)}
+    />
+  );
+}
+
+/** Why the picker looks the way it does — nothing to choose, or something chosen. */
+function connectionPickerHint(optionCount: number, viaConnection: boolean): string | undefined {
+  if (optionCount === 0) {
+    return 'No connections of this kind yet. One is worth making when a second connector needs the same address.';
+  }
+  if (viaConnection) {
+    return 'The connection supplies the address and the credential. What stays below is only what is specific to this load.';
+  }
+  return undefined;
+}
+
+/** Save and cancel, plus whatever the server said when saving failed. */
+function ConnectorFormActions({
+  editing,
+  pending,
+  incomplete,
+  error,
+  onClose,
+}: {
+  editing: boolean;
+  pending: boolean;
+  incomplete: boolean;
+  error: unknown;
+  onClose: () => void;
+}) {
+  return (
+    <>
+      <div className="flex items-center gap-2">
+        <button
+          type="submit"
+          disabled={pending || incomplete}
+          className="rounded-md bg-zinc-950 px-3 py-1.5 text-xs text-zinc-50 disabled:opacity-40 dark:bg-zinc-100 dark:text-zinc-950"
+        >
+          {pending ? 'Saving…' : editing ? 'Save changes' : 'Save connector'}
+        </button>
+        <button
+          type="button"
+          onClick={onClose}
+          className={cn('rounded-md px-3 py-1.5 text-xs', MUTED)}
+        >
+          Cancel
+        </button>
+      </div>
+
+      {error ? (
+        <p className="text-[11px] text-red-600">
+          {error instanceof Error ? error.message : 'Could not save.'}
+        </p>
+      ) : null}
+    </>
+  );
+}
+
 function ConnectorForm({
   connector,
   transforms,
@@ -627,34 +733,12 @@ function ConnectorForm({
         />
       </div>
 
-      {/*
-       * The connection picker, above the address fields it replaces.
-       *
-       * Offered rather than required: a one-off source does not deserve a second
-       * object to manage, and forcing one would make the quickest thing this
-       * screen can do — paste a URL, load it once — the slowest.
-       */}
       {usesConnection(kind) && (
-        <SelectField
-          label="Read through"
-          ariaLabel="Connection"
+        <ConnectionPicker
           value={chosenConnection}
-          onValueChange={setConnectionId}
-          options={[
-            {
-              value: INLINE_CONNECTION,
-              label: 'Configure the address here',
-              hint: 'This connector alone',
-            },
-            ...connectionOptions,
-          ]}
-          hint={
-            connectionOptions.length === 0
-              ? 'No connections of this kind yet. One is worth making when a second connector needs the same address.'
-              : viaConnection
-                ? 'The connection supplies the address and the credential. What stays below is only what is specific to this load.'
-                : undefined
-          }
+          options={connectionOptions}
+          viaConnection={viaConnection}
+          onChange={setConnectionId}
         />
       )}
 
@@ -703,28 +787,13 @@ function ConnectorForm({
         hint="A disabled connector keeps its configuration and its watermark, and refuses to run."
       />
 
-      <div className="flex items-center gap-2">
-        <button
-          type="submit"
-          disabled={save.isPending || incomplete}
-          className="rounded-md bg-zinc-950 px-3 py-1.5 text-xs text-zinc-50 disabled:opacity-40 dark:bg-zinc-100 dark:text-zinc-950"
-        >
-          {save.isPending ? 'Saving…' : connector ? 'Save changes' : 'Save connector'}
-        </button>
-        <button
-          type="button"
-          onClick={onClose}
-          className={cn('rounded-md px-3 py-1.5 text-xs', MUTED)}
-        >
-          Cancel
-        </button>
-      </div>
-
-      {save.error && (
-        <p className="text-[11px] text-red-600">
-          {save.error instanceof Error ? save.error.message : 'Could not save.'}
-        </p>
-      )}
+      <ConnectorFormActions
+        editing={connector !== undefined}
+        pending={save.isPending}
+        incomplete={incomplete}
+        error={save.error}
+        onClose={onClose}
+      />
     </form>
   );
 }

@@ -358,18 +358,7 @@ export class MySqlPipelineStore
 
     const em = this.em.fork();
 
-    // Referential checks are separate from `validateWorkflow` because they need
-    // the database, and keeping them out of the pure validator is what lets the
-    // canvas run it in the browser at all.
-    for (const node of nodes) {
-      if (node.kind !== 'transform') continue;
-      const transform = await em.findOne(TransformRow, { id: node.transformId });
-      if (!transform) {
-        throw new BadRequestException(
-          `Node "${node.name}" (${node.id}) runs transform ${node.transformId}, which does not exist. Saving it would leave a graph that fails partway through a load rather than at the moment it was drawn.`,
-        );
-      }
-    }
+    await assertTransformsExist(em, nodes);
 
     // Validation guarantees exactly one sink, so this find cannot be ambiguous
     // and cannot be absent.
@@ -694,6 +683,27 @@ function toRun(row: ConnectorRunRow): ConnectorRun {
 }
 
 /**
+ * Every transform node points at a transform that exists.
+ *
+ * Kept out of `validateWorkflow` because it needs the database, and keeping the
+ * validator pure is exactly what lets the canvas run the same rules in the
+ * browser. Checked node by node rather than with one `IN` query so the refusal
+ * can name the node the author is looking at, which is the difference between a
+ * fixable message and a list of ids.
+ */
+async function assertTransformsExist(em: EntityManager, nodes: WorkflowNode[]): Promise<void> {
+  for (const node of nodes) {
+    if (node.kind !== 'transform') continue;
+    const transform = await em.findOne(TransformRow, { id: node.transformId });
+    if (!transform) {
+      throw new BadRequestException(
+        `Node "${node.name}" (${node.id}) runs transform ${node.transformId}, which does not exist. Saving it would leave a graph that fails partway through a load rather than at the moment it was drawn.`,
+      );
+    }
+  }
+}
+
+/**
  * Read the per-node record back, dropping anything malformed.
  *
  * The one place in this file that falls back rather than throwing, and the
@@ -709,24 +719,38 @@ function toNodeOutcomes(
   if (!value) return undefined;
   const outcomes: Record<string, WorkflowNodeOutcome> = {};
   for (const [nodeId, raw] of Object.entries(value)) {
-    if (typeof raw !== 'object' || raw === null) continue;
-    const status = Reflect.get(raw, 'status');
-    const rows = Reflect.get(raw, 'rows');
-    if (status !== 'succeeded' && status !== 'failed' && status !== 'skipped') {
-      continue;
-    }
-    const transformVersion = Reflect.get(raw, 'transformVersion');
-    const elapsedMs = Reflect.get(raw, 'elapsedMs');
-    const error = Reflect.get(raw, 'error');
-    outcomes[nodeId] = {
-      status,
-      rows: typeof rows === 'number' ? rows : 0,
-      transformVersion: typeof transformVersion === 'number' ? transformVersion : undefined,
-      elapsedMs: typeof elapsedMs === 'number' ? elapsedMs : undefined,
-      error: typeof error === 'string' ? error : undefined,
-    };
+    const outcome = toNodeOutcome(raw);
+    if (outcome !== undefined) outcomes[nodeId] = outcome;
   }
   return outcomes;
+}
+
+/**
+ * One node's outcome, or `undefined` if it is not one.
+ *
+ * `status` is the only field that can reject the entry: it is what a panel
+ * groups and counts by, so an unrecognised value would show up as a fourth
+ * status nobody has a colour for. Every other field degrades to a default,
+ * because a missing `elapsedMs` costs a column in one row and dropping the
+ * whole outcome over it would lose the status too.
+ */
+function toNodeOutcome(raw: unknown): WorkflowNodeOutcome | undefined {
+  if (typeof raw !== 'object' || raw === null) return undefined;
+  const status = Reflect.get(raw, 'status');
+  const rows = Reflect.get(raw, 'rows');
+  if (status !== 'succeeded' && status !== 'failed' && status !== 'skipped') {
+    return undefined;
+  }
+  const transformVersion = Reflect.get(raw, 'transformVersion');
+  const elapsedMs = Reflect.get(raw, 'elapsedMs');
+  const error = Reflect.get(raw, 'error');
+  return {
+    status,
+    rows: typeof rows === 'number' ? rows : 0,
+    transformVersion: typeof transformVersion === 'number' ? transformVersion : undefined,
+    elapsedMs: typeof elapsedMs === 'number' ? elapsedMs : undefined,
+    error: typeof error === 'string' ? error : undefined,
+  };
 }
 
 /**

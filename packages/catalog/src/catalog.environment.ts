@@ -636,15 +636,63 @@ export function planPromotion(input: {
   now?: () => Date;
 }): CatalogPromotionPlan {
   const { from, to, source, target } = input;
-  const changes: CatalogPromotionChange[] = [];
-  const blockers: CatalogPromotionBlocker[] = [];
-  const withheld: CatalogPromotionWithheld[] = [];
 
   const selected = (kind: PromotableKind, id: string): boolean =>
     input.select === undefined || input.select.includes(`${kind}:${id}`);
 
-  // --- The model -------------------------------------------------------------
+  // The order changes are listed in is the order they must be applied. Workflows
+  // come before connectors deliberately: a connector arriving before the graph it
+  // runs would point at nothing for as long as the apply takes.
+  const changes: CatalogPromotionChange[] = [
+    ...planObjectTypes(source, target, selected),
+    ...planTransforms(source, target, selected),
+    ...planWorkflows(source, target, to, selected),
+  ];
+
+  // Connectors last, and given what came before: whether a connector's transform
+  // or workflow is acceptable depends on what this same promotion is carrying.
+  const connectors = planConnectors({ source, target, from, to, selected, earlier: changes });
+  changes.push(...connectors.changes);
+
+  const createdAt = (input.now?.() ?? new Date()).toISOString();
+  return {
+    from,
+    to,
+    createdAt,
+    changes,
+    blockers: connectors.blockers,
+    withheld: connectors.withheld,
+    fingerprint: fingerprintOf(from, to, changes, connectors.blockers),
+  };
+}
+
+/** Whether one promotable thing is in the operator's selection. */
+type PromotionSelector = (kind: PromotableKind, id: string) => boolean;
+
+/**
+ * What a promotion does to one thing: creates it, updates it, or nothing.
+ *
+ * One definition rather than four copies of the same nested ternary, because
+ * "unchanged" is what the summary counts and the fingerprint filters on, and
+ * the four kinds disagreeing about it would be invisible until it mattered.
+ */
+function actionFor(
+  existing: unknown,
+  fields: readonly PromotionFieldDiff[],
+): CatalogPromotionChange['action'] {
+  if (!existing) return 'create';
+  return fields.length ? 'update' : 'unchanged';
+}
+
+/** The model. A created type brings its table, and never its rows. */
+function planObjectTypes(
+  source: CatalogPromotableSet,
+  target: CatalogPromotableSet,
+  selected: PromotionSelector,
+): CatalogPromotionChange[] {
   const targetTypes = new Map(target.objectTypes.map((t) => [t.name, t]));
+  const changes: CatalogPromotionChange[] = [];
+
   for (const type of source.objectTypes) {
     if (!selected('objectType', type.name)) continue;
     const existing = targetTypes.get(type.name);
@@ -653,7 +701,7 @@ export function planPromotion(input: {
       kind: 'objectType',
       id: type.name,
       name: type.displayName,
-      action: existing ? (fields.length ? 'update' : 'unchanged') : 'create',
+      action: actionFor(existing, fields),
       fields,
       notes: existing
         ? []
@@ -665,8 +713,18 @@ export function planPromotion(input: {
     });
   }
 
-  // --- Transforms ------------------------------------------------------------
+  return changes;
+}
+
+/** Transforms. The target bumps its own version; see the note on `planPromotion`. */
+function planTransforms(
+  source: CatalogPromotableSet,
+  target: CatalogPromotableSet,
+  selected: PromotionSelector,
+): CatalogPromotionChange[] {
   const targetTransforms = new Map(target.transforms.map((t) => [t.id, t]));
+  const changes: CatalogPromotionChange[] = [];
+
   for (const transform of source.transforms) {
     if (!selected('transform', transform.id)) continue;
     const existing = targetTransforms.get(transform.id);
@@ -675,7 +733,7 @@ export function planPromotion(input: {
       kind: 'transform',
       id: transform.id,
       name: transform.name,
-      action: existing ? (fields.length ? 'update' : 'unchanged') : 'create',
+      action: actionFor(existing, fields),
       fields,
       notes:
         existing && fields.length
@@ -686,19 +744,29 @@ export function planPromotion(input: {
     });
   }
 
-  // --- Workflows -------------------------------------------------------------
-  // Before connectors, deliberately: the order changes are listed is the order
-  // they must be applied, and a connector arriving before the graph it runs
-  // would point at nothing for as long as the apply takes.
+  return changes;
+}
+
+/**
+ * Workflows, compared on the graph hash rather than field by field.
+ *
+ * Node positions and names are in the record but not in the hash, so moving a
+ * box on a canvas is correctly reported as nothing to release.
+ */
+function planWorkflows(
+  source: CatalogPromotableSet,
+  target: CatalogPromotableSet,
+  to: CatalogEnvironmentId,
+  selected: PromotionSelector,
+): CatalogPromotionChange[] {
   const targetWorkflows = new Map(
     (target.workflows ?? []).map((workflow) => [workflow.id, workflow]),
   );
+  const changes: CatalogPromotionChange[] = [];
+
   for (const workflow of source.workflows ?? []) {
     if (!selected('workflow', workflow.id)) continue;
     const existing = targetWorkflows.get(workflow.id);
-    // Compared on the hash, not field by field: node positions and names are in
-    // the record but not in the hash, so moving a box on a canvas is correctly
-    // reported as nothing to release.
     const fields = diffFields(existing, workflow, [
       'name',
       'description',
@@ -709,7 +777,7 @@ export function planPromotion(input: {
       kind: 'workflow',
       id: workflow.id,
       name: workflow.name,
-      action: existing ? (fields.length ? 'update' : 'unchanged') : 'create',
+      action: actionFor(existing, fields),
       fields,
       notes:
         existing && existing.graphHash !== workflow.graphHash
@@ -720,17 +788,38 @@ export function planPromotion(input: {
     });
   }
 
-  // --- Connectors ------------------------------------------------------------
+  return changes;
+}
+
+/**
+ * Connectors, and everything that refuses one.
+ *
+ * The only section that produces blockers and withheld entries, because it is
+ * the only one whose subject points at other things: a connection that must
+ * already exist in the target, and code that must either be there or be in this
+ * same promotion. `earlier` is what the promotion is already carrying.
+ */
+function planConnectors(input: {
+  source: CatalogPromotableSet;
+  target: CatalogPromotableSet;
+  from: CatalogEnvironmentId;
+  to: CatalogEnvironmentId;
+  selected: PromotionSelector;
+  earlier: readonly CatalogPromotionChange[];
+}): {
+  changes: CatalogPromotionChange[];
+  blockers: CatalogPromotionBlocker[];
+  withheld: CatalogPromotionWithheld[];
+} {
+  const { source, target, from, to, selected, earlier } = input;
+
   const targetConnectors = new Map(target.connectors.map((c) => [c.id, c]));
   const targetConnections = new Map(target.connections.map((c) => [c.id, c]));
-  const targetTransformIds = new Set(target.transforms.map((t) => t.id));
-  const promotedTransformIds = new Set(
-    changes.filter((change) => change.kind === 'transform').map((change) => change.id),
-  );
-  const targetWorkflowIds = new Set((target.workflows ?? []).map((workflow) => workflow.id));
-  const promotedWorkflowIds = new Set(
-    changes.filter((change) => change.kind === 'workflow').map((change) => change.id),
-  );
+  const known = knownCodeIds(target, earlier);
+
+  const changes: CatalogPromotionChange[] = [];
+  const blockers: CatalogPromotionBlocker[] = [];
+  const withheld: CatalogPromotionWithheld[] = [];
 
   for (const connector of source.connectors) {
     if (!selected('connector', connector.id)) continue;
@@ -749,88 +838,19 @@ export function planPromotion(input: {
     ]);
     const notes: string[] = [];
 
-    // A connector reads through a connection, and the connection is the one
-    // thing that is genuinely per-environment. Requiring it to pre-exist is
-    // what stops a promotion from silently repointing the target at the
-    // source's database.
-    if (connector.connectionId) {
-      const match = targetConnections.get(connector.connectionId);
-      if (!match) {
-        const sourceConnection = source.connections.find(
-          (candidate) => candidate.id === connector.connectionId,
-        );
-        blockers.push({
-          kind: 'connection',
-          id: connector.connectionId,
-          name: sourceConnection?.name ?? connector.connectionId,
-          reason: `"${connector.name}" reads through connection ${connector.connectionId}, which does not exist in ${to}. Create it there, pointed at ${to}'s own system and with ${to}'s own credential, and run the preview again. A promotion will not create it: a connection is an address and a credential reference, and copying ${from}'s would point ${to} at ${from}'s data.`,
-        });
-      } else {
-        withheld.push({
-          kind: 'connection',
-          id: match.id,
-          name: match.name,
-          fields: PROMOTION_WITHHELD_CONNECTION_FIELDS,
-          why: `Matched by id to ${to}'s own "${match.name}". Its address and credential stay exactly as ${to} has them.`,
-        });
-        if (match.kind !== connector.kind) {
-          blockers.push({
-            kind: 'connection',
-            id: match.id,
-            name: match.name,
-            reason: `${to}'s connection "${match.name}" is a ${match.kind} connection, but "${connector.name}" expects a ${connector.kind} one. Same id, different kind of system — the load would fail on its first run, or worse, read something that happens to parse.`,
-          });
-        }
-      }
-    } else {
-      notes.push(
-        `Carries its own source configuration rather than reading through a connection, so whatever address is in its config is being promoted verbatim. Check it names something ${to} should be reading.`,
-      );
-    }
-
-    // A connector pointing at code that is not there is a load that fails on
-    // its first scheduled run, at night, in the target — the worst place to
-    // discover it. Caught here, where somebody is looking.
-    if (
-      connector.transformId &&
-      !targetTransformIds.has(connector.transformId) &&
-      !promotedTransformIds.has(connector.transformId)
-    ) {
-      blockers.push({
-        kind: 'connector',
-        id: connector.id,
-        name: connector.name,
-        reason: `"${connector.name}" runs transform ${connector.transformId}, which is neither in ${to} nor included in this promotion. Add it to the selection, or the connector would arrive pointing at code that does not exist.`,
-      });
-    }
-
-    // The same hole, one level up. A workflow is a graph of transforms, so a
-    // connector arriving without it is worse than one arriving without a
-    // transform: nothing about the load is defined at all.
-    if (
-      connector.workflowId &&
-      !targetWorkflowIds.has(connector.workflowId) &&
-      !promotedWorkflowIds.has(connector.workflowId)
-    ) {
-      blockers.push({
-        kind: 'connector',
-        id: connector.id,
-        name: connector.name,
-        reason: `"${connector.name}" runs workflow ${connector.workflowId}, which is neither in ${to} nor included in this promotion. Promote the workflow first, or the connector would arrive pointing at a graph that does not exist.`,
-      });
-    }
-
-    withheld.push({
-      kind: 'connector',
-      id: connector.id,
-      name: connector.name,
-      fields: existing
-        ? PROMOTION_WITHHELD_CONNECTOR_FIELDS.filter((field) => field !== 'enabled')
-        : PROMOTION_WITHHELD_CONNECTOR_FIELDS,
-      why: existing
-        ? `${to} keeps its own watermark, its own run history, its own credential reference and its own enabled/disabled switch.`
-        : `Arrives disabled, with no watermark and no credential reference. Point it at ${to}'s secret and enable it when somebody is watching.`,
+    checkConnectorConnection({
+      connector,
+      source,
+      targetConnections,
+      from,
+      to,
+      blockers,
+      withheld,
+      notes,
     });
+    checkConnectorCode({ connector, known, to, blockers });
+
+    withheld.push(connectorWithheld(connector, existing !== undefined, to));
 
     if (!existing) {
       notes.push('Arrives disabled. Enable it in the target once its connection has been checked.');
@@ -840,21 +860,160 @@ export function planPromotion(input: {
       kind: 'connector',
       id: connector.id,
       name: connector.name,
-      action: existing ? (fields.length ? 'update' : 'unchanged') : 'create',
+      action: actionFor(existing, fields),
       fields,
       notes,
     });
   }
 
-  const createdAt = (input.now?.() ?? new Date()).toISOString();
+  return { changes, blockers, withheld };
+}
+
+/**
+ * That the connector's connection exists in the target, and is the same kind.
+ *
+ * A connector reads through a connection, and the connection is the one thing
+ * that is genuinely per-environment. Requiring it to pre-exist is what stops a
+ * promotion from silently repointing the target at the source's database.
+ */
+function checkConnectorConnection(input: {
+  connector: CatalogPromotableSet['connectors'][number];
+  source: CatalogPromotableSet;
+  targetConnections: Map<string, CatalogPromotableSet['connections'][number]>;
+  from: CatalogEnvironmentId;
+  to: CatalogEnvironmentId;
+  blockers: CatalogPromotionBlocker[];
+  withheld: CatalogPromotionWithheld[];
+  notes: string[];
+}): void {
+  const { connector, source, targetConnections, from, to, blockers, withheld, notes } = input;
+
+  if (!connector.connectionId) {
+    notes.push(
+      `Carries its own source configuration rather than reading through a connection, so whatever address is in its config is being promoted verbatim. Check it names something ${to} should be reading.`,
+    );
+    return;
+  }
+
+  const match = targetConnections.get(connector.connectionId);
+  if (!match) {
+    const sourceConnection = source.connections.find(
+      (candidate) => candidate.id === connector.connectionId,
+    );
+    blockers.push({
+      kind: 'connection',
+      id: connector.connectionId,
+      name: sourceConnection?.name ?? connector.connectionId,
+      reason: `"${connector.name}" reads through connection ${connector.connectionId}, which does not exist in ${to}. Create it there, pointed at ${to}'s own system and with ${to}'s own credential, and run the preview again. A promotion will not create it: a connection is an address and a credential reference, and copying ${from}'s would point ${to} at ${from}'s data.`,
+    });
+    return;
+  }
+
+  withheld.push({
+    kind: 'connection',
+    id: match.id,
+    name: match.name,
+    fields: PROMOTION_WITHHELD_CONNECTION_FIELDS,
+    why: `Matched by id to ${to}'s own "${match.name}". Its address and credential stay exactly as ${to} has them.`,
+  });
+  if (match.kind !== connector.kind) {
+    blockers.push({
+      kind: 'connection',
+      id: match.id,
+      name: match.name,
+      reason: `${to}'s connection "${match.name}" is a ${match.kind} connection, but "${connector.name}" expects a ${connector.kind} one. Same id, different kind of system — the load would fail on its first run, or worse, read something that happens to parse.`,
+    });
+  }
+}
+
+/**
+ * That the code a connector runs will be there when it arrives.
+ *
+ * A connector pointing at code that is not there is a load that fails on its
+ * first scheduled run, at night, in the target — the worst place to discover it.
+ * Caught here, where somebody is looking. Either the target already has it, or
+ * this promotion is carrying it.
+ */
+function checkConnectorCode(input: {
+  connector: CatalogPromotableSet['connectors'][number];
+  known: KnownCodeIds;
+  to: CatalogEnvironmentId;
+  blockers: CatalogPromotionBlocker[];
+}): void {
+  const { connector, known, to, blockers } = input;
+  const { transformId, workflowId } = connector;
+
+  if (
+    transformId &&
+    !known.transforms.has(transformId) &&
+    !known.arrivingTransforms.has(transformId)
+  ) {
+    blockers.push({
+      kind: 'connector',
+      id: connector.id,
+      name: connector.name,
+      reason: `"${connector.name}" runs transform ${transformId}, which is neither in ${to} nor included in this promotion. Add it to the selection, or the connector would arrive pointing at code that does not exist.`,
+    });
+  }
+
+  // The same hole, one level up. A workflow is a graph of transforms, so a
+  // connector arriving without it is worse than one arriving without a
+  // transform: nothing about the load is defined at all.
+  if (workflowId && !known.workflows.has(workflowId) && !known.arrivingWorkflows.has(workflowId)) {
+    blockers.push({
+      kind: 'connector',
+      id: connector.id,
+      name: connector.name,
+      reason: `"${connector.name}" runs workflow ${workflowId}, which is neither in ${to} nor included in this promotion. Promote the workflow first, or the connector would arrive pointing at a graph that does not exist.`,
+    });
+  }
+}
+
+/**
+ * Every transform and workflow id a connector may legally point at.
+ *
+ * Two sources each: what the target already has, and what this promotion is
+ * carrying. Built once per plan rather than scanned per connector, which is what
+ * keeps a release of two hundred connectors from being quadratic.
+ */
+interface KnownCodeIds {
+  transforms: Set<string>;
+  arrivingTransforms: Set<string>;
+  workflows: Set<string>;
+  arrivingWorkflows: Set<string>;
+}
+
+function knownCodeIds(
+  target: CatalogPromotableSet,
+  earlier: readonly CatalogPromotionChange[],
+): KnownCodeIds {
+  const arriving = (kind: PromotableKind): Set<string> =>
+    new Set(earlier.filter((change) => change.kind === kind).map((change) => change.id));
+
   return {
-    from,
-    to,
-    createdAt,
-    changes,
-    blockers,
-    withheld,
-    fingerprint: fingerprintOf(from, to, changes, blockers),
+    transforms: new Set(target.transforms.map((t) => t.id)),
+    arrivingTransforms: arriving('transform'),
+    workflows: new Set((target.workflows ?? []).map((workflow) => workflow.id)),
+    arrivingWorkflows: arriving('workflow'),
+  };
+}
+
+/** What the target keeps for itself when a connector lands on it. */
+function connectorWithheld(
+  connector: CatalogPromotableSet['connectors'][number],
+  exists: boolean,
+  to: CatalogEnvironmentId,
+): CatalogPromotionWithheld {
+  return {
+    kind: 'connector',
+    id: connector.id,
+    name: connector.name,
+    fields: exists
+      ? PROMOTION_WITHHELD_CONNECTOR_FIELDS.filter((field) => field !== 'enabled')
+      : PROMOTION_WITHHELD_CONNECTOR_FIELDS,
+    why: exists
+      ? `${to} keeps its own watermark, its own run history, its own credential reference and its own enabled/disabled switch.`
+      : `Arrives disabled, with no watermark and no credential reference. Point it at ${to}'s secret and enable it when somebody is watching.`,
   };
 }
 
@@ -914,7 +1073,7 @@ function fingerprintOf(
  * difference on every promotion and train everybody to click through the diff.
  */
 function stable(value: unknown): string {
-  if (value === undefined) return ' undefined';
+  if (value === undefined) return '\u0000undefined';
   if (value === null) return 'null';
   if (Array.isArray(value)) return `[${value.map(stable).join(',')}]`;
   if (typeof value === 'object') {

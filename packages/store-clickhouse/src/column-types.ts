@@ -92,26 +92,34 @@ export function normalise(
 ): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const property of properties) {
-    const value = row[property.name];
-    if (value === null || value === undefined) {
-      out[property.name] = null;
-    } else if (property.type === 'boolean') {
-      out[property.name] = Boolean(Number(value));
-    } else if (property.type === 'number') {
-      const n = Number(value);
-      out[property.name] = Number.isFinite(n) ? n : null;
-    } else if (property.type === 'date' && typeof value === 'string') {
-      const parsed = new Date(`${value.replace(' ', 'T')}Z`);
-      out[property.name] = Number.isNaN(parsed.getTime()) ? value : parsed.toISOString();
-    } else if (value instanceof Date) {
-      out[property.name] = value.toISOString();
-    } else if (typeof value === 'bigint') {
-      out[property.name] = value.toString();
-    } else {
-      out[property.name] = value;
-    }
+    out[property.name] = normaliseValue(row[property.name], property.type);
   }
   return out;
+}
+
+/**
+ * One cell of {@link normalise}, in declaration order.
+ *
+ * The order is the contract: the declared type wins over the runtime one, so a
+ * property declared `date` that arrives as a ClickHouse-formatted string is
+ * read as UTC rather than falling through to the `instanceof Date` and
+ * `bigint` rules, which exist only for values whose declared type says nothing
+ * useful about how the driver happened to hand them over.
+ */
+function normaliseValue(value: unknown, type: ScalarType): unknown {
+  if (value === null || value === undefined) return null;
+  if (type === 'boolean') return Boolean(Number(value));
+  if (type === 'number') {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : null;
+  }
+  if (type === 'date' && typeof value === 'string') {
+    const parsed = new Date(`${value.replace(' ', 'T')}Z`);
+    return Number.isNaN(parsed.getTime()) ? value : parsed.toISOString();
+  }
+  if (value instanceof Date) return value.toISOString();
+  if (typeof value === 'bigint') return value.toString();
+  return value;
 }
 
 /** JSON cannot carry BigInt or Date; neither can a table cell. */

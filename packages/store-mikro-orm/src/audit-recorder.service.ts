@@ -541,61 +541,14 @@ function assembleTraces(rows: SpanRow[]): CatalogTrace[] {
 
   for (const row of rows) {
     const traceId = row.snapshot_id;
-    let trace = byId.get(traceId);
 
-    if (!trace) {
-      const startedAt = toDate(row.started_at);
-      const lastEventAt = toDate(row.last_at);
-      const outcome = isCatalogTraceOutcome(row.outcome)
-        ? row.outcome
-        : // Unreachable while the CASE above and the outcome list agree. If they
-          // ever stop agreeing, "incomplete" is the reading that claims least.
-          'incomplete';
-      const ended = outcome === 'succeeded' || outcome === 'failed';
-
-      trace = {
-        id: traceId,
-        typeName: row.type_name ?? undefined,
-        principalId: row.principal_id ?? undefined,
-        connectorId: row.connector_id ?? undefined,
-        connectorName: row.connector_name ?? undefined,
-        outcome,
-        startedAt: startedAt.toISOString(),
-        lastEventAt: lastEventAt.toISOString(),
-        endedAt: ended ? lastEventAt.toISOString() : undefined,
-        durationMs: ended ? lastEventAt.getTime() - startedAt.getTime() : undefined,
-        eventCount: toNumber(row.event_count),
-        failureCount: toNumber(row.failures),
-        rowsCommitted:
-          row.rows_committed === null || row.rows_committed === undefined
-            ? undefined
-            : toNumber(row.rows_committed),
-        coarse: lastEventAt.getTime() - startedAt.getTime() < CLOCK_RESOLUTION_MS,
-        spans: [],
-      };
-      byId.set(traceId, trace);
+    if (!byId.has(traceId)) {
+      byId.set(traceId, traceFromRow(row));
       spansById.set(traceId, []);
       order.push(traceId);
     }
 
-    const detail = toDetail(row.span_detail);
-    const error = errorOf(detail);
-    const spans = spansById.get(traceId) ?? [];
-    spans.push({
-      id: row.span_id,
-      event: row.span_event,
-      typeName: row.span_type_name ?? undefined,
-      principalId: row.span_principal_id ?? undefined,
-      detail,
-      occurredAt: toDate(row.span_at).toISOString(),
-      // Filled in on the second pass, once the whole trace is known: a span's
-      // width is the distance to the event after it, which the row itself
-      // cannot see.
-      offsetMs: 0,
-      durationMs: 0,
-      failed: error !== undefined || detail.status === 'failed',
-      error,
-    });
+    spansById.get(traceId)?.push(spanFromRow(row));
   }
 
   return order.map((traceId) => {
@@ -604,21 +557,96 @@ function assembleTraces(rows: SpanRow[]): CatalogTrace[] {
     // Neither can be missing — both maps are written together above — but a
     // non-null assertion here would be a promise the compiler cannot check.
     if (!trace) throw new Error(`Lost trace ${traceId} while assembling it.`);
-
-    const start = new Date(trace.startedAt).getTime();
-    for (let index = 0; index < spans.length; index += 1) {
-      const at = new Date(spans[index].occurredAt).getTime();
-      const next = spans[index + 1];
-      spans[index].offsetMs = at - start;
-      spans[index].durationMs = next ? new Date(next.occurredAt).getTime() - at : 0;
-    }
-
-    // The most recent failure, not the first: on a retried snapshot id the last
-    // one is the reason it is still broken, and the earlier ones stay reachable
-    // on their own spans.
-    const lastFailure = [...spans].reverse().find((span) => span.error);
-    return { ...trace, error: lastFailure?.error, spans };
+    return withSpanTiming(trace, spans);
   });
+}
+
+/**
+ * The trace header, taken from the first row that carries its id.
+ *
+ * Every row of one trace repeats these columns — they are the aggregate side of
+ * the join — so the first row is as good as any, and reading them again per row
+ * would be the same answer computed N times.
+ */
+function traceFromRow(row: SpanRow): CatalogTrace {
+  const startedAt = toDate(row.started_at);
+  const lastEventAt = toDate(row.last_at);
+  const outcome = isCatalogTraceOutcome(row.outcome)
+    ? row.outcome
+    : // Unreachable while the CASE above and the outcome list agree. If they
+      // ever stop agreeing, "incomplete" is the reading that claims least.
+      'incomplete';
+  const ended = outcome === 'succeeded' || outcome === 'failed';
+
+  return {
+    id: row.snapshot_id,
+    typeName: row.type_name ?? undefined,
+    principalId: row.principal_id ?? undefined,
+    connectorId: row.connector_id ?? undefined,
+    connectorName: row.connector_name ?? undefined,
+    outcome,
+    startedAt: startedAt.toISOString(),
+    lastEventAt: lastEventAt.toISOString(),
+    endedAt: ended ? lastEventAt.toISOString() : undefined,
+    durationMs: ended ? lastEventAt.getTime() - startedAt.getTime() : undefined,
+    eventCount: toNumber(row.event_count),
+    failureCount: toNumber(row.failures),
+    rowsCommitted:
+      row.rows_committed === null || row.rows_committed === undefined
+        ? undefined
+        : toNumber(row.rows_committed),
+    coarse: lastEventAt.getTime() - startedAt.getTime() < CLOCK_RESOLUTION_MS,
+    spans: [],
+  };
+}
+
+/** One row's span, with the timings left for {@link withSpanTiming}. */
+function spanFromRow(row: SpanRow): CatalogTraceSpan {
+  const detail = toDetail(row.span_detail);
+  const error = errorOf(detail);
+
+  return {
+    id: row.span_id,
+    event: row.span_event,
+    typeName: row.span_type_name ?? undefined,
+    principalId: row.span_principal_id ?? undefined,
+    detail,
+    occurredAt: toDate(row.span_at).toISOString(),
+    // Filled in on the second pass, once the whole trace is known: a span's
+    // width is the distance to the event after it, which the row itself
+    // cannot see.
+    offsetMs: 0,
+    durationMs: 0,
+    failed: error !== undefined || detail.status === 'failed',
+    error,
+  };
+}
+
+/**
+ * Second pass: the two numbers a span cannot know about itself.
+ *
+ * A span's offset is measured from the trace's start and its width is the
+ * distance to the event after it, so both need the assembled, ordered trace —
+ * which is the whole reason this is a second pass rather than part of
+ * {@link spanFromRow}. The last span has no successor and is given zero width
+ * rather than being stretched to the trace's end: it has not necessarily
+ * finished, and drawing it as though it had is the difference between a running
+ * load and a finished one.
+ */
+function withSpanTiming(trace: CatalogTrace, spans: CatalogTraceSpan[]): CatalogTrace {
+  const start = new Date(trace.startedAt).getTime();
+  for (let index = 0; index < spans.length; index += 1) {
+    const at = new Date(spans[index].occurredAt).getTime();
+    const next = spans[index + 1];
+    spans[index].offsetMs = at - start;
+    spans[index].durationMs = next ? new Date(next.occurredAt).getTime() - at : 0;
+  }
+
+  // The most recent failure, not the first: on a retried snapshot id the last
+  // one is the reason it is still broken, and the earlier ones stay reachable
+  // on their own spans.
+  const lastFailure = [...spans].reverse().find((span) => span.error);
+  return { ...trace, error: lastFailure?.error, spans };
 }
 
 function toAuditEvent(row: UnlinkedRow): CatalogAuditEvent {

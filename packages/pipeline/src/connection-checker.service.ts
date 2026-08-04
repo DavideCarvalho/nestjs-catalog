@@ -45,19 +45,7 @@ export class ConnectionChecker {
     if (connection.kind === 'http') {
       const url = text('url');
       if (!url) throw new Error('This connection has no url.');
-      const response = await fetch(url, {
-        method: 'GET',
-        headers: secret ? { authorization: `Bearer ${secret}` } : {},
-        signal: AbortSignal.timeout(10_000),
-      });
-      // Any answer at all proves the host resolves and is listening, which is
-      // most of what a check is for. A 4xx is reported rather than thrown
-      // because "reachable but refused" and "unreachable" send an operator to
-      // different places.
-      if (!response.ok) {
-        throw new Error(`${url} answered ${response.status}.`);
-      }
-      return `${url} answered ${response.status}.`;
+      return await probeHttp(url, secret);
     }
 
     if (connection.kind === 'sql') {
@@ -83,6 +71,22 @@ export class ConnectionChecker {
 
     return 'This kind needs no connection.';
   }
+}
+
+async function probeHttp(url: string, secret?: string): Promise<string> {
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: secret ? { authorization: `Bearer ${secret}` } : {},
+    signal: AbortSignal.timeout(10_000),
+  });
+  // Any answer at all proves the host resolves and is listening, which is most
+  // of what a check is for. A 4xx is reported rather than thrown because
+  // "reachable but refused" and "unreachable" send an operator to different
+  // places.
+  if (!response.ok) {
+    throw new Error(`${url} answered ${response.status}.`);
+  }
+  return `${url} answered ${response.status}.`;
 }
 
 async function probeMysql(url: string): Promise<string> {
