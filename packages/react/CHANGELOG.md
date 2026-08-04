@@ -1,5 +1,80 @@
 # @dudousxd/nestjs-catalog-react
 
+## 0.5.0
+
+### Minor Changes
+
+- 3214fc7: One code editor, themed by the console instead of against it
+
+  The query console and the transform editor each carried their own copy of the
+  same overlay editor — a transparent `<textarea>` over a highlighted `<pre>` —
+  with the same two boxes, the same three comments, and only one of them taught
+  about anything but its own language. They now share `ui/CodeEditor`.
+
+  **It was unreadable.** Both copies passed `themes.github`, a light Prism theme
+  that paints keywords a dark red and strings a dark blue. That was invisible for
+  as long as the console was light and became dark-on-dark the moment the console
+  went dark: the editor still worked perfectly, you just could not read what you
+  were typing. The theme is now defined against the same `--text` / `--muted` /
+  `--accent` variables the shell sets, so the two cannot drift apart again.
+
+  **The sample-records pane gets highlighting too.** It was the one that stayed a
+  bare textarea, so the JSON you debug a transform against rendered flat grey
+  beside a coloured transform — and a missing brace in a sample is exactly what
+  highlighting finds for you.
+
+  Two smaller things found while extracting it: the theme's `plain` was never
+  applied, because `Highlight`'s `style` was not spread onto the `<pre>`; and
+  `leading-[1.5]` was being dropped by tailwind-merge, which treats a
+  `text-{size}` utility as able to carry a line-height and discards a `leading-*`
+  written before it. Both layers agreed, so the caret never drifted — the intended
+  line-height simply was not there.
+
+  Still a textarea rather than CodeMirror, and deliberately: the platform's
+  textarea already has the caret, selection, undo, IME and every accessibility
+  affordance, and a controlled document-model editor has to reimplement all of it
+  — the classic symptom being a caret that jumps to the end when the value updates
+  from outside. What is missing is autocomplete and bracket matching, which
+  nothing here asks for.
+
+- 93ed05b: Every table on TanStack Table v9
+
+  Four screens hand-rolled `<table>` markup with the same header row, the same
+  hairlines and the same "numbers go right" rule, each slightly differently. They
+  now share `ui/DataTable`, and there is no raw `<table>` left outside `ui/`.
+
+  **Sorting is a prop, not a row model, and that is the load-bearing decision.**
+  The object explorer sorts, pages and searches on the SERVER, because it reads a
+  warehouse table that does not fit in a browser. Handing those columns to
+  `createSortedRowModel` would sort the rows currently on screen and present the
+  result as though it were the whole answer — a worse bug than no sorting at all,
+  because it looks right. So the header renders the affordance and reports the
+  click, and the caller decides whether that means a refetch or a reorder. A test
+  asserts the rows come out in the order they went in.
+
+  What each screen gained:
+
+  - **Query results** and the **dashboard card preview** shared a value-rendering
+    ladder that they each had a copy of. `renderUnknown` is now one function, and
+    it keeps `0`, `false` and `''` visible — the `value || '—'` shorthand erases
+    all three and nothing reports it.
+  - **The object explorer** keeps its server-side sort, and `aria-sort` moved onto
+    the column header where a screen reader announces it as part of the column;
+    on the button it read as "this control is sorted".
+  - **The property editor** declares its six columns once, with their widths beside
+    their contents rather than in a separate header row kept in the same order by
+    hand. The widths stay fixed on purpose: those cells hold inputs, and a
+    content-sized column reflows the table on every keystroke.
+
+  `@tanstack/react-table` joins the peer dependencies at `>=9`. v9 is opt-in per
+  feature rather than v8's batteries-included table, so a table that never groups
+  does not ship the grouping code — this one registers the core features and
+  nothing else. Two things about its API worth knowing: the row model factories
+  live inside `features` rather than in a sibling option, and `useTable` needs
+  explicit type arguments, because `columns` and `data` are two inference sites
+  for the same pair and TS falls back to the constraints with a third parameter
+  in play.
+
 ## 0.4.0
 
 ### Minor Changes
