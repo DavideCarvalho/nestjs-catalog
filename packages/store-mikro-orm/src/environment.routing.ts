@@ -192,6 +192,29 @@ export class RoutingCatalogStore implements CatalogMergeStore, CatalogQueryStore
     return requireEnvironmentBundle().store.listSnapshots(type);
   }
 
+  /**
+   * Which snapshot this type is actually being served from.
+   *
+   * Forwarded unconditionally, because unlike the fan-out there is no
+   * capability question here: this proxy stands in front of one concrete
+   * `MySqlWarehouseStore`, which implements it. Leaving it off did not make the
+   * proxy answer "no" — it made the method *absent*, and absent is how a caller
+   * that probes structurally decides the store cannot answer.
+   *
+   * What that costs is not hypothetical: a caller with no pointer falls back to
+   * the newest entry in `listSnapshots`, which `catalog.store.ts` calls not
+   * survivable — after a rollback the newest snapshot is precisely the one that
+   * was rolled back, so the guess points at data somebody deliberately stopped
+   * serving.
+   */
+  currentSnapshot(type: CatalogObjectTypeDef): Promise<SnapshotRef | undefined> {
+    const { store } = requireEnvironmentBundle();
+    // Still optional on the interface, so still probed — the bundle's store is
+    // whatever the host bound, and a host may bind one that cannot answer.
+    if (!store.currentSnapshot) return Promise.resolve(undefined);
+    return store.currentSnapshot(type);
+  }
+
   ensureType(type: CatalogObjectTypeDef): Promise<void> {
     return requireEnvironmentBundle().store.ensureType(type);
   }
