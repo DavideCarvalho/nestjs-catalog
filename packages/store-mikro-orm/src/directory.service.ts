@@ -28,13 +28,20 @@ export class MikroOrmCatalogDirectory implements CatalogDirectory {
   ) {}
 
   async listApplications(): Promise<CatalogApplicationSummary[]> {
+    // Forked, and not optional: the injected EntityManager is the GLOBAL one,
+    // and MikroORM refuses context-specific calls on it — `Using global
+    // EntityManager instance methods for context specific actions is
+    // disallowed`. A read from a request handler is exactly that, so without
+    // this every call to these endpoints is a 500. Nothing catches it at build
+    // time, and a unit test with a stubbed EntityManager will not either.
+    const em = this.em.fork();
     const [principals, types] = await Promise.all([
-      this.em.find(PrincipalRow, {}, { orderBy: { displayName: 'asc' } }),
+      em.find(PrincipalRow, {}, { orderBy: { displayName: 'asc' } }),
       // Ownership lives on the type, not the principal, so it cannot be read
       // from `catalog_principal` alone. One query for all of them rather than
       // one per principal: this list is small, and the N+1 would be invisible
       // until a catalog had enough applications to make the screen slow.
-      this.em.find(ObjectTypeRow, {}, { fields: ['name', 'ownerPrincipalId'] }),
+      em.find(ObjectTypeRow, {}, { fields: ['name', 'ownerPrincipalId'] }),
     ]);
 
     const owned = new Map<string, string[]>();
