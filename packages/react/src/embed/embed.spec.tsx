@@ -175,7 +175,7 @@ describe('resolveEmbedActions', () => {
   });
 
   it("answers the whole set for 'all'", () => {
-    expect(resolveEmbedActions('all')).toEqual(['csv']);
+    expect(resolveEmbedActions('all')).toEqual(['csv', 'png', 'pdf']);
   });
 
   it('keeps what was asked for', () => {
@@ -188,9 +188,48 @@ describe('resolveEmbedActions', () => {
 
   it('drops an action nobody implemented rather than drawing a dead control', () => {
     // @ts-expect-error — the union stops a TypeScript host, but this package is published and
-    // plenty of callers compile nothing. 'pdf' does not exist, so it must not become a button.
-    expect(resolveEmbedActions(['csv', 'pdf'])).toEqual(['csv']);
+    // plenty of callers compile nothing. 'xlsx' does not exist, so it must not become a button.
+    expect(resolveEmbedActions(['csv', 'xlsx'])).toEqual(['csv']);
   });
+
+  it('answers what was ASKED for, not what is possible', () => {
+    // Half the answer on purpose. Whether a PNG can be produced depends on the
+    // card — the built-in renderer draws divs, so there is no `<svg>` — and a
+    // PDF depends on the host having registered an exporter.
+    // `useAvailableEmbedActions` decides that per card; splitting the two is
+    // what lets the toolbar's switch stay exhaustive while still drawing
+    // nothing when an action cannot be performed.
+    expect(resolveEmbedActions(['png', 'pdf'])).toEqual(['png', 'pdf']);
+  });
+
+  it('offers no PNG when the chart is drawn without an <svg>', async () => {
+    // The built-in renderer draws divs, and a table visualization is the same
+    // shape: markup, no `<svg>`. So `'all'` gives the CSV link and no PNG.
+    const { transport } = fakeTransport({
+      [CHART_PATH]: chartPayload({ visualization: { kind: 'table' } }),
+    });
+    mount(transport, <EmbeddedChart chartId="q1" actions="all" />);
+
+    await screen.findByText('Sorties by unit');
+    expect(screen.queryByLabelText('Download PNG')).toBeNull();
+    // CSV is a link to the server and needs nothing from the DOM, so it stays.
+    expect(screen.getByLabelText('Download CSV')).toBeTruthy();
+  });
+
+  // The PDF branch cannot be reached from here at all, and pretending otherwise
+  // would be worse than leaving it uncovered. `usePdfExport().available`
+  // requires `canRasterise()`, which is false in jsdom because there is no
+  // canvas — so no PDF action appears no matter what is registered.
+  //
+  // I wrote the two obvious tests first — "no PDF without an exporter" and "it
+  // appears when a host registers one" — and mutation-checked them: deleting
+  // the exporter check entirely left the first one passing. It was decoration,
+  // asserting the absence of a control jsdom could never have drawn.
+  //
+  // What IS covered: `resolveEmbedActions` returns `'pdf'` when asked, above;
+  // and `usePdfExport`'s own spec mutation-checks the availability rule against
+  // an injected rasteriser. Their composition — this toolbar reading that hook
+  // — is the seam only a real browser can test.
 });
 
 describe('loading and failure belong to the host', () => {

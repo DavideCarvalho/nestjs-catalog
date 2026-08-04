@@ -42,6 +42,7 @@ export {
   canRasterise,
   type PngExport,
   type PngExportTarget,
+  useHasExportableSvg,
   usePngExport,
   type UsePngExportOptions,
 } from './use-png-export';

@@ -173,3 +173,43 @@ export {
 export { Button, type ButtonProps, type ButtonSize, type ButtonVariant } from './ui/button';
 export { Tabs, TabsList, TabsPanel, TabsTab } from './ui/tabs';
 export { Tooltip, TooltipProvider } from './ui/tooltip';
+
+// Getting a chart out of the console as a file.
+//
+// PNG needs no dependency at all — a serialised SVG, a canvas and `toBlob` are
+// already in every browser. Two limits are worth knowing before offering it: an
+// SVG rasterised through a data URI cannot load `@font-face`, so exported text
+// falls back to a system face; and the built-in CSS bar chart draws with divs
+// rather than an `<svg>`, so it cannot be exported at all.
+//
+// PDF is a SEAM, not a renderer. This package takes no PDF dependency — the
+// two candidates cost ~128KB gzipped on every consumer for a feature only some
+// want, which is the same argument `charts/registry.tsx` makes about chart
+// libraries. The host registers something backed by its own document pipeline,
+// and where nobody did, no PDF action appears.
+export {
+  buildChartPdfSource,
+  canRasterise,
+  type ChartPdfExporter,
+  type ChartPdfSource,
+  defaultPngFilename,
+  downloadSvgAsPng,
+  type ExportBackground,
+  exportSvgAsPdf,
+  findExportableSvg,
+  getPdfExporter,
+  type PdfExport,
+  type PdfSourceOptions,
+  type PngExport,
+  type PngExportOptions,
+  type PngExportTarget,
+  rasteriseSerializedSvg,
+  registerPdfExporter,
+  serializeSvg,
+  subscribeToPdfExporter,
+  type SvgRasteriser,
+  svgToPngBlob,
+  useHasExportableSvg,
+  usePdfExport,
+  usePngExport,
+} from './export';

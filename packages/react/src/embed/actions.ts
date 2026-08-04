@@ -1,3 +1,6 @@
+import { usePdfExport } from '../export/use-pdf-export';
+import { type PngExportTarget, useHasExportableSvg } from '../export/use-png-export';
+
 /**
  * What an embedded chart's toolbar may offer.
  *
@@ -9,13 +12,18 @@
  * again on demand, straight past whatever caching the host put in front of this
  * component, from a page the catalog's operators do not control.
  *
- * Only actions that exist appear here. `'png'` is deliberately absent until the
- * renderer that produces one lands; `'pdf'` is absent because nobody has
- * decided what a PDF of a chart even is. An option that does nothing is worse
+ * Only actions that exist appear here. An option that does nothing is worse
  * than a missing one — a host ships it, a user clicks it, and the bug report
  * arrives against the host.
+ *
+ * Being in this union is necessary and NOT sufficient. `'png'` cannot be
+ * produced from the built-in CSS bar chart, which draws with divs rather than
+ * an `<svg>`; `'pdf'` needs the host to have registered an exporter, because
+ * this package ships no PDF dependency. Both are decided per card at render
+ * time — see {@link useAvailableEmbedActions}, which is what the toolbar
+ * actually draws from.
  */
-export type EmbedAction = 'csv';
+export type EmbedAction = 'csv' | 'png' | 'pdf';
 
 /**
  * Every action, in the order a toolbar draws them.
@@ -25,7 +33,7 @@ export type EmbedAction = 'csv';
  * one place a new action is added: append it, and `'all'`, the filter below and
  * the toolbar's switch all pick it up.
  */
-export const EMBED_ACTIONS: readonly EmbedAction[] = ['csv'];
+export const EMBED_ACTIONS: readonly EmbedAction[] = ['csv', 'png', 'pdf'];
 
 /**
  * What the host asked for.
@@ -55,4 +63,36 @@ export function resolveEmbedActions(actions: EmbedActions = 'none'): EmbedAction
   if (actions === 'none') return [];
   if (actions === 'all') return [...EMBED_ACTIONS];
   return EMBED_ACTIONS.filter((action) => actions.includes(action));
+}
+
+/**
+ * Whether each requested action can actually be performed on THIS card.
+ *
+ * Asking for an action and being able to do it are different questions, and the
+ * union can only answer the first. A chart drawn by the built-in renderer is
+ * divs, so there is no `<svg>` to rasterise and no PNG; a PDF needs the host to
+ * have registered an exporter, and most hosts never will.
+ *
+ * Filtering here rather than letting each control return null is what keeps the
+ * toolbar's exhaustive `switch` meaningful: every action it is handed IS
+ * drawable, so the `never` at the bottom still means "you added a member and
+ * forgot to draw it" rather than "this one sometimes draws nothing".
+ *
+ * It also means an empty toolbar is a real answer. A host that asked for `'all'`
+ * on a CSS-drawn chart with no PDF exporter gets the CSV link and nothing else,
+ * rather than three buttons of which two apologise.
+ */
+export function useAvailableEmbedActions(
+  actions: EmbedActions | undefined,
+  target: PngExportTarget,
+): EmbedAction[] {
+  const requested = resolveEmbedActions(actions);
+  const png = useHasExportableSvg(target);
+  const pdf = usePdfExport(target);
+
+  return requested.filter((action) => {
+    if (action === 'png') return png;
+    if (action === 'pdf') return pdf.available;
+    return true;
+  });
 }

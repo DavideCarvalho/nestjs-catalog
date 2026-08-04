@@ -161,3 +161,45 @@ export function usePngExport(options: UsePngExportOptions = {}): PngExport {
 
   return { exportPng, renderPng, exporting, error, supported: canRasterise() };
 }
+
+/**
+ * Whether this target has an `<svg>` that can be exported, right now.
+ *
+ * A hook rather than a function because the answer changes after mount and the
+ * caller needs to re-render when it does. Two things make that true, and both
+ * were learned the hard way:
+ *
+ * - The element is only knowable after a commit, so on the first render there
+ *   is nothing to look at. Hence no dependency array — keying on the null the
+ *   first render sees would mean never looking again.
+ * - Recharts measures its container and then inserts its `<svg>` from its own
+ *   state, with no React render to prompt a second look. Without the observer,
+ *   the answer stays `false` forever on exactly the renderer that most needs it.
+ *
+ * The built-in CSS bar chart draws with divs, so this is permanently `false`
+ * there — which is the point: a caller uses it to offer no action rather than
+ * one that fails on click.
+ */
+export function useHasExportableSvg(target: PngExportTarget): boolean {
+  const [hasSvg, setHasSvg] = useState(false);
+  const latest = useRef(target);
+  latest.current = target;
+
+  useEffect(() => {
+    const element = unwrapExportTarget(latest.current);
+    const check = () => {
+      const found = findExportableSvg(element) !== null;
+      // Guarded, so this does not feed itself through the missing dep array.
+      setHasSvg((current) => (current === found ? current : found));
+    };
+
+    check();
+    if (!element || typeof MutationObserver !== 'function') return;
+
+    const observer = new MutationObserver(check);
+    observer.observe(element, { childList: true, subtree: true });
+    return () => observer.disconnect();
+  });
+
+  return hasSvg;
+}

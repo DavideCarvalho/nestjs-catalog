@@ -12,6 +12,7 @@ import {
   canRasterise,
   toExportError,
   unwrapExportTarget,
+  useHasExportableSvg,
 } from './use-png-export';
 
 /**
@@ -86,7 +87,6 @@ export function usePdfExport(
 ): PdfExport {
   const [exporting, setExporting] = useState(false);
   const [error, setError] = useState<Error | null>(null);
-  const [hasSvg, setHasSvg] = useState(false);
 
   // The exporter object itself is the snapshot: it only changes when somebody
   // registers, so the reference is stable between renders and
@@ -108,26 +108,10 @@ export function usePdfExport(
     };
   }, []);
 
-  // Deliberately no dependency array. The element is only knowable after a
-  // commit, so there is no value computed during render that could key this
-  // correctly: on the first render the ref is still null, and keying on that
-  // null would mean never looking again. Re-running is cheap — one
-  // `querySelector` and one observer — and the state write is guarded, so this
-  // does not feed itself.
-  useEffect(() => {
-    const element = unwrapExportTarget(latest.current.target);
-    const check = () => {
-      const found = findExportableSvg(element) !== null;
-      setHasSvg((current) => (current === found ? current : found));
-    };
-
-    check();
-    if (!element || typeof MutationObserver !== 'function') return;
-
-    const observer = new MutationObserver(check);
-    observer.observe(element, { childList: true, subtree: true });
-    return () => observer.disconnect();
-  });
+  // One implementation of "is there an `<svg>` here yet", shared with the
+  // toolbar that decides whether a PNG action exists — including the
+  // MutationObserver, which is what makes it true for recharts.
+  const hasSvg = useHasExportableSvg(target);
 
   const exportPdf = useCallback(
     async (overrides?: PdfSourceOptions): Promise<ChartPdfSource | null> => {

@@ -1,8 +1,11 @@
-import { Download } from 'lucide-react';
+import { Download, FileDown, ImageDown } from 'lucide-react';
+import { type RefObject, useRef } from 'react';
 import { ChartBody } from '../charts/body';
 import { cn } from '../cn';
 import { useCatalogClient } from '../context';
-import { type EmbedAction, type EmbedActions, resolveEmbedActions } from './actions';
+import { usePdfExport } from '../export/use-pdf-export';
+import { usePngExport } from '../export/use-png-export';
+import { type EmbedAction, type EmbedActions, useAvailableEmbedActions } from './actions';
 import type { EmbeddedChartPayload } from './payload';
 import { resultFromEmbed } from './payload';
 
@@ -31,6 +34,8 @@ export function EmbeddedChartCard({
   height?: number;
   className?: string;
 }) {
+  const chartRef = useRef<HTMLDivElement | null>(null);
+
   return (
     <div className={cn('min-w-0', className)}>
       <div className="flex items-start justify-between gap-2">
@@ -47,14 +52,17 @@ export function EmbeddedChartCard({
             {chart.rowCount} rows{chart.cached ? ' · cached' : ''}
           </time>
         </div>
-        <EmbedToolbar chartId={chart.id} actions={actions} />
+        <EmbedToolbar chartId={chart.id} actions={actions} chart={chartRef} title={chart.title} />
       </div>
 
       {chart.description && (
         <p className={cn('mt-0.5 truncate text-[11px]', MUTED)}>{chart.description}</p>
       )}
 
-      <div className="mt-3">
+      {/* The ref is on the box the renderer draws into, not on the card: an
+          export of the card would carry the title, the row count and the
+          toolbar's own buttons into the image. */}
+      <div className="mt-3" ref={chartRef}>
         {/*
          * No cap on the table. A dashboard card previews because the whole
          * answer is one click away in the console; an embed has no such click,
@@ -86,14 +94,34 @@ export function EmbeddedChartCard({
  * `title` plus an `aria-label` needs no context and is what a screen reader
  * reads anyway.
  */
-function EmbedToolbar({ chartId, actions }: { chartId: string; actions?: EmbedActions }) {
-  const resolved = resolveEmbedActions(actions);
-  if (resolved.length === 0) return null;
+function EmbedToolbar({
+  chartId,
+  actions,
+  chart,
+  title,
+}: {
+  chartId: string;
+  actions?: EmbedActions;
+  chart: RefObject<HTMLDivElement | null>;
+  title: string;
+}) {
+  // Availability, not just what was asked for. A PNG needs an `<svg>` — the
+  // built-in renderer draws divs — and a PDF needs the host to have registered
+  // an exporter. Filtering here is what lets `EmbedActionControl` keep an
+  // exhaustive switch: everything it is handed is drawable.
+  const available = useAvailableEmbedActions(actions, chart);
+  if (available.length === 0) return null;
 
   return (
     <div className="flex shrink-0 items-center gap-0.5">
-      {resolved.map((action) => (
-        <EmbedActionControl key={action} action={action} chartId={chartId} />
+      {available.map((action) => (
+        <EmbedActionControl
+          key={action}
+          action={action}
+          chartId={chartId}
+          chart={chart}
+          title={title}
+        />
       ))}
     </div>
   );
@@ -109,11 +137,28 @@ const CONTROL = 'rounded-sm p-1 hover:bg-zinc-100 dark:hover:bg-zinc-800';
  * — a fallthrough returning null — is exactly the "an option that does nothing"
  * failure the union was written to prevent, just moved one level down.
  *
- * PNG belongs here when the renderer being built in `src/export/` lands: one
- * more branch, one more entry in `EMBED_ACTIONS`, and nothing else changes.
+ * Every action handed here is already known to be performable —
+ * `useAvailableEmbedActions` filtered on that — so no branch needs to ask
+ * whether it can do its job. That separation is what keeps this switch
+ * exhaustive AND honest at the same time.
  */
-function EmbedActionControl({ action, chartId }: { action: EmbedAction; chartId: string }) {
+function EmbedActionControl({
+  action,
+  chartId,
+  chart,
+  title,
+}: {
+  action: EmbedAction;
+  chartId: string;
+  chart: RefObject<HTMLDivElement | null>;
+  title: string;
+}) {
   const client = useCatalogClient();
+  // The chart's own title as the filename, rather than the timestamped default:
+  // somebody exporting three cards from one board wants three names they can
+  // tell apart afterwards.
+  const png = usePngExport({ filename: () => `${title}.png` });
+  const pdf = usePdfExport(chart, { title });
 
   if (action === 'csv') {
     // A link, not a button, because the server's export is a GET that streams
@@ -129,6 +174,38 @@ function EmbedActionControl({ action, chartId }: { action: EmbedAction; chartId:
       >
         <Download size={11} />
       </a>
+    );
+  }
+
+  if (action === 'png') {
+    return (
+      <button
+        type="button"
+        onClick={() => png.exportPng(chart)}
+        disabled={png.exporting}
+        aria-label="Download PNG"
+        title="Download PNG"
+        className={cn(CONTROL, MUTED)}
+      >
+        <ImageDown size={11} />
+      </button>
+    );
+  }
+
+  if (action === 'pdf') {
+    return (
+      <button
+        type="button"
+        onClick={() => pdf.exportPdf()}
+        disabled={pdf.exporting}
+        // The host named its own document, so the label says what the host
+        // calls it rather than what this library assumes it is.
+        aria-label={pdf.label ?? 'Download PDF'}
+        title={pdf.label ?? 'Download PDF'}
+        className={cn(CONTROL, MUTED)}
+      >
+        <FileDown size={11} />
+      </button>
     );
   }
 
