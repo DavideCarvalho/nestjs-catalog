@@ -140,6 +140,7 @@ export {
   maySeeClassification,
   mayRead,
   mayWrite,
+  readableObjectPage,
   StaticKeyPrincipalResolver,
 } from './catalog.principal';
 // Everything, deliberately. The last release exported the directory interface

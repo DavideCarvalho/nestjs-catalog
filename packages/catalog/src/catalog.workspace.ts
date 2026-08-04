@@ -35,8 +35,14 @@ export interface SavedQuery {
    * relations, so working out "which types does this touch" means parsing the
    * statement — and a permission derived from a parser is a permission that
    * silently widens the day the parser meets a query it did not expect. Marking
-   * it shared is a decision a person made, and it shows up in the audit trail
-   * as one.
+   * it shared is a decision a person made, and it shows up in the audit trail as
+   * one: `CatalogService` emits `query.shared` on the transition, in both
+   * directions, naming whoever made it.
+   *
+   * That last sentence was a claim before it was true — the event did not exist
+   * and the one act that hands an outside application data left no trace at all.
+   * Anything written here about what is recorded should be checkable against
+   * `CATALOG_EVENTS` and an emit site.
    */
   shared: boolean;
 }
@@ -75,7 +81,11 @@ export interface Dashboard {
   createdAt: string;
   updatedAt: string;
   cards: DashboardCard[];
-  /** Fetchable through the embed API by an application with `catalog:embed`. */
+  /**
+   * Fetchable through the embed API by an application with `catalog:embed`.
+   *
+   * Audited the same way {@link SavedQuery.shared} is, as `dashboard.shared`.
+   */
   shared: boolean;
 }
 

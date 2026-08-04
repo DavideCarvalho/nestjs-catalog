@@ -17,6 +17,8 @@
  * not an answer anybody accepts.
  */
 
+import type { CatalogObjectPage } from './catalog.types';
+
 export type CatalogScope =
   /** Read object metadata and rows. */
   | 'catalog:read'
@@ -132,7 +134,9 @@ export interface CatalogPrincipal {
   readTypes?: string[];
   /**
    * Classifications this principal may see. A column marked with anything
-   * outside this list is dropped from its reads.
+   * outside this list is to be dropped from its reads — *by whoever serves
+   * them*, which is not this library. See the note above {@link mayWrite} on
+   * who enforces, and {@link readableObjectPage} for the drop itself.
    *
    * Undefined means "no classified columns", not "all of them" — the safe
    * default for a caller nobody has thought about yet.
@@ -338,10 +342,47 @@ function matches(list: string[] | undefined, typeName: string): boolean {
   return list.includes('*') || list.includes(typeName);
 }
 
+// -----------------------------------------------------------------------------
+// The grant predicates, and who is expected to call them.
+//
+// **This library declares and evaluates; the host enforces.** The same split
+// `catalog.route-auth.ts` states for scopes holds for grants: nothing in this
+// package ever turns a request into a principal. `CatalogPrincipalResolver` is
+// an interface with one bundled development implementation, no guard ships here,
+// and the `request.principal` that `publish.controller.ts` reads is put there by
+// a guard the host wrote — the error it throws even names a class this repo does
+// not contain.
+//
+// The asymmetry between write and read is real and is not the bug it looks like.
+// `mayWrite` is called inside the library, in `publish.service.ts`, for exactly
+// one reason: the publish API takes a `CatalogPrincipal` as an argument, so it
+// has one in hand. The read path does not. `CatalogService.readObjects` has no
+// principal parameter, `GET /catalog/objects/:name` has none to give it, and so
+// `mayRead` and `maySeeClassification` are called nowhere in this repository at
+// runtime. That is the design: a library that filtered reads would need a
+// principal on every read, which means shipping a guard, which means having an
+// opinion about the host's identity provider.
+//
+// What was wrong was not the mechanism but the prose around it. A host reading
+// "classifications this principal may see" is entitled to assume something drops
+// the columns, and nothing does. So, stated once, here: **the read path applies
+// no grants and no classification filtering, and a host that wants either calls
+// `readableObjectPage` itself.** Anyone about to "wire this up" should change
+// that sentence rather than quietly making it false.
+// -----------------------------------------------------------------------------
+
+/** Enforced by the library, because the publish API is handed a principal. */
 export function mayWrite(principal: CatalogPrincipal, typeName: string): boolean {
   return hasScope(principal, 'catalog:write') && matches(principal.writeTypes, typeName);
 }
 
+/**
+ * Whether this principal may read a type at all.
+ *
+ * A predicate for a host to apply, not something the catalog's own read routes
+ * consult — see the note above. `readableObjectPage` is the ready-made
+ * application of it.
+ */
 export function mayRead(principal: CatalogPrincipal, typeName: string): boolean {
   if (!hasScope(principal, 'catalog:read')) return false;
   // Undefined readTypes means every type, which is the useful default for a
@@ -354,6 +395,9 @@ export function mayRead(principal: CatalogPrincipal, typeName: string): boolean 
  *
  * Unclassified columns are visible to everyone; a classified one requires the
  * principal to name that classification. Absence is denial.
+ *
+ * The same caveat as {@link mayRead}: answering the question is all this does.
+ * No read path in this library asks it.
  */
 export function maySeeClassification(
   principal: CatalogPrincipal,
@@ -361,4 +405,59 @@ export function maySeeClassification(
 ): boolean {
   if (!classification) return true;
   return principal.classifications?.includes(classification) ?? false;
+}
+
+/**
+ * A page of objects as this principal is allowed to see it: the page, minus
+ * every column carrying a classification they do not hold — and `null` when
+ * they may not read the type at all.
+ *
+ * This exists so that "who applies `mayRead` and `maySeeClassification`?" has an
+ * answer a host can call rather than a rule a host has to re-derive. Wrap the
+ * service:
+ *
+ * ```ts
+ * const page = await this.catalog.readObjects(name, query);
+ * const visible = readableObjectPage(principal, page);
+ * if (!visible) throw new ForbiddenException(`${principal.id} may not read ${name}.`);
+ * return visible;
+ * ```
+ *
+ * `null` rather than a thrown exception because the status code is the host's
+ * decision: a 403 confirms to the caller that the type exists, and a deployment
+ * that considers the type list itself sensitive would rather answer 404. `null`
+ * rather than an empty page because a page with no columns is what a type whose
+ * every column is hidden legitimately returns, and a denial must not be
+ * mistakable for one.
+ *
+ * Hidden values are **deleted** from each row rather than blanked. A key present
+ * with `null` asserts that the column exists and happens to be empty, which for
+ * a classified column is itself a disclosure.
+ *
+ * What it does not do: rows can carry keys no column declares, because
+ * `readObjects` always fetches the primary key so a UI has a row identity even
+ * when that key is hidden. Those survive. This removes what a classification
+ * hides; it is not a whitelist, and a classified column that is also part of a
+ * hidden primary key is outside what a page alone can express.
+ */
+export function readableObjectPage(
+  principal: CatalogPrincipal,
+  page: CatalogObjectPage,
+): CatalogObjectPage | null {
+  if (!mayRead(principal, page.type)) return null;
+
+  const hidden = page.columns
+    .filter((column) => !maySeeClassification(principal, column.classification))
+    .map((column) => column.name);
+  if (hidden.length === 0) return page;
+
+  return {
+    ...page,
+    columns: page.columns.filter((column) => !hidden.includes(column.name)),
+    rows: page.rows.map((row) => {
+      const visible = { ...row };
+      for (const name of hidden) delete visible[name];
+      return visible;
+    }),
+  };
 }

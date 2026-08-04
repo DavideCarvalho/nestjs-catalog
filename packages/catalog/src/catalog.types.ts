@@ -182,7 +182,13 @@ export interface CatalogObjectPage {
   size: number;
   total: number;
   pages: number;
-  /** Only the visible, non-redacted columns, in overlay order. */
+  /**
+   * The visible, non-blob columns, in overlay order.
+   *
+   * Visible means "not hidden by the overlay". It does **not** mean redacted for
+   * a caller: a classified column is here, with its `classification` on it, and
+   * dropping it is the host's move — see `readableObjectPage`.
+   */
   columns: Array<{
     name: string;
     displayName: string;

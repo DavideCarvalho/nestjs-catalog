@@ -6,6 +6,7 @@ import {
   NotFoundException,
   Optional,
 } from '@nestjs/common';
+import { emitCatalog } from './catalog.events';
 import { CATALOG_OPTIONS, type CatalogModuleOptions } from './catalog.options';
 import {
   type CatalogQueryRelation,
@@ -115,6 +116,17 @@ export class CatalogService {
     return type.properties.filter((p) => !p.hidden && p.type !== 'json');
   }
 
+  /**
+   * Rows of one type, paged.
+   *
+   * **No principal, and so no access control.** This applies the guardrails that
+   * hold for every caller — the type exists, the page is bounded, the sort names
+   * a real column — and none that depend on who is asking: a classified column
+   * comes back to whoever the host's guard let through the door. That is the
+   * library's declare-and-enforce split, written out at length above `mayWrite`
+   * in `catalog.principal.ts`. A host that wants per-principal reads passes this
+   * page through `readableObjectPage`.
+   */
   async readObjects(
     typeName: string,
     query: CatalogObjectQuery & { snapshot?: string },
@@ -275,18 +287,81 @@ export class CatalogService {
     return found;
   }
 
-  saveQuery(input: SaveQueryInput, createdBy: string): Promise<SavedQuery> {
+  // ---------------------------------------------------------------------------
+  // Sharing is audited, and the four methods below are where.
+  //
+  // `shared` on a saved query or a dashboard is the entire embed boundary: it is
+  // the one field that hands another company's frontend rows out of this
+  // catalog, and it is set by a person clicking a toggle. So it is emitted the
+  // way every other governance decision here is — `type.curated`,
+  // `transform.changed` — rather than being the one that is not.
+  //
+  // Two rules hold across all four, and both are load-bearing:
+  //
+  // *On the transition, never on the write.* A save that leaves the flag where
+  // it was is not a sharing decision. A trail that recorded one per keystroke
+  // would be a trail people learn to scroll past, which costs more than the
+  // entries are worth. Un-sharing is emitted too, under the same event name with
+  // `shared: false` — a trail that records only grants cannot answer "was this
+  // still shared last Tuesday".
+  //
+  // *Against what the store returned, never against what the caller asked for.*
+  // A store that ignores `shared` must not produce an entry claiming access was
+  // granted when nothing was.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * @param createdBy who saved it — the row's author and the audit entry's
+   * actor. The host's resolved principal id where the host resolves one; see
+   * the enforcement note in `catalog.principal.ts` for why this library cannot
+   * work it out itself.
+   */
+  async saveQuery(input: SaveQueryInput, createdBy: string): Promise<SavedQuery> {
     if (!input?.name?.trim()) {
       throw new BadRequestException('A saved query needs a name.');
     }
     assertReadOnlyShape(input.sql ?? '');
-    return this.requireWorkspace().saveQuery(input, createdBy);
+    const saved = await this.requireWorkspace().saveQuery(input, createdBy);
+    // Born shared is a grant with nothing to transition from: an outside
+    // application can fetch it the moment this returns. Born unshared is not an
+    // event at all.
+    if (saved.shared) {
+      emitCatalog('query.shared', {
+        savedQueryId: saved.id,
+        name: saved.name,
+        shared: true,
+        principalId: createdBy,
+      });
+    }
+    return saved;
   }
 
-  async updateSavedQuery(id: string, input: Partial<SaveQueryInput>): Promise<SavedQuery> {
+  /** @param changedBy who made the change, for the audit trail. */
+  async updateSavedQuery(
+    id: string,
+    input: Partial<SaveQueryInput>,
+    changedBy: string,
+  ): Promise<SavedQuery> {
     if (input.sql !== undefined) assertReadOnlyShape(input.sql);
+    // Read the old value only when the flag is in play. A transition needs both
+    // ends, and every other edit — a rename, a new chart type — should not pay
+    // for a round trip it does not need.
+    const before =
+      input.shared === undefined ? undefined : await this.requireWorkspace().getSavedQuery(id);
     const updated = await this.requireWorkspace().updateSavedQuery(id, input);
     if (!updated) throw new NotFoundException(`No saved query ${id}`);
+    // `before` missing while the update succeeded means a store that disagrees
+    // with itself about whether this query exists. The transition is then
+    // unknowable, and an audit trail should over-record a grant rather than
+    // miss one, so it is emitted.
+    if (input.shared !== undefined && before?.shared !== updated.shared) {
+      emitCatalog('query.shared', {
+        savedQueryId: updated.id,
+        name: updated.name,
+        shared: updated.shared,
+        principalId: changedBy,
+      });
+    }
     return updated;
   }
 
@@ -325,16 +400,26 @@ export class CatalogService {
    * the toggle saves, the response says `shared: false`, and the embed API
    * keeps answering 403 for a board somebody just shared.
    */
-  saveDashboard(
+  async saveDashboard(
     input: { name: string; description?: string; cards?: DashboardCard[]; shared?: boolean },
     createdBy: string,
   ): Promise<Dashboard> {
     if (!input?.name?.trim()) {
       throw new BadRequestException('A dashboard needs a name.');
     }
-    return this.requireWorkspace().saveDashboard(input, createdBy);
+    const saved = await this.requireWorkspace().saveDashboard(input, createdBy);
+    if (saved.shared) {
+      emitCatalog('dashboard.shared', {
+        dashboardId: saved.id,
+        name: saved.name,
+        shared: true,
+        principalId: createdBy,
+      });
+    }
+    return saved;
   }
 
+  /** @param changedBy who made the change, for the audit trail. */
   async updateDashboard(
     id: string,
     input: Partial<{
@@ -343,9 +428,20 @@ export class CatalogService {
       cards: DashboardCard[];
       shared: boolean;
     }>,
+    changedBy: string,
   ): Promise<Dashboard> {
+    const before =
+      input.shared === undefined ? undefined : await this.requireWorkspace().getDashboard(id);
     const updated = await this.requireWorkspace().updateDashboard(id, input);
     if (!updated) throw new NotFoundException(`No dashboard ${id}`);
+    if (input.shared !== undefined && before?.shared !== updated.shared) {
+      emitCatalog('dashboard.shared', {
+        dashboardId: updated.id,
+        name: updated.name,
+        shared: updated.shared,
+        principalId: changedBy,
+      });
+    }
     return updated;
   }
 

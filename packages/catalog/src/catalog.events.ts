@@ -27,6 +27,8 @@ export const CATALOG_EVENTS = [
   'connector.run.finished',
   'transform.changed',
   'workflow.changed',
+  'query.shared',
+  'dashboard.shared',
 ] as const;
 
 export type CatalogEvent = (typeof CATALOG_EVENTS)[number];
@@ -63,6 +65,16 @@ export const CATALOG_EVENT_PHASE: Record<CatalogEvent, number> = {
   // be complete is exactly the mechanism that will fail the build the day a new
   // event is added and nobody thinks about where it belongs.
   'type.curated': 2,
+  // Sharing carries no snapshot id either, for the same reason curation does
+  // not: it is a standalone act on a saved query or a board, not a step of any
+  // load. So these ranks are never consulted, and they are written out for the
+  // reason the note above gives — the `Record` has to be complete, and that is
+  // what makes the build fail the day an event is added and nobody thinks about
+  // where it belongs. Ranked beside curation because they are the same kind of
+  // thing: a person deciding something about the catalog rather than data moving
+  // through it.
+  'query.shared': 2,
+  'dashboard.shared': 2,
   'schema.changed': 3,
   'snapshot.written': 4,
   'snapshot.committed': 5,
@@ -183,6 +195,45 @@ export interface CatalogEventPayloads {
     targetType: string;
     nodeCount: number;
     changedBy: string;
+  };
+  /**
+   * A saved query started or stopped being fetchable through the embed API.
+   *
+   * The single act that hands an outside application data from this catalog, and
+   * for a long time the only one that left no trace: `SavedQuery.shared` is the
+   * whole embed boundary, it is set by a person, and nothing recorded that they
+   * had set it.
+   *
+   * One event for both directions rather than a `query.unshared` beside it,
+   * following `connector.run.finished`: anybody watching for shares has to watch
+   * for revocations too — a trail that records only the grants cannot answer
+   * "was this still shared last Tuesday", which is the question an incident
+   * actually asks. The direction is in {@link shared}.
+   *
+   * Emitted on the transition only. A save that leaves the flag where it was is
+   * not a sharing decision, and a trail that logged every keystroke on a query
+   * would be a trail nobody reads.
+   */
+  'query.shared': {
+    savedQueryId: string;
+    /** As it read at the moment of the change, so the trail is legible alone. */
+    name: string;
+    /** True when access was granted, false when it was taken back. */
+    shared: boolean;
+    /**
+     * Who decided. The host-resolved principal where there is one, and named
+     * `principalId` because that is the field a recorder lifts into the audit
+     * table's indexed column — spell it anything else and the entry lands
+     * attributed to nobody.
+     */
+    principalId: string;
+  };
+  /** The same decision, about a whole board. See {@link CatalogEventPayloads['query.shared']}. */
+  'dashboard.shared': {
+    dashboardId: string;
+    name: string;
+    shared: boolean;
+    principalId: string;
   };
 }
 

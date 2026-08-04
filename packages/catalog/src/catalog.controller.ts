@@ -11,10 +11,12 @@ import {
   Patch,
   Post,
   Query,
+  Req,
   Res,
   type Type,
   UseGuards,
 } from '@nestjs/common';
+import type { CatalogPrincipal } from './catalog.principal';
 import { toCsv } from './catalog.query-cache';
 import { CatalogRegistry } from './catalog.registry.base';
 import { RequireScopes } from './catalog.route-auth';
@@ -183,8 +185,11 @@ export function createCatalogController(
     }
 
     @Post('saved-queries')
-    saveSavedQuery(@Body() body: SaveQueryInput & { createdBy?: string }) {
-      return this.service.saveQuery(body, body?.createdBy ?? 'console');
+    saveSavedQuery(
+      @Body() body: SaveQueryInput & { createdBy?: string },
+      @Req() request: { principal?: CatalogPrincipal },
+    ) {
+      return this.service.saveQuery(body, actorOf(request, body?.createdBy));
     }
 
     @Get('saved-queries/:id')
@@ -192,9 +197,20 @@ export function createCatalogController(
       return this.service.getSavedQuery(id);
     }
 
+    /**
+     * The body names no actor, deliberately — unlike the create route above,
+     * which has always let one be declared because `createdBy` is a stored
+     * field. Here the only consumer of the name is the audit entry a `shared`
+     * toggle produces, and a caller that can put any string into the audit trail
+     * is worse than one the trail records as the console.
+     */
     @Patch('saved-queries/:id')
-    patchSavedQuery(@Param('id') id: string, @Body() body: Partial<SaveQueryInput>) {
-      return this.service.updateSavedQuery(id, body);
+    patchSavedQuery(
+      @Param('id') id: string,
+      @Body() body: Partial<SaveQueryInput>,
+      @Req() request: { principal?: CatalogPrincipal },
+    ) {
+      return this.service.updateSavedQuery(id, body, actorOf(request));
     }
 
     @Delete('saved-queries/:id')
@@ -252,8 +268,9 @@ export function createCatalogController(
         shared?: boolean;
         createdBy?: string;
       },
+      @Req() request: { principal?: CatalogPrincipal },
     ) {
-      return this.service.saveDashboard(body, body?.createdBy ?? 'console');
+      return this.service.saveDashboard(body, actorOf(request, body?.createdBy));
     }
 
     @Get('dashboards/:id')
@@ -271,8 +288,9 @@ export function createCatalogController(
         cards: DashboardCard[];
         shared: boolean;
       }>,
+      @Req() request: { principal?: CatalogPrincipal },
     ) {
-      return this.service.updateDashboard(id, body);
+      return this.service.updateDashboard(id, body, actorOf(request));
     }
 
     @Delete('dashboards/:id')
@@ -401,6 +419,28 @@ export function createCatalogController(
   }
 
   return CatalogController;
+}
+
+/**
+ * Who to record a workspace change against.
+ *
+ * The host's resolved principal wins over anything the body claimed, and that
+ * order is the whole point: a `createdBy` in a request body is a name the caller
+ * chose for itself, and letting it beat the principal a guard authenticated
+ * would make the audit trail's actor column a free-text field. It is still
+ * honoured when there is no principal, because this library does not resolve
+ * one — see the enforcement note in `catalog.principal.ts` — and a host that has
+ * not wired a guard yet is better served by "console" than by nothing.
+ *
+ * `principal.id` rather than `applicationId`, matching every other event on this
+ * channel: for a delegated caller that string carries the person inside it, and
+ * dropping to the application half would attribute a person's decision to the
+ * console they used.
+ */
+function actorOf(request: { principal?: CatalogPrincipal } | undefined, claimed?: string): string {
+  const resolved = request?.principal?.id?.trim();
+  if (resolved) return resolved;
+  return claimed?.trim() || 'console';
 }
 
 /**

@@ -12,7 +12,9 @@ import {
   maySeeClassification,
   mayWrite,
   parsePrincipalId,
+  readableObjectPage,
 } from './catalog.principal';
+import type { CatalogObjectPage } from './catalog.types';
 
 function principal(overrides: Partial<CatalogPrincipal> = {}): CatalogPrincipal {
   return { id: 'console', scopes: [], ...overrides };
@@ -337,6 +339,87 @@ describe('maySeeClassification', () => {
 
   it('does not honour "*" — the check is by exact label', () => {
     expect(maySeeClassification(principal({ classifications: ['*'] }), 'cui')).toBe(false);
+  });
+});
+
+describe('readableObjectPage', () => {
+  /**
+   * Two classified columns and one plain one, so a partial grant is
+   * distinguishable from all-or-nothing: a helper that dropped every classified
+   * column the moment one was denied would pass a single-column fixture.
+   */
+  function page(overrides: Partial<CatalogObjectPage> = {}): CatalogObjectPage {
+    return {
+      type: 'Person',
+      page: 1,
+      size: 25,
+      total: 1,
+      pages: 1,
+      columns: [
+        { name: 'id', displayName: 'Id', type: 'uuid' },
+        { name: 'name', displayName: 'Name', type: 'string', classification: 'cui' },
+        { name: 'ssn', displayName: 'SSN', type: 'string', classification: 'secret' },
+      ],
+      rows: [{ id: 'p-1', name: 'Ana', ssn: '000-00-0000' }],
+      ...overrides,
+    };
+  }
+
+  const reader = principal({ scopes: ['catalog:read'], classifications: ['cui'] });
+
+  it('refuses the whole page when the principal may not read the type', () => {
+    // `null`, not an empty page: a type whose every column is hidden legitimately
+    // returns no columns, and a denial that looked like one would be reported by
+    // a host as "nothing to show" rather than as a refusal.
+    const denied = principal({ scopes: ['catalog:read'], readTypes: ['Vehicle'] });
+
+    expect(readableObjectPage(denied, page())).toBeNull();
+    expect(readableObjectPage(reader, page())).not.toBeNull();
+  });
+
+  it('drops only the columns whose classification the principal lacks', () => {
+    const visible = readableObjectPage(reader, page());
+
+    expect(visible?.columns.map((column) => column.name)).toEqual(['id', 'name']);
+  });
+
+  it('deletes the hidden values from every row rather than blanking them', () => {
+    // A key present with `null` asserts the column exists and is empty, which
+    // for a classified column is the disclosure this is meant to prevent.
+    const visible = readableObjectPage(reader, page());
+
+    expect(visible?.rows[0]).toEqual({ id: 'p-1', name: 'Ana' });
+    expect(Object.hasOwn(visible?.rows[0] ?? {}, 'ssn')).toBe(false);
+  });
+
+  it('does not mutate the page it was given', () => {
+    // The service caches nothing here, but a host calling this per-principal on
+    // one fetched page would otherwise redact the second caller's page with the
+    // first caller's grants — and the more restrictive call would win silently.
+    const original = page();
+    readableObjectPage(reader, original);
+
+    expect(original.columns).toHaveLength(3);
+    expect(original.rows[0]).toEqual({ id: 'p-1', name: 'Ana', ssn: '000-00-0000' });
+  });
+
+  it('leaves a page alone when every column is readable', () => {
+    const cleared = principal({ scopes: ['catalog:read'], classifications: ['cui', 'secret'] });
+
+    expect(readableObjectPage(cleared, page())?.rows[0]).toEqual({
+      id: 'p-1',
+      name: 'Ana',
+      ssn: '000-00-0000',
+    });
+  });
+
+  it('hides every classified column from a principal that named none', () => {
+    // The default for a caller nobody has thought about yet — see
+    // `CatalogPrincipal.classifications`.
+    const visible = readableObjectPage(principal({ scopes: ['catalog:read'] }), page());
+
+    expect(visible?.columns.map((column) => column.name)).toEqual(['id']);
+    expect(visible?.rows[0]).toEqual({ id: 'p-1' });
   });
 });
 
