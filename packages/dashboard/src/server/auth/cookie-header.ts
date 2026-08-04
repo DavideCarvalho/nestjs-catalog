@@ -40,9 +40,32 @@ export interface SetCookieOptions {
 }
 
 /**
- * Serialize a `Set-Cookie` header value. Always `HttpOnly` + `SameSite=Lax` (Lax blocks
- * cross-site `POST`s carrying the cookie — CSRF coverage for the login/logout endpoints).
- * Platform-agnostic: just a string.
+ * Serialize a `Set-Cookie` header value. Always `HttpOnly` + `SameSite=Lax`. Platform-agnostic:
+ * just a string.
+ *
+ * WHAT `SameSite=Lax` BUYS, EXACTLY
+ * ---------------------------------
+ * A Lax cookie is withheld from every cross-site request except a top-level GET navigation. So it
+ * covers the CSRF cases that matter here — a cross-site `fetch`/`XMLHttpRequest`, and a cross-site
+ * form `POST` — which is what makes the console's `credentials: 'same-origin'` a real boundary
+ * rather than a convention (see `client/transport.ts`): another site's script cannot get this
+ * cookie attached to a request at all, whatever the service's CORS says.
+ *
+ * It does NOT cover a cross-site top-level GET navigation, which is the one thing Lax lets
+ * through. That leaves exactly the state-changing GET endpoints exposed, and this package ships
+ * one deliberately: `GET <basePath>/logout`. It destroys only the caller's own session, so the
+ * worst a third-party link achieves is signing somebody out. The trade is argued where the route
+ * is defined — `catalog-auth.controller.ts` — and stated only there, so the two cannot disagree
+ * about what is covered.
+ *
+ * `Strict` was considered and rejected. It costs nothing on the flows this package ships (Mode A's
+ * launcher and Mode B's login page both navigate same-origin, via root-relative URLs), but a
+ * Strict cookie is also withheld from a top-level navigation ARRIVING from another site — a link
+ * to the console from the host's own product on a different registrable domain, a wiki, a chat
+ * message. A signed-in operator following one would land on the login page (or, under Mode A, on
+ * "open this console from your application"), and be signed in again on reload. That is an
+ * intermittent-looking auth bug traded for coverage of GET-only CSRF the package already has no
+ * meaningful exposure to.
  */
 export function serializeSetCookie(name: string, value: string, options: SetCookieOptions): string {
   const parts = [`${name}=${options.clear ? '' : encodeURIComponent(value)}`];

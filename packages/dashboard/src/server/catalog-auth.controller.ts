@@ -106,8 +106,20 @@ export class CatalogAuthController {
 
   // Plain `GET` (not `POST`): logging out only ever destroys the CALLER's own session, so it's
   // safe/idempotent from the caller's perspective — a simple `<a href>` (no JS, no CSRF token)
-  // works. Non-passthrough `@Res()`: this handler owns the response outright (clears the cookie,
-  // then redirects), so Nest must not also try to send a return value afterwards.
+  // works.
+  //
+  // This is the ONE state-changing GET in the package, and it is where the session cookie's
+  // `SameSite=Lax` stops covering us: Lax is sent on a cross-site top-level GET navigation, so a
+  // link on another site can reach this route with the cookie attached and sign the visitor out.
+  // Taken knowingly. The blast radius is one session belonging to whoever followed the link, there
+  // is nothing to read back (the response is a redirect), and the cost of closing it — a POST, and
+  // therefore a form and a token on every sign-out control including the plain `<a>` on the
+  // session-required page — is paid on every logout to prevent a nuisance. `cookie-header.ts`
+  // states what Lax covers and points here for what it does not; this comment is the only place
+  // the trade itself is argued.
+  //
+  // Non-passthrough `@Res()`: this handler owns the response outright (clears the cookie, then
+  // redirects), so Nest must not also try to send a return value afterwards.
   @Get('logout')
   logout(@Req() request: unknown, @Res() response: unknown): void {
     // Best-effort: even without dashboardAuth configured, clearing is harmless.

@@ -25,6 +25,7 @@ import { registeredChartLibraries, visualizationFor } from './charts/registry';
 import { ChartFailed, ChartSkeleton } from './charts/skeleton';
 import { cn } from './cn';
 import { useCatalogClient } from './context';
+import { ShareControl } from './sharing';
 import { Select } from './ui/select';
 import { Tooltip, TooltipProvider } from './ui/tooltip';
 
@@ -77,6 +78,22 @@ export function DashboardBoard() {
   const update = useMutation({
     mutationFn: ({ id, cards }: { id: string; cards: Dashboard['cards'] }) =>
       client.updateDashboard(id, { cards }),
+    onSuccess: invalidate,
+  });
+
+  /**
+   * Sharing, as its own mutation rather than a third caller of `update`.
+   *
+   * Two reasons, and both are about what the screen says while it happens. A
+   * drag that is still saving must not disable the share button, and a refused
+   * share must be reported next to the share control rather than swallowed into
+   * whatever the last layout write did. They are also different acts: one
+   * arranges a board, the other hands it to an application this deployment does
+   * not run, which the server records as an event.
+   */
+  const share = useMutation({
+    mutationFn: ({ id, shared }: { id: string; shared: boolean }) =>
+      client.updateDashboard(id, { shared }),
     onSuccess: invalidate,
   });
 
@@ -296,6 +313,23 @@ export function DashboardBoard() {
                   Delete
                 </button>
               </div>
+
+              {/*
+               * On its own line under the title rather than tucked in beside
+               * Delete: this is the one control on the screen whose effect is
+               * felt outside this deployment, and the sentence explaining what
+               * the current state means is the reason it is a row and not an
+               * icon. See `sharing.tsx` for why it is not a switch.
+               */}
+              <ShareControl
+                className="mt-4"
+                kind="dashboard"
+                shared={selected.shared}
+                pending={share.isPending}
+                error={share.error}
+                name={selected.name}
+                onChange={(shared) => share.mutate({ id: selected.id, shared })}
+              />
 
               {selected.cards.length === 0 ? (
                 <p

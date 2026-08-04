@@ -5,6 +5,7 @@ import { useMemo, useState } from 'react';
 import { registeredChartLibraries } from './charts/registry';
 import { cn } from './cn';
 import { useCatalogClient } from './context';
+import { ShareBadge, ShareControl } from './sharing';
 import { Select } from './ui/select';
 import { Tooltip } from './ui/tooltip';
 
@@ -22,6 +23,14 @@ export const savedQueryKeys = {
  * number, because only the person writing the query knows whether a
  * five-minute-old answer is fine. Zero — never cache — is the default, so the
  * surprising behaviour is the one you have to ask for.
+ *
+ * The list also carries the sharing state and the way back out of it. "Let
+ * other apps embed this" is a checkbox on the save form, which used to be the
+ * ONLY place `shared` could be set: a query shared by a slip of the mouse
+ * stayed shared, because no screen afterwards could reach the flag and the only
+ * way to revoke the grant was deleting the query. The badge is why a mistake is
+ * noticed at all — it renders without hovering, so a shared query announces
+ * itself in the list rather than waiting to be discovered from the embed API.
  */
 /**
  * The kinds a visualization can be, as the single list both the picker and the
@@ -74,6 +83,19 @@ export function SavedQueryPanel({
 
   const remove = useMutation({
     mutationFn: (id: string) => client.deleteSavedQuery(id),
+    onSuccess: invalidate,
+  });
+
+  /**
+   * The first call site `updateSavedQuery` has ever had.
+   *
+   * It was on the client, typed to take the whole of `Partial<SaveQueryInput>`
+   * — `shared` included — and reachable from nothing. A method no screen calls
+   * is a capability the product does not have, whatever the type says.
+   */
+  const share = useMutation({
+    mutationFn: ({ id, shared }: { id: string; shared: boolean }) =>
+      client.updateSavedQuery(id, { shared }),
     onSuccess: invalidate,
   });
 
@@ -250,6 +272,26 @@ export function SavedQueryPanel({
                     )}
                   </button>
                 </Tooltip>
+                {/*
+                 * Only when shared, and never hidden behind a hover. Every
+                 * other control in this row appears on hover because it is an
+                 * action; this is not an action, it is the answer to "which of
+                 * these can an outside application already read", and an answer
+                 * you have to go looking for one row at a time is not one.
+                 */}
+                {query.shared && <ShareBadge shared className="mr-1" />}
+                <ShareControl
+                  layout="row"
+                  kind="query"
+                  shared={query.shared}
+                  pending={share.isPending}
+                  name={query.name}
+                  onChange={(shared) => share.mutate({ id: query.id, shared })}
+                  className={cn(
+                    'opacity-0 group-hover:opacity-100 focus-visible:opacity-100',
+                    MUTED,
+                  )}
+                />
                 <Tooltip content="Download as CSV">
                   <a
                     href={client.exportUrl(query.id)}
@@ -274,6 +316,19 @@ export function SavedQueryPanel({
             ))}
           </div>
         ))}
+        {/*
+         * A refused share, said once for the list rather than under the row.
+         * The rows are a single line tall and the control is hover-revealed, so
+         * a message inside one would reflow the list under the pointer that
+         * asked for it — and this is the failure that must not pass unnoticed:
+         * the badge does not move, so nothing else on screen would say the
+         * grant was not made.
+         */}
+        {share.error !== null && (
+          <p className="px-2 py-1 text-[11px] text-red-600">
+            {share.error instanceof Error ? share.error.message : 'Could not change sharing.'}
+          </p>
+        )}
       </div>
     </div>
   );

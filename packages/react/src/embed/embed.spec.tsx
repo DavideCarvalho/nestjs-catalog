@@ -127,12 +127,18 @@ describe('what an embedded chart offers', () => {
 
   it('draws the CSV download when the host asks for it, pointing at the export endpoint', async () => {
     const { transport } = fakeTransport({ [CHART_PATH]: chartPayload() });
-    mount(transport, <EmbeddedChart chartId="q1" actions={['csv']} />);
+    // Where the HOST said its API lives. This assertion used to read
+    // `/api/catalog/...` and pass against a transport that had never been asked
+    // — `exportUrl` hardcoded the prefix — which made this test a record of the
+    // bug rather than of the behaviour. An embed runs inside somebody else's
+    // page by definition, so `/api` was wrong for every host but the console.
+    const routed: CatalogTransport = { ...transport, url: (path) => `/gateway/v2${path}` };
+    mount(routed, <EmbeddedChart chartId="q1" actions={['csv']} />);
 
     const link = await screen.findByRole('link', { name: 'Download CSV' });
     // The saved query's own export, because an embedded chart IS a saved query — a second
     // endpoint would be a second answer to "what is in this chart".
-    expect(link.getAttribute('href')).toBe('/api/catalog/saved-queries/q1/export.csv');
+    expect(link.getAttribute('href')).toBe('/gateway/v2/catalog/saved-queries/q1/export.csv');
   });
 
   it("draws only what exists under 'all'", async () => {

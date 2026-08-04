@@ -56,6 +56,29 @@ export interface CatalogTransport {
   patch<T>(path: string, body: unknown): Promise<T>;
   post<T>(path: string, body?: unknown): Promise<T>;
   delete<T>(path: string): Promise<T>;
+  /**
+   * Where this transport would send `path`, as a URL a browser can navigate to.
+   *
+   * The one thing a `Promise`-returning method cannot express. An export is a
+   * GET that streams a file: the browser downloads it without this library
+   * touching the response, which is what lets the control be a link that can be
+   * copied, bookmarked or handed to a download manager. `exportUrl` is the only
+   * caller.
+   *
+   * It exists because `exportUrl` used to answer `/api${path}` — the single
+   * hardcoded mount point in a package whose whole argument (see `routes.ts`,
+   * which makes it verbatim) is that the transport is the only thing that knows
+   * where the API lives. Worse, the component it broke first is the embedded
+   * chart, which by definition runs inside an application that mounted this
+   * catalog wherever it liked.
+   *
+   * Optional so an existing transport keeps compiling, and a transport that
+   * does not answer gets the path exactly as written — right only where the API
+   * is served from the root. Implement it if your transport prepends anything
+   * at all; it is the same concatenation the four methods above already do, and
+   * the console's own does it in one line.
+   */
+  url?(path: string): string;
 }
 
 /**
@@ -239,10 +262,39 @@ export interface CatalogClient {
   exportUrl(id: string): string;
 
   listDashboards(): Promise<Dashboard[]>;
-  saveDashboard(input: { name: string; description?: string }): Promise<Dashboard>;
+  /**
+   * `shared` is declared on both writes, and it is not decoration.
+   *
+   * The server's `patchDashboard` says why one layer down: a field a body type
+   * does not name is a field a host's whitelisting `ValidationPipe` deletes, so
+   * the write appears to succeed and the flag never moves. This type dropped it
+   * again — and a field a CLIENT type does not name cannot even be passed, so
+   * the failure arrives earlier and reads as a compile error in the one screen
+   * that would have set it.
+   *
+   * What that cost: `shared` is the entire access boundary of the embed API, so
+   * every dashboard a shipped console produced was un-embeddable, `embedDashboard`
+   * answered `403` for all of them, and `<EmbeddedDashboard>`'s "Nothing on this
+   * dashboard has been shared" was not an empty state but the only state.
+   *
+   * On `saveDashboard` too, although the console's create form does not offer
+   * it — a board is created empty and there is nothing yet to share. The field
+   * is here because the route accepts it and a host driving this client
+   * directly should not have to discover that the two writes disagree.
+   */
+  saveDashboard(input: {
+    name: string;
+    description?: string;
+    shared?: boolean;
+  }): Promise<Dashboard>;
   updateDashboard(
     id: string,
-    input: Partial<{ name: string; description: string; cards: DashboardCard[] }>,
+    input: Partial<{
+      name: string;
+      description: string;
+      cards: DashboardCard[];
+      shared: boolean;
+    }>,
   ): Promise<Dashboard>;
   deleteDashboard(id: string): Promise<{ deleted: boolean }>;
 
@@ -256,7 +308,9 @@ export interface CatalogClient {
    * `embedQuery(sql)` and never will be.
    *
    * `exportUrl` above is what an embedded chart's CSV action links to — the
-   * same export the console uses, because it is the same saved query.
+   * same export the console uses, because it is the same saved query, and
+   * resolved through the transport so it points at wherever the HOST mounted
+   * this catalog rather than at wherever the console happens to live.
    */
   embedChart(id: string): Promise<EmbeddedChartPayload>;
   embedDashboard(id: string): Promise<EmbeddedDashboardPayload>;
@@ -413,8 +467,14 @@ export function CatalogProvider({
         transport.delete<{ deleted: boolean }>(catalogRoutes.savedQuery(id)),
       runSavedQuery: (id) => transport.post(catalogRoutes.runSavedQuery(id), {}),
       // A URL rather than a fetch: an export the browser downloads itself can
-      // be a link, and a link can be copied, bookmarked or scheduled.
-      exportUrl: (id) => `/api${catalogRoutes.exportSavedQuery(id)}`,
+      // be a link, and a link can be copied, bookmarked or scheduled. Where
+      // that link points is the transport's answer, exactly like every other
+      // request this client makes — see `CatalogTransport.url` for what this
+      // hardcoded `/api` used to cost.
+      exportUrl: (id) => {
+        const path = catalogRoutes.exportSavedQuery(id);
+        return transport.url ? transport.url(path) : path;
+      },
 
       listDashboards: () => transport.get(catalogRoutes.dashboards()),
       saveDashboard: (input) => transport.post<Dashboard>(catalogRoutes.dashboards(), input),

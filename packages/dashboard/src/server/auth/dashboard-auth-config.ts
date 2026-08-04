@@ -62,13 +62,34 @@ export type AuthMode = 'session' | 'login';
 
 /**
  * Author-facing `dashboardAuth` option on `CatalogDashboardModule.forRoot`/`forRootAsync`. Gates
- * BOTH the SPA (a full-page navigation redirected to a server-rendered login page) and the JSON
- * API (a plain `401`) behind a signed session cookie, mirroring `@dudousxd/nestjs-telescope`'s
- * `dashboardAuth` mechanism (same HMAC-SHA256 cookie, same fail-closed validation). Two ways to
- * mint that cookie: Mode A (`session`) — the host frontend, already carrying its own auth, POSTs
- * to `<basePath>/session` and the host hook decides; or Mode B (`login`) — the built-in,
- * dependency-free server-rendered login page (`GET <basePath>/login`). At least one of the two is
- * required so an un-mintable gate is a boot error, not a silently-open (or silently-stuck) console.
+ * the SPA — a full-page navigation, redirected to a server-rendered login page — behind a signed
+ * session cookie, mirroring `@dudousxd/nestjs-telescope`'s `dashboardAuth` mechanism (same
+ * HMAC-SHA256 cookie, same fail-closed validation). Two ways to mint that cookie: Mode A
+ * (`session`) — the host frontend, already carrying its own auth, POSTs to `<basePath>/session`
+ * and the host hook decides; or Mode B (`login`) — the built-in, dependency-free server-rendered
+ * login page (`GET <basePath>/login`). At least one of the two is required so an un-mintable gate
+ * is a boot error, not a silently-open (or silently-stuck) console.
+ *
+ * IT DOES NOT GATE THE JSON API, AND CANNOT
+ * -----------------------------------------
+ * This said "gates BOTH the SPA and the JSON API (a plain 401)" for as long as it existed, and
+ * that was never true: this module registers `CatalogUiController` and `CatalogAuthController` and
+ * nothing else — there is no API controller here to guard. The catalog's HTTP surface is mounted
+ * by `CatalogModule`/`CatalogPipelineModule`, behind whatever the host already put in front of it,
+ * and a second guarded copy proxied through this console is the thing this package deliberately
+ * does not ship (see `CatalogDashboardOptions.apiPath`). A host that configured `auth` and stopped
+ * reading here therefore left rows, ad-hoc SQL and connector runs on whatever was guarding the API
+ * before — which was the honest state of things, described backwards at the one place a host
+ * configures auth.
+ *
+ * Closing it is one of two host-side moves, and the package ships both:
+ *
+ *  - `readCatalogConsoleSession(auth, request)` — verify the console's cookie inside the host's
+ *    OWN API guard, alongside its own tokens. The right shape when the host's guard already
+ *    exists and needs the identity, not merely a yes/no. See `server/index.ts`.
+ *  - `CatalogApiSessionGuard` — the same check as a ready-made guard the host applies to its API
+ *    controllers with `@UseGuards`. The right shape when a console session IS the credential for
+ *    that surface. See `catalog-session.guard.ts` for how to apply it.
  */
 export interface DashboardAuthOptions {
   /** REQUIRED HMAC-SHA256 signing key. Missing/empty => boot error (fail closed). */

@@ -24,6 +24,11 @@ export type { DashboardSession, DashboardSessionUser } from './auth/session-cook
  * console session on it, and whose? Signature and expiry are checked here;
  * `revalidate` is not run, because that is renewal and belongs to the guard
  * that owns the cookie's lifetime.
+ *
+ * The ready-made half of the same answer is `CatalogApiSessionGuard` below —
+ * take that when a console session simply IS the credential for the host's API
+ * surface, and this when the host has a guard already and needs the identity
+ * rather than a verdict.
  */
 export { readSessionFromRequest as readCatalogConsoleSession } from './auth/session-cookie-io.js';
 export { CatalogAuthController } from './catalog-auth.controller.js';
@@ -33,6 +38,12 @@ export {
   type CatalogDashboardAsyncOptions,
   type CatalogDashboardOptions,
 } from './catalog-dashboard.module.js';
+/**
+ * `CatalogUiSessionGuard` is stamped on the console shell by the module and needs nothing from a
+ * host. `CatalogApiSessionGuard` is the opposite: it is bound to nothing, because the API it
+ * guards is mounted in the HOST's tree — apply it there with `@UseGuards`, having imported
+ * `CatalogDashboardModule` (which provides and exports it). See its docblock.
+ */
 export {
   CatalogApiSessionGuard,
   CatalogUiSessionGuard,

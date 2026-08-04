@@ -13,7 +13,7 @@ import {
   resolveDashboardAuth,
 } from './auth/dashboard-auth-config.js';
 import { CatalogAuthController } from './catalog-auth.controller.js';
-import { CatalogUiSessionGuard } from './catalog-session.guard.js';
+import { CatalogApiSessionGuard, CatalogUiSessionGuard } from './catalog-session.guard.js';
 import {
   CatalogUiController,
   DASHBOARD_API_PATH,
@@ -178,6 +178,20 @@ function build(
     // Constructed by Nest, so it must be declared here — a guard stamped by
     // `UseGuards` is still resolved from the declaring module's injector.
     CatalogUiSessionGuard,
+    // Not stamped on anything here, and it cannot be: it guards the catalog's
+    // JSON API, which this package deliberately does not mount (see `apiPath`).
+    //
+    // Declared so it can be RESOLVED, which is a narrower claim than it looks.
+    // `@UseGuards(CatalogApiSessionGuard)` on a host's own controller already
+    // worked without this line — Nest instantiates a class enhancer from the
+    // declaring module's injector, and `DASHBOARD_AUTH` is exported above, so
+    // the dependency is in reach. What did NOT work is
+    // `moduleRef.get(CatalogApiSessionGuard)`, which is how a host reaches an
+    // instance to hand to `app.useGlobalGuards(...)` — the way you guard a
+    // whole API surface rather than remembering every controller on it. That
+    // threw "Nest could not find CatalogApiSessionGuard element", against a
+    // class exported from this package's barrel and documented as the answer.
+    CatalogApiSessionGuard,
   ];
 
   return {

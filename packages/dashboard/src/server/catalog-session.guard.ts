@@ -66,12 +66,55 @@ export class CatalogUiSessionGuard implements CanActivate {
 }
 
 /**
- * Gates `CatalogApiController` (the JSON API the SPA fetches) on a valid `dashboardAuth` session
- * cookie. A no-op (always `true`) when `dashboardAuth` was not configured. Missing/invalid/expired
- * session => a plain `401` (the API is called via `fetch`, never a browser navigation, so a
- * redirect would just fail the request anyway — the caller reads the status code, not HTML).
+ * The console session as a guard a HOST applies to ITS OWN API controllers.
  *
- * Mount-level and role-agnostic, same as `CatalogUiSessionGuard` above.
+ * It is bound to nothing in this package, and that is not an oversight to be tidied away — it is
+ * the only shape this guard can have. There is no JSON API here to guard: this module registers
+ * the SPA shell and the session endpoints, and the catalog's HTTP surface is mounted by
+ * `CatalogModule`/`CatalogPipelineModule` in the host's own tree, deliberately un-proxied (see
+ * `CatalogDashboardOptions.apiPath`). A guard cannot be stamped from here onto a controller this
+ * package never sees.
+ *
+ * (Its docblock used to claim it gated `CatalogApiController`, a class that exists nowhere in the
+ * repo, and cited a `catalog-client.ts` that does not either. Both were written for a proxying
+ * design this package does not have.)
+ *
+ * WHEN TO REACH FOR IT
+ * --------------------
+ * The gap it fills is real and specific: the console SPA fetches the catalog API from a browser,
+ * carrying this cookie and no bearer token, so a host whose API guard understands only its own
+ * tokens answers 401 to every screen while the shell loads perfectly. Two ways out, and the
+ * difference is whether the host has a guard already:
+ *
+ *  - Its own guard, needing the identity as well as the verdict: inject `DASHBOARD_AUTH` and call
+ *    `readCatalogConsoleSession` — see `catalog-console-session.integration.spec.ts`, written from
+ *    the host's side.
+ *  - No guard of its own, or one for which a console session simply IS the credential: apply this
+ *    one. Import `CatalogDashboardModule` in the module that owns those controllers — that is what
+ *    puts `DASHBOARD_AUTH` in reach — then either stamp it per controller or hand it to the whole
+ *    application:
+ *
+ *    ```ts
+ *    @Module({ imports: [CatalogDashboardModule.forRoot({ auth }), CatalogModule.forRoot(...)] })
+ *    class AppModule {}
+ *
+ *    @UseGuards(CatalogApiSessionGuard)          // per controller, or…
+ *    app.useGlobalGuards(app.get(CatalogApiSessionGuard));  // …the whole surface
+ *    ```
+ *
+ *    The second line is why the module provides and exports this class as well as the barrel
+ *    re-exporting it: the decorator form resolves without that (Nest builds a class enhancer from
+ *    the declaring module's injector), and `app.get` does not.
+ *
+ * Missing/invalid/expired session => a plain `401` (the API is called via `fetch`, never a browser
+ * navigation, so the redirect `CatalogUiSessionGuard` throws would just fail the request — the
+ * caller reads a status code, not HTML). A no-op (always `true`) when `dashboardAuth` was not
+ * configured, matching `CatalogUiSessionGuard`: a host that left the console open has not asked
+ * for its API to be shut by this.
+ *
+ * Mount-level and role-agnostic, same as `CatalogUiSessionGuard` above: it only ever answers "is
+ * there a valid console session", never who may do what with it. Authorisation on the catalog's
+ * surface is `CatalogModule`'s scopes, which this cannot and must not stand in for.
  */
 @Injectable()
 export class CatalogApiSessionGuard implements CanActivate {
@@ -93,9 +136,12 @@ export class CatalogApiSessionGuard implements CanActivate {
 
   /**
    * A bare 401 body carrying `{ auth: { modes } }` — mirrors `@dudousxd/nestjs-telescope`'s
-   * dashboardAuth 401. The API is fetched (never navigated), so this is the ONLY way the console
-   * SPA (`catalog-client.ts`) learns which auth surface to send the operator to on a mid-session
-   * 401; `CatalogUiSessionGuard`'s redirect/session-required exceptions above don't reach it.
+   * dashboardAuth 401. The API is fetched, never navigated, so the redirect and session-required
+   * exceptions `CatalogUiSessionGuard` throws are useless here: what reaches the SPA is a status
+   * code and a body. `modes` is in that body so the console can send an operator to the right
+   * place on a mid-session 401 — the built-in login page under Mode B, the host's launcher under
+   * Mode A — rather than guessing at one of them. `client/transport.ts` surfaces the raw body on
+   * `UnauthorizedError`, which is what puts it in reach.
    */
   private unauthorized(auth: ResolvedDashboardAuth): UnauthorizedException {
     return new UnauthorizedException({ auth: { modes: auth.modes } });

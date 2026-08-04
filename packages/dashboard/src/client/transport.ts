@@ -104,10 +104,22 @@ async function request<T>(
 
   const response = await fetch(url, {
     ...rest,
-    // Explicit rather than relying on the default. The session cookie is
-    // `SameSite=Strict`, so it rides along on same-origin requests and on
-    // nothing else — which is what stops the service's permissive CORS from
-    // being a way for another site to act as a signed-in user.
+    // Explicit rather than relying on the default, and it is half of a pair.
+    //
+    // This half: `same-origin` means this console never attaches the cookie to
+    // a cross-origin request of its own. The other half is the cookie's
+    // `SameSite=Lax` (see `server/auth/cookie-header.ts`), which is what stops
+    // ANOTHER site's script from doing it — Lax cookies are not sent on
+    // cross-site `fetch`, `XMLHttpRequest` or form POSTs at all, so the
+    // service's permissive CORS cannot be turned into a way to act as a
+    // signed-in user: the request either carries no cookie or is never sent.
+    //
+    // Lax, not Strict. An earlier version of this comment said `Strict` and no
+    // code ever set it; the guarantee above is the one Lax actually makes. What
+    // Lax additionally permits is a cross-site top-level GET NAVIGATION, so the
+    // residual exposure is exactly "state-changing GET endpoints", of which
+    // this package has one on purpose — see the note on `logout` in
+    // `server/catalog-auth.controller.ts`.
     credentials: 'same-origin',
     headers: {
       'content-type': 'application/json',
@@ -143,6 +155,13 @@ export const transport: CatalogTransport = {
       body: body === undefined ? undefined : JSON.stringify(body),
     }),
   delete: (path) => request(path, { method: 'DELETE' }),
+  // The CSV export is a link the browser follows, not a fetch, so the screens
+  // need the URL rather than the response — and it has to be built by the same
+  // `buildUrl` as everything above. It used to be built by the React package
+  // instead, from a hardcoded `/api`, which was right for this app by accident
+  // and wrong for every other host of those screens. Nothing is appended: an
+  // export takes no query string, and `URL` would encode one anyway.
+  url: (path) => buildUrl(path, undefined).toString(),
 };
 
 /** Endpoints outside the catalog library's own surface. */
