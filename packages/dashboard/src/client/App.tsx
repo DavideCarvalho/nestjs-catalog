@@ -8,6 +8,7 @@ import {
   ObjectExplorer,
   PipelineConsole,
   QueryConsole,
+  Select,
   Tabs,
   TabsPanel,
   cn,
@@ -140,29 +141,29 @@ function EnvironmentPicker() {
   return (
     <label className="ml-auto mr-3 flex items-center gap-1.5 text-[10px]">
       <span className="font-mono uppercase tracking-[0.14em] text-zinc-400">Env</span>
-      <select
+      <Select
         value={current}
-        onChange={(event) => {
-          setEnvironment(event.target.value);
+        onValueChange={(next) => {
+          setEnvironment(next);
           window.location.reload();
         }}
-        aria-label="Environment"
+        ariaLabel="Environment"
         className={cn(
-          'rounded-md border px-1.5 py-1 font-mono text-[10px] outline-none',
-          'border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900',
+          'font-mono text-[10px]',
           // A protected environment looks different, because "am I about to do
           // this to production" should not require reading the word.
           active?.protected && 'border-amber-500 text-amber-700 dark:text-amber-400',
         )}
-      >
-        {environments.length === 0 && <option value={current}>{current}</option>}
-        {environments.map((environment) => (
-          <option key={environment.id} value={environment.id}>
-            {environment.displayName}
-            {environment.protected ? ' (protected)' : ''}
-          </option>
-        ))}
-      </select>
+        options={
+          environments.length === 0
+            ? [{ value: current, label: current }]
+            : environments.map((environment) => ({
+                value: environment.id,
+                label: environment.displayName,
+                ...(environment.protected ? { hint: 'protected' } : {}),
+              }))
+        }
+      />
     </label>
   );
 }

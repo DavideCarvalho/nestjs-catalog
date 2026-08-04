@@ -25,6 +25,7 @@ import { ChartEmpty, ChartFailed, ChartSkeleton } from './charts/skeleton';
 import { cn } from './cn';
 import { useCatalogClient } from './context';
 import { DataTable, renderUnknown } from './ui/data-table';
+import { Select } from './ui/select';
 import { Tooltip, TooltipProvider } from './ui/tooltip';
 
 const MUTED = 'text-zinc-400 dark:text-zinc-500';
@@ -745,18 +746,18 @@ function MiniTable({ result }: { result: CatalogQueryResult }) {
  * current value still has to be readable while arranging.
  */
 /**
- * What the default option says, given what the query chose and what exists.
+ * What the default option says underneath its label.
  *
  * Three cases, and the third is the one worth the function: a query naming a
  * library nobody registered. The card falls back to the built-in, correctly and
- * silently, so the label has to be the thing that says so.
+ * silently, so this line has to be the thing that says so.
  */
-export function followsLabel(queryLibrary: string | undefined, available: string[]): string {
-  if (!queryLibrary) return 'follows query (built-in)';
+export function followsHint(queryLibrary: string | undefined, available: string[]): string {
+  if (!queryLibrary) return 'the built-in renderer';
   if (!available.includes(queryLibrary)) {
-    return `follows query (${queryLibrary} — not installed, drawing built-in)`;
+    return `${queryLibrary} — not installed, drawing built-in`;
   }
-  return `follows query (${queryLibrary})`;
+  return queryLibrary;
 }
 
 function CardLibraryPicker({
@@ -777,30 +778,23 @@ function CardLibraryPicker({
   if (available.length === 0) return null;
 
   return (
-    <Tooltip content="Which chart library draws this card. Follows the saved query unless you choose here.">
-      <select
-        value={library ?? ''}
-        onChange={(event) => onLibrary(event.target.value || undefined)}
-        aria-label="Chart library for this card"
-        className={cn(
-          'mr-1 rounded-md border bg-transparent px-1.5 py-0.5 font-mono text-[10px] outline-none',
-          RULE,
-        )}
-      >
-        <option value="">
-          {/* Says what will actually DRAW, not what the query asked for. A
-              saved query can name a library this app never registered — the
-              card then degrades to the built-in, which is the right behaviour
-              and an invisible one. "follows query (visx)" on a card drawing
-              built-in bars is the control lying about the thing it controls. */}
-          {followsLabel(queryLibrary, available)}
-        </option>
-        {available.map((name) => (
-          <option key={name} value={name}>
-            {name}
-          </option>
-        ))}
-      </select>
-    </Tooltip>
+    <Select
+      value={library ?? ''}
+      onValueChange={(next) => onLibrary(next || undefined)}
+      ariaLabel="Chart library for this card"
+      className="mr-1"
+      options={[
+        {
+          value: '',
+          label: 'follows query',
+          // The hint is the reason this is not a native `<option>`: a native
+          // one is a single line of unstyleable text, and what matters here is
+          // the second line — that the query named a library nobody installed,
+          // so the card is drawing something other than what it says.
+          hint: followsHint(queryLibrary, available),
+        },
+        ...available.map((name) => ({ value: name, label: name })),
+      ]}
+    />
   );
 }
