@@ -73,8 +73,21 @@ export interface FanoutReplayResult {
   comparison: FanoutComparison;
 }
 
-/** Steps a replay discharges, because it supplies the rows they were meant to. */
-const REPLAYED_STAGES: FanoutStage[] = ['ensureType', 'write', 'carryForward'];
+/**
+ * Steps a replay discharges, because it supplies the rows they were meant to.
+ *
+ * `ensureType` is deliberately not here, and was — where it did nothing at all.
+ * Those entries are recorded under `FANOUT_SCHEMA_SCOPE` rather than under a
+ * snapshot id, so `clearDebt`, which queries by snapshot, filtered them out
+ * before this list was ever consulted: the stage was listed, the operator was
+ * told the replay had cleared its debts, and the schema entry that holds the
+ * follower back from every future commit survived untouched.
+ *
+ * Listing it and widening the query would have been the wrong repair anyway. A
+ * schema debt says a column is missing; rows arriving is not evidence about
+ * columns. It is discharged by `ensureTypeOn` below, which is the call that is.
+ */
+const REPLAYED_STAGES: FanoutStage[] = ['write', 'carryForward'];
 
 @Injectable()
 export class CatalogFanoutMigration {
@@ -270,7 +283,10 @@ export class CatalogFanoutMigration {
    *    it for any other id would silently hand over current data under an old
    *    name — the worst outcome available here.
    * 2. `ensureType` on the follower, because the reason the rows never arrived is
-   *    quite often that the table never did.
+   *    quite often that the table never did — through the fan-out's journalled
+   *    path, so that a schema failure the follower has been carrying is actually
+   *    discharged by this call succeeding, and a fresh one is written down rather
+   *    than thrown out of a repair that leaves no trace.
    * 3. Drop the follower's copy of the snapshot. Necessary, not tidy: `write`
    *    replaces per batch, so a shorter replay over a longer failed attempt
    *    would leave the failed attempt's high-numbered batches in place, and the
@@ -309,7 +325,12 @@ export class CatalogFanoutMigration {
       );
     }
 
-    await follower.store.ensureType(resolved);
+    const schema = await this.fanout.ensureTypeOn(resolved, followerName);
+    if (schema.recovered) {
+      notes.push(
+        `${followerName} was carrying a failed schema change for ${resolved.name}, which held it back from every commit of every snapshot — including ones it held in full. Taking the schema succeeded this time, so that debt is discharged.`,
+      );
+    }
     await this.clearFollowerCopy(resolved, snapshotId, followerName);
 
     const fields = resolved.properties.map((property) => property.name);
@@ -340,12 +361,13 @@ export class CatalogFanoutMigration {
       principalId,
     });
 
-    const cleared = await this.fanout.clearDebt(
-      resolved.name,
-      snapshotId,
-      followerName,
-      REPLAYED_STAGES,
-    );
+    // The schema entry counts towards this only when `ensureTypeOn` reported it
+    // actually discharged one. A repair that adds to its own total on the
+    // strength of having run is a repair whose total cannot be checked, and this
+    // number is what an operator reads before believing the follower is fixed.
+    const cleared =
+      (schema.recovered ? 1 : 0) +
+      (await this.fanout.clearDebt(resolved.name, snapshotId, followerName, REPLAYED_STAGES));
 
     const shouldCommit = await this.commitReplayIfCurrent(
       resolved,
@@ -528,16 +550,39 @@ export class CatalogFanoutMigration {
     return `catalog-fanout/replay@${this.fanout.primary.name}`;
   }
 
-  /** The snapshot a comparison defaults to. */
+  /**
+   * The snapshot a comparison defaults to, from the best answer available.
+   *
+   * Three sources, strictly ordered, and the order is the whole content of this
+   * method:
+   *
+   * 1. **The journal's commit mark.** The fan-out performed the commit, so this
+   *    is a record of what happened rather than an inference about it.
+   * 2. **The primary's own `currentSnapshot`.** A pointer the store reads, which
+   *    is what makes it right in the case that breaks the third source: rolling
+   *    a bad load back means committing an *older* snapshot, after which the
+   *    newest snapshot and the current one are different rows.
+   * 3. **The newest in `listSnapshots`.** A guess, and named as one by the core
+   *    package, which does not distinguish committed from half-written. Needed
+   *    because a fan-out installed on top of an existing catalog has a journal
+   *    that knows nothing about the loads before it and may face a store with no
+   *    pointer to offer.
+   *
+   * Source 2 was missing, for a reason that had nothing to do with this method:
+   * the fan-out did not forward `currentSnapshot`, so a MySQL primary — which
+   * implements it — looked from here exactly like a store that cannot answer, and
+   * every comparison and every unpinned replay went to the guess.
+   */
   private async currentSnapshotOf(type: CatalogObjectTypeDef): Promise<string> {
     const mark = await this.fanout.journal.lastCommitted(type.name);
     if (mark) return mark.snapshotId;
 
-    // Falling back to the store's own list, newest first, because a fan-out
-    // installed on top of an existing catalog has a journal that knows nothing
-    // about the loads that came before it. The list is what the store is willing
-    // to say; it does not distinguish committed from half-written, which is why
-    // it is the fallback and not the first answer.
+    const current = this.fanout.primary.store.currentSnapshot;
+    if (current) {
+      const ref = await current.call(this.fanout.primary.store, type);
+      if (ref) return ref.id;
+    }
+
     const list = this.fanout.primary.store.listSnapshots;
     if (list) {
       const refs = await list.call(this.fanout.primary.store, type);

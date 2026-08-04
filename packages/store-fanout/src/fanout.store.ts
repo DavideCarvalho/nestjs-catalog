@@ -5,6 +5,7 @@ import type {
   CatalogQueryRelation,
   CatalogQueryRequest,
   CatalogQueryResult,
+  CatalogQueryStore,
   CatalogReadQuery,
   CatalogReadResult,
   CatalogReadStore,
@@ -12,10 +13,16 @@ import type {
   CatalogWriteStore,
   SnapshotRef,
 } from '@dudousxd/nestjs-catalog';
-import { isQueryStore, isWriteStore, supportsCarryForward } from '@dudousxd/nestjs-catalog';
+import {
+  isCatalogStoreCapabilities,
+  isQueryStore,
+  isWriteStore,
+  supportsCarryForward,
+} from '@dudousxd/nestjs-catalog';
 import { BadRequestException, Inject, Injectable, Logger } from '@nestjs/common';
 import { composeCapabilities, explainCapabilities } from './capabilities';
 import { emitFanout } from './events';
+import type { AssertNothingMissing, OptionalKeyOf } from './exhaustive';
 import {
   type CatalogFanoutJournal,
   FANOUT_SCHEMA_SCOPE,
@@ -135,8 +142,22 @@ export class FanoutCatalogStore implements CatalogWriteStore {
    * field, so an unassigned one is genuinely absent rather than present and
    * undefined; a plain optional field would be an own property and `in` would
    * find it.
+   *
+   * **The list is the hazard.** Every entry here is a method some other package
+   * probes structurally, and the failure of leaving one out is silent in exactly
+   * the same way in both directions: a caller asks, gets no, and takes the
+   * fallback path. `currentSnapshot` was missing from this list for as long as it
+   * has existed, so a MySQL primary behind a fan-out reported that it could not
+   * say which snapshot it was serving, and the replay fell back to guessing the
+   * newest — the failure the core package spells out as "not survivable". So the
+   * list is checked against the interfaces by {@link PROBED_STORE_METHODS} and
+   * the assertions under it, and adding an optional member to `CatalogWriteStore`
+   * now stops this package compiling until somebody has decided what to do.
    */
   declare readonly listSnapshots?: (type: CatalogObjectTypeDef) => Promise<SnapshotRef[]>;
+  declare readonly currentSnapshot?: (
+    type: CatalogObjectTypeDef,
+  ) => Promise<SnapshotRef | undefined>;
   declare readonly carryForward?: CatalogMergeStore['carryForward'];
   declare readonly runQuery?: (request: CatalogQueryRequest) => Promise<CatalogQueryResult>;
   declare readonly queryRelations?: () => Promise<CatalogQueryRelation[]>;
@@ -171,6 +192,16 @@ export class FanoutCatalogStore implements CatalogWriteStore {
     if (primary.store.listSnapshots) {
       const listSnapshots = primary.store.listSnapshots.bind(primary.store);
       this.listSnapshots = listSnapshots;
+    }
+    if (primary.store.currentSnapshot) {
+      // Bound to the primary and not composed, for the reason every read is: the
+      // primary's commit is what decides that a load happened, so the snapshot it
+      // is serving is *the* answer. A composed one — the newest snapshot every
+      // store agrees on, say — would report a follower's staleness as the
+      // catalog's, and a caller cannot act on that: the rows it is about to read
+      // come from the primary either way.
+      const currentSnapshot = primary.store.currentSnapshot.bind(primary.store);
+      this.currentSnapshot = currentSnapshot;
     }
     if (supportsCarryForward(primary.store)) {
       this.carryForward = (type, snapshotId, options) =>
@@ -620,6 +651,54 @@ export class FanoutCatalogStore implements CatalogWriteStore {
   }
 
   /**
+   * Bring one named follower's physical shape in line with the type, journalled
+   * like any other step.
+   *
+   * The head of a replay, and public for the same reason {@link commitFollower}
+   * is its tail: a repair that touches a follower outside this class's
+   * announce-before-attempt path is a repair whose failure nobody writes down,
+   * and — worse here — whose *success* discharges nothing.
+   *
+   * **The bug this exists to close.** A follower that failed `ensureType` owes an
+   * entry under {@link FANOUT_SCHEMA_SCOPE}, and {@link outstandingFor} folds the
+   * schema scope into every snapshot, so that follower is held back from every
+   * commit from then on and `verify()` is red for good. The documented repair is
+   * a replay — which used to call `follower.store.ensureType` directly, so the
+   * one thing that could discharge the entry was the one call that bypassed the
+   * journal. The operator ran the repair, was told how many debts it cleared, and
+   * the follower was still held back on the next load, with nothing in the output
+   * of either step to suggest why.
+   *
+   * It is not enough to sweep the schema scope in {@link clearDebt} instead. That
+   * entry says a column is missing, and copying rows in does not make a column
+   * appear — `supersede` says the same thing about why committing loads never
+   * discharges it. The only evidence that the schema debt is paid is an
+   * `ensureType` that succeeded, so the repair has to be that call, made where it
+   * can be seen.
+   *
+   * Returns whether a debt was actually discharged, so a caller reporting a count
+   * reports what happened rather than that the call returned.
+   */
+  async ensureTypeOn(
+    type: CatalogObjectTypeDef,
+    followerName: string,
+  ): Promise<{ recovered: boolean }> {
+    const follower = this.followerNamed(followerName);
+    const outcome = await this.attempt(
+      follower,
+      { type, snapshotId: FANOUT_SCHEMA_SCOPE, stage: 'ensureType' },
+      () => follower.store.ensureType(type),
+    );
+    if (!outcome.ok) {
+      throw new CatalogFanoutError(
+        `${followerName} would not take the schema for ${type.name}: ${outcome.error}. Until it does, every commit holds this follower back, because a follower whose table is a column short is not holding a snapshot of this type however many rows it has.`,
+        [{ follower: followerName, stage: 'ensureType', error: outcome.error }],
+      );
+    }
+    return { recovered: outcome.recovered };
+  }
+
+  /**
    * Commit a snapshot on one named follower, journalled like any other step.
    *
    * The tail of a replay, and public for exactly that reason: once the rows have
@@ -702,6 +781,20 @@ export class FanoutCatalogStore implements CatalogWriteStore {
    * Only ever called after a replay has finished copying, never speculatively.
    * A journal that can be cleared without the data having moved is a journal
    * whose entries mean nothing.
+   *
+   * **Schema-scoped entries are out of reach here, deliberately.** The query is
+   * by snapshot id and a failed `ensureType` is recorded under
+   * {@link FANOUT_SCHEMA_SCOPE}, so no `stages` argument naming `ensureType` can
+   * ever match one. That is not an oversight to be repaired by widening the
+   * query: copying rows in is evidence about rows and about nothing else, and a
+   * schema debt discharged on the strength of a successful copy would be exactly
+   * the cleared-without-the-data-having-moved case above — the follower's table
+   * can still be a column short, and the next load would write into it happily.
+   * {@link ensureTypeOn} is where that debt is paid, by the call that is evidence
+   * for it.
+   *
+   * The returned count is entries this call actually resolved: it skips stages
+   * it was not asked for, and skips entries `resolve` reported nothing owed for.
    */
   async clearDebt(
     typeName: string,
@@ -754,7 +847,7 @@ export class FanoutCatalogStore implements CatalogWriteStore {
       batch?: number;
     },
     run: () => Promise<T>,
-  ): Promise<{ ok: true; value: T } | { ok: false; error: string }> {
+  ): Promise<{ ok: true; value: T; recovered: boolean } | { ok: false; error: string }> {
     const key = fanoutEntryKey({
       typeName: scope.type.name,
       snapshotId: scope.snapshotId,
@@ -783,7 +876,13 @@ export class FanoutCatalogStore implements CatalogWriteStore {
     try {
       const value = await run();
       const cleared = await this.journal.resolve(key);
-      if (wasOwed && cleared) {
+      // Reported to the caller as well as announced, because a repair has to be
+      // able to say how many debts it actually discharged. Deriving that from
+      // "the repair ran and did not throw" is how a count comes to overstate
+      // itself, and an overstated count is worse than none: it is the number the
+      // operator reads before deciding the follower is fixed.
+      const recovered = wasOwed && cleared;
+      if (recovered) {
         emitFanout('follower.recovered', {
           follower: follower.name,
           typeName: scope.type.name,
@@ -795,7 +894,7 @@ export class FanoutCatalogStore implements CatalogWriteStore {
           `${follower.name} caught up on ${scope.stage} of ${scope.type.name} snapshot ${scope.snapshotId}.`,
         );
       }
-      return { ok: true, value };
+      return { ok: true, value, recovered };
     } catch (cause) {
       const error = messageOf(cause);
       await this.journal.record({
@@ -901,6 +1000,57 @@ export class FanoutCatalogStore implements CatalogWriteStore {
 }
 
 /**
+ * Every optional store method this class probes the primary for and forwards.
+ *
+ * A runtime list as well as a type, because the two halves of "the fan-out
+ * offers what its primary offers" fail differently and only one of them is a
+ * type error. Leaving a method out of the `declare` block is caught below at
+ * compile time; declaring it and forgetting the line in the constructor that
+ * binds it is not a type error at all — the field is optional, so an unassigned
+ * one is a legal absence — and it produces the identical silent no. This list is
+ * what the suite walks to check the bindings, so a method added to the block
+ * enters that check without anybody remembering to add it there too.
+ *
+ * Exported for the tests and not from the package's entry point: it is a fact
+ * about this class's wiring, not something a host has any use for.
+ */
+export const PROBED_STORE_METHODS = [
+  'listSnapshots',
+  'currentSnapshot',
+  'carryForward',
+  'runQuery',
+  'queryRelations',
+] as const;
+
+/**
+ * Every method the rest of the ecosystem discovers by looking for it.
+ *
+ * Three sources, because there are three ways a store says it can do something
+ * extra: an optional member of the write interface, the one member that makes a
+ * store a merge store, and the members that make it a query store. All three are
+ * probed structurally by the core package, and all three grow.
+ */
+type ProbedStoreMethod =
+  | OptionalKeyOf<CatalogWriteStore>
+  | Exclude<keyof CatalogMergeStore, keyof CatalogWriteStore>
+  | keyof CatalogQueryStore;
+
+/** A method the interfaces have and this class does not declare. */
+type _EveryProbedMethodIsDeclared = AssertNothingMissing<
+  Exclude<ProbedStoreMethod, keyof FanoutCatalogStore>
+>;
+
+/** A method this class declares that the tests would never look for. */
+type _EveryProbedMethodIsListed = AssertNothingMissing<
+  Exclude<ProbedStoreMethod, (typeof PROBED_STORE_METHODS)[number]>
+>;
+
+/** A name in the list that no interface has, i.e. a check for something gone. */
+type _EveryListedMethodIsProbed = AssertNothingMissing<
+  Exclude<(typeof PROBED_STORE_METHODS)[number], ProbedStoreMethod>
+>;
+
+/**
  * Narrow an injected token to a store that can be loaded into.
  *
  * A runtime check rather than a type argument on the module options, because
@@ -926,22 +1076,22 @@ export function asWriteStore(name: string, value: unknown): CatalogWriteStore {
   return value;
 }
 
+/**
+ * The capability half is the core package's own predicate, not a local copy.
+ *
+ * There was a local copy, and it had already drifted: it knew nothing about the
+ * three optional atomicity fields, so a store declaring `transactional: "yes"`
+ * was refused by the core package and accepted here. The core exports its
+ * predicate for exactly this — a fan-out composing three stores and a dashboard
+ * rendering one have to agree about what counts as a capability object, or a
+ * store is admitted by one and rejected by the other for reasons neither reports.
+ */
 function isCatalogReadStore(value: unknown): value is CatalogReadStore {
   return (
     typeof value === 'object' &&
     value !== null &&
     typeof Reflect.get(value, 'read') === 'function' &&
-    isCapabilities(Reflect.get(value, 'capabilities'))
-  );
-}
-
-function isCapabilities(value: unknown): value is CatalogStoreCapabilities {
-  if (typeof value !== 'object' || value === null) return false;
-  const snapshots = Reflect.get(value, 'snapshots');
-  return (
-    (snapshots === 'native' || snapshots === 'emulated' || snapshots === 'none') &&
-    typeof Reflect.get(value, 'writable') === 'boolean' &&
-    typeof Reflect.get(value, 'timeTravel') === 'boolean'
+    isCatalogStoreCapabilities(Reflect.get(value, 'capabilities'))
   );
 }
 
