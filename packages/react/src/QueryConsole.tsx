@@ -6,6 +6,7 @@ import { SavedQueryPanel } from './SavedQueryPanel';
 import { cn } from './cn';
 import { useCatalogClient } from './context';
 import { CodeEditor } from './ui/code-editor';
+import { DataTable, renderUnknown } from './ui/data-table';
 import { Tooltip, TooltipProvider } from './ui/tooltip';
 
 const MUTED = 'text-zinc-400 dark:text-zinc-500';
@@ -337,11 +338,28 @@ function SqlEditor({
 }
 
 function ResultTable({ result }: { result: CatalogQueryResult }) {
-  if (result.rowCount === 0) {
-    return (
-      <p className={cn('p-8 text-center text-sm', MUTED)}>The query ran and matched nothing.</p>
+  // Built from the answer, because the answer decides them: a free SQL query
+  // returns whatever columns it returns, and there is no type to derive them
+  // from ahead of time.
+  const columns = useMemo(
+    () =>
+      result.columns.map((column) => ({
+        id: column,
+        accessorFn: (row: Record<string, unknown>) => row[column],
+        header: column,
+        cell: (context: { getValue: () => unknown }) => renderUnknown(context.getValue()),
+      })),
+    [result.columns],
+  );
+
+  // Whether a column is numeric is a property of the DATA here, not of a
+  // schema — the first row is the only thing available to ask.
+  const numericColumns = useMemo(() => {
+    const first = result.rows[0];
+    return new Set(
+      first ? result.columns.filter((column) => typeof first[column] === 'number') : [],
     );
-  }
+  }, [result.columns, result.rows]);
 
   return (
     <div className="p-4">
@@ -351,55 +369,15 @@ function ResultTable({ result }: { result: CatalogQueryResult }) {
           answer.
         </p>
       )}
-      <div className={cn('overflow-x-auto rounded-lg border', RULE, PANEL)}>
-        <table className="w-full min-w-max text-sm">
-          <thead>
-            <tr className={cn('border-b bg-zinc-50 dark:bg-zinc-950', RULE)}>
-              {result.columns.map((column) => (
-                <th
-                  key={column}
-                  className={cn(
-                    'whitespace-nowrap px-3 py-2 text-left font-mono text-[10px] font-normal uppercase tracking-[0.12em]',
-                    MUTED,
-                  )}
-                >
-                  {column}
-                </th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {result.rows.map((row, index) => (
-              // biome-ignore lint/suspicious/noArrayIndexKey: arbitrary SQL has no key
-              <tr
-                key={index}
-                className="border-b border-zinc-100 last:border-0 dark:border-zinc-900"
-              >
-                {result.columns.map((column) => {
-                  const value = row[column];
-                  const numeric = typeof value === 'number';
-                  return (
-                    <td
-                      key={column}
-                      className={cn(
-                        'whitespace-nowrap px-3 py-1.5',
-                        numeric && 'text-right font-mono tabular-nums',
-                        (value === null || value === undefined) && MUTED,
-                      )}
-                    >
-                      {value === null || value === undefined
-                        ? '—'
-                        : typeof value === 'object'
-                          ? JSON.stringify(value)
-                          : String(value)}
-                    </td>
-                  );
-                })}
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+      <DataTable
+        data={result.rows}
+        columns={columns}
+        numeric={(id) => numericColumns.has(id)}
+        className={cn('rounded-lg border', RULE, PANEL)}
+        empty={
+          <p className={cn('p-8 text-center text-sm', MUTED)}>The query ran and matched nothing.</p>
+        }
+      />
     </div>
   );
 }

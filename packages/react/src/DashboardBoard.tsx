@@ -18,12 +18,13 @@ import { CSS } from '@dnd-kit/utilities';
 import type { CatalogQueryResult, Dashboard, SavedQuery } from '@dudousxd/nestjs-catalog/client';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Download, GripVertical, LayoutGrid, Plus, RefreshCw, Trash2 } from 'lucide-react';
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { CssBarChart } from './charts/css';
 import { getChartRenderer } from './charts/registry';
 import { ChartEmpty, ChartFailed, ChartSkeleton } from './charts/skeleton';
 import { cn } from './cn';
 import { useCatalogClient } from './context';
+import { DataTable, renderUnknown } from './ui/data-table';
 import { Tooltip, TooltipProvider } from './ui/tooltip';
 
 const MUTED = 'text-zinc-400 dark:text-zinc-500';
@@ -585,43 +586,33 @@ function CardBody({
 }
 
 function MiniTable({ result }: { result: CatalogQueryResult }) {
+  // Five columns and six rows, because this is a PREVIEW inside a card — the
+  // whole answer lives on the query screen, and a card that tried to show it
+  // would be a card you cannot read at a glance, which is the only thing a card
+  // is for.
+  const shown = useMemo<string[]>(() => result.columns.slice(0, 5), [result.columns]);
+  const columns = useMemo(
+    () =>
+      shown.map((column) => ({
+        id: column,
+        accessorFn: (row: Record<string, unknown>) => row[column],
+        header: column,
+        cell: (context: { getValue: () => unknown }) => renderUnknown(context.getValue()),
+      })),
+    [shown],
+  );
+  const rows = useMemo(() => result.rows.slice(0, 6), [result.rows]);
+  const numericColumns = useMemo(() => {
+    const first = rows[0];
+    return new Set(first ? shown.filter((column) => typeof first[column] === 'number') : []);
+  }, [rows, shown]);
+
   return (
-    <div className="overflow-x-auto">
-      <table className="w-full text-[11px]">
-        <thead>
-          <tr className={cn('border-b', RULE)}>
-            {result.columns.slice(0, 5).map((column) => (
-              <th
-                key={column}
-                className={cn(
-                  'whitespace-nowrap px-1 py-1 text-left font-mono text-[9px] uppercase',
-                  MUTED,
-                )}
-              >
-                {column}
-              </th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {result.rows.slice(0, 6).map((row, index) => (
-            // biome-ignore lint/suspicious/noArrayIndexKey: rows have no key
-            <tr key={index} className="border-b border-zinc-100 last:border-0 dark:border-zinc-900">
-              {result.columns.slice(0, 5).map((column) => (
-                <td
-                  key={column}
-                  className={cn(
-                    'whitespace-nowrap px-1 py-0.5',
-                    typeof row[column] === 'number' && 'text-right font-mono tabular-nums',
-                  )}
-                >
-                  {row[column] === null || row[column] === undefined ? '—' : String(row[column])}
-                </td>
-              ))}
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
+    <DataTable
+      data={rows}
+      columns={columns}
+      numeric={(id) => numericColumns.has(id)}
+      density="text-[11px]"
+    />
   );
 }

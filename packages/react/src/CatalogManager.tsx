@@ -12,6 +12,7 @@ import { CoverageLedger } from './CoverageLedger';
 import { EditableField } from './EditableField';
 import { cn } from './cn';
 import { catalogQueryKeys, useCatalogClient } from './context';
+import { DataTable } from './ui/data-table';
 import { Tooltip, TooltipProvider } from './ui/tooltip';
 
 /**
@@ -422,106 +423,7 @@ function TypeDetail({
           note="The column and its SQL type are read from the ORM. The label, description and unit are yours."
         />
         <div className={cn('overflow-hidden rounded-lg border', RULE, PANEL)}>
-          <table className="w-full text-sm">
-            <thead>
-              <tr className={cn('border-b bg-zinc-50 text-left dark:bg-zinc-950', RULE)}>
-                <Th className="w-[30%]">Label</Th>
-                <Th className="w-[22%]">Column</Th>
-                <Th className="w-[10%]">Type</Th>
-                <Th className="w-[12%]">Unit</Th>
-                <Th className="w-[20%]">Meaning</Th>
-                <Th className="w-[6%] text-right">Shown</Th>
-              </tr>
-            </thead>
-            <tbody>
-              {type.properties.map((property) => (
-                <tr
-                  key={property.name}
-                  className={cn(
-                    'border-b last:border-0',
-                    HAIRLINE,
-                    property.hidden && 'opacity-45',
-                  )}
-                >
-                  <td className="px-3 py-2 align-top">
-                    <EditableField
-                      label={`label for ${property.name}`}
-                      value={property.displayName}
-                      onSave={(displayName) => onPatchProperty(property.name, { displayName })}
-                      inputClassName="text-sm"
-                    />
-                    <div className={cn('px-1.5 font-mono text-[10px]', MUTED)}>
-                      {property.name}
-                      {property.primary && (
-                        <Tooltip content="Primary key. Always fetched, even when hidden, so a row keeps a stable identity.">
-                          <span className="ml-1.5 cursor-help text-sky-600 dark:text-sky-400">
-                            pk
-                          </span>
-                        </Tooltip>
-                      )}
-                      {!property.nullable && !property.primary && (
-                        <Tooltip content="NOT NULL in the database. Read from the ORM, not something this screen can change.">
-                          <span className="ml-1.5 cursor-help text-amber-600">required</span>
-                        </Tooltip>
-                      )}
-                    </div>
-                  </td>
-                  <td className={cn('px-3 py-2 align-top font-mono text-[11px]', SECONDARY)}>
-                    {property.columnName}
-                  </td>
-                  <td className="px-3 py-2 align-top">
-                    <ScalarBadge type={property.type} />
-                  </td>
-                  <td className="px-3 py-2 align-top">
-                    <EditableField
-                      label={`unit for ${property.name}`}
-                      value={property.unit ?? ''}
-                      placeholder="—"
-                      onSave={(unit) => onPatchProperty(property.name, { unit })}
-                      inputClassName="text-xs"
-                      className="text-xs"
-                    />
-                  </td>
-                  <td className="px-3 py-2 align-top">
-                    <EditableField
-                      label={`description for ${property.name}`}
-                      multiline
-                      value={property.description ?? ''}
-                      placeholder="—"
-                      onSave={(description) => onPatchProperty(property.name, { description })}
-                      className={cn('text-xs leading-snug', SECONDARY)}
-                      inputClassName="text-xs leading-snug"
-                    />
-                  </td>
-                  <td className="px-3 py-2 text-right align-top">
-                    <Tooltip
-                      content={
-                        property.hidden
-                          ? `Hidden from tables and search. ${property.displayName} is still stored — showing it again needs no migration.`
-                          : `Shown in tables and search. Hiding it only changes what is displayed; the column is untouched.`
-                      }
-                    >
-                      <button
-                        type="button"
-                        aria-label={`${property.hidden ? 'Show' : 'Hide'} ${property.displayName}`}
-                        onClick={() =>
-                          onPatchProperty(property.name, {
-                            hidden: !property.hidden,
-                          })
-                        }
-                        className={cn(
-                          'rounded-sm p-1 hover:bg-zinc-100 dark:hover:bg-zinc-800',
-                          MUTED,
-                        )}
-                      >
-                        {property.hidden ? <EyeOff size={14} /> : <Eye size={14} />}
-                      </button>
-                    </Tooltip>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+          <PropertyTable properties={type.properties} onPatchProperty={onPatchProperty} />
         </div>
       </section>
 
@@ -574,26 +476,6 @@ function SectionHeading({ title, note }: { title: string; note: string }) {
   );
 }
 
-function Th({
-  children,
-  className,
-}: {
-  children: React.ReactNode;
-  className?: string;
-}) {
-  return (
-    <th
-      className={cn(
-        'px-3 py-2 font-mono text-[10px] font-normal uppercase tracking-[0.12em]',
-        MUTED,
-        className,
-      )}
-    >
-      {children}
-    </th>
-  );
-}
-
 function FieldChip({
   label,
   value,
@@ -615,5 +497,186 @@ function FieldChip({
         inputClassName="text-xs"
       />
     </div>
+  );
+}
+
+/**
+ * The properties of one type, as a table.
+ *
+ * Every cell is an editor or a badge, so what TanStack contributes here is not
+ * cell rendering but the column model: six columns declared once, with their
+ * widths beside their contents instead of in a separate header row that has to
+ * be kept in the same order by hand.
+ *
+ * The widths are fixed rather than content-sized, and that is the point of
+ * declaring them at all: these cells contain inputs, and a column that sizes to
+ * its content reflows the whole table on every keystroke.
+ */
+function PropertyTable({
+  properties,
+  onPatchProperty,
+}: {
+  properties: CatalogObjectTypeDef['properties'];
+  onPatchProperty: (property: string, patch: PropertyPatch) => void;
+}) {
+  type Property = CatalogObjectTypeDef['properties'][number];
+
+  const columns = useMemo(
+    () => [
+      {
+        id: 'label',
+        header: 'Label',
+        accessorFn: (p: Property) => p.displayName,
+        cell: ({ row }: { row: { original: Property } }) => (
+          <PropertyLabelCell property={row.original} onPatchProperty={onPatchProperty} />
+        ),
+      },
+      {
+        id: 'column',
+        header: 'Column',
+        accessorFn: (p: Property) => p.columnName,
+        cell: ({ row }: { row: { original: Property } }) => (
+          <span className={cn('font-mono text-[11px]', SECONDARY)}>{row.original.columnName}</span>
+        ),
+      },
+      {
+        id: 'type',
+        header: 'Type',
+        accessorFn: (p: Property) => p.type,
+        cell: ({ row }: { row: { original: Property } }) => (
+          <ScalarBadge type={row.original.type} />
+        ),
+      },
+      {
+        id: 'unit',
+        header: 'Unit',
+        accessorFn: (p: Property) => p.unit ?? '',
+        cell: ({ row }: { row: { original: Property } }) => (
+          <EditableField
+            label={`unit for ${row.original.name}`}
+            value={row.original.unit ?? ''}
+            placeholder="—"
+            onSave={(unit) => onPatchProperty(row.original.name, { unit })}
+            inputClassName="text-xs"
+            className="text-xs"
+          />
+        ),
+      },
+      {
+        id: 'meaning',
+        header: 'Meaning',
+        accessorFn: (p: Property) => p.description ?? '',
+        cell: ({ row }: { row: { original: Property } }) => (
+          <EditableField
+            label={`description for ${row.original.name}`}
+            multiline
+            value={row.original.description ?? ''}
+            placeholder="—"
+            onSave={(description) => onPatchProperty(row.original.name, { description })}
+            className={cn('text-xs leading-snug', SECONDARY)}
+            inputClassName="text-xs leading-snug"
+          />
+        ),
+      },
+      {
+        id: 'shown',
+        header: 'Shown',
+        accessorFn: (p: Property) => !p.hidden,
+        cell: ({ row }: { row: { original: Property } }) => (
+          <VisibilityToggle property={row.original} onPatchProperty={onPatchProperty} />
+        ),
+      },
+    ],
+    [onPatchProperty],
+  );
+
+  return (
+    <DataTable
+      data={properties}
+      columns={columns}
+      getRowId={(property) => property.name}
+      // Dimmed rather than dropped: a hidden property is still stored, and a
+      // screen that simply omitted it could not tell you that showing it again
+      // needs no migration.
+      rowClassName={(property) => (property.hidden ? 'opacity-45' : undefined)}
+      columnClassName={(id) => PROPERTY_WIDTHS[id]}
+      // `align-top`, because two of these cells hold a multi-line editor and a
+      // row centred on the tallest one leaves the single-line cells floating.
+      cellClassName={() => 'align-top whitespace-normal py-2'}
+    />
+  );
+}
+
+const PROPERTY_WIDTHS: Record<string, string> = {
+  label: 'w-[30%]',
+  column: 'w-[22%]',
+  type: 'w-[10%]',
+  unit: 'w-[12%]',
+  meaning: 'w-[20%]',
+  shown: 'w-[6%] text-right',
+};
+
+/** The label cell: the curated name, with the physical name and its constraints beneath. */
+function PropertyLabelCell({
+  property,
+  onPatchProperty,
+}: {
+  property: CatalogObjectTypeDef['properties'][number];
+  onPatchProperty: (property: string, patch: PropertyPatch) => void;
+}) {
+  return (
+    <>
+      <EditableField
+        label={`label for ${property.name}`}
+        value={property.displayName}
+        onSave={(displayName) => onPatchProperty(property.name, { displayName })}
+        inputClassName="text-sm"
+      />
+      <div className={cn('px-1.5 font-mono text-[10px]', MUTED)}>
+        {property.name}
+        {property.primary && (
+          <Tooltip content="Primary key. Always fetched, even when hidden, so a row keeps a stable identity.">
+            <span className="ml-1.5 cursor-help text-sky-600 dark:text-sky-400">pk</span>
+          </Tooltip>
+        )}
+        {!property.nullable && !property.primary && (
+          <Tooltip content="NOT NULL in the database. Read from the ORM, not something this screen can change.">
+            <span className="ml-1.5 cursor-help text-amber-600">required</span>
+          </Tooltip>
+        )}
+      </div>
+    </>
+  );
+}
+
+/**
+ * Hiding is presentation, not schema — the tooltip says so on both sides,
+ * because "hidden" next to a database column reads as destructive until
+ * somebody tells you it is not.
+ */
+function VisibilityToggle({
+  property,
+  onPatchProperty,
+}: {
+  property: CatalogObjectTypeDef['properties'][number];
+  onPatchProperty: (property: string, patch: PropertyPatch) => void;
+}) {
+  return (
+    <Tooltip
+      content={
+        property.hidden
+          ? `Hidden from tables and search. ${property.displayName} is still stored — showing it again needs no migration.`
+          : 'Shown in tables and search. Hiding it only changes what is displayed; the column is untouched.'
+      }
+    >
+      <button
+        type="button"
+        aria-label={`${property.hidden ? 'Show' : 'Hide'} ${property.displayName}`}
+        onClick={() => onPatchProperty(property.name, { hidden: !property.hidden })}
+        className={cn('rounded-sm p-1 hover:bg-zinc-100 dark:hover:bg-zinc-800', MUTED)}
+      >
+        {property.hidden ? <EyeOff size={14} /> : <Eye size={14} />}
+      </button>
+    </Tooltip>
   );
 }
