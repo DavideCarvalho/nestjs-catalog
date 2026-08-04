@@ -11,8 +11,28 @@ import {
   DEFAULT_ACCESS_BASE_PATH,
   DEFAULT_PIPELINE_BASE_PATH,
   accessRoutes,
+  embedRoutes,
   pipelineRoutes,
 } from './routes';
+
+describe('embedRoutes', () => {
+  it('matches the paths the catalog controller actually serves', () => {
+    // Unlike everything else in this file these ARE library-served — `@Get('embed')`,
+    // `@Get('embed/charts/:id')` and `@Get('embed/dashboards/:id')` on the catalog controller,
+    // behind `catalog:embed`. A wrong path here is a 404 that reads as "this chart was never
+    // shared", which sends whoever is debugging it into the sharing settings instead.
+    expect(embedRoutes.embeddable()).toBe('/catalog/embed');
+    expect(embedRoutes.chart('q1')).toBe('/catalog/embed/charts/q1');
+    expect(embedRoutes.dashboard('d1')).toBe('/catalog/embed/dashboards/d1');
+  });
+
+  it('escapes an id into its own segment', () => {
+    // Saved query ids are server-generated today, but the builder is what stands between an id
+    // holding a slash and a request to an endpoint nobody meant to call.
+    expect(embedRoutes.chart('a/b')).toBe('/catalog/embed/charts/a%2Fb');
+    expect(embedRoutes.dashboard('a?b=1')).toBe('/catalog/embed/dashboards/a%3Fb%3D1');
+  });
+});
 
 describe('pipelineRoutes', () => {
   it('defaults to the mount the README documents', () => {

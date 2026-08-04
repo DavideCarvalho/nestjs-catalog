@@ -23,11 +23,13 @@ import type {
 } from '@dudousxd/nestjs-catalog/client';
 import { catalogRoutes } from '@dudousxd/nestjs-catalog/client';
 import { type ReactNode, createContext, useContext, useMemo } from 'react';
+import type { EmbeddedChartPayload, EmbeddedDashboardPayload } from './embed/payload';
 import {
   DEFAULT_ACCESS_BASE_PATH,
   DEFAULT_PIPELINE_BASE_PATH,
   type PeopleQuery,
   accessRoutes,
+  embedRoutes,
   pipelineRoutes,
 } from './routes';
 // The graph itself comes from `@dudousxd/nestjs-catalog/client`; what is left in
@@ -244,6 +246,21 @@ export interface CatalogClient {
   ): Promise<Dashboard>;
   deleteDashboard(id: string): Promise<{ deleted: boolean }>;
 
+  /**
+   * What another application may render.
+   *
+   * Reads only, and rendered rather than executable: a chart comes back as
+   * columns and rows with a visualization, never as SQL, so an embed cannot ask
+   * for anything the sharer did not already share. Both refuse anything not
+   * explicitly marked shared in the console, which is why there is no
+   * `embedQuery(sql)` and never will be.
+   *
+   * `exportUrl` above is what an embedded chart's CSV action links to — the
+   * same export the console uses, because it is the same saved query.
+   */
+  embedChart(id: string): Promise<EmbeddedChartPayload>;
+  embedDashboard(id: string): Promise<EmbeddedDashboardPayload>;
+
   listEvents(query: {
     event?: string;
     typeName?: string;
@@ -405,6 +422,9 @@ export function CatalogProvider({
         transport.patch<Dashboard>(catalogRoutes.dashboard(id), input),
       deleteDashboard: (id) => transport.delete<{ deleted: boolean }>(catalogRoutes.dashboard(id)),
 
+      embedChart: (id) => transport.get<EmbeddedChartPayload>(embedRoutes.chart(id)),
+      embedDashboard: (id) => transport.get<EmbeddedDashboardPayload>(embedRoutes.dashboard(id)),
+
       listEvents: (query) => transport.get(catalogRoutes.events(), { ...query }),
       listTraces: (query) => transport.get(catalogRoutes.traces(), { ...query }),
 
@@ -477,6 +497,16 @@ export const catalogQueryKeys = {
   runs: (connectorId?: string) =>
     ['nestjs-catalog', 'pipeline', 'runs', connectorId ?? 'all'] as const,
   workflows: ['nestjs-catalog', 'pipeline', 'workflows'] as const,
+
+  /**
+   * The embed keys, under one prefix so a host can invalidate every embedded
+   * chart on its page at once — which is the only refresh an embed has. The
+   * components deliberately ship no refresh control of their own, so this is
+   * the seam a host uses to decide when its own page reloads its data.
+   */
+  embed: ['nestjs-catalog', 'embed'] as const,
+  embeddedChart: (id: string) => ['nestjs-catalog', 'embed', 'chart', id] as const,
+  embeddedDashboard: (id: string) => ['nestjs-catalog', 'embed', 'dashboard', id] as const,
 
   access: ['nestjs-catalog', 'access'] as const,
   principals: ['nestjs-catalog', 'access', 'principals'] as const,

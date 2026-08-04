@@ -18,13 +18,13 @@ import { CSS } from '@dnd-kit/utilities';
 import type { CatalogQueryResult, Dashboard, SavedQuery } from '@dudousxd/nestjs-catalog/client';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Download, GripVertical, LayoutGrid, Plus, RefreshCw, Trash2 } from 'lucide-react';
-import { useMemo, useState } from 'react';
-import { CssBarChart } from './charts/css';
-import { getChartRenderer, registeredChartLibraries, visualizationFor } from './charts/registry';
-import { ChartEmpty, ChartFailed, ChartSkeleton } from './charts/skeleton';
+import { useState } from 'react';
+import { ChartBody } from './charts/body';
+import { CHART_GRID, chartSpan } from './charts/grid';
+import { registeredChartLibraries, visualizationFor } from './charts/registry';
+import { ChartFailed, ChartSkeleton } from './charts/skeleton';
 import { cn } from './cn';
 import { useCatalogClient } from './context';
-import { DataTable, renderUnknown } from './ui/data-table';
 import { Select } from './ui/select';
 import { Tooltip, TooltipProvider } from './ui/tooltip';
 
@@ -319,13 +319,11 @@ export function DashboardBoard() {
                       .map((c) => c.id)}
                     strategy={rectSortingStrategy}
                   >
-                    {/* Container queries, not viewport ones. The board sits
-                        beside a sidebar, so how much room a card actually has
-                        is a fact about THIS box and not about the window —
-                        `md:` here would give two columns on an 800px screen
-                        whose board is 500px wide. `@container` is declared on
-                        the scroll region above. */}
-                    <div className="mt-6 grid grid-cols-1 gap-4 @2xl:grid-cols-2 @5xl:grid-cols-4">
+                    {/* The grid and the per-card spans travel together — see
+                        charts/grid.ts, which the embedded board uses too so a
+                        dashboard is arranged the same way wherever it is shown.
+                        `@container` is declared on the scroll region above. */}
+                    <div className={cn('mt-6', CHART_GRID)}>
                       {[...selected.cards]
                         .sort((a, b) => a.position - b.position)
                         .map((card) => (
@@ -385,7 +383,7 @@ function SortableCard({
       ref={setNodeRef}
       style={{ transform: CSS.Transform.toString(transform), transition }}
       className={cn(
-        SPAN[width] ?? SPAN[2],
+        chartSpan(width),
         // A grid item defaults to `min-width: auto`, so a chart wider than its
         // column pushes the column out instead of being constrained by it —
         // the same rule that made the nav overflow the page.
@@ -420,21 +418,6 @@ function SortableCard({
     </div>
   );
 }
-
-/**
- * The width an operator chose, applied only where there are columns to spend.
- *
- * Below `@5xl` the grid has fewer than four columns, and a `col-span-4` there
- * spans past the end — which is what put a chart's axis labels outside its own
- * card. Every card is full width on a narrow board, two-up in the middle, and
- * only honours the chosen span once four columns exist to divide.
- */
-const SPAN: Record<number, string> = {
-  1: '@5xl:col-span-1',
-  2: '@2xl:col-span-2 @5xl:col-span-2',
-  3: '@2xl:col-span-2 @5xl:col-span-3',
-  4: '@2xl:col-span-2 @5xl:col-span-4',
-};
 
 /**
  * How many of the four columns this card spans.
@@ -660,73 +643,22 @@ function CardBody({
   /** This card's override. Undefined means "whatever the query chose". */
   library?: string;
 }) {
-  // Merged into the visualization rather than passed beside it, so a renderer
-  // reading `visualization.library` sees the one it is actually being drawn as.
-  const viz = visualizationFor(query.visualization, library);
-  // Held at the chart's own height rather than collapsing to one line, so a
-  // card that matched nothing does not resize the grid around it — and said in
-  // words, because "no rows" beside a skeleton-shaped hole is the one reading
-  // that must never be ambiguous.
-  if (result.rowCount === 0) {
-    return <ChartEmpty height={200} message="The query ran and matched nothing." />;
-  }
-
-  if (viz.kind === 'number') {
-    const column = viz.valueColumns?.[0] ?? result.columns[0];
-    return (
-      <div className="py-4 text-center">
-        <div className="font-mono text-3xl tabular-nums">
-          {String(result.rows[0]?.[column] ?? '—')}
-        </div>
-        <div className={cn('mt-1 font-mono text-[10px] uppercase', MUTED)}>
-          {viz.labelColumn ?? column}
-        </div>
-      </div>
-    );
-  }
-
-  if (viz.kind === 'bar' || viz.kind === 'line' || viz.kind === 'area') {
-    // A registered library when the query names one and the host installed it;
-    // otherwise the built-in bars. Falling back beats failing: a dashboard
-    // should degrade to a plainer chart, not to an error message.
-    const Renderer = getChartRenderer(viz.library);
-    if (Renderer) {
-      return <Renderer result={result} visualization={viz} height={200} />;
-    }
-    return <CssBarChart result={result} visualization={viz} height={200} />;
-  }
-
-  return <MiniTable result={result} />;
-}
-
-function MiniTable({ result }: { result: CatalogQueryResult }) {
-  // Five columns and six rows, because this is a PREVIEW inside a card — the
-  // whole answer lives on the query screen, and a card that tried to show it
-  // would be a card you cannot read at a glance, which is the only thing a card
-  // is for.
-  const shown = useMemo<string[]>(() => result.columns.slice(0, 5), [result.columns]);
-  const columns = useMemo(
-    () =>
-      shown.map((column) => ({
-        id: column,
-        accessorFn: (row: Record<string, unknown>) => row[column],
-        header: column,
-        cell: (context: { getValue: () => unknown }) => renderUnknown(context.getValue()),
-      })),
-    [shown],
-  );
-  const rows = useMemo(() => result.rows.slice(0, 6), [result.rows]);
-  const numericColumns = useMemo(() => {
-    const first = rows[0];
-    return new Set(first ? shown.filter((column) => typeof first[column] === 'number') : []);
-  }, [rows, shown]);
-
   return (
-    <DataTable
-      data={rows}
-      columns={columns}
-      numeric={(id) => numericColumns.has(id)}
-      density="text-[11px]"
+    <ChartBody
+      result={result}
+      // Merged into the visualization rather than passed beside it, so a
+      // renderer reading `visualization.library` sees the one it is actually
+      // being drawn as. The merge stays HERE rather than inside `ChartBody`,
+      // because the per-card override is a console feature: an embed has no
+      // card to override from, and giving it one would be an authoring control.
+      visualization={visualizationFor(query.visualization, library)}
+      height={200}
+      // Five columns and six rows, because this is a PREVIEW inside a card —
+      // the whole answer lives on the query screen, and a card that tried to
+      // show it would be a card you cannot read at a glance, which is the only
+      // thing a card is for.
+      maxColumns={5}
+      maxRows={6}
     />
   );
 }

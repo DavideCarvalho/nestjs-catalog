@@ -1,5 +1,6 @@
 /**
- * The paths behind the pipeline and access screens.
+ * The paths behind the pipeline and access screens — and, for now, the embed
+ * components, which are the documented exception at the top of the file.
  *
  * These deliberately do **not** live in `@dudousxd/nestjs-catalog/client` beside
  * `catalogRoutes`, and the difference is worth being precise about, because it
@@ -29,6 +30,30 @@
  * `CatalogClient` plus these paths, and a host that would rather satisfy it from
  * somewhere else entirely can pass its own base path, or replace the client.
  */
+
+/**
+ * The embed API, which is the exception to everything above.
+ *
+ * These paths ARE served by the catalog library's own controller — `GET
+ * embed`, `GET embed/charts/:id`, `GET embed/dashboards/:id`, behind
+ * `catalog:embed` — so by the argument in this file's header they belong beside
+ * `catalogRoutes` in `@dudousxd/nestjs-catalog/client`, and that is where they
+ * should end up. They are here only because the embed components landed in this
+ * package first; moving them is a one-line change in the server package and a
+ * re-export here.
+ *
+ * Which is why they are a frozen object of builders, in `catalogRoutes`' style,
+ * rather than a `f(basePath)` like `pipelineRoutes` below. The shape is a
+ * statement about who owns the path: a host cannot move these anywhere the rest
+ * of the catalog controller has not also moved, so offering a base path would
+ * be offering a knob that cannot be turned independently.
+ */
+export const embedRoutes = {
+  /** What this caller may embed. Discovery, so ids need not be passed out of band. */
+  embeddable: () => '/catalog/embed',
+  chart: (id: string) => `/catalog/embed/charts/${encodeURIComponent(id)}`,
+  dashboard: (id: string) => `/catalog/embed/dashboards/${encodeURIComponent(id)}`,
+} as const;
 
 /** Where the pipeline endpoints sit unless the host says otherwise. */
 export const DEFAULT_PIPELINE_BASE_PATH = '/pipeline';
