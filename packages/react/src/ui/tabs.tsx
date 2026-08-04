@@ -1,5 +1,5 @@
 import { Tabs as BaseTabs } from '@base-ui/react/tabs';
-import type { ReactNode } from 'react';
+import type { ReactNode, Ref } from 'react';
 import { cn } from '../cn';
 
 /**
@@ -42,12 +42,19 @@ export function Tabs({
 export function TabsList({
   children,
   className,
+  ref,
 }: {
   children: ReactNode;
   className?: string;
+  /**
+   * For a caller that has to MEASURE the list — a strip narrow enough to
+   * scroll needs to know how far it has scrolled to say so.
+   */
+  ref?: Ref<HTMLDivElement>;
 }) {
   return (
     <BaseTabs.List
+      ref={ref}
       className={cn('flex gap-1 border-b border-zinc-200 dark:border-zinc-800', className)}
     >
       {children}
@@ -58,9 +65,12 @@ export function TabsList({
 export function TabsTab({
   value,
   children,
+  className,
 }: {
   value: string;
   children: ReactNode;
+  /** For a caller whose strip has its own metrics — the console nav is taller. */
+  className?: string;
 }) {
   return (
     <BaseTabs.Tab
@@ -72,6 +82,7 @@ export function TabsTab({
         'focus-visible:ring-2 focus-visible:ring-sky-500/30',
         'data-[selected]:border-sky-600 data-[selected]:text-zinc-950',
         'dark:data-[selected]:text-zinc-50',
+        className,
       )}
     >
       {children}

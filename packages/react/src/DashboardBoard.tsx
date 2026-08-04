@@ -243,7 +243,7 @@ export function DashboardBoard() {
           )}
         </aside>
 
-        <main className="min-w-0 flex-1 overflow-y-auto">
+        <main className="@container min-w-0 flex-1 overflow-y-auto">
           {!selected ? (
             <div className="flex h-full items-center justify-center px-6">
               <div className="max-w-sm text-center">
@@ -299,7 +299,13 @@ export function DashboardBoard() {
                       .map((c) => c.id)}
                     strategy={rectSortingStrategy}
                   >
-                    <div className="mt-6 grid grid-cols-4 gap-4">
+                    {/* Container queries, not viewport ones. The board sits
+                        beside a sidebar, so how much room a card actually has
+                        is a fact about THIS box and not about the window —
+                        `md:` here would give two columns on an 800px screen
+                        whose board is 500px wide. `@container` is declared on
+                        the scroll region above. */}
+                    <div className="mt-6 grid grid-cols-1 gap-4 @2xl:grid-cols-2 @5xl:grid-cols-4">
                       {[...selected.cards]
                         .sort((a, b) => a.position - b.position)
                         .map((card) => (
@@ -353,7 +359,11 @@ function SortableCard({
       ref={setNodeRef}
       style={{ transform: CSS.Transform.toString(transform), transition }}
       className={cn(
-        SPAN[width] ?? 'col-span-2',
+        SPAN[width] ?? SPAN[2],
+        // A grid item defaults to `min-width: auto`, so a chart wider than its
+        // column pushes the column out instead of being constrained by it —
+        // the same rule that made the nav overflow the page.
+        'min-w-0',
         'motion-safe:animate-in motion-safe:fade-in motion-safe:zoom-in-95',
         isDragging && 'z-10 opacity-60 shadow-lg',
       )}
@@ -383,11 +393,19 @@ function SortableCard({
   );
 }
 
+/**
+ * The width an operator chose, applied only where there are columns to spend.
+ *
+ * Below `@5xl` the grid has fewer than four columns, and a `col-span-4` there
+ * spans past the end — which is what put a chart's axis labels outside its own
+ * card. Every card is full width on a narrow board, two-up in the middle, and
+ * only honours the chosen span once four columns exist to divide.
+ */
 const SPAN: Record<number, string> = {
-  1: 'col-span-1',
-  2: 'col-span-2',
-  3: 'col-span-3',
-  4: 'col-span-4',
+  1: '@5xl:col-span-1',
+  2: '@2xl:col-span-2 @5xl:col-span-2',
+  3: '@2xl:col-span-2 @5xl:col-span-3',
+  4: '@2xl:col-span-2 @5xl:col-span-4',
 };
 
 function Card({
