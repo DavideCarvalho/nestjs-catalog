@@ -1,5 +1,211 @@
 # @dudousxd/nestjs-catalog-react
 
+## 0.9.0
+
+### Minor Changes
+
+- d07687d: Embed a chart or a board in somebody else's application
+
+  The server already served `GET embed`, `embed/charts/:id` and
+  `embed/dashboards/:id`, returning rendered rows rather than SQL so a consumer
+  never becomes a second implementation of the console. What was missing was
+  everything a consumer needs to use it: no client method, no component, no
+  documentation, and — it turns out — no enforcement.
+
+  **The `catalog:embed` scope was attached to no route.** It existed as a type, was
+  expanded by `catalog:admin`, and was named in two docblocks as the thing that
+  gates this API, while `packages/pipeline` had declared its scopes on all 20 of
+  its routes since it shipped. Any principal a host's guard let past the door could
+  fetch every shared dashboard. All three routes declare it now, discovery
+  included: a caller the fetches refuse has no use for the list, and an open
+  discovery endpoint is an inventory of what is worth asking for.
+
+  **The embed dropped the card's overrides.** `DashboardCard.title` and
+  `.library` exist to override the saved query _on that board_, and the payload
+  used the query's own — so the console and the embed drew the same dashboard
+  differently, silently. The server now restates the same precedence the React
+  side uses (card, then query, then built-in) rather than inventing a second rule.
+
+  **`shared` was undeclared on dashboard writes.** It worked only because the body
+  reached the store untouched; under a host's whitelisting `ValidationPipe` it is
+  stripped and a dashboard can never become shareable, with no error anywhere.
+
+  `<EmbeddedChart>` and `<EmbeddedDashboard>` render the payload with a toolbar
+  that holds only OUTPUT actions — no refresh, no delete, no chart-library picker.
+  Those are authoring controls and belong to the console where the board is
+  assembled; an embed that could refresh would also bypass whatever caching the
+  host put in front of it. `actions` defaults to `'none'`, and a caller's list is
+  filtered against the actions that exist rather than trusted, so a host asking for
+  one that does not exist gets no control instead of a dead button.
+
+  A chart can be exported as PNG with no dependency — a serialised SVG, a canvas
+  and `toBlob` are already in every browser. Two limits are worth knowing: an SVG
+  rasterised through a data URI cannot load `@font-face`, so exported text falls
+  back to a system face; and the built-in CSS bar chart draws with divs rather than
+  an `<svg>`, so it cannot be exported at all and offers no action rather than a
+  failing one.
+
+- c0c2b8c: A PDF seam, the read rules said plainly, and an audit trail for sharing
+
+  **PDF is a seam, not a dependency.** A host registers something backed by its own
+  document pipeline; where nobody did, no PDF action appears — the rule the chart
+  registry already follows. The two client-side candidates cost ~128KB gzipped on
+  every consumer for a feature only some want, and the application embedding this
+  catalog already generates PDFs server-side. The exporter receives BOTH the PNG
+  and the serialised SVG: a host drawing with an image library takes the raster, a
+  host with a vector pipeline takes the markup and keeps text selectable at print
+  size.
+
+  The registry is subscribable, unlike the chart one, and that difference is
+  load-bearing: a PDF pipeline is heavy, so it is usually behind a dynamic import
+  that resolves after the console has mounted. Without a subscription the cards
+  already on screen would stay actionless forever. The card also watches for a
+  late `<svg>`, because recharts inserts one from its own state with no React
+  render to prompt a second look.
+
+  **The read rules are a toolkit, and now say so.** `mayRead` and
+  `maySeeClassification` have no call site anywhere, and that turns out to be the
+  design rather than a hole: this library declares and the host enforces — no
+  guard ships, `CatalogPrincipalGuard` does not exist in this repo, and
+  `readObjects` takes no principal to enforce with. What was wrong was the prose.
+  `CatalogPrincipal.classifications` claimed a column outside the list "is dropped
+  from its reads" and `CatalogObjectPage.columns` claimed "non-redacted columns" —
+  both describing a mechanism nothing performs. Corrected, with the decision
+  written where the next reader will ask. `readableObjectPage(principal, page)` is
+  the named helper that applies both, deleting hidden values rather than blanking
+  them, since a key present with `null` is itself a disclosure.
+
+  **Sharing leaves a trail.** `SavedQuery.shared`'s docblock claimed marking a
+  query shared "shows up in the audit trail as one"; no such event existed, so the
+  single act that grants an outside application access to data left no record.
+  `query.shared` and `dashboard.shared` now fire — on the transition only, because
+  a save that leaves the flag alone is not a sharing event and a trail that logs
+  every save teaches people to ignore it. Un-sharing is recorded too and is
+  distinguishable. The actor is the resolved principal rather than anything the
+  body claimed.
+
+  `PROMOTION_AUDIT_EVENT` was the third instance of the same pattern —
+  referenced nowhere, while its docblock explained where the record is written. It
+  is fixed in the same release; see the store adapter's entry.
+
+- d62e481: Sharing can be switched on from the console, and the export link follows the host
+
+  **A dashboard can be shared, which means the embed API is reachable at all.**
+  `CatalogClient.saveDashboard`/`updateDashboard` did not name `shared`, so
+  `updateDashboard(id, { shared: true })` was a compile error and no screen ever
+  sent it. `shared` is the entire access boundary of the embed API, so every
+  dashboard a shipped console produced answered `403` from `embedDashboard`, and
+  `<EmbeddedDashboard>`'s "Nothing on this dashboard has been shared" was not an
+  empty state but the only state the component had. The server anticipated exactly
+  this one layer down — `patchDashboard` declares the field so a whitelisting
+  `ValidationPipe` cannot strip it — and the client type dropped it again.
+
+  Both writes name it now, and the board carries a control: the state, a sentence
+  saying who can reach the board while it holds, and a button naming the
+  transition. Not a switch — the server records this crossing as an event, in both
+  directions, and a control for an audited act should say where you are before it
+  offers to move you.
+
+  **A saved query can be un-shared.** `shared` was settable only when the query was
+  first saved, and `updateSavedQuery` — which accepts it — had no call site
+  anywhere, so a query shared by mistake could only be un-shared by deleting it.
+  The list now marks a shared query without waiting to be hovered, and offers both
+  directions.
+
+  **`exportUrl` no longer hardcodes `/api`.** It was the one method on
+  `CatalogClient` that bypassed the injected transport, in the component most
+  likely to run inside somebody else's page. `CatalogTransport` gained an optional
+  `url(path)`, and the export link is built from it like every other request.
+
+  > **Hosts should implement `url` on their transport.** It is optional, so
+  > nothing stops compiling — but a transport that does not answer gets the path
+  > exactly as written, which is right only where the catalog API is served from
+  > the root. If yours prepends a base (an axios `baseURL`, a gateway prefix), add
+  > `url: (path) => \`${base}${path}\``or the CSV export will 404. Hosts that were
+mounted under`/api` were previously right by accident.
+
+  **`CatalogApiSessionGuard` is a host-appliable primitive, and says so.** It
+  documented itself as gating `CatalogApiController`, a class that exists nowhere,
+  and was bound to nothing. It cannot be bound here: the catalog's JSON API is
+  mounted in the host's own tree and deliberately not proxied through the console.
+  The module now provides and exports it, so `app.get(CatalogApiSessionGuard)` —
+  how a host puts it in front of a whole API surface — resolves.
+
+  **`dashboardAuth` no longer claims to gate the JSON API.** It gates the SPA
+  shell, and only that; the option's own docblock said "BOTH the SPA and the JSON
+  API", which left a host that configured `auth` and stopped reading with its rows,
+  ad-hoc SQL and connector runs on whatever guarded the API before. The docblock
+  now points at the two seams that close it, `readCatalogConsoleSession` and the
+  guard above.
+
+  **The CSRF rationale names the flag the code actually sets.** The console's
+  transport justified `credentials: 'same-origin'` with a `SameSite=Strict` cookie;
+  `serializeSetCookie` has only ever emitted `Lax`. Lax is kept — `Strict` costs
+  nothing on the flows this package ships but withholds the cookie from a top-level
+  navigation arriving from another site, which is how a console gets linked to —
+  and the guarantee is restated accurately: Lax covers cross-site `fetch`, `XHR`
+  and form POSTs, and permits a cross-site top-level GET. The one state-changing
+  GET that leaves exposed, `GET logout`, is argued once, where the route is.
+
+### Patch Changes
+
+- c02c36f: Every dropdown follows the theme, because none of them is a native select any more
+
+  Six controls were raw `<select>` elements against sixteen using the vendored
+  one. A native select draws its option list with the platform's own widget: the
+  list stays light on a dark console and no class can reach it. On the dark
+  surface the console now wears, they were unreadable.
+
+  They are all `Select` now — the Base UI one this package already vendored — so
+  the list is markup that inherits the theme like everything else. Converted: the
+  environment picker in the nav, the card's chart-library picker, both governance
+  filters, and both visualization pickers in the save panel.
+
+  Two things fell out of the conversion:
+
+  - The options that needed a **second line** can have one. `SelectOption.hint`
+    already existed, described as "the reason a native option was not enough", and
+    it is exactly what the card picker's default needed to say the query names a
+    library nobody installed. A native `<option>` is one line of unstyleable text.
+  - The chart-kind picker had a `as 'table'` cast on the raw event value. It is a
+    lookup against one exported list now, which the picker also renders from — so
+    a kind added to the union appears in the dropdown instead of being silently
+    absent from it.
+
+- 3becb3a: Say which library is actually drawing, not which one was asked for
+
+  Found on a real board the moment the card picker shipped: a saved query named
+  `visx`, nobody had registered it, and the card drew the built-in bars — correctly
+  — while the control read "follows query (visx)".
+
+  The fallback is right and it is silent, so the label has to be the thing that
+  says so. It now reads "follows query (visx — not installed, drawing built-in)".
+
+  A control that reports an intention the card is not honouring is worse than one
+  that reports nothing: it is the exact failure the picker was built from a
+  registry to avoid, arriving through the default option instead.
+
+- f1100ba: Enforce per-type write grants across the pipeline surface, stop serving connection passwords, and make a deleted connector actually stop retrying.
+
+  **Behaviour change: the pipeline routes now authorise, not just attribute.** `mayWrite` had call sites in one file — `publish.service.ts` — and none on this surface. Every route here read `request.principal` for `?.id ?? 'console'` and used it as a name to write in a log, so a principal holding `catalog:write` with `writeTypes: ["Mvr"]` could author a workflow whose sink commits `Subwo`, attach a connector, and run it. Nothing lied on the way through: the graph validated, the run succeeded, and the snapshot recorded the write as authorised.
+
+  Four routes now refuse. `POST /pipeline/workflows` and `POST /pipeline/connectors` check at save time, which is the gate the scheduled path depends on — a cron-fired run carries a synthetic scheduler id with no grants to consult, so the question has to have been answered when the graph was written down. `POST /pipeline/workflows/:id/run` and `POST /pipeline/connectors/:id/run` check again at run time, which catches what save time cannot see: a graph saved by a principal that held the grant, run by one that does not. Types are read off **every** sink, not off `WorkflowRow.targetType`, which records only the first sink a multi-sink graph declares.
+
+  A host may now be refused for: saving or running a workflow whose sink commits a type outside the principal's `writeTypes`; saving a connector whose `targetType` is outside it, or one attached to a workflow whose sinks are; running either. Refusals are `403` and name every type they turned down.
+
+  **Behaviour change: these routes now require a principal.** `saveConnection`, `saveConnector`, `saveTransform`, `saveWorkflow`, and both run routes previously fell back to attributing the write to `'console'` when no guard had put a principal on the request. They now fail the way `createPublishController` already did, because a caller with no identity has no grants to check and "allow everything when nobody is identified" is the bug being fixed. **A deployment that mounts `CatalogPipelineModule` without a principal guard will start failing these routes.**
+
+  **Behaviour change: a connection URL carrying a password is no longer accepted or served.** `ConnectorRow.config`, `ConnectionRow.config` and `sources.ts` all promise that a credential is never stored — only the _name_ of an environment variable. That held for token-based sources and not for SQL, where `fetchSql` reads `config.url` and `postgres://user:pass@host/db` is a password with an address attached. `config` was persisted verbatim, returned verbatim, and served by `GET /pipeline/connections` and `GET /pipeline/connectors`, both of which ask only for `catalog:read`.
+
+  Two halves, because neither alone is enough:
+
+  - `MySqlPipelineStore.saveConnector` and `saveConnection` refuse a password-bearing URL in `config` that is not already the stored value for that row. Refused in the store rather than the controller, because a connector saved by curl, by a host's own code, or by `applyPromotion` reaches it and nothing else. **A host may now be refused for** creating a connector or connection whose config carries such a URL, changing an existing one's to a different password-bearing URL, or **promoting such a connector into an environment that does not have it yet** — `promoteConnectors` already refuses to carry `secretEnvVar` across so a promoted connector "arrives with no credential", and this applies that rule to the credential that was hiding inside `config`. Move the URL into an environment variable and name it in `secretEnvVar`. Rows already in the table are grandfathered and keep running.
+  - The four read routes that serve connectors and connections redact the password on the way out. This is what covers the rows that are already stored. It is at the route and not in the store on purpose: `ConnectorRunnerService` resolves the connector it is about to run through the store, and `applyPromotion` copies connectors between environments by reading them from it — a store that redacted would hand the runner a URL that cannot connect and promote the placeholder into the next environment as though it were the password.
+
+  A console that reads a connector, edits it and posts the whole object back is safe: the save routes put the stored credential back when the value they receive is exactly the redaction of what is held.
+
+  **Fix: `FatalError` in the connector step now actually stops the retries.** `connector-run.steps.ts` documented that a deleted or disabled connector must not be retried and did not achieve it. `FatalError` carries `message` and `code` and no `retryable`; durable core honours the class itself only in `runStepHandler`'s local retry loop, while a dispatched step is judged by `existing.error?.retryable !== false` on a serialised envelope. All three attempts were burning over roughly fifteen minutes for a connector somebody deleted on purpose. Fixed the way `workflow-run.steps.ts` already had been, by extending `FatalError` with `readonly retryable = false` so both paths are correct.
+
 ## 0.8.0
 
 ### Minor Changes

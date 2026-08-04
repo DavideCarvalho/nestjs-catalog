@@ -1,5 +1,126 @@
 # @dudousxd/nestjs-catalog-store-mikro-orm
 
+## 0.3.0
+
+### Minor Changes
+
+- ad6b892: An audit event can finally say which environment it happened in, and a trace can say when its steps happened
+
+  **The recorder injects `CATALOG_WORKSPACE_STORE` instead of `MySqlWorkspaceStore`.**
+  This is the release-visible one. `environment.routing.ts` explained at length that
+  handing `CatalogAuditRecorder` the routing store is what makes "every audit event
+  records its environment" true by construction — but the recorder asked for
+  `MySqlWorkspaceStore` _by class_, and `RoutingWorkspaceStore` implements the
+  interface rather than extending the class, so no host could ever substitute it.
+  In a multi-environment process every audit row landed in whichever single
+  database the recorder happened to be constructed against, under no environment
+  column: a dev event sitting in the production audit table, reading exactly like a
+  production one. Every sibling in the package already injected by token; the
+  recorder was the only one that did not.
+
+  The single-environment default is unchanged — `CatalogMikroOrmStoreModule` already
+  binds that token to `MySqlWorkspaceStore`. A host that constructs the recorder
+  itself and provides only the concrete class must now bind the token too.
+
+  **`stampEnvironment` has a call site.** It shipped with a paragraph about
+  answering "everything this person did this week" across environments and was
+  referenced by nothing. `RoutingWorkspaceStore.listEvents` now stamps what it read
+  and widens its return type to say so. It happens there and cannot happen anywhere
+  else: that reader is the only one that resolved an environment in order to choose
+  the connection, which is the whole reason the value is stamped on read rather
+  than stored in a column a row could lie in.
+
+  **`CLOCK_RESOLUTION_MS` was stale by three orders of magnitude.** The audit
+  column was widened to `datetime(3)` and this constant went on saying `1_000`, so
+  `coarse` was set for every trace that finished inside a second — which is most of
+  them. The explorer answered with a dashed track and "there is no internal timing
+  to draw" over spans whose real spacing was sitting in the rows, on exactly the
+  loads a waterfall exists for. Rows written before the widening are still whole
+  seconds and still come back `coarse`, which is the truth about them.
+
+  **And three docblocks corrected rather than built.** `TransformRow` claimed a row
+  per version; there is one row, overwritten in place, and `saveTransform` bumps a
+  counter on it — real versioning is a schema change with its own retention
+  question, and the console rendering `code v3` was already inviting operators to
+  believe a bad load's source was recoverable. `CatalogPromotionPlan.fingerprint`
+  claimed an apply endpoint that recomputes and refuses; there is none in this
+  repository, and the check belongs to the host, phrased the way `applyPromotion`
+  already phrases it. `CatalogEnvironment.protected` claimed the API demands
+  confirmation; nothing server-side reads it and the only reader paints a badge, so
+  it is now documented as advisory until a host enforces it.
+
+- f1100ba: Enforce per-type write grants across the pipeline surface, stop serving connection passwords, and make a deleted connector actually stop retrying.
+
+  **Behaviour change: the pipeline routes now authorise, not just attribute.** `mayWrite` had call sites in one file — `publish.service.ts` — and none on this surface. Every route here read `request.principal` for `?.id ?? 'console'` and used it as a name to write in a log, so a principal holding `catalog:write` with `writeTypes: ["Mvr"]` could author a workflow whose sink commits `Subwo`, attach a connector, and run it. Nothing lied on the way through: the graph validated, the run succeeded, and the snapshot recorded the write as authorised.
+
+  Four routes now refuse. `POST /pipeline/workflows` and `POST /pipeline/connectors` check at save time, which is the gate the scheduled path depends on — a cron-fired run carries a synthetic scheduler id with no grants to consult, so the question has to have been answered when the graph was written down. `POST /pipeline/workflows/:id/run` and `POST /pipeline/connectors/:id/run` check again at run time, which catches what save time cannot see: a graph saved by a principal that held the grant, run by one that does not. Types are read off **every** sink, not off `WorkflowRow.targetType`, which records only the first sink a multi-sink graph declares.
+
+  A host may now be refused for: saving or running a workflow whose sink commits a type outside the principal's `writeTypes`; saving a connector whose `targetType` is outside it, or one attached to a workflow whose sinks are; running either. Refusals are `403` and name every type they turned down.
+
+  **Behaviour change: these routes now require a principal.** `saveConnection`, `saveConnector`, `saveTransform`, `saveWorkflow`, and both run routes previously fell back to attributing the write to `'console'` when no guard had put a principal on the request. They now fail the way `createPublishController` already did, because a caller with no identity has no grants to check and "allow everything when nobody is identified" is the bug being fixed. **A deployment that mounts `CatalogPipelineModule` without a principal guard will start failing these routes.**
+
+  **Behaviour change: a connection URL carrying a password is no longer accepted or served.** `ConnectorRow.config`, `ConnectionRow.config` and `sources.ts` all promise that a credential is never stored — only the _name_ of an environment variable. That held for token-based sources and not for SQL, where `fetchSql` reads `config.url` and `postgres://user:pass@host/db` is a password with an address attached. `config` was persisted verbatim, returned verbatim, and served by `GET /pipeline/connections` and `GET /pipeline/connectors`, both of which ask only for `catalog:read`.
+
+  Two halves, because neither alone is enough:
+
+  - `MySqlPipelineStore.saveConnector` and `saveConnection` refuse a password-bearing URL in `config` that is not already the stored value for that row. Refused in the store rather than the controller, because a connector saved by curl, by a host's own code, or by `applyPromotion` reaches it and nothing else. **A host may now be refused for** creating a connector or connection whose config carries such a URL, changing an existing one's to a different password-bearing URL, or **promoting such a connector into an environment that does not have it yet** — `promoteConnectors` already refuses to carry `secretEnvVar` across so a promoted connector "arrives with no credential", and this applies that rule to the credential that was hiding inside `config`. Move the URL into an environment variable and name it in `secretEnvVar`. Rows already in the table are grandfathered and keep running.
+  - The four read routes that serve connectors and connections redact the password on the way out. This is what covers the rows that are already stored. It is at the route and not in the store on purpose: `ConnectorRunnerService` resolves the connector it is about to run through the store, and `applyPromotion` copies connectors between environments by reading them from it — a store that redacted would hand the runner a URL that cannot connect and promote the placeholder into the next environment as though it were the password.
+
+  A console that reads a connector, edits it and posts the whole object back is safe: the save routes put the stored credential back when the value they receive is exactly the redaction of what is held.
+
+  **Fix: `FatalError` in the connector step now actually stops the retries.** `connector-run.steps.ts` documented that a deleted or disabled connector must not be retried and did not achieve it. `FatalError` carries `message` and `code` and no `retryable`; durable core honours the class itself only in `runStepHandler`'s local retry loop, while a dispatched step is judged by `existing.error?.retryable !== false` on a serialised envelope. All three attempts were burning over roughly fifteen minutes for a connector somebody deleted on purpose. Fixed the way `workflow-run.steps.ts` already had been, by extending `FatalError` with `readonly retryable = false` so both paths are correct.
+
+- 09c9bc9: Promoting into production leaves a record, and cannot land in the wrong world
+
+  `PROMOTION_AUDIT_EVENT` was exported with a paragraph explaining where the record
+  is written, and referenced nowhere. `applyPromotion` wrote no audit row, so the
+  act of releasing into production was unrecorded — while the code said otherwise,
+  and while `CatalogPromotionApproval.reason` claimed the operator's text was
+  "recorded in the audit trail".
+
+  It writes one `promotion.applied` row per promotion now, into the TARGET
+  environment's own table rather than through the routing store: a promotion is
+  the one act about two environments at once, and the record has to be provably in
+  the one that changed. One row rather than one per change, because a promotion is
+  a single act by one person against one approved fingerprint — but every promoted
+  id is in the detail, kept apart by kind, so the trail does not lose what moved.
+
+  **A promotion that throws part-way records too.** An apply is not atomic, so the
+  half-finished one is the record worth most; `status` and `error` carry it, the
+  way `connector.run.finished` already reports both outcomes under one name.
+
+  **And a refusal that was missing entirely.** `applyPromotion` never checked that
+  the plan's `to` matched the environment it was handed. A caller that resolved the
+  wrong bundle would release an approved-for-staging plan into production — and,
+  once auditing existed, file the record under the environment the plan named
+  rather than the one it hit. It refuses now. This is a behaviour change to a
+  public API and the one part a host could notice.
+
+  `reason` is a new optional argument, carried verbatim and never parsed. It is the
+  one part of "who, what, when and why" that cannot be reconstructed from the two
+  databases afterwards.
+
+### Patch Changes
+
+- 655f964: The routing store now forwards `currentSnapshot`
+
+  `RoutingCatalogStore` proxies a `MySqlWarehouseStore`, which implements
+  `currentSnapshot`, and did not forward it. That did not make the proxy answer
+  "no" — it made the method absent, and a caller probing structurally reads absent
+  as "this store cannot answer".
+
+  What that costs is not hypothetical. A caller with no pointer falls back to the
+  newest entry in `listSnapshots`, which `catalog.store.ts` calls not survivable:
+  after a rollback the newest snapshot is precisely the one that was rolled back,
+  so the fallback aims the reader at data somebody deliberately stopped serving.
+
+  Still probed rather than assumed — the bundle's store is whatever the host bound,
+  and forwarding blindly would turn a missing method into a crash inside a proxy
+  the caller did not know was there.
+
+  The real defect was that a hand-written proxy had no test that fails when the
+  list falls behind. It has one now.
+
 ## 0.2.2
 
 ### Patch Changes
