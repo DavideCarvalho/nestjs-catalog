@@ -1,9 +1,10 @@
 import type { CatalogObjectTypeDef, ScalarType } from '@dudousxd/nestjs-catalog/client';
 import { useQuery } from '@tanstack/react-query';
-import { ArrowLeft, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Search } from 'lucide-react';
+import { ArrowLeft, ChevronDown, ChevronLeft, ChevronRight, Search } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import { cn } from './cn';
 import { catalogQueryKeys, useCatalogClient } from './context';
+import { DataTable } from './ui/data-table';
 
 /**
  * One table for every object type in the catalog.
@@ -136,6 +137,36 @@ export function ObjectExplorer({
 
   const selectedType = snapshot?.types.find((t) => t.name === typeName);
 
+  // Derived from what the SERVER said the columns are, not from a type this
+  // file knows: the explorer renders whatever was published. The second header
+  // line is the physical column name, which is what somebody writing SQL
+  // against the same table needs and the display name will not give them.
+  const columns = useMemo(
+    () =>
+      (data?.columns ?? []).map((column) => ({
+        id: column.name,
+        accessorFn: (row: Record<string, unknown>) => row[column.name],
+        header: () => (
+          <>
+            <span>
+              {column.displayName}
+              {column.unit && (
+                <span className={cn('ml-1 font-mono text-[10px]', MUTED)}>({column.unit})</span>
+              )}
+            </span>
+            <div className={cn('font-mono text-[10px] font-normal', MUTED)}>{column.name}</div>
+          </>
+        ),
+        cell: (context: { getValue: () => unknown }) => formatCell(context.getValue(), column.type),
+      })),
+    [data?.columns],
+  );
+
+  const numericColumns = useMemo(
+    () => new Set((data?.columns ?? []).filter((c) => isNumeric(c.type)).map((c) => c.name)),
+    [data?.columns],
+  );
+
   function toggleSort(column: string) {
     if (sort === column) {
       setDir((d) => (d === 'asc' ? 'desc' : 'asc'));
@@ -259,90 +290,17 @@ export function ObjectExplorer({
             isFetching && 'opacity-60',
           )}
         >
-          <div className="overflow-x-auto">
-            <table className="w-full min-w-max text-sm">
-              <thead>
-                <tr className={cn('border-b bg-zinc-50 dark:bg-zinc-950', RULE)}>
-                  {data?.columns.map((column) => {
-                    const active = sort === column.name;
-                    return (
-                      <th
-                        key={column.name}
-                        className={cn(
-                          'whitespace-nowrap px-3 py-2 text-left font-normal',
-                          isNumeric(column.type) && 'text-right',
-                        )}
-                      >
-                        <button
-                          type="button"
-                          onClick={() => toggleSort(column.name)}
-                          className={cn(
-                            'group inline-flex items-center gap-1',
-                            isNumeric(column.type) && 'flex-row-reverse',
-                          )}
-                        >
-                          <span
-                            className={cn(
-                              'text-xs',
-                              active
-                                ? 'text-zinc-950 dark:text-zinc-50'
-                                : 'text-zinc-500 dark:text-zinc-400',
-                            )}
-                          >
-                            {column.displayName}
-                            {column.unit && (
-                              <span className={cn('ml-1 font-mono text-[10px]', MUTED)}>
-                                ({column.unit})
-                              </span>
-                            )}
-                          </span>
-                          {active ? (
-                            dir === 'asc' ? (
-                              <ChevronUp size={12} />
-                            ) : (
-                              <ChevronDown size={12} />
-                            )
-                          ) : (
-                            <ChevronUp
-                              size={12}
-                              className="opacity-0 transition-opacity group-hover:opacity-40"
-                            />
-                          )}
-                        </button>
-                        <div className={cn('font-mono text-[10px] font-normal', MUTED)}>
-                          {column.name}
-                        </div>
-                      </th>
-                    );
-                  })}
-                </tr>
-              </thead>
-              <tbody>
-                {data?.rows.map((row, index) => (
-                  <tr
-                    key={String(row[selectedType?.primaryKey[0] ?? 'id'] ?? index)}
-                    className={cn(
-                      'border-b last:border-0 hover:bg-zinc-50 dark:hover:bg-zinc-950',
-                      HAIRLINE,
-                    )}
-                  >
-                    {data.columns.map((column) => (
-                      <td
-                        key={column.name}
-                        className={cn(
-                          'whitespace-nowrap px-3 py-2',
-                          isNumeric(column.type) && 'text-right font-mono tabular-nums',
-                          (row[column.name] === null || row[column.name] === undefined) && MUTED,
-                        )}
-                      >
-                        {formatCell(row[column.name], column.type)}
-                      </td>
-                    ))}
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+          {/* Sorting is reported, not performed. This screen reads a warehouse
+              table through a PAGED endpoint, so the rows on screen are a window
+              — sorting them here would reorder the window and present it as the
+              whole answer, which looks right and is not. `toggleSort` refetches. */}
+          <DataTable
+            data={data?.rows ?? []}
+            columns={columns}
+            getRowId={(row, index) => String(row[selectedType?.primaryKey[0] ?? 'id'] ?? index)}
+            sort={{ by: sort ?? null, dir, onSort: toggleSort }}
+            numeric={(id) => numericColumns.has(id)}
+          />
 
           {data && data.rows.length === 0 && (
             <EmptyState

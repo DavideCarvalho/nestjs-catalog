@@ -15,3 +15,5 @@ minimumReleaseAgeExclude:
   # THIRD-party (potentially compromised) deps — our own scope is exempt. Patterns match
   # package NAMES (globs), not name@version.
   - '@dudousxd/*'
+  - '@tanstack/react-table@9.0.0'
+  - '@tanstack/table-core@9.0.0'
