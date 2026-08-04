@@ -145,61 +145,16 @@ export function DataTable<TData extends RowData>({
         <thead>
           {table.getHeaderGroups().map((group) => (
             <tr key={group.id} className={cn('border-b bg-zinc-50 dark:bg-zinc-950', RULE)}>
-              {group.headers.map((header) => {
-                const id = header.column.id;
-                const canSort = sort ? (sort.sortable?.(id) ?? true) : false;
-                const isNumeric = numeric?.(id) ?? false;
-                const label = flexRender(header.column.columnDef.header, header.getContext());
-
-                return (
-                  <th
-                    key={header.id}
-                    // `aria-sort` on the header cell, not on the button. Screen
-                    // readers announce it as part of the column, and a button
-                    // carrying it says "this control is sorted" instead.
-                    {...(canSort && sort?.by === id
-                      ? { 'aria-sort': sort.dir === 'asc' ? 'ascending' : ('descending' as const) }
-                      : {})}
-                    className={cn(
-                      'whitespace-nowrap px-3 py-2 text-left font-normal',
-                      isNumeric && 'text-right',
-                      columnClassName?.(id),
-                    )}
-                  >
-                    {canSort && sort ? (
-                      <button
-                        type="button"
-                        onClick={() => sort.onSort(id)}
-                        className={cn(
-                          'group inline-flex items-center gap-1',
-                          // The arrow follows the text to the edge it is
-                          // aligned to, rather than sitting between the label
-                          // and the numbers it describes.
-                          isNumeric && 'flex-row-reverse',
-                        )}
-                      >
-                        <span
-                          className={cn(
-                            'text-xs',
-                            sort.by === id
-                              ? 'text-zinc-950 dark:text-zinc-50'
-                              : 'text-zinc-500 dark:text-zinc-400',
-                          )}
-                        >
-                          {label}
-                        </span>
-                        <SortIcon active={sort.by === id} dir={sort.dir} />
-                      </button>
-                    ) : (
-                      <span
-                        className={cn('font-mono text-[10px] uppercase tracking-[0.12em]', MUTED)}
-                      >
-                        {label}
-                      </span>
-                    )}
-                  </th>
-                );
-              })}
+              {group.headers.map((header) => (
+                <HeaderCell
+                  key={header.id}
+                  id={header.column.id}
+                  label={flexRender(header.column.columnDef.header, header.getContext())}
+                  sort={sort}
+                  isNumeric={numeric?.(header.column.id) ?? false}
+                  className={columnClassName?.(header.column.id)}
+                />
+              ))}
             </tr>
           ))}
         </thead>
@@ -263,4 +218,69 @@ export function renderUnknown(value: unknown): ReactNode {
   }
   if (typeof value === 'object') return JSON.stringify(value);
   return String(value);
+}
+
+/**
+ * One column header, sortable or not.
+ *
+ * Its own component because the two shapes barely overlap: a sortable header is
+ * a button carrying the label and an indicator, and a plain one is a mono
+ * caption. Inlined, the branch pushed `DataTable` past the complexity the lint
+ * allows — which was a fair reading, not a technicality.
+ */
+function HeaderCell({
+  id,
+  label,
+  sort,
+  isNumeric,
+  className,
+}: {
+  id: string;
+  label: ReactNode;
+  sort: DataTableSort | undefined;
+  isNumeric: boolean;
+  className: string | undefined;
+}) {
+  const canSort = sort ? (sort.sortable?.(id) ?? true) : false;
+  const active = sort?.by === id;
+
+  return (
+    <th
+      // `aria-sort` on the header cell, not on the button. Screen readers
+      // announce it as part of the column; a button carrying it says "this
+      // control is sorted" instead.
+      {...(canSort && active && sort
+        ? { 'aria-sort': sort.dir === 'asc' ? ('ascending' as const) : ('descending' as const) }
+        : {})}
+      className={cn(
+        'whitespace-nowrap px-3 py-2 text-left font-normal',
+        isNumeric && 'text-right',
+        className,
+      )}
+    >
+      {canSort && sort ? (
+        <button
+          type="button"
+          onClick={() => sort.onSort(id)}
+          // The arrow follows the text to the edge it is aligned to, rather
+          // than sitting between the label and the numbers it describes.
+          className={cn('group inline-flex items-center gap-1', isNumeric && 'flex-row-reverse')}
+        >
+          <span
+            className={cn(
+              'text-xs',
+              active ? 'text-zinc-950 dark:text-zinc-50' : 'text-zinc-500 dark:text-zinc-400',
+            )}
+          >
+            {label}
+          </span>
+          <SortIcon active={active} dir={sort.dir} />
+        </button>
+      ) : (
+        <span className={cn('font-mono text-[10px] uppercase tracking-[0.12em]', MUTED)}>
+          {label}
+        </span>
+      )}
+    </th>
+  );
 }
