@@ -1,6 +1,6 @@
 import type { CatalogAuditEvent, CatalogObjectTypeDef } from '@dudousxd/nestjs-catalog/client';
 import { useQuery } from '@tanstack/react-query';
-import { ArrowRight, CircleAlert, CircleCheck, CircleDot } from 'lucide-react';
+import { ArrowRight, CircleAlert, CircleCheck, CircleDot, Link2 } from 'lucide-react';
 import { useMemo } from 'react';
 import { cn } from './cn';
 import { catalogQueryKeys, useCatalogClient } from './context';
@@ -90,6 +90,21 @@ interface Lane {
   }>;
   schemaChanges: number;
   lastAt?: string;
+  /**
+   * Links out of this type whose other end is not this publisher's to load.
+   *
+   * The reason this screen shows links at all. A lane says how a load has been
+   * going; it cannot say whether the load is USEFUL, and a type full of rows
+   * pointing at a type nobody has loaded joins to nothing. That failure is
+   * completely silent — the rows are there, the timestamps are fresh, and every
+   * screen downstream renders a blank where a base name should be.
+   *
+   * Deliberately only the links that cross a boundary. A type pointing at
+   * another type the same application feeds is that application's own ordering
+   * problem and it can see it; a link to somebody else's type, or to no type at
+   * all, is the one nobody owns.
+   */
+  dependsOn: Array<{ typeName: string; displayName: string; publisher?: string }>;
 }
 
 /**
@@ -104,6 +119,7 @@ function newLane(
   principalId: string,
   typeName: string,
   def: CatalogObjectTypeDef | undefined,
+  byType: Map<string, CatalogObjectTypeDef>,
 ): Lane {
   return {
     principalId,
@@ -112,7 +128,49 @@ function newLane(
     icon: def?.icon,
     loads: [],
     schemaChanges: 0,
+    dependsOn: crossPublisherLinks(principalId, def, byType),
   };
+}
+
+/**
+ * The links out of a type that land outside this publisher's own set.
+ *
+ * "Whose type is it" is answered by who last committed to it, which is the same
+ * evidence the rest of this screen runs on — a declared owner would be a claim,
+ * and a lane built from claims is the diagram this screen exists not to be. A
+ * type nobody has committed to yet has no publisher, and that is reported as its
+ * own state rather than folded into "someone else's": nothing has ever loaded it
+ * is a worse answer than somebody else loads it, and they want different fixes.
+ *
+ * Unpublished targets (`targetPublished === false`) are the sharpest case and
+ * are included first: the catalog does not hold the type at all, so the join has
+ * nowhere to land no matter who runs.
+ */
+function crossPublisherLinks(
+  principalId: string,
+  def: CatalogObjectTypeDef | undefined,
+  byType: Map<string, CatalogObjectTypeDef>,
+): Lane['dependsOn'] {
+  if (!def) return [];
+
+  const seen = new Set<string>();
+  const dependsOn: Lane['dependsOn'] = [];
+  for (const relation of def.relations) {
+    const target = byType.get(relation.targetType);
+    const publisher = target?.lastPrincipalId;
+    // The links this publisher can fix on its own are not this screen's news.
+    if (relation.targetPublished && publisher === principalId) continue;
+    // One entry per target, not per link: two foreign keys into the same type
+    // are one dependency, and listing both says nothing the first did not.
+    if (seen.has(relation.targetType)) continue;
+    seen.add(relation.targetType);
+    dependsOn.push({
+      typeName: relation.targetType,
+      displayName: target?.displayName ?? relation.targetType,
+      ...(publisher === undefined ? {} : { publisher }),
+    });
+  }
+  return dependsOn;
 }
 
 /**
@@ -149,7 +207,8 @@ function buildLanes(types: CatalogObjectTypeDef[], events: CatalogAuditEvent[]):
     if (!event.typeName) continue;
     const principalId = event.principalId ?? 'curated by hand';
     const key = `${principalId}:${event.typeName}`;
-    const lane = lanes.get(key) ?? newLane(principalId, event.typeName, byType.get(event.typeName));
+    const lane =
+      lanes.get(key) ?? newLane(principalId, event.typeName, byType.get(event.typeName), byType);
 
     if (event.event === 'schema.changed') lane.schemaChanges += 1;
     recordSnapshot(lane, event);
@@ -232,6 +291,37 @@ function Lane({ lane }: { lane: Lane }) {
           </Tooltip>
         )}
       </div>
+
+      {lane.dependsOn.length > 0 && (
+        <div
+          className={cn('mt-2 flex flex-wrap items-center gap-1.5 font-mono text-[10px]', MUTED)}
+        >
+          <Link2 size={10} />
+          <span>needs</span>
+          {lane.dependsOn.map((dependency) => (
+            <Tooltip
+              key={dependency.typeName}
+              content={
+                dependency.publisher
+                  ? `${lane.displayName} links to ${dependency.displayName}, which ${dependency.publisher} loads. Rows here can arrive before the ones they point at, and the join comes back empty rather than failing.`
+                  : `${lane.displayName} links to ${dependency.typeName}, and nothing has ever committed to it. Every one of those joins resolves to nothing.`
+              }
+            >
+              <span
+                className={cn(
+                  'cursor-help rounded-sm border px-1.5 py-0.5',
+                  dependency.publisher
+                    ? 'border-zinc-200 dark:border-zinc-800'
+                    : 'border-amber-200 text-amber-700 dark:border-amber-900 dark:text-amber-300',
+                )}
+              >
+                {dependency.displayName}
+                {dependency.publisher ? ` · ${dependency.publisher}` : ' · nobody'}
+              </span>
+            </Tooltip>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

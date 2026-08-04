@@ -58,7 +58,24 @@ export interface CatalogPropertyDef {
   enriched: boolean;
 }
 
-/** A link between two object types. Derived entirely from the ORM. */
+/**
+ * A link between two object types — the thing that makes this an ontology
+ * rather than a list of tables.
+ *
+ * **Structure derived, semantics declared**, the same split as everywhere else.
+ * A `@ManyToOne` already names its target, its kind and its join column, so none
+ * of that is ever written by hand — a decorator that could restate it is a
+ * decorator that can disagree with the schema. What a human adds is what they
+ * add to a scalar, a label and a meaning, through `@CatalogProperty` or the
+ * overlay; both key on the property name and so reach a relation without having
+ * to know it is one.
+ *
+ * **One row per declaration, not per link.** `@ManyToOne(() => Base)` on `Mvr`
+ * with the matching `@OneToMany` on `Base` is two rows describing one link.
+ * Collapsing them here would mean `Base` could not carry its own label for the
+ * end it declares, and a type could not say what it points at without consulting
+ * every other type. The graph collapses them instead — see {@link CatalogGraph}.
+ */
 export interface CatalogRelationDef {
   name: string;
   displayName: string;
@@ -71,6 +88,39 @@ export interface CatalogRelationDef {
   nullable: boolean;
   hidden: boolean;
   order: number;
+  /**
+   * True when this side physically holds the key.
+   *
+   * The two ends of a link are not interchangeable. The owning end is where the
+   * foreign key actually is, so it is the end a join is written from, the end
+   * whose column can be indexed, and the end whose removal breaks the link. A
+   * `1:m` is never the owner — the key lives on the many side.
+   */
+  owner: boolean;
+  /**
+   * The property on {@link targetType} that is the other end of this same link,
+   * when the ORM knows it (MikroORM's `mappedBy` / `inversedBy`).
+   *
+   * This is what lets two rows be recognised as one link. Pairing them by name
+   * instead only works for the accident of both ends being spelled the same:
+   * `Mvr.base` and `Base.mvrs` are one link and would otherwise draw two edges,
+   * which is exactly the picture a graph is supposed to prevent.
+   */
+  inverseName?: string;
+  /**
+   * Whether {@link targetType} is a type this catalog actually holds.
+   *
+   * False when the target was excluded by configuration, or belongs to an
+   * application that has not published it. The relation is still reported: that
+   * an MVR points at something called `Base` is true, and when the other end is
+   * missing that is the most useful single fact about it. Dropping it silently
+   * would leave a type looking unlinked when it is really linked to something
+   * out of reach — but drawing it as a navigable edge promises a node that
+   * cannot be opened, so the graph omits it and the type page keeps it, marked.
+   */
+  targetPublished: boolean;
+  /** True when a human has labelled or described this link. */
+  enriched: boolean;
 }
 
 /** One node of the ontology. */
@@ -152,13 +202,28 @@ export interface CatalogSnapshot {
   stats: {
     types: number;
     properties: number;
+    /**
+     * Declared relations, summed over the types — **not** distinct links. A link
+     * declared at both ends counts twice, because that is what this number is
+     * derived from and quietly halving it would make it disagree with the rows
+     * on the type pages that produce it. `getGraph().edges.length` is the count
+     * of links.
+     */
     relations: number;
     enrichedTypes: number;
   };
   types: CatalogObjectTypeDef[];
 }
 
-/** Nodes and edges, for drawing the ontology. */
+/**
+ * Nodes and edges, for drawing the ontology.
+ *
+ * One edge per **link**, not per declaration: a link declared at both ends is
+ * one line on the picture, drawn from the end that holds the key so the arrow
+ * points the way a join is written. And every edge lands on a node that is
+ * present — a target this catalog does not hold produces no edge, because an
+ * edge to nowhere is a node the reader will try to click.
+ */
 export interface CatalogGraph {
   nodes: Array<{
     id: string;
@@ -191,6 +256,12 @@ export interface CatalogOverlay {
       icon?: string;
       group?: string;
       titleProperty?: string;
+      /**
+       * Keyed by property name — and a relation is a property to whoever is
+       * looking, so a link's label and description are curated through this map
+       * too, under the relation's own name. That is why curating a link needs no
+       * new route and no new patch shape: `patchProperty` already accepts one.
+       */
       properties?: Record<
         string,
         {

@@ -3,7 +3,9 @@ import {
   type CatalogObjectTypeDef,
   type CatalogOverlay,
   CatalogRegistry,
+  type CatalogRelationDef,
   type CatalogSnapshot,
+  type RelationKind,
   type ScalarType,
   emitCatalog,
 } from '@dudousxd/nestjs-catalog';
@@ -12,7 +14,7 @@ import type { EntityManager } from '@mikro-orm/mysql';
 import { Inject, Injectable, Logger, type OnModuleInit } from '@nestjs/common';
 import { CATALOG_STORE_ENTITY_MANAGER, CATALOG_STORE_MIKRO_ORM } from './context';
 import { SnapshotRow } from './entities/governance';
-import { ObjectTypeRow, PropertyRow } from './entities/model';
+import { ObjectTypeRow, PropertyRow, type StoredRelation, relationsOf } from './entities/model';
 import { CATALOG_STORE_OPTIONS, type CatalogStoreModuleOptions } from './options';
 import { ensureCatalogSchema } from './schema';
 
@@ -21,6 +23,36 @@ const SCALARS: ScalarType[] = ['string', 'number', 'boolean', 'date', 'json', 'u
 function toScalar(value: string): ScalarType {
   const found = SCALARS.find((s) => s === value);
   return found ?? 'unknown';
+}
+
+const RELATION_KINDS: RelationKind[] = ['1:1', '1:m', 'm:1', 'm:n'];
+
+/**
+ * Narrow a stored kind, the same way {@link toScalar} narrows a stored type.
+ *
+ * `m:1` is the fallback rather than a throw, because the alternative to a
+ * best-guess kind is a catalog that refuses to load over one bad row written by
+ * a publisher nobody can reach right now. The kind decides an arrowhead; the
+ * link itself is still true.
+ */
+function toRelationKind(value: string): RelationKind {
+  const found = RELATION_KINDS.find((kind) => kind === value);
+  return found ?? 'm:1';
+}
+
+/**
+ * A key both ends of one link agree on.
+ *
+ * Deliberately the same rule as `linkKey` in `MikroOrmCatalogRegistry`, and the
+ * duplication is the honest cost of the two registries living in different
+ * packages with no shared graph builder between them — the right home is the
+ * `CatalogRegistry` base class. If one of these changes, the two screens
+ * disagree about how many links exist, so change both.
+ */
+function linkKey(holder: string, relation: CatalogRelationDef): string {
+  if (relation.owner) return `${holder}.${relation.name}`;
+  if (relation.inverseName) return `${relation.targetType}.${relation.inverseName}`;
+  return `${[holder, relation.targetType].sort().join('::')}::${relation.name}`;
 }
 
 /**
@@ -66,8 +98,11 @@ export class StoredCatalogRegistry extends CatalogRegistry implements OnModuleIn
       await ensureCatalogSchema(this.orm);
     }
     await this.reload();
+    // Relations in the boot line for the same reason the in-app registry prints
+    // them: a wire that stopped carrying links shows up here as a zero, and
+    // nowhere else until somebody opens the graph and finds it bare.
     this.logger.log(
-      `Catalog loaded: ${this.snapshot.stats.types} object types, ${this.snapshot.stats.properties} properties`,
+      `Catalog loaded: ${this.snapshot.stats.types} object types, ${this.snapshot.stats.properties} properties, ${this.snapshot.stats.relations} relations`,
     );
   }
 
@@ -80,14 +115,18 @@ export class StoredCatalogRegistry extends CatalogRegistry implements OnModuleIn
     );
 
     const serving = await this.servingSnapshots(em);
-    const types = rows.map((row) => this.toDef(row, serving.get(row.name)));
+    // Every published name, before any type is built. Whether a link's other end
+    // exists is a fact about the catalog rather than about the type holding the
+    // link, so it cannot be answered while the catalog is half-assembled.
+    const published = new Set(rows.map((row) => row.name));
+    const types = rows.map((row) => this.toDef(row, published, serving.get(row.name)));
     this.snapshot = {
       version: this.snapshot.version + 1,
       generatedAt: new Date().toISOString(),
       stats: {
         types: types.length,
         properties: types.reduce((n, t) => n + t.properties.length, 0),
-        relations: 0,
+        relations: types.reduce((n, t) => n + t.relations.length, 0),
         enrichedTypes: types.filter((t) => t.enriched).length,
       },
       types,
@@ -103,13 +142,34 @@ export class StoredCatalogRegistry extends CatalogRegistry implements OnModuleIn
   }
 
   /**
-   * Empty for now.
+   * The ontology, as nodes and lines.
    *
-   * Links are the one thing that cannot be derived here: a foreign key lives in
-   * the publisher's schema, and what arrives is a flat set of rows. They have
-   * to be published explicitly, which is the next piece of the wire format.
+   * Nothing about a link is derivable here and nothing ever will be: there are
+   * no entity classes and no foreign keys — every published type lands as a flat
+   * snapshot — so what a `@ManyToOne` says in the owning application has to
+   * arrive over the wire or be asserted by a curator. The one thing this must
+   * not do is guess. A `base_id` column beside a type called `Base` is a strong
+   * hint and a bad edge: an ontology that invents joins is worse than one with
+   * none, because the invented ones are indistinguishable from the real ones.
+   *
+   * One edge per link, drawn from the end that holds the key, and only where
+   * both ends are published. See `CatalogGraph` for why each of those matters.
    */
   getGraph(): CatalogGraph {
+    const byLink = new Map<string, { holder: string; relation: CatalogRelationDef }>();
+    for (const type of this.snapshot.types) {
+      for (const relation of type.relations) {
+        if (!relation.targetPublished) continue;
+        const key = linkKey(type.name, relation);
+        const seen = byLink.get(key);
+        // The owning row replaces a non-owning one and nothing else replaces
+        // anything, so the edge order follows the type order rather than
+        // shuffling on every reload.
+        if (seen && (seen.relation.owner || !relation.owner)) continue;
+        byLink.set(key, { holder: type.name, relation });
+      }
+    }
+
     return {
       nodes: this.snapshot.types.map((t) => ({
         id: t.name,
@@ -117,9 +177,15 @@ export class StoredCatalogRegistry extends CatalogRegistry implements OnModuleIn
         group: t.group,
         icon: t.icon,
         propertyCount: t.properties.length,
-        relationCount: 0,
+        relationCount: t.relations.length,
       })),
-      edges: [],
+      edges: [...byLink.values()].map(({ holder, relation }) => ({
+        id: `${holder}.${relation.name}`,
+        source: holder,
+        target: relation.targetType,
+        label: relation.displayName,
+        kind: relation.kind,
+      })),
     };
   }
 
@@ -150,6 +216,18 @@ export class StoredCatalogRegistry extends CatalogRegistry implements OnModuleIn
     return this.getType(typeName);
   }
 
+  /**
+   * Curate one field — and a relation is a field to whoever is looking.
+   *
+   * The same route, the same patch shape, and the fallback below is why no new
+   * endpoint was needed to name a link: the console sends `PATCH
+   * .../properties/base` whether `base` turns out to be a column or a link, and
+   * a caller that had to know which in advance would have to read the type first
+   * just to pick a URL. The library registry already behaved this way — its
+   * overlay is keyed by property name and a relation's name is in the same
+   * namespace — so this is the persisted path catching up rather than a new
+   * idea.
+   */
   async patchProperty(
     typeName: string,
     propertyName: string,
@@ -159,16 +237,20 @@ export class StoredCatalogRegistry extends CatalogRegistry implements OnModuleIn
     const row = await em.findOne(PropertyRow, {
       id: `${typeName}.${propertyName}`,
     });
-    if (!row) return undefined;
 
-    if (patch.displayName !== undefined) row.displayName = patch.displayName;
-    if (patch.description !== undefined) row.description = patch.description;
-    if (patch.hidden !== undefined) row.hidden = patch.hidden;
-    if (patch.order !== undefined) row.position = patch.order;
-    if (patch.classification !== undefined) {
-      row.classification = patch.classification;
+    if (row) {
+      if (patch.displayName !== undefined) row.displayName = patch.displayName;
+      if (patch.description !== undefined) row.description = patch.description;
+      if (patch.hidden !== undefined) row.hidden = patch.hidden;
+      if (patch.order !== undefined) row.position = patch.order;
+      if (patch.classification !== undefined) {
+        row.classification = patch.classification;
+      }
+      if (patch.unit !== undefined) row.unit = patch.unit;
+    } else if (!(await this.patchRelation(em, typeName, propertyName, patch))) {
+      return undefined;
     }
-    if (patch.unit !== undefined) row.unit = patch.unit;
+
     await em.flush();
     await this.reload();
     emitCatalog('type.curated', {
@@ -177,6 +259,43 @@ export class StoredCatalogRegistry extends CatalogRegistry implements OnModuleIn
       changed: Object.keys(patch),
     });
     return this.getType(typeName);
+  }
+
+  /**
+   * Apply a field patch to a link instead of a column. False when there is no
+   * such link, which is what makes the caller answer 404 rather than 200.
+   *
+   * `unit` and `classification` are ignored rather than rejected. They are
+   * meaningless on a link — it has no value to carry a unit — and the console
+   * sends whichever fields its editor changed, so refusing the whole patch over
+   * a field nobody typed would break the editable label this exists to serve.
+   */
+  private async patchRelation(
+    em: EntityManager,
+    typeName: string,
+    relationName: string,
+    patch: NonNullable<CatalogOverlay['types'][string]['properties']>[string],
+  ): Promise<boolean> {
+    const row = await em.findOne(ObjectTypeRow, { name: typeName });
+    if (!row) return false;
+    const relations = relationsOf(row);
+    const existing = relations.find((relation) => relation.name === relationName);
+    if (!existing) return false;
+
+    const patched: StoredRelation = {
+      ...existing,
+      ...(patch.displayName === undefined ? {} : { displayName: patch.displayName }),
+      ...(patch.description === undefined ? {} : { description: patch.description }),
+      ...(patch.hidden === undefined ? {} : { hidden: patch.hidden }),
+      ...(patch.order === undefined ? {} : { position: patch.order }),
+    };
+    // Replaced, never mutated in place: MikroORM diffs a JSON property against
+    // the snapshot it took at load, and editing the object it already holds can
+    // leave the flush with nothing to write.
+    row.relations = relations.map((relation) =>
+      relation.name === relationName ? patched : relation,
+    );
+    return true;
   }
 
   /**
@@ -219,7 +338,37 @@ export class StoredCatalogRegistry extends CatalogRegistry implements OnModuleIn
     return serving;
   }
 
-  private toDef(row: ObjectTypeRow, serving?: SnapshotRow): CatalogObjectTypeDef {
+  private toDef(
+    row: ObjectTypeRow,
+    published: Set<string>,
+    serving?: SnapshotRow,
+  ): CatalogObjectTypeDef {
+    const relations: CatalogRelationDef[] = [...relationsOf(row)]
+      .sort((a, b) => a.position - b.position)
+      .map((relation) => ({
+        name: relation.name,
+        displayName: relation.displayName,
+        kind: toRelationKind(relation.kind),
+        targetType: relation.targetType,
+        nullable: relation.nullable,
+        hidden: relation.hidden,
+        order: relation.position,
+        owner: relation.owner,
+        // Computed here rather than stored, because it is not a fact about this
+        // link: the application that owns `Base` can publish it tomorrow or be
+        // switched off tonight, and a persisted answer would keep insisting on
+        // whichever was true when the row was written.
+        targetPublished: published.has(relation.targetType),
+        // Same limit the properties above have, for the same reason: there is no
+        // derived layer underneath here, so a display name that arrived from a
+        // publisher is indistinguishable from one a curator typed. A description
+        // is the one field nothing writes by default.
+        enriched: Boolean(relation.description),
+        ...(relation.description === undefined ? {} : { description: relation.description }),
+        ...(relation.localKey === undefined ? {} : { localKey: relation.localKey }),
+        ...(relation.inverseName === undefined ? {} : { inverseName: relation.inverseName }),
+      }));
+
     const properties = row.properties
       .getItems()
       .sort((a, b) => a.position - b.position)
@@ -248,7 +397,10 @@ export class StoredCatalogRegistry extends CatalogRegistry implements OnModuleIn
       group: row.group,
       titleProperty: row.titleProperty,
       primaryKey: row.primaryKey ?? [],
-      enriched: Boolean(row.description) || properties.some((p) => p.enriched),
+      enriched:
+        Boolean(row.description) ||
+        properties.some((p) => p.enriched) ||
+        relations.some((r) => r.enriched),
       // Spread so a type with no committed snapshot carries no key at all
       // rather than three explicit `undefined`s. The absence is the statement —
       // "never loaded" and "loaded long ago" have to stay distinguishable, and
@@ -261,7 +413,7 @@ export class StoredCatalogRegistry extends CatalogRegistry implements OnModuleIn
           }
         : {}),
       properties,
-      relations: [],
+      relations,
     };
   }
 }

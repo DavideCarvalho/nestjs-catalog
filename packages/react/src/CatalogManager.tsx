@@ -6,7 +6,16 @@ import type {
   TypePatch,
 } from '@dudousxd/nestjs-catalog/client';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { ArrowUpRight, Eye, EyeOff, RotateCcw, Search } from 'lucide-react';
+import {
+  ArrowLeft,
+  ArrowRight,
+  ArrowUpRight,
+  Eye,
+  EyeOff,
+  RotateCcw,
+  Search,
+  Unlink,
+} from 'lucide-react';
 import { useMemo, useState } from 'react';
 import { CoverageLedger } from './CoverageLedger';
 import { EditableField } from './EditableField';
@@ -192,7 +201,17 @@ export function CatalogManager({
             <div className="flex items-center gap-6">
               <Stat label="Types" value={data.stats.types} />
               <Stat label="Properties" value={data.stats.properties} />
-              <Stat label="Links" value={data.stats.relations} />
+              {/*
+                "Relations", not "Links", and the tooltip says why: this counts
+                declared relations, and a link declared at both ends contributes
+                two. Calling it Links made the header disagree with the graph by
+                a factor that changed per catalog.
+              */}
+              <Tooltip content="Relations declared across every type. A link declared at both ends counts twice — the graph draws it once.">
+                <span className="cursor-help">
+                  <Stat label="Relations" value={data.stats.relations} />
+                </span>
+              </Tooltip>
               <button
                 type="button"
                 onClick={() => resetMutation.mutate()}
@@ -309,6 +328,12 @@ export function CatalogManager({
               <TypeDetail
                 key={selected.name}
                 type={selected}
+                // The whole catalog, so the detail pane can answer what points
+                // AT this type. Nothing on a type records its inbound links —
+                // one row per declaration, and the declaration lives on the
+                // other end — so the only place that question can be answered
+                // is somewhere holding every type.
+                types={types}
                 explorerHref={explorerHref}
                 onPatchType={(patch) => typeMutation.mutate({ name: selected.name, patch })}
                 onPatchProperty={(property, patch) =>
@@ -337,6 +362,7 @@ function Stat({ label, value }: { label: string; value: number }) {
 
 interface TypeDetailProps {
   type: CatalogObjectTypeDef;
+  types: CatalogObjectTypeDef[];
   explorerHref?: (typeName: string) => string;
   onPatchType: (patch: TypePatch) => void;
   onPatchProperty: (property: string, patch: PropertyPatch) => void;
@@ -345,6 +371,7 @@ interface TypeDetailProps {
 
 function TypeDetail({
   type,
+  types,
   explorerHref,
   onPatchType,
   onPatchProperty,
@@ -428,43 +455,255 @@ function TypeDetail({
         </div>
       </section>
 
-      <section className="mt-10 pb-16">
-        <SectionHeading title="Links" note="Read from the foreign keys." />
-        {type.relations.length === 0 ? (
-          <p
+      <LinkSection
+        type={type}
+        types={types}
+        onPatchProperty={onPatchProperty}
+        onNavigate={onNavigate}
+      />
+    </div>
+  );
+}
+
+/** What each kind actually says, for people who do not read `m:n` fluently. */
+const KIND_MEANING: Record<CatalogObjectTypeDef['relations'][number]['kind'], string> = {
+  'm:1': 'Many of these point at one of those. The key is on this side.',
+  '1:m': 'One of these has many of those. The key is on the other side.',
+  '1:1': 'One of each, paired.',
+  'm:n': 'Many on both sides, joined through a table of pairs.',
+};
+
+/**
+ * A link this type declares, together with the one that points back at it.
+ *
+ * A type carries one row per link it DECLARES, which is the honest shape — the
+ * declaration belongs to whoever wrote it, and inventing a mirror row on the
+ * other type would double every count and hand a curator a label no publisher
+ * owns. But it makes half the truth invisible: `@ManyToOne(() => Base)` on `Mvr`
+ * leaves `Base` with an empty relations list, and this screen said, in as many
+ * words, that nothing linked to or from it. Base is one of the most linked-to
+ * types in the schema.
+ *
+ * So the inbound half is derived here, from the catalog the screen already has,
+ * and derived is exactly what it stays: nothing about it is stored, counted or
+ * editable from this end.
+ */
+function inboundLinks(
+  type: CatalogObjectTypeDef,
+  types: CatalogObjectTypeDef[],
+): Array<{ from: CatalogObjectTypeDef; relation: CatalogObjectTypeDef['relations'][number] }> {
+  // The other ends this type already declares. `Base.mvrs` names `Mvr.base`
+  // through `inverseName`, and the two are one link — listing the second as an
+  // inbound arrival would show a single foreign key as two separate links.
+  const alreadyMine = new Set(
+    type.relations.flatMap((relation) =>
+      relation.inverseName ? [`${relation.targetType}.${relation.inverseName}`] : [],
+    ),
+  );
+
+  const inbound: Array<{
+    from: CatalogObjectTypeDef;
+    relation: CatalogObjectTypeDef['relations'][number];
+  }> = [];
+  for (const from of types) {
+    // A type that points at itself is already listed once, above. Showing it
+    // again under "points here" says there are two links where there is one.
+    if (from.name === type.name) continue;
+    for (const relation of from.relations) {
+      if (relation.targetType !== type.name) continue;
+      if (alreadyMine.has(`${from.name}.${relation.name}`)) continue;
+      inbound.push({ from, relation });
+    }
+  }
+  return inbound;
+}
+
+function LinkSection({
+  type,
+  types,
+  onPatchProperty,
+  onNavigate,
+}: {
+  type: CatalogObjectTypeDef;
+  types: CatalogObjectTypeDef[];
+  onPatchProperty: (property: string, patch: PropertyPatch) => void;
+  onNavigate: (name: string) => void;
+}) {
+  const inbound = useMemo(() => inboundLinks(type, types), [type, types]);
+  const labelFor = useMemo(() => new Map(types.map((t) => [t.name, t.displayName])), [types]);
+
+  return (
+    <section className="mt-10 pb-16">
+      <SectionHeading
+        title="Links"
+        note="Read from the foreign keys. What a link is called is yours to change; where it points is not."
+      />
+
+      {type.relations.length === 0 && inbound.length === 0 ? (
+        <p
+          className={cn(
+            'rounded-lg border border-dashed px-4 py-6 text-center text-sm',
+            RULE,
+            MUTED,
+          )}
+        >
+          Nothing links to or from {type.displayName} yet.
+        </p>
+      ) : (
+        <div className="space-y-5">
+          {type.relations.length > 0 && (
+            <div>
+              <p className={cn('mb-2 font-mono text-[10px] uppercase tracking-[0.14em]', MUTED)}>
+                {type.displayName} points at
+              </p>
+              <ul className="space-y-1.5">
+                {type.relations.map((relation) => (
+                  <OutboundLink
+                    key={relation.name}
+                    relation={relation}
+                    targetLabel={labelFor.get(relation.targetType)}
+                    onPatchProperty={onPatchProperty}
+                    onNavigate={onNavigate}
+                  />
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {inbound.length > 0 && (
+            <div>
+              <p className={cn('mb-2 font-mono text-[10px] uppercase tracking-[0.14em]', MUTED)}>
+                Points at {type.displayName}
+              </p>
+              <ul className="space-y-1.5">
+                {inbound.map(({ from, relation }) => (
+                  <li key={`${from.name}.${relation.name}`}>
+                    <button
+                      type="button"
+                      onClick={() => onNavigate(from.name)}
+                      className={cn(
+                        'flex w-full items-center gap-2 rounded-md border px-3 py-2 text-left transition-colors',
+                        RULE,
+                        PANEL,
+                        'hover:border-sky-500 hover:bg-sky-100 dark:hover:bg-sky-950',
+                      )}
+                    >
+                      <ArrowLeft size={13} className={MUTED} />
+                      <span className="text-sm">{from.displayName}</span>
+                      <span className={cn('font-mono text-[10px]', MUTED)}>
+                        {relation.kind} · {from.name}.{relation.name}
+                      </span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+              {/*
+                Said out loud, because the asymmetry is otherwise read as a bug:
+                the labels above are editable and these are not, and the reason
+                is that the declaration — and therefore the label — belongs to
+                the type it was written on.
+              */}
+              <p className={cn('mt-1.5 text-[11px]', MUTED)}>
+                Declared on the other type. Open it to rename the link.
+              </p>
+            </div>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
+/**
+ * One link this type declares.
+ *
+ * Not a single button any more, and that is the point: the label is editable and
+ * the target is navigable, so a control that was both meant the only way to
+ * rename a link was to first go somewhere else. A nested interactive element is
+ * also the one thing a screen reader cannot describe.
+ */
+function OutboundLink({
+  relation,
+  targetLabel,
+  onPatchProperty,
+  onNavigate,
+}: {
+  relation: CatalogObjectTypeDef['relations'][number];
+  targetLabel: string | undefined;
+  onPatchProperty: (property: string, patch: PropertyPatch) => void;
+  onNavigate: (name: string) => void;
+}) {
+  return (
+    <li
+      className={cn(
+        'flex items-center gap-2 rounded-md border px-3 py-2',
+        RULE,
+        PANEL,
+        relation.hidden && 'opacity-45',
+      )}
+    >
+      <Tooltip content={KIND_MEANING[relation.kind]}>
+        <span className={cn('cursor-help font-mono text-[10px] uppercase tracking-wider', MUTED)}>
+          {relation.kind}
+        </span>
+      </Tooltip>
+
+      {/* `EditableField` is `w-full`, so it needs a track of its own to grow in. */}
+      <span className="min-w-0 flex-1">
+        <EditableField
+          label={`label for ${relation.name}`}
+          value={relation.displayName}
+          onSave={(displayName) => onPatchProperty(relation.name, { displayName })}
+          className="text-sm"
+          inputClassName="text-sm"
+        />
+      </span>
+
+      <span className={cn('shrink-0 font-mono text-[10px]', MUTED)}>
+        {relation.name}
+        {/*
+          The join column, where there is one. It is the difference between a
+          link somebody can go and check in the database and a link they have to
+          take on trust — and only the end that owns the key has one.
+        */}
+        {relation.localKey ? ` · ${relation.localKey}` : ''}
+      </span>
+
+      <span className="shrink-0">
+        {relation.targetPublished ? (
+          <button
+            type="button"
+            onClick={() => onNavigate(relation.targetType)}
             className={cn(
-              'rounded-lg border border-dashed px-4 py-6 text-center text-sm',
-              RULE,
-              MUTED,
+              'flex items-center gap-1.5 rounded-md px-1.5 py-0.5 text-xs transition-colors',
+              SECONDARY,
+              'hover:bg-sky-100 dark:hover:bg-sky-950',
             )}
           >
-            Nothing links to or from {type.displayName} yet.
-          </p>
+            <ArrowRight size={13} />
+            {targetLabel ?? relation.targetType}
+          </button>
         ) : (
-          <div className="flex flex-wrap gap-2">
-            {type.relations.map((relation) => (
-              <button
-                key={relation.name}
-                type="button"
-                onClick={() => onNavigate(relation.targetType)}
-                className={cn(
-                  'group flex items-center gap-2 rounded-md border px-3 py-2 text-left transition-colors',
-                  RULE,
-                  PANEL,
-                  'hover:border-sky-500 hover:bg-sky-100 dark:hover:bg-sky-950',
-                )}
-              >
-                <span className={cn('font-mono text-[10px] uppercase tracking-wider', MUTED)}>
-                  {relation.kind}
-                </span>
-                <span className="text-sm">{relation.displayName}</span>
-                <span className={cn('font-mono text-[10px]', MUTED)}>→ {relation.targetType}</span>
-              </button>
-            ))}
-          </div>
+          // Kept, and marked. Dropping it would leave the type looking less
+          // connected than it is; making it navigable would send the reader to
+          // a type that is not there — the button used to do exactly that, and
+          // silently selected whichever type happened to be first.
+          <Tooltip
+            content={`This catalog holds nothing called ${relation.targetType}. The link is real in the source schema; the type on the other end has been excluded, or nobody has published it here.`}
+          >
+            <span
+              className={cn(
+                'flex cursor-help items-center gap-1.5 rounded-md px-1.5 py-0.5 text-xs',
+                'text-amber-700 dark:text-amber-400',
+              )}
+            >
+              <Unlink size={13} />
+              {relation.targetType}
+            </span>
+          </Tooltip>
         )}
-      </section>
-    </div>
+      </span>
+    </li>
   );
 }
 

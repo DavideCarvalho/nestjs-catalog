@@ -30,6 +30,47 @@ function isRelationKind(kind: string): kind is RelationKind {
   return RELATION_KINDS.includes(kind as RelationKind);
 }
 
+/**
+ * Which end of the link holds the key.
+ *
+ * Not simply `prop.owner`, and the difference matters. MikroORM sets that flag
+ * while resolving the *pair*, so it is dependable for `1:1` and `m:n` — where
+ * either side could plausibly own the key and only the mapping says which — and
+ * beside the point for the two kinds that have no choice: a `m:1` is the many
+ * end and therefore always holds the column, a `1:m` is the one end and
+ * therefore never does. Deriving those two from the kind rather than from a flag
+ * also means metadata assembled by hand (an `EntitySchema`, or a test) answers
+ * correctly without having to know the flag exists.
+ *
+ * `mappedBy` is checked first because it is unambiguous wherever it appears: the
+ * ORM only ever writes it on the inverse side.
+ */
+function isOwningSide(prop: EntityProperty, kind: RelationKind): boolean {
+  if (prop.mappedBy) return false;
+  if (kind === '1:m') return false;
+  if (kind === 'm:1') return true;
+  return Boolean(prop.owner);
+}
+
+/**
+ * A key both ends of one link agree on, so the graph can draw it once.
+ *
+ * The owning end names the link — `Mvr.base` — and the inverse end, which knows
+ * the owner's property through `mappedBy`, arrives at the same string. That is
+ * the whole trick, and it is why `inverseName` is carried on the def at all.
+ *
+ * The fallback covers metadata that names neither end of the pair: both rows
+ * then reduce to the unordered pair plus the property name, which collapses the
+ * symmetric case (two `m:n` sides spelled alike) and leaves genuinely different
+ * names as two links. Guessing harder than that would mean pairing links by
+ * shape, and drawing one line where the schema has two is the worse error.
+ */
+function linkKey(holder: string, relation: CatalogRelationDef): string {
+  if (relation.owner) return `${holder}.${relation.name}`;
+  if (relation.inverseName) return `${relation.targetType}.${relation.inverseName}`;
+  return `${[holder, relation.targetType].sort().join('::')}::${relation.name}`;
+}
+
 /** Classify one type name. Returns "unknown" when nothing matches. */
 function classify(raw: string): ScalarType {
   const t = raw.toLowerCase();
@@ -165,7 +206,6 @@ export class MikroOrmCatalogRegistry extends CatalogRegistry implements OnModule
 
   getGraph(): CatalogGraph {
     const snapshot = this.getSnapshot();
-    const known = new Set(snapshot.types.map((t) => t.name));
     const nodes = snapshot.types.map((t) => ({
       id: t.name,
       label: t.displayName,
@@ -174,28 +214,7 @@ export class MikroOrmCatalogRegistry extends CatalogRegistry implements OnModule
       propertyCount: t.properties.length,
       relationCount: t.relations.length,
     }));
-
-    // Both ends of a relation are declared, so every link shows up twice. Keep
-    // one edge per unordered pair per name so the graph does not double up.
-    const seen = new Set<string>();
-    const edges: CatalogGraph['edges'] = [];
-    for (const type of snapshot.types) {
-      for (const relation of type.relations) {
-        if (!known.has(relation.targetType)) continue;
-        const pair = [type.name, relation.targetType].sort().join('::');
-        const key = `${pair}::${relation.name}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        edges.push({
-          id: `${type.name}.${relation.name}`,
-          source: type.name,
-          target: relation.targetType,
-          label: relation.displayName,
-          kind: relation.kind,
-        });
-      }
-    }
-    return { nodes, edges };
+    return { nodes, edges: buildEdges(snapshot.types) };
   }
 
   /** Tier-0 edit on a type. Never touches the database. */
@@ -265,12 +284,20 @@ export class MikroOrmCatalogRegistry extends CatalogRegistry implements OnModule
     const all = this.orm.getMetadata().getAll();
     const types: CatalogObjectTypeDef[] = [];
 
+    // Two passes, because a relation cannot be described without knowing the
+    // whole catalog: whether its target is published is a fact about the
+    // catalog, not about the entity being read, and a single pass would answer
+    // it differently depending on discovery order.
     this.entityClasses.clear();
+    const included: EntityMetadata[] = [];
     for (const meta of all.values()) {
       if (!this.shouldInclude(meta)) continue;
       this.entityClasses.set(meta.className, meta.class);
-      types.push(this.buildType(meta));
+      included.push(meta);
     }
+
+    const published = new Set(included.map((meta) => meta.className));
+    for (const meta of included) types.push(this.buildType(meta, published));
 
     types.sort(
       (a, b) => a.group.localeCompare(b.group) || a.displayName.localeCompare(b.displayName),
@@ -301,7 +328,7 @@ export class MikroOrmCatalogRegistry extends CatalogRegistry implements OnModule
     return true;
   }
 
-  private buildType(meta: EntityMetadata): CatalogObjectTypeDef {
+  private buildType(meta: EntityMetadata, published: Set<string>): CatalogObjectTypeDef {
     const entityClass = meta.class;
     const declared = readTypeOptions(entityClass);
     const declaredProps = readPropertyOptions(entityClass);
@@ -327,16 +354,28 @@ export class MikroOrmCatalogRegistry extends CatalogRegistry implements OnModule
       );
 
       if (isRelationKind(prop.kind)) {
+        const targetType = prop.targetMeta?.className ?? String(prop.type);
         relations.push({
           name: prop.name,
           displayName,
           description,
           kind: prop.kind,
-          targetType: prop.targetMeta?.className ?? String(prop.type),
+          targetType,
           localKey: prop.fieldNames?.[0],
           nullable: Boolean(prop.nullable),
           hidden,
           order,
+          owner: isOwningSide(prop, prop.kind),
+          // Either name identifies the same thing — the property at the other
+          // end — and only one of them is ever set, on the side the ORM decided
+          // is inverse. Read as one field because callers pairing the two ends
+          // do not care which of the two spellings carried it.
+          inverseName: prop.mappedBy || prop.inversedBy || undefined,
+          targetPublished: published.has(targetType),
+          // A relation is enriched on the same terms as a scalar: somebody said
+          // something about it. Structure is not enrichment — every relation
+          // here was derived, so its existence proves nothing about curation.
+          enriched: Boolean(fromDecorator || fromOverlay),
         });
         return;
       }
@@ -376,11 +415,60 @@ export class MikroOrmCatalogRegistry extends CatalogRegistry implements OnModule
       enriched:
         Object.keys(declared).length > 0 ||
         Object.keys(overlay).length > 0 ||
-        properties.some((p) => p.enriched),
+        properties.some((p) => p.enriched) ||
+        // Relations count too. A type whose only human input is "this link is
+        // called Home base" has been worked on, and leaving it out of the tally
+        // put it back on the "nobody has named this" list the curator uses to
+        // decide what to do next.
+        relations.some((r) => r.enriched),
       properties,
       relations,
     };
   }
+}
+
+/**
+ * The links, as lines to draw.
+ *
+ * Two rules, and both exist because the naive version of this drew a picture
+ * that was wrong in a way nobody would notice:
+ *
+ * 1. **One edge per link.** A link declared at both ends produces two rows, and
+ *    keying the de-duplication on the property name only caught the case where
+ *    both ends happened to be spelled alike — so `Mvr.base` plus `Base.mvrs`,
+ *    the ordinary shape, drew two lines between the same pair of nodes. See
+ *    {@link linkKey}.
+ * 2. **Drawn from the end that holds the key**, so the arrow points the way a
+ *    join is written. Both ends are collected before either is chosen, because
+ *    otherwise the direction depends on which type was discovered first.
+ *
+ * Hidden relations are deliberately still drawn. Hiding is a statement about a
+ * table cell; a graph that quietly dropped edges would be a picture nobody could
+ * read as complete, which is the only thing a graph is for.
+ */
+function buildEdges(types: CatalogObjectTypeDef[]): CatalogGraph['edges'] {
+  const byLink = new Map<string, { holder: string; relation: CatalogRelationDef }>();
+
+  for (const type of types) {
+    for (const relation of type.relations) {
+      if (!relation.targetPublished) continue;
+      const key = linkKey(type.name, relation);
+      const seen = byLink.get(key);
+      // Replace only when this row is the owning one and the row already held
+      // is not: anything else keeps the first, so the edge order stays the type
+      // order rather than shuffling with every rebuild.
+      if (seen && (seen.relation.owner || !relation.owner)) continue;
+      byLink.set(key, { holder: type.name, relation });
+    }
+  }
+
+  return [...byLink.values()].map(({ holder, relation }) => ({
+    id: `${holder}.${relation.name}`,
+    source: holder,
+    target: relation.targetType,
+    label: relation.displayName,
+    kind: relation.kind,
+  }));
 }
 
 /**
