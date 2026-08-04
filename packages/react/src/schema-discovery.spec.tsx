@@ -245,6 +245,20 @@ describe('the connector editor', () => {
     expect(discover).toHaveBeenCalledWith('c1');
   });
 
+  // A second discovery is a new column list, and choices made against the old one may name
+  // columns that no longer exist. Carrying them forward would silently confirm a schema nobody
+  // looked at.
+  it('drops the choices made against an earlier report when it runs again', async () => {
+    await discoverIn(bridgeFor(discovery()));
+    fireEvent.click(screen.getByLabelText('Include plate'));
+    expect(screen.getByLabelText('Include plate')).toHaveProperty('checked', false);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Discover schema' }));
+    await waitFor(() =>
+      expect(screen.getByLabelText('Include plate')).toHaveProperty('checked', true),
+    );
+  });
+
   it('says what the server said the report can prove', async () => {
     await discoverIn(bridgeFor(discovery()));
     expect(screen.getByText(/Read from the driver/)).toBeTruthy();
