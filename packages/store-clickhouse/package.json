@@ -1,6 +1,6 @@
 {
   "name": "@dudousxd/nestjs-catalog-store-clickhouse",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "ClickHouse warehouse store for @dudousxd/nestjs-catalog: one partition per snapshot batch, idempotent loads without mutations, and an atomic view cutover.",
   "license": "MIT",
   "author": "Davide Carvalho",
