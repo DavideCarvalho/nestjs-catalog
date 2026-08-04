@@ -27,14 +27,23 @@ import type { MikroORM } from '@mikro-orm/core';
 import type { EntityManager } from '@mikro-orm/mysql';
 import { Logger } from '@nestjs/common';
 import { MySqlCatalogTraceStore } from './audit-recorder.service';
+import type { PromotionTarget } from './environment.promotion';
 import { MySqlWarehouseStore } from './mysql-warehouse.store';
 import { MySqlPipelineStore } from './pipeline.store';
 import { ensureCatalogSchema } from './schema';
 import { StoredCatalogRegistry } from './stored-registry.service';
 import { MySqlWorkspaceStore } from './workspace.store';
 
-/** Everything the catalog can do, for exactly one environment. */
-export class CatalogEnvironmentBundle {
+/**
+ * Everything the catalog can do, for exactly one environment.
+ *
+ * `implements PromotionTarget` is a claim checked here rather than at a call
+ * site, because in this repository there is no call site: `applyPromotion` is
+ * exported for hosts, so nothing else would notice the day a store on this
+ * class is renamed and a promotion stops compiling only in somebody else's
+ * build.
+ */
+export class CatalogEnvironmentBundle implements PromotionTarget {
   readonly registry: StoredCatalogRegistry;
   readonly store: MySqlWarehouseStore;
   readonly pipeline: MySqlPipelineStore;

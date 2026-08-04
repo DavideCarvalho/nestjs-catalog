@@ -47,7 +47,9 @@ export {
 } from './environment.routing';
 export {
   applyPromotion,
+  promotionAuditEvent,
   type PromotionOutcome,
+  type PromotionTarget,
   readPromotable,
 } from './environment.promotion';
 export { ObjectTypeRow, PropertyRow } from './entities/model';

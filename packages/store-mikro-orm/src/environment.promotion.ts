@@ -15,17 +15,29 @@
  */
 
 import type {
+  CatalogAuditEvent,
+  CatalogEnvironment,
+  CatalogPipelineStore,
   CatalogPromotableSet,
   CatalogPromotionPlan,
+  CatalogWorkspaceStore,
   PromotableConnector,
   PromotableObjectType,
   PromotableTransform,
 } from '@dudousxd/nestjs-catalog';
-import { effectiveChanges, isPromotable, supportsWorkflows } from '@dudousxd/nestjs-catalog';
+import {
+  PROMOTION_AUDIT_EVENT,
+  effectiveChanges,
+  isPromotable,
+  supportsWorkflows,
+} from '@dudousxd/nestjs-catalog';
+import type { EntityManager } from '@mikro-orm/mysql';
 import { BadRequestException, Logger } from '@nestjs/common';
 import { ObjectTypeRow, PropertyRow } from './entities/model';
 import type { CatalogEnvironmentBundle } from './environment.bundle';
 import { tableFor } from './identifiers';
+import type { MySqlWarehouseStore } from './mysql-warehouse.store';
+import type { StoredCatalogRegistry } from './stored-registry.service';
 
 /**
  * Everything promotable in one environment.
@@ -138,7 +150,28 @@ export interface PromotionOutcome {
 }
 
 /**
- * Apply a plan.
+ * What applying a plan needs from the environment it is being applied to.
+ *
+ * A {@link CatalogEnvironmentBundle} is the only thing production passes, and
+ * the class declares that it satisfies this — so the two cannot drift. It is
+ * written structurally, and named down to the five members an apply actually
+ * touches, for one reason: the audit row this function writes is a governance
+ * record, and a record whose only test boots MySQL in a container is a record
+ * whose test does not run on the machine where it would catch the regression.
+ * With this, the trail can be asserted against stubs.
+ */
+export interface PromotionTarget {
+  readonly environment: Pick<CatalogEnvironment, 'id'>;
+  readonly em: Pick<EntityManager, 'fork'>;
+  readonly registry: Pick<StoredCatalogRegistry, 'reload' | 'getType'>;
+  readonly store: Pick<MySqlWarehouseStore, 'ensureType'>;
+  /** Whole, because {@link supportsWorkflows} narrows the store, not a method. */
+  readonly pipeline: CatalogPipelineStore;
+  readonly workspace: Pick<CatalogWorkspaceStore, 'recordEvent'>;
+}
+
+/**
+ * Apply a plan, and record in the target that it was applied.
  *
  * Refuses a blocked plan outright rather than applying the unblocked part. A
  * partially applied promotion leaves the target holding a connector whose
@@ -150,20 +183,49 @@ export interface PromotionOutcome {
  * before this and confirmed the fingerprint matches what the reviewer approved.
  * That check lives with the caller because it is a policy decision about who is
  * allowed to approve what, and this function is the mechanism.
+ *
+ * Every exit that touched the target writes one `promotion.applied` row into
+ * the target's audit table — see {@link promotionAuditEvent} for why one, and
+ * why written here rather than emitted on the diagnostics channel. Including
+ * the exit that threw: an apply is not atomic, so the half-finished promotion
+ * is the one whose record is worth most, and it is the only account of what is
+ * now in the target that does not depend on somebody remembering.
  */
 export async function applyPromotion(input: {
   source: CatalogPromotableSet;
-  target: CatalogEnvironmentBundle;
+  target: PromotionTarget;
   plan: CatalogPromotionPlan;
   /** Recorded as the author of everything this creates in the target. */
   promotedBy: string;
+  /**
+   * The operator's `CatalogPromotionApproval.reason`, verbatim.
+   *
+   * Carried through to the audit row and never parsed. It is the only part of
+   * "who promoted what into production, when, and why" that no amount of
+   * inspecting the target afterwards can reconstruct — the changes are visible
+   * in the databases, the actor and the clock are columns, and the reason
+   * exists nowhere unless it was written down at this moment.
+   */
+  reason?: string;
 }): Promise<PromotionOutcome> {
-  const { source, target, plan, promotedBy } = input;
+  const { source, target, plan, promotedBy, reason } = input;
   const logger = new Logger('CatalogPromotion');
 
   if (!isPromotable(plan)) {
     throw new Error(
       `This promotion has ${plan.blockers.length} blocker(s) and will not be applied in part: ${plan.blockers.map((blocker) => blocker.reason).join(' ')}`,
+    );
+  }
+
+  // The plan names the environment it was reviewed against; the bundle is the
+  // one that will be written to and the one whose audit table takes the record.
+  // Nothing else in this function compares them, so a caller that resolved the
+  // wrong bundle would release an approved-for-staging plan into production and
+  // then file the record of it under `to: "staging"` — a trail that is worse
+  // than none, because it reads as an answer.
+  if (plan.to !== target.environment.id) {
+    throw new Error(
+      `This plan promotes into "${plan.to}" but was handed the "${target.environment.id}" environment. Refusing: the changes would land in one world and the record of them would name another.`,
     );
   }
 
@@ -183,15 +245,111 @@ export async function applyPromotion(input: {
   // dependency order means the target is never in a state it could not have
   // been put into by hand.
   const step: PromotionStep = { source, target, changes, promotedBy, outcome };
-  await promoteObjectTypes(step);
-  await promoteTransforms(step);
-  await promoteWorkflows(step);
-  await promoteConnectors(step);
+  try {
+    await promoteObjectTypes(step);
+    await promoteTransforms(step);
+    await promoteWorkflows(step);
+    await promoteConnectors(step);
+  } catch (error) {
+    await target.workspace.recordEvent(
+      promotionAuditEvent({ plan, promotedBy, reason, outcome, error }),
+    );
+    throw error;
+  }
 
+  await target.workspace.recordEvent(promotionAuditEvent({ plan, promotedBy, reason, outcome }));
   logger.log(
     `Promoted ${plan.from} -> ${plan.to} by ${promotedBy}: ${outcome.objectTypes.length} types, ${outcome.transforms.length} transforms, ${outcome.connectors.length} connectors (${plan.fingerprint.slice(0, 12)}).`,
   );
   return outcome;
+}
+
+/**
+ * One promotion, as one row in the target environment's audit table.
+ *
+ * **One row per promotion, not one per change.** A promotion is a single act —
+ * one person, one approved fingerprint, one reason — over a plan that happens
+ * to span four kinds. Split into a row per change it stops being an act at all:
+ * the reason is repeated forty times, nothing says which forty rows were the
+ * same release, and the flat trail everybody reads first becomes unreadable at
+ * exactly the moment somebody is trying to read it. What a single row must not
+ * do is lose *what* moved, so every promoted id is in the detail, kept apart by
+ * kind — "which types went to production in March" is answerable from
+ * `objectTypes`, and a promotion that carried only connectors is visibly
+ * different from one that reshaped the model.
+ *
+ * **Written here rather than emitted on `aviary:catalog:*`.** That is the
+ * instruction on {@link PROMOTION_AUDIT_EVENT} and the reason is worth
+ * repeating: the recorder that turns channel events into rows writes through
+ * whichever environment is in scope, and a promotion is the one act that is
+ * about two of them at once. Written directly, the row is in the target's own
+ * database because that is the database this call was given, which is not a
+ * fact any later reader has to take on trust.
+ *
+ * **No `snapshotId`.** The trace view groups on that column, and a promotion
+ * that borrowed it would appear on the loads screen as a trace that started and
+ * never finished — for ever, since nothing about a promotion emits the terminal
+ * events that grade one. Left empty, it lands in the unlinked list beside
+ * `type.curated` and `query.shared`, which is the right company: acts a person
+ * performed on the catalog, rather than steps of a load.
+ *
+ * Pure, and separate from the call that writes it, so that the exit that threw
+ * and the exit that finished cannot build the row two different ways.
+ */
+export function promotionAuditEvent(input: {
+  plan: CatalogPromotionPlan;
+  promotedBy: string;
+  reason?: string;
+  outcome: PromotionOutcome;
+  /** Absent on the path that finished. Present, and reported, on the one that did not. */
+  error?: unknown;
+  now?: () => Date;
+}): Omit<CatalogAuditEvent, 'id'> {
+  const { plan, promotedBy, reason, outcome, error } = input;
+  const failure = error === undefined ? undefined : messageOf(error);
+
+  return {
+    event: PROMOTION_AUDIT_EVENT,
+    // The indexed actor column, which is what makes "everything this person did"
+    // a query rather than a scan of JSON.
+    principalId: promotedBy,
+    detail: {
+      from: plan.from,
+      to: plan.to,
+      // Whole, not the shortened form the log line prints: this is the value an
+      // incident review compares against the approval that was recorded
+      // elsewhere, and a prefix cannot be compared with confidence.
+      fingerprint: plan.fingerprint,
+      // Both outcomes under one event name, following `connector.run.finished`:
+      // anybody watching promotions has to watch the successes anyway to notice
+      // the ones that stopped halfway.
+      status: failure === undefined ? 'succeeded' : 'failed',
+      error: failure,
+      reason,
+      applied: outcome.applied,
+      // Copied rather than referenced. `outcome` is mutated in place by the
+      // phases, and a detail holding the live arrays would be a record that
+      // kept changing after the moment it claims to describe.
+      objectTypes: [...outcome.objectTypes],
+      transforms: [...outcome.transforms],
+      workflows: [...outcome.workflows],
+      connectors: [...outcome.connectors],
+    },
+    occurredAt: (input.now?.() ?? new Date()).toISOString(),
+  };
+}
+
+/**
+ * A thrown value as one line of the record.
+ *
+ * `String(error)` is not used: a thrown object renders as `[object Object]`,
+ * which occupies the field where the reason the promotion stopped was supposed
+ * to be and looks like it was filled in.
+ */
+function messageOf(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (typeof error === 'string' && error.length > 0) return error;
+  return `The promotion stopped on a thrown ${typeof error} carrying no message.`;
 }
 
 /**
@@ -204,7 +362,7 @@ export async function applyPromotion(input: {
  */
 interface PromotionStep {
   source: CatalogPromotableSet;
-  target: CatalogEnvironmentBundle;
+  target: PromotionTarget;
   changes: ReturnType<typeof effectiveChanges>;
   promotedBy: string;
   outcome: PromotionOutcome;
@@ -374,10 +532,7 @@ async function promoteConnectors({
  * releasing the curation they did in dev, so it overwrites — that is what they
  * asked for, and the preview showed them the before and after.
  */
-async function promoteType(
-  target: CatalogEnvironmentBundle,
-  type: PromotableObjectType,
-): Promise<void> {
+async function promoteType(target: PromotionTarget, type: PromotableObjectType): Promise<void> {
   const em = target.em.fork();
   const existing = await em.findOne(
     ObjectTypeRow,
