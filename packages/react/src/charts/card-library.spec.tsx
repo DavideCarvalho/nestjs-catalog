@@ -118,7 +118,7 @@ describe('the registry the picker reads', () => {
 
     render(
       <Renderer
-        result={{ columns: ['a'], rows: [{ a: 1 }], rowCount: 1, truncated: false, ms: 0 }}
+        result={{ columns: ['a'], rows: [{ a: 1 }], rowCount: 1, truncated: false, elapsedMs: 0 }}
         visualization={{ kind: 'bar' }}
       />,
     );
