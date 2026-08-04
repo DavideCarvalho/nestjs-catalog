@@ -7,7 +7,11 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { RouterModule } from '@nestjs/core';
-import { DASHBOARD_AUTH, type DashboardAuthOptions } from './auth/dashboard-auth-config.js';
+import {
+  DASHBOARD_AUTH,
+  type DashboardAuthOptions,
+  resolveDashboardAuth,
+} from './auth/dashboard-auth-config.js';
 import { CatalogAuthController } from './catalog-auth.controller.js';
 import {
   CatalogUiController,
@@ -85,7 +89,15 @@ export interface CatalogDashboardAsyncOptions extends Omit<CatalogDashboardOptio
 @Module({})
 export class CatalogDashboardModule {
   static forRoot(options: CatalogDashboardOptions = {}): DynamicModule {
-    return build(options, { provide: DASHBOARD_AUTH, useValue: options.auth ?? null });
+    // Resolved, not passed through: `resolveDashboardAuth` derives `modes` from
+    // which hooks are present, and every consumer reads that. Handing over the
+    // raw options gives a value whose `modes` is undefined, and the endpoints
+    // fail with `Cannot read properties of undefined (reading 'includes')` — a
+    // 500 where a 401 belongs.
+    return build(options, {
+      provide: DASHBOARD_AUTH,
+      useValue: options.auth ? resolveDashboardAuth(options.auth) : null,
+    });
   }
 
   /**
@@ -97,9 +109,15 @@ export class CatalogDashboardModule {
    * which is why `guards` stays a static option on both forms.
    */
   static forRootAsync(options: CatalogDashboardAsyncOptions): DynamicModule {
+    const factory = options.useDashboardAuth;
     const mounted = build(options, {
       provide: DASHBOARD_AUTH,
-      useFactory: options.useDashboardAuth,
+      // Same resolution as `forRoot`, wrapped around the host's factory so the
+      // async path cannot skip it.
+      useFactory: async (...args: never[]) => {
+        const auth = await factory(...args);
+        return auth ? resolveDashboardAuth(auth) : null;
+      },
       inject: options.inject ?? [],
     });
     // Appended, not replaced: `build` puts the RouterModule registration in
