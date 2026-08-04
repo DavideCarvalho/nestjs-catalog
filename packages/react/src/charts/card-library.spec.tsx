@@ -20,6 +20,7 @@
  */
 import { cleanup, render, screen } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { followsLabel } from '../DashboardBoard';
 import {
   getChartRenderer,
   registerChartRenderer,
@@ -123,5 +124,27 @@ describe('the registry the picker reads', () => {
     );
 
     expect(screen.getByText('drawn by the probe')).toBeTruthy();
+  });
+});
+
+describe('what the default option says', () => {
+  // Imported from the board rather than restated: the whole point is that the
+  // label and the drawing cannot disagree.
+  it('names the built-in when the query chose nothing', () => {
+    expect(followsLabel(undefined, ['css', 'shadcn'])).toBe('follows query (built-in)');
+  });
+
+  it('names the library when it is installed', () => {
+    expect(followsLabel('shadcn', ['css', 'shadcn'])).toBe('follows query (shadcn)');
+  });
+
+  it('says the card is drawing something else when the library is not installed', () => {
+    // THE case, found on a real board: a saved query named `visx`, nobody had
+    // registered it, and the card drew built-in bars while the control said it
+    // was following visx. A control that reports an intention the card is not
+    // honouring is worse than one that reports nothing.
+    expect(followsLabel('visx', ['css', 'shadcn', 'bklit'])).toBe(
+      'follows query (visx — not installed, drawing built-in)',
+    );
   });
 });
