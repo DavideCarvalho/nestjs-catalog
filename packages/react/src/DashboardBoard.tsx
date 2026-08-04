@@ -20,7 +20,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Download, GripVertical, LayoutGrid, Plus, RefreshCw, Trash2 } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import { CssBarChart } from './charts/css';
-import { getChartRenderer } from './charts/registry';
+import { getChartRenderer, registeredChartLibraries, visualizationFor } from './charts/registry';
 import { ChartEmpty, ChartFailed, ChartSkeleton } from './charts/skeleton';
 import { cn } from './cn';
 import { useCatalogClient } from './context';
@@ -123,6 +123,24 @@ export function DashboardBoard() {
     update.mutate({
       id: selected.id,
       cards: selected.cards.map((card) => (card.id === cardId ? { ...card, width } : card)),
+    });
+  }
+
+  function setLibrary(cardId: string, library: string | undefined) {
+    if (!selected) return;
+    update.mutate({
+      id: selected.id,
+      cards: selected.cards.map((card) =>
+        // The key is REMOVED rather than set to undefined when the card goes
+        // back to following the query: `library: undefined` survives into the
+        // stored JSON on some drivers and then reads as "this card chose the
+        // built-in", which is a different statement.
+        card.id === cardId
+          ? library
+            ? { ...card, library }
+            : (({ library: _following, ...rest }) => rest)(card)
+          : card,
+      ),
     });
   }
 
@@ -315,8 +333,10 @@ export function DashboardBoard() {
                             id={card.id}
                             savedQueryId={card.savedQueryId}
                             width={card.width}
+                            {...(card.library ? { library: card.library } : {})}
                             onRemove={() => removeCard(card.id)}
                             onWidth={(w) => setWidth(card.id, w)}
+                            onLibrary={(next) => setLibrary(card.id, next)}
                           />
                         ))}
                     </div>
@@ -342,14 +362,18 @@ function SortableCard({
   id,
   savedQueryId,
   width,
+  library,
   onRemove,
   onWidth,
+  onLibrary,
 }: {
   id: string;
   savedQueryId: string;
   width: number;
+  library?: string;
   onRemove: () => void;
   onWidth: (width: 1 | 2 | 3 | 4) => void;
+  onLibrary: (library: string | undefined) => void;
 }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id,
@@ -372,8 +396,10 @@ function SortableCard({
       <Card
         savedQueryId={savedQueryId}
         width={width}
+        {...(library ? { library } : {})}
         onRemove={onRemove}
         onWidth={onWidth}
+        onLibrary={onLibrary}
         dragHandle={
           <button
             type="button"
@@ -466,6 +492,9 @@ function CardWidthPicker({
 function CardToolbar({
   width,
   onWidth,
+  library,
+  queryLibrary,
+  onLibrary,
   cached,
   fetching,
   exportHref,
@@ -474,6 +503,9 @@ function CardToolbar({
 }: {
   width: number;
   onWidth?: (width: 1 | 2 | 3 | 4) => void;
+  library?: string;
+  queryLibrary?: string;
+  onLibrary?: (library: string | undefined) => void;
   cached: boolean;
   fetching: boolean;
   exportHref: string | undefined;
@@ -483,6 +515,9 @@ function CardToolbar({
   return (
     <div className="flex shrink-0 items-center gap-0.5">
       {onWidth && <CardWidthPicker width={width} onWidth={onWidth} />}
+      {onLibrary && (
+        <CardLibraryPicker library={library} queryLibrary={queryLibrary} onLibrary={onLibrary} />
+      )}
       <Tooltip content={cached ? 'Cached — refetch anyway' : 'Run again'}>
         <button
           type="button"
@@ -519,14 +554,18 @@ function CardToolbar({
 function Card({
   savedQueryId,
   width,
+  library,
   onRemove,
   onWidth,
+  onLibrary,
   dragHandle,
 }: {
   savedQueryId: string;
   width: number;
+  library?: string;
   onRemove: () => void;
   onWidth?: (width: 1 | 2 | 3 | 4) => void;
+  onLibrary?: (library: string | undefined) => void;
   dragHandle?: React.ReactNode;
 }) {
   const client = useCatalogClient();
@@ -567,6 +606,11 @@ function Card({
         <CardToolbar
           width={width}
           onWidth={onWidth}
+          {...(library ? { library } : {})}
+          {...(data?.savedQuery.visualization?.library
+            ? { queryLibrary: data.savedQuery.visualization.library }
+            : {})}
+          onLibrary={onLibrary}
           cached={data?.result.cached === true}
           fetching={isFetching}
           exportHref={data ? client.exportUrl(savedQueryId) : undefined}
@@ -594,7 +638,11 @@ function Card({
         ) : isPending ? (
           <ChartSkeleton kind={pendingKind} height={200} />
         ) : data ? (
-          <CardBody query={data.savedQuery} result={data.result} />
+          <CardBody
+            query={data.savedQuery}
+            result={data.result}
+            {...(library ? { library } : {})}
+          />
         ) : null}
       </div>
     </div>
@@ -604,11 +652,16 @@ function Card({
 function CardBody({
   query,
   result,
+  library,
 }: {
   query: SavedQuery;
   result: CatalogQueryResult;
+  /** This card's override. Undefined means "whatever the query chose". */
+  library?: string;
 }) {
-  const viz = query.visualization ?? { kind: 'table' };
+  // Merged into the visualization rather than passed beside it, so a renderer
+  // reading `visualization.library` sees the one it is actually being drawn as.
+  const viz = visualizationFor(query.visualization, library);
   // Held at the chart's own height rather than collapsing to one line, so a
   // card that matched nothing does not resize the grid around it — and said in
   // words, because "no rows" beside a skeleton-shaped hole is the one reading
@@ -674,5 +727,60 @@ function MiniTable({ result }: { result: CatalogQueryResult }) {
       numeric={(id) => numericColumns.has(id)}
       density="text-[11px]"
     />
+  );
+}
+
+/**
+ * Which chart library draws this card.
+ *
+ * On the card rather than only on the saved query, because the two answer
+ * different questions: the query says how this ANSWER is best drawn wherever it
+ * appears, and the card says how it should look HERE, beside the other cards on
+ * this board. A board mixing two libraries' idea of a bar reads as two boards,
+ * and fixing that by editing the saved query would change it everywhere else
+ * the query is used.
+ *
+ * A select rather than a button group — unlike width, the options are whatever
+ * the host registered, so there is no fixed small set to lay out, and the
+ * current value still has to be readable while arranging.
+ */
+function CardLibraryPicker({
+  library,
+  queryLibrary,
+  onLibrary,
+}: {
+  /** This card's override, if it has one. */
+  library: string | undefined;
+  /** What the saved query chose, shown as the default option's subtitle. */
+  queryLibrary: string | undefined;
+  onLibrary: (library: string | undefined) => void;
+}) {
+  // Only what the host actually registered. Offering a library nobody
+  // installed would be offering a choice that silently degrades to the
+  // built-in — the picker would say one thing and the card draw another.
+  const available = registeredChartLibraries();
+  if (available.length === 0) return null;
+
+  return (
+    <Tooltip content="Which chart library draws this card. Follows the saved query unless you choose here.">
+      <select
+        value={library ?? ''}
+        onChange={(event) => onLibrary(event.target.value || undefined)}
+        aria-label="Chart library for this card"
+        className={cn(
+          'mr-1 rounded-md border bg-transparent px-1.5 py-0.5 font-mono text-[10px] outline-none',
+          RULE,
+        )}
+      >
+        <option value="">
+          {queryLibrary ? `follows query (${queryLibrary})` : 'follows query (built-in)'}
+        </option>
+        {available.map((name) => (
+          <option key={name} value={name}>
+            {name}
+          </option>
+        ))}
+      </select>
+    </Tooltip>
   );
 }
