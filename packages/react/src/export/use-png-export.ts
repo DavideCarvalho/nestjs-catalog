@@ -53,14 +53,22 @@ export interface PngExport {
   supported: boolean;
 }
 
-function unwrapTarget(target: PngExportTarget): Element | null {
+/**
+ * The element behind a target, whichever of the two forms it came in.
+ *
+ * Exported for `use-pdf-export.ts`, which has the same job and must resolve a
+ * target exactly the same way — the two hooks disagreeing about what counts as
+ * a target would mean one action appearing on a card and the other not.
+ */
+export function unwrapExportTarget(target: PngExportTarget): Element | null {
   if (!target) return null;
   if (target instanceof Element) return target;
   const current = target.current;
   return current instanceof Element ? current : null;
 }
 
-function toError(thrown: unknown): Error {
+/** Whatever was thrown, as an `Error`. Shared with the PDF hook for the same reason. */
+export function toExportError(thrown: unknown): Error {
   return thrown instanceof Error ? thrown : new Error(String(thrown));
 }
 
@@ -113,7 +121,7 @@ export function usePngExport(options: UsePngExportOptions = {}): PngExport {
       setExporting(true);
       setError(null);
       try {
-        const svg = findExportableSvg(unwrapTarget(target));
+        const svg = findExportableSvg(unwrapExportTarget(target));
         if (!svg) {
           throw new Error(
             'Nothing to export: no <svg> was found in this card. The built-in CSS chart draws with ' +
@@ -130,7 +138,7 @@ export function usePngExport(options: UsePngExportOptions = {}): PngExport {
         onExported?.(blob, name);
         return blob;
       } catch (thrown) {
-        const failure = toError(thrown);
+        const failure = toExportError(thrown);
         if (mounted.current) setError(failure);
         onError?.(failure);
         return null;

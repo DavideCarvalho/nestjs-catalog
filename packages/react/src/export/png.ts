@@ -1,4 +1,9 @@
-import { type SerializeSvgOptions, serializeSvg, svgToDataUri } from './serialize';
+import {
+  type SerializeSvgOptions,
+  type SerializedSvg,
+  serializeSvg,
+  svgToDataUri,
+} from './serialize';
 
 /**
  * SVG chart → PNG, in the browser, with no dependency.
@@ -124,12 +129,26 @@ function canvasToBlob(canvas: HTMLCanvasElement, mimeType: string): Promise<Blob
   });
 }
 
-/** A PNG of the given chart `<svg>`, at `scale` times its on-screen size. */
-export async function svgToPngBlob(
-  svg: SVGSVGElement,
+/**
+ * A PNG from markup that has ALREADY been serialised.
+ *
+ * Split out of `svgToPngBlob` for the one caller that needs the serialised
+ * document as well as the raster — the PDF seam in `pdf.ts` hands a host both.
+ * Serialising twice would work and would be wrong in a way that only shows up
+ * later: the size is measured during serialisation, so two passes over a chart
+ * that resized in between produce a `width`/`height` that describes one of them
+ * and a PNG that is the other. A host sizing a PDF page from those numbers then
+ * gets a stretched image, and nothing in either call reported a problem.
+ *
+ * It is also the seam a test can stand in for. jsdom cannot rasterise at all,
+ * so a test that wants to check what a caller does with the blob substitutes
+ * this and leaves the serialisation real.
+ */
+export async function rasteriseSerializedSvg(
+  serialized: SerializedSvg,
   options: PngExportOptions = {},
 ): Promise<Blob> {
-  const { markup, width, height } = serializeSvg(svg, options);
+  const { markup, width, height } = serialized;
   const scale = resolveScale(options.scale, width, height);
 
   const canvas = document.createElement('canvas');
@@ -158,6 +177,14 @@ export async function svgToPngBlob(
     }
     throw error;
   }
+}
+
+/** A PNG of the given chart `<svg>`, at `scale` times its on-screen size. */
+export async function svgToPngBlob(
+  svg: SVGSVGElement,
+  options: PngExportOptions = {},
+): Promise<Blob> {
+  return rasteriseSerializedSvg(serializeSvg(svg, options), options);
 }
 
 /** `chart-2026-08-04T12-30-00.png` — sortable, and unique enough for a downloads folder. */
