@@ -13,6 +13,7 @@ import { EditableField } from './EditableField';
 import { cn } from './cn';
 import { catalogQueryKeys, useCatalogClient } from './context';
 import { DataTable } from './ui/data-table';
+import { RichTextField } from './ui/rich-text-field';
 import { Tooltip, TooltipProvider } from './ui/tooltip';
 
 /**
@@ -396,14 +397,12 @@ function TypeDetail({
       </div>
 
       <div className="mt-5 border-l-2 border-sky-200 pl-4 dark:border-sky-900">
-        <EditableField
+        <RichTextField
           label="description"
-          multiline
           value={type.description ?? ''}
           placeholder="No one has written down what this type means yet."
           onSave={(description) => onPatchType({ description })}
           className={cn('text-sm leading-relaxed', SECONDARY)}
-          inputClassName="text-sm leading-relaxed"
         />
       </div>
 
@@ -567,14 +566,12 @@ function PropertyTable({
         header: 'Meaning',
         accessorFn: (p: Property) => p.description ?? '',
         cell: ({ row }: { row: { original: Property } }) => (
-          <EditableField
+          <RichTextField
             label={`description for ${row.original.name}`}
-            multiline
             value={row.original.description ?? ''}
             placeholder="—"
             onSave={(description) => onPatchProperty(row.original.name, { description })}
             className={cn('text-xs leading-snug', SECONDARY)}
-            inputClassName="text-xs leading-snug"
           />
         ),
       },
