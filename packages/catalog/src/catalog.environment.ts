@@ -156,13 +156,24 @@ export interface CatalogEnvironment {
    */
   rank: number;
   /**
-   * Whether this environment refuses changes that did not arrive as a reviewed
-   * promotion.
+   * A declaration that this environment is one where changes are supposed to
+   * arrive as a reviewed promotion. True for production.
    *
-   * True for production. It does not lock the environment — an operator can
-   * still fix something by hand — it means the API demands the explicit
-   * confirmation described on {@link CatalogPromotionApproval} rather than
-   * accepting a plan somebody generated in another tab ten minutes ago.
+   * **Advisory. Nothing in this library refuses anything because of it.** No
+   * guard, no store and no plan reads this field; the only code that does is the
+   * console, which paints the environment switcher amber so that "am I about to
+   * do this to production" is answerable at a glance. That is worth having and
+   * it is worth not overstating — a flag documented as an enforcement point,
+   * enforced nowhere, is worse than no flag, because it invites a host to
+   * believe the refusal already exists.
+   *
+   * Kept rather than removed because the enforcement it describes cannot live
+   * here. The library has no apply endpoint and no opinion about who may approve
+   * what — see {@link CatalogPromotionPlan.fingerprint} for the same division —
+   * so the refusal belongs to whatever host exposes promotion over HTTP. This
+   * field is how that host learns which environments to demand
+   * {@link CatalogPromotionApproval} for, without every deployment restating its
+   * own list of environment names in a guard.
    */
   protected: boolean;
 }
@@ -309,18 +320,41 @@ export function catalogDatabaseNameFor(base: string, environmentId: CatalogEnvir
  * It stops being enough the moment anyone asks a governance question across
  * environments — "everything this person did this week" has to be answerable
  * without the reader having to remember which of three lists they are looking
- * at — so the environment is stamped onto every event as it leaves its store.
+ * at.
  *
  * Stamped on read rather than stored in a column on purpose: a stored column
  * can be wrong, because nothing in the database stops a row in the production
  * table saying `environment: "dev"`. A value derived from which connection the
  * row was read through cannot be.
+ *
+ * Which is also why the stamping does not happen here, and cannot. This package
+ * knows what an environment *is*; it has no connection and no scope, so it can
+ * only supply the shape and the function. The stamp is applied by the one reader
+ * that resolved an environment in order to do the read at all —
+ * `RoutingWorkspaceStore.listEvents` in the MikroORM store package, which widens
+ * its return type to this intersection. A read that went straight to a store,
+ * with no environment resolved anywhere above it, is *not* stamped, and that is
+ * the honest answer rather than a gap: nothing in that call knew which world it
+ * was reading, so anything written into the field would be a guess.
  */
 export interface EnvironmentStampedAuditEvent {
   environment: CatalogEnvironmentId;
 }
 
-/** Stamps a batch of events with the environment they were read from. */
+/**
+ * Stamps a batch of events with the environment they were read from.
+ *
+ * A separate function taking the id as an argument rather than a method
+ * somewhere, so the caller has to have the environment in hand to call it. There
+ * is no default and nothing to look up — the id comes from the same resolution
+ * that chose the connection, which is what makes the stamp a fact about the read
+ * rather than a label somebody attached afterwards.
+ *
+ * Generic over the event rather than typed to `CatalogAuditEvent`, which lives
+ * in `catalog.workspace.ts` and would make this file depend on the workspace
+ * vocabulary to say something true of any row. Nothing here needs to know more
+ * about an event than that it is an object.
+ */
 export function stampEnvironment<T>(
   environment: CatalogEnvironmentId,
   events: readonly T[],
@@ -571,9 +605,22 @@ export interface CatalogPromotionPlan {
    * The point of a preview is that somebody read it. Without a fingerprint the
    * apply call is a fresh promotion that happens to have been preceded by a
    * preview, and anything that changed in between — a colleague editing the
-   * transform, a connector deleted — goes in unreviewed. The apply endpoint
-   * demands this value back, recomputes the plan, and refuses if the two
-   * differ. That is what turns "we show a diff" into "you approved this diff".
+   * transform, a connector deleted — goes in unreviewed.
+   *
+   * **The check is the host's, and this library does not perform it.** There is
+   * no apply endpoint here: `applyPromotion` is exported for a host to call, and
+   * it does not recompute the plan or compare anything to this value. The
+   * expectation, stated the same way where the apply lives, is that the caller
+   * re-runs {@link planPromotion} immediately before applying and confirms the
+   * fingerprint still matches what the reviewer approved. It lives with the
+   * caller because it is a policy decision about who may approve what, and
+   * `applyPromotion` is the mechanism rather than the policy.
+   *
+   * So this field is what makes that check *possible* — a stable name for one
+   * reviewed set of changes, computed from the effect and not the clock — and
+   * not, on its own, the check. A host that carries the value from preview to
+   * apply and never compares it has a promotion nobody approved, and nothing in
+   * this package will say so.
    */
   fingerprint: string;
 }
@@ -592,7 +639,13 @@ export interface CatalogPromotionPlan {
  */
 export const PROMOTION_AUDIT_EVENT = 'promotion.applied';
 
-/** What an apply call must present to prove which plan was approved. */
+/**
+ * What a host's apply call asks for, to prove which plan was approved.
+ *
+ * A shape rather than a check — see {@link CatalogPromotionPlan.fingerprint} for
+ * why the comparison lives with the caller. Written down here so that every host
+ * demands the same two things and an audit row means the same thing in each.
+ */
 export interface CatalogPromotionApproval {
   fingerprint: string;
   /** Free text the operator typed. Recorded in the audit trail, never parsed. */

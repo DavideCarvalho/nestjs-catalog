@@ -56,6 +56,7 @@ import type {
   ConnectorRun,
   Dashboard,
   DashboardCard,
+  EnvironmentStampedAuditEvent,
   SaveQueryInput,
   SavedQuery,
   SnapshotRef,
@@ -64,6 +65,7 @@ import {
   CatalogRegistry,
   UnresolvedEnvironmentError,
   isQueryStore,
+  stampEnvironment,
   supportsWorkflowStages,
   supportsWorkflows,
 } from '@dudousxd/nestjs-catalog';
@@ -455,6 +457,19 @@ function requireStages(store: CatalogPipelineStore): CatalogPipelineStore & Cata
  * cannot claim to be a dev event, because nothing but a production-scoped call
  * can put a row there.
  *
+ * The claim is only true while the recorder can actually be handed this class.
+ * It could not, once: the recorder asked for `MySqlWorkspaceStore` by class, and
+ * this one implements the interface rather than extending it, so no amount of
+ * host wiring could substitute it and every event in a multi-environment process
+ * went to one database regardless of scope. It injects `CATALOG_WORKSPACE_STORE`
+ * now. A host that runs several environments binds *this* class to that token;
+ * a host with one binds `MySqlWorkspaceStore`, which is what
+ * `CatalogMikroOrmStoreModule` does and why the single-environment default is
+ * unchanged.
+ *
+ * {@link listEvents} completes the round trip by stamping what it read — see the
+ * note on it for why the stamp can only be applied here.
+ *
  * `recordEvent` is the one method that must not throw when there is no scope.
  * An event emitted outside any environment — a boot-time diagnostic, a
  * schedule tick that has not entered its environment yet — is a lost audit row,
@@ -543,7 +558,35 @@ export class RoutingWorkspaceStore implements CatalogWorkspaceStore {
     await bundle.workspace.recordEvent(event);
   }
 
-  listEvents(query: AuditQuery): Promise<CatalogAuditEvent[]> {
-    return this.inner.listEvents(query);
+  /**
+   * The trail, with the environment it came out of stamped onto every event.
+   *
+   * Here and nowhere else, because here is the only place that knows. A
+   * `MySqlWorkspaceStore` holds one EntityManager and has never been told which
+   * environment that connection belongs to; this proxy resolved the bundle in
+   * order to do the read, so the id it stamps is derived from the connection the
+   * rows were actually read through. That is the whole point of stamping on read
+   * rather than storing a column: a column can be wrong — nothing in MySQL stops
+   * a row in the production table saying `environment: "dev"` — and a value
+   * taken from the connection that produced the row cannot be.
+   *
+   * The return type widens rather than the shared `CatalogAuditEvent` gaining a
+   * field. An optional `environment?` on the interface would be absent on most
+   * reads and present on some, which is a shape every consumer has to test
+   * before trusting; this way the type says exactly what is true, that events
+   * read through environment routing carry their environment and events read
+   * straight off a store do not.
+   *
+   * What it buys is the cross-environment governance question — "everything this
+   * person did this week", asked of a deployment with three of them. The answer
+   * is N reads, one per `runInEnvironment` scope, concatenated; without the
+   * stamp the concatenation is a list whose rows are indistinguishable and the
+   * reader has to remember which third of it they are looking at.
+   */
+  async listEvents(
+    query: AuditQuery,
+  ): Promise<Array<CatalogAuditEvent & EnvironmentStampedAuditEvent>> {
+    const bundle = requireEnvironmentBundle();
+    return stampEnvironment(bundle.environment.id, await bundle.workspace.listEvents(query));
   }
 }

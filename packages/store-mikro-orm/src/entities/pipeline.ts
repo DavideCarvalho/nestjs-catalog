@@ -100,9 +100,25 @@ export class ConnectorRow {
 /**
  * User code that shapes stored data.
  *
- * Versioned rather than overwritten. A load that produced surprising numbers is
- * investigated afterwards, and "which code ran" is the first question — a row
- * per version costs almost nothing and is the only thing that can answer it.
+ * **Only the latest code is kept.** One row per transform, overwritten in place:
+ * `saveTransform` assigns the new code onto the existing row and increments
+ * `version` when the code differs. There is no history table and no second row,
+ * so the code that ran last week is gone the moment somebody saves over it.
+ *
+ * `version` is therefore an *identifier*, not an archive. A run records the
+ * version it executed, so an investigation into a surprising load can always
+ * establish that the transform has been edited since — v3 in the run history
+ * against v5 on the row is a definite answer to "is this still the code that
+ * produced those numbers". What it cannot do is produce v3. This is the same
+ * limitation {@link WorkflowRow} states for graphs, and it is stated here
+ * because the console reinforces the opposite reading: a run renders as
+ * `code v3`, which looks like a reference to something retrievable.
+ *
+ * Keeping the old rows is a schema change and not a docblock — a second table,
+ * a foreign key from the run, and an answer to how long code bodies are retained
+ * in a table nobody prunes. Worth doing if the investigation above turns out to
+ * need the code itself rather than the fact that it changed; not worth implying
+ * before then.
  */
 @Entity({ tableName: 'catalog_transform' })
 export class TransformRow {
@@ -171,6 +187,15 @@ export class ConnectorRunRow {
   @Property({ type: 'text', nullable: true })
   error?: string;
 
+  /**
+   * Which version of the transform this run executed.
+   *
+   * Enough to *identify* the code and never enough to recover it — see
+   * {@link TransformRow}, which holds one row per transform and overwrites it.
+   * A console that renders this as `code v3` is naming a version, not linking to
+   * a copy, and an investigation that gets as far as this number has learned
+   * whether the transform has changed since, which is usually the question.
+   */
   @Property({ nullable: true })
   transformVersion?: number;
 

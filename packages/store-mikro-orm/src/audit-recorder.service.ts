@@ -4,6 +4,7 @@ import {
   CATALOG_EVENT_PHASE,
   CATALOG_EVENT_PHASE_FALLBACK,
   CATALOG_LIB,
+  CATALOG_WORKSPACE_STORE,
   type CatalogAuditEvent,
   type CatalogTrace,
   type CatalogTraceList,
@@ -11,6 +12,7 @@ import {
   type CatalogTraceStore,
   type CatalogTraceTotals,
   type CatalogUnlinkedList,
+  type CatalogWorkspaceStore,
   type TraceQuery,
   channelNameFor,
   isCatalogTraceOutcome,
@@ -25,7 +27,6 @@ import {
   type OnModuleInit,
 } from '@nestjs/common';
 import { CATALOG_STORE_ENTITY_MANAGER } from './context';
-import { MySqlWorkspaceStore } from './workspace.store';
 
 type Handler = (message: unknown) => void;
 
@@ -44,7 +45,19 @@ export class CatalogAuditRecorder implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(CatalogAuditRecorder.name);
   private readonly handlers = new Map<string, Handler>();
 
-  constructor(private readonly workspace: MySqlWorkspaceStore) {}
+  constructor(
+    // By token, never positionally — and here for a second reason on top of the
+    // one its siblings give. Asking for `MySqlWorkspaceStore` by class pins this
+    // recorder to one connection for the life of the process, and
+    // `RoutingWorkspaceStore` *implements* the interface rather than extending
+    // the class, so it could never be substituted however a host wired its
+    // module. Every event in a multi-environment deployment would have landed in
+    // whichever single database the recorder happened to be constructed
+    // against, filed under no environment at all — a dev event sitting in the
+    // production audit table, reading exactly like a production one.
+    @Inject(CATALOG_WORKSPACE_STORE)
+    private readonly workspace: CatalogWorkspaceStore,
+  ) {}
 
   onModuleInit(): void {
     for (const event of CATALOG_EVENTS) {
@@ -103,15 +116,31 @@ export { CATALOG_LIB };
 // -----------------------------------------------------------------------------
 
 /**
- * The audit table's timestamp is a MySQL `datetime`, which keeps whole seconds.
+ * The finest gap the audit table's timestamp can express, in milliseconds.
  *
- * Reported rather than assumed by the consumer, and it is the reason a trace
- * carries a `coarse` flag: most loads finish inside one second, so their spans
- * all land on the same instant and there is no internal timing to draw. Raising
- * this means widening the column, which changes what the writer stores — a
- * decision that belongs to whoever owns the entity, not to this query.
+ * Read off `AuditEventRow.occurredAt` in `entities/workspace.ts`, which is
+ * `@Property({ length: 3 })` — a `datetime(3)`, and its own docblock explains
+ * why it was widened. This constant went on saying `1_000` after that widening,
+ * and the cost was not academic: `coarse` is
+ * `duration < CLOCK_RESOLUTION_MS`, so every trace that finished inside a second
+ * — which is most of them, and all of the fast ones — was flagged as having no
+ * measurable internal timing. The explorer answered with a dashed track and the
+ * tooltip "there is no internal timing to draw" over spans whose real spacing
+ * was sitting right there in the rows, on exactly the loads a waterfall exists
+ * to explain.
+ *
+ * Reported to the consumer rather than assumed by it, because only this side
+ * knows what the writer stored. Rows written before the column was widened are
+ * still whole seconds: their spans collapse onto one instant, so they come back
+ * `coarse` under this value too and are drawn as markers — which is the truth
+ * about them. What changes is that a *newer* trace is no longer told it has
+ * nothing to show.
+ *
+ * If the column is ever narrowed or widened again, this is the number that has
+ * to move with it. They are two halves of one fact and there is no way for the
+ * code to check that they agree.
  */
-const CLOCK_RESOLUTION_MS = 1_000;
+const CLOCK_RESOLUTION_MS = 1;
 
 const DEFAULT_TRACE_LIMIT = 25;
 const MAX_TRACE_LIMIT = 200;
