@@ -5,6 +5,7 @@ import { useMemo, useState } from 'react';
 import { registeredChartLibraries } from './charts/registry';
 import { cn } from './cn';
 import { useCatalogClient } from './context';
+import { Select } from './ui/select';
 import { Tooltip } from './ui/tooltip';
 
 const MUTED = 'text-zinc-400 dark:text-zinc-500';
@@ -22,6 +23,22 @@ export const savedQueryKeys = {
  * five-minute-old answer is fine. Zero — never cache — is the default, so the
  * surprising behaviour is the one you have to ask for.
  */
+/**
+ * The kinds a visualization can be, as the single list both the picker and the
+ * narrowing read. A `as 'table'` cast — which is what this replaces — claims a
+ * value the compiler then stops checking, and a new kind added to the union
+ * would not have shown up in the dropdown.
+ */
+const CHART_KINDS = ['table', 'bar', 'line', 'area', 'number'] as const;
+
+function asChartKind(value: string): (typeof CHART_KINDS)[number] {
+  const found = CHART_KINDS.find((kind) => kind === value);
+  // The picker only ever offers these, so the fallback is unreachable in
+  // practice; it is here because narrowing a string has to end somewhere, and
+  // a table is the kind that renders any result.
+  return found ?? 'table';
+}
+
 export function SavedQueryPanel({
   currentSql,
   onLoad,
@@ -123,53 +140,40 @@ export function SavedQueryPanel({
             )}
           />
           <div className="flex gap-1.5">
-            <select
+            <Select
               value={draft.visualization?.kind ?? 'table'}
-              onChange={(e) =>
+              onValueChange={(kind) =>
                 setDraft({
                   ...draft,
-                  visualization: {
-                    ...(draft.visualization ?? {}),
-                    kind: e.target.value as 'table',
-                  },
+                  visualization: { ...(draft.visualization ?? {}), kind: asChartKind(kind) },
                 })
               }
-              aria-label="Chart type"
-              className={cn(
-                'min-w-0 flex-1 rounded-md border bg-white px-1 py-1 text-[11px] outline-none dark:bg-zinc-900',
-                RULE,
-              )}
-            >
-              {['table', 'bar', 'line', 'area', 'number'].map((kind) => (
-                <option key={kind} value={kind}>
-                  {kind}
-                </option>
-              ))}
-            </select>
-            <select
-              value={draft.visualization?.library ?? 'css'}
-              onChange={(e) =>
+              ariaLabel="Chart type"
+              className="min-w-0 flex-1"
+              options={CHART_KINDS.map((kind) => ({ value: kind, label: kind }))}
+            />
+            <Select
+              value={draft.visualization?.library ?? ''}
+              onValueChange={(library) =>
                 setDraft({
                   ...draft,
                   visualization: {
                     ...(draft.visualization ?? { kind: 'table' }),
-                    library: e.target.value === 'css' ? undefined : e.target.value,
+                    // Empty means "the built-in renderer", stored as absent.
+                    ...(library ? { library } : { library: undefined }),
                   },
                 })
               }
-              aria-label="Chart library"
-              title="Which chart library draws this. Only libraries this app registered appear here."
-              className={cn(
-                'min-w-0 flex-1 rounded-md border bg-white px-1 py-1 text-[11px] outline-none dark:bg-zinc-900',
-                RULE,
-              )}
-            >
-              {registeredChartLibraries().map((library) => (
-                <option key={library} value={library}>
-                  {library}
-                </option>
-              ))}
-            </select>
+              ariaLabel="Chart library"
+              className="min-w-0 flex-1"
+              options={[
+                { value: '', label: 'built-in', hint: 'no dependency' },
+                ...registeredChartLibraries().map((library) => ({
+                  value: library,
+                  label: library,
+                })),
+              ]}
+            />
           </div>
           <label className={cn('flex items-center gap-1.5 text-[11px]', MUTED)}>
             <input

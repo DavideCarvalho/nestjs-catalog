@@ -10,6 +10,7 @@ import {
 } from './TraceExplorer';
 import { cn } from './cn';
 import { useCatalogClient } from './context';
+import { Select } from './ui/select';
 import { Tooltip, TooltipProvider } from './ui/tooltip';
 
 const MUTED = 'text-zinc-400 dark:text-zinc-500';
@@ -148,38 +149,27 @@ export function GovernanceTimeline({
             */}
             {view === 'events' && (
               <>
-                <select
+                <Select
                   value={event}
-                  onChange={(e) => setEvent(e.target.value)}
-                  aria-label="Filter by event"
-                  className={cn(
-                    'rounded-md border bg-white px-2 py-1 text-xs outline-none dark:bg-zinc-900',
-                    RULE,
-                  )}
-                >
-                  <option value="">Every event</option>
-                  {Object.entries(CATALOG_EVENT_META).map(([id, meta]) => (
-                    <option key={id} value={id}>
-                      {meta.label}
-                    </option>
-                  ))}
-                </select>
-                <select
+                  onValueChange={setEvent}
+                  ariaLabel="Filter by event"
+                  options={[
+                    { value: '', label: 'Every event' },
+                    ...Object.entries(CATALOG_EVENT_META).map(([id, meta]) => ({
+                      value: id,
+                      label: meta.label,
+                    })),
+                  ]}
+                />
+                <Select
                   value={principal}
-                  onChange={(e) => setPrincipal(e.target.value)}
-                  aria-label="Filter by application"
-                  className={cn(
-                    'rounded-md border bg-white px-2 py-1 text-xs outline-none dark:bg-zinc-900',
-                    RULE,
-                  )}
-                >
-                  <option value="">Every application</option>
-                  {principals.map((id) => (
-                    <option key={id} value={id}>
-                      {id}
-                    </option>
-                  ))}
-                </select>
+                  onValueChange={setPrincipal}
+                  ariaLabel="Filter by application"
+                  options={[
+                    { value: '', label: 'Every application' },
+                    ...principals.map((id) => ({ value: id, label: id })),
+                  ]}
+                />
               </>
             )}
           </div>
