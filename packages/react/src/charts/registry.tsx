@@ -93,3 +93,29 @@ export function seriesFrom(
 
 /** A palette that works in both themes, so a renderer need not invent one. */
 export const CHART_COLORS = ['#8b5cf6', '#10b981', '#f59e0b', '#0ea5e9', '#f43f5e'];
+
+/**
+ * Which library draws a card, given the two places that can say.
+ *
+ * Here rather than inside the board, so the precedence is one named thing a
+ * test can hold — the alternative was two lines inside a component that needs a
+ * query client and a transport to render, and a test that mirrors them can
+ * drift from them silently.
+ *
+ * The card wins because it is the more specific statement: it says how this
+ * answer should look on THIS board, while the query says how it looks wherever
+ * it appears. Reading them the other way round means editing one board changes
+ * every other board that uses the same query.
+ *
+ * When neither chose, the key is ABSENT rather than explicitly undefined. The
+ * two behave identically at the lookup, but a card is stored as JSON and "the
+ * key is there and empty" is a different statement from "nobody chose" the
+ * moment anything else reads it.
+ */
+export function visualizationFor(
+  saved: QueryVisualization | undefined,
+  cardLibrary: string | undefined,
+): QueryVisualization {
+  const base = saved ?? { kind: 'table' };
+  return cardLibrary ? { ...base, library: cardLibrary } : base;
+}

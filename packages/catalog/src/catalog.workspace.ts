@@ -84,6 +84,22 @@ export interface DashboardCard {
   savedQueryId: string;
   /** Overrides the saved query's own title on this dashboard. */
   title?: string;
+  /**
+   * Overrides the saved query's chart library on this dashboard.
+   *
+   * Separate from the query's own choice because the two answer different
+   * questions. The query says how this ANSWER is best drawn, once, wherever it
+   * appears; the card says how it should look HERE, next to the other cards on
+   * this board. A dashboard that mixes two chart libraries' idea of a bar looks
+   * like two dashboards, and fixing that by editing the saved query would
+   * change it on every other board that uses it.
+   *
+   * Undefined falls back to the query's `visualization.library`, which in turn
+   * falls back to the built-in renderer. A name nobody registered degrades to
+   * the built-in rather than failing — a dashboard should come back plainer,
+   * not broken.
+   */
+  library?: string;
   /** 1–4, in a twelve-column grid. Kept coarse on purpose. */
   width: 1 | 2 | 3 | 4;
   position: number;
