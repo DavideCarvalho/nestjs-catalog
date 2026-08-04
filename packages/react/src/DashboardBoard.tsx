@@ -15,7 +15,12 @@ import {
   useSortable,
 } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import type { CatalogQueryResult, Dashboard, SavedQuery } from '@dudousxd/nestjs-catalog/client';
+import type {
+  CatalogQueryResult,
+  Dashboard,
+  QueryVisualization,
+  SavedQuery,
+} from '@dudousxd/nestjs-catalog/client';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Download, GripVertical, LayoutGrid, Plus, RefreshCw, Trash2 } from 'lucide-react';
 import { useState } from 'react';
@@ -638,32 +643,62 @@ function Card({
       </div>
 
       <div className="mt-3">
-        {/*
-         * Three states, and keeping them apart is the whole point. A failed
-         * query says so and offers a retry; a query that is merely refreshing
-         * keeps the chart it already drew, because swapping a live chart for a
-         * placeholder on every background refetch is the flicker the skeleton
-         * exists to avoid; and only a card with no data yet gets the skeleton.
-         *
-         * `isPending`, never `isFetching`, for that reason.
-         */}
-        {error ? (
-          <ChartFailed
-            height={200}
-            message={error instanceof Error ? error.message : 'The card failed to load.'}
-            onRetry={() => refetch()}
-          />
-        ) : isPending ? (
-          <ChartSkeleton kind={pendingKind} height={200} />
-        ) : data ? (
-          <CardBody
-            query={data.savedQuery}
-            result={data.result}
-            {...(library ? { library } : {})}
-          />
-        ) : null}
+        <CardContent
+          error={error}
+          isPending={isPending}
+          data={data}
+          pendingKind={pendingKind}
+          {...(library ? { library } : {})}
+          onRetry={() => refetch()}
+        />
       </div>
     </div>
+  );
+}
+
+/**
+ * Which of the three things a card can be showing.
+ *
+ * Its own component rather than a ternary inside `Card`, which had grown past
+ * the point where the branches were readable — and this is the part of the card
+ * that must stay readable, because the states are easy to collapse into each
+ * other and the collapse is invisible until somebody's dashboard flickers.
+ *
+ * A failed query says so and offers a retry; a query that is merely refreshing
+ * keeps the chart it already drew, because swapping a live chart for a
+ * placeholder on every background refetch is the flicker the skeleton exists to
+ * avoid; and only a card with no data yet gets the skeleton.
+ *
+ * `isPending`, never `isFetching`, for that reason.
+ */
+function CardContent({
+  error,
+  isPending,
+  data,
+  pendingKind,
+  library,
+  onRetry,
+}: {
+  error: unknown;
+  isPending: boolean;
+  data: { savedQuery: SavedQuery; result: CatalogQueryResult } | undefined;
+  pendingKind: QueryVisualization['kind'];
+  library?: string;
+  onRetry: () => void;
+}) {
+  if (error) {
+    return (
+      <ChartFailed
+        height={200}
+        message={error instanceof Error ? error.message : 'The card failed to load.'}
+        onRetry={onRetry}
+      />
+    );
+  }
+  if (isPending) return <ChartSkeleton kind={pendingKind} height={200} />;
+  if (!data) return null;
+  return (
+    <CardBody query={data.savedQuery} result={data.result} {...(library ? { library } : {})} />
   );
 }
 

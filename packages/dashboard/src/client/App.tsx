@@ -139,8 +139,13 @@ function EnvironmentPicker() {
   const active = environments.find((environment) => environment.id === current);
 
   return (
-    <label className="ml-auto mr-3 flex items-center gap-1.5 text-[10px]">
-      <span className="font-mono uppercase tracking-[0.14em] text-zinc-400">Env</span>
+    // A div, not a label. `Select` renders its own control and carries its own
+    // `ariaLabel`, so wrapping it in a label gave a screen reader two names for
+    // one thing — and gave the label no control of its own to point at.
+    <div className="ml-auto mr-3 flex items-center gap-1.5 text-[10px]">
+      <span aria-hidden className="font-mono uppercase tracking-[0.14em] text-zinc-400">
+        Env
+      </span>
       <Select
         value={current}
         onValueChange={(next) => {
@@ -164,7 +169,7 @@ function EnvironmentPicker() {
               }))
         }
       />
-    </label>
+    </div>
   );
 }
 

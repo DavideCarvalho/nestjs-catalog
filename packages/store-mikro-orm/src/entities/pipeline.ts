@@ -24,6 +24,16 @@ export class ConnectorRow {
    * Never a credential. What is stored is the *name* of an environment
    * variable, so a catalog database that leaks leaks the shape of the
    * integration rather than the keys to it.
+   *
+   * That was a promise this column could not keep on its own, and for SQL
+   * sources it did not keep it: `fetchSql` reads `config.url`, and a connection
+   * URL is a password with an address attached. It was persisted verbatim and
+   * served verbatim to anything holding `catalog:read`.
+   *
+   * `MySqlPipelineStore.saveConnector` refuses a password-bearing URL that is
+   * not already stored here, and the pipeline's read routes redact one out of
+   * anything they serve. Rows written before either existed are still sitting
+   * in this column — the redaction is what covers them.
    */
   @Property({ type: 'json' })
   config: Record<string, unknown> = {};
@@ -390,7 +400,15 @@ export class ConnectionRow {
   @Property({ length: 32 })
   kind!: string;
 
-  /** Address and options. Never the credential — only the name of its env var. */
+  /**
+   * Address and options. Never the credential — only the name of its env var.
+   *
+   * Enforced now rather than asserted: `MySqlPipelineStore.saveConnection`
+   * refuses a password-bearing URL that is not already stored here, and
+   * `GET pipeline/connections` redacts one on the way out. Before both,
+   * `postgres://user:pass@host/db` sat in this column and was handed to every
+   * caller holding `catalog:read`.
+   */
   @Property({ type: 'json' })
   config: Record<string, unknown> = {};
 
