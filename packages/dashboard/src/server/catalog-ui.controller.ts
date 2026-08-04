@@ -7,10 +7,12 @@ import {
   Header,
   Inject,
   NotFoundException,
+  Optional,
   Param,
   StreamableFile,
   UseFilters,
 } from '@nestjs/common';
+import { DASHBOARD_AUTH } from './auth/dashboard-auth-config.js';
 import { DashboardLoginRedirectFilter } from './auth/login-redirect.exception.js';
 import { DashboardSessionRequiredFilter } from './auth/session-required.exception.js';
 
@@ -58,6 +60,9 @@ export class CatalogUiController {
   constructor(
     @Inject(DASHBOARD_BASE_PATH) private readonly basePath: string,
     @Inject(DASHBOARD_API_PATH) private readonly apiBasePath: string,
+    @Optional()
+    @Inject(DASHBOARD_AUTH)
+    private readonly auth: unknown = null,
   ) {}
 
   // index.html references hash-named bundles, so it MUST NOT be cached (stale bundle = the
@@ -76,8 +81,12 @@ export class CatalogUiController {
       `="${BUILD_BASE}/`,
       `="${this.basePath}/`,
     );
-    // __DURABLE_BASE__ = where assets load; __DURABLE_API__ = where the SPA fetches the JSON API.
-    const inject = `<script>window.__DURABLE_BASE__='${this.basePath}';window.__DURABLE_API__='${this.apiBasePath}';</script>`;
+    // __CATALOG_BASE__ = where assets load; __CATALOG_API__ = where the SPA fetches the JSON API;
+    // __CATALOG_HOST_AUTH__ = whether the HOST authenticates, in which case the SPA must not show
+    // its own sign-in. A console mounted inside an application that already knows who you are and
+    // then asks you to log in again is not a smaller problem than one that lets anybody in.
+    const hostAuth = this.auth ? 'true' : 'false';
+    const inject = `<script>window.__CATALOG_BASE__='${this.basePath}';window.__CATALOG_API__='${this.apiBasePath}';window.__CATALOG_HOST_AUTH__=${hostAuth};</script>`;
     return html.includes('</head>') ? html.replace('</head>', `${inject}</head>`) : inject + html;
   }
 

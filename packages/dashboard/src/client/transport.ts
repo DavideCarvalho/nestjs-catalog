@@ -53,7 +53,11 @@ async function request<T>(
   init: RequestInit & { params?: Record<string, unknown> } = {},
 ): Promise<T> {
   const { params, ...rest } = init;
-  const url = new URL(`/api${path}`, window.location.origin);
+  // The host decides where the API lives and injects it; hardcoding `/api` here
+  // sent every call to the wrong place the moment this was mounted anywhere but
+  // the standalone app — `/api/auth/me` instead of `<apiPath>/auth/me`.
+  const apiBase = (window as { __CATALOG_API__?: string }).__CATALOG_API__ ?? '/api';
+  const url = new URL(`${apiBase}${path}`, window.location.origin);
   for (const [name, value] of Object.entries(params ?? {})) {
     if (value !== undefined && value !== null && value !== '') {
       url.searchParams.set(name, String(value));

@@ -25,6 +25,28 @@ import {
 } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { IDENTITY_QUERY_KEY, KeyGate } from './KeyGate';
+
+/**
+ * Whether the HOST already knows who this is.
+ *
+ * Set by the server when the mount was given an auth config. A console embedded
+ * in an application that authenticated you and then shows its own sign-in form
+ * is not a smaller problem than one that lets anybody in: it asks for a
+ * credential that does not exist, and the only honest thing it can report is
+ * that the endpoint it wanted is missing — which is exactly what
+ * `Cannot GET /api/auth/me` was.
+ *
+ * When the host authenticates, the gate is skipped entirely: the session cookie
+ * the host minted is already on every request this SPA makes.
+ */
+const HOST_AUTHENTICATES =
+  (window as { __CATALOG_HOST_AUTH__?: boolean }).__CATALOG_HOST_AUTH__ === true;
+
+/** The gate, or nothing at all when the host owns identity. */
+function IdentityGate({ children }: { children: React.ReactNode }) {
+  if (HOST_AUTHENTICATES) return <>{children}</>;
+  return <KeyGate>{children}</KeyGate>;
+}
 import { api, getEnvironment, listEnvironments, setEnvironment, transport } from './transport';
 
 type Tab =
@@ -160,7 +182,7 @@ export function App() {
 
   return (
     <CatalogProvider transport={transport}>
-      <KeyGate>
+      <IdentityGate>
         <div className="flex h-full flex-col bg-zinc-50 dark:bg-zinc-950">
           <nav className="flex shrink-0 items-center gap-1 border-b border-zinc-200 bg-white px-4 dark:border-zinc-800 dark:bg-zinc-900">
             <span className="mr-4 flex items-center gap-2 py-3 text-sm font-semibold tracking-tight">
@@ -227,7 +249,7 @@ export function App() {
             )}
           </main>
         </div>
-      </KeyGate>
+      </IdentityGate>
     </CatalogProvider>
   );
 }
