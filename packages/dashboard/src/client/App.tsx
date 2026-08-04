@@ -23,7 +23,7 @@ import {
   TerminalSquare,
   Workflow,
 } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { IDENTITY_QUERY_KEY, KeyGate } from './KeyGate';
 
 /**
@@ -180,34 +180,73 @@ export function App() {
     return () => window.removeEventListener('hashchange', sync);
   }, []);
 
+  // A ref callback rather than an effect: it fires exactly when the active
+  // button mounts or changes, which is the moment the strip needs to move.
+  // `nearest` so a tab already on screen is left alone — recentering on every
+  // click makes the whole strip jump under the cursor.
+  const scrollActiveIntoView = useCallback((node: HTMLButtonElement | null) => {
+    node?.scrollIntoView({ inline: 'nearest', block: 'nearest' });
+  }, []);
+
   return (
     <CatalogProvider transport={transport}>
       <IdentityGate>
         <div className="flex h-full flex-col bg-zinc-50 dark:bg-zinc-950">
+          {/* Nine tabs plus the brand and two controls need ~1150px. Below that
+              the strip used to push the whole DOCUMENT sideways — `nav` is
+              `shrink-0` inside a flex column, so nothing absorbed the excess and
+              the page itself grew a horizontal scrollbar, taking every screen
+              with it. At 809px it overflowed by 345.
+
+              So the tabs get their own scroll container and the things that are
+              not tabs stay pinned: the brand on the left, the environment picker
+              and store badge on the right. Scrolling a tab strip is ordinary;
+              having the environment you are editing scroll off the screen is
+              not. */}
           <nav className="flex shrink-0 items-center gap-1 border-b border-zinc-200 bg-white px-4 dark:border-zinc-800 dark:bg-zinc-900">
-            <span className="mr-4 flex items-center gap-2 py-3 text-sm font-semibold tracking-tight">
+            <span className="mr-4 flex shrink-0 items-center gap-2 py-3 text-sm font-semibold tracking-tight">
               <span className="text-base">◈</span> Catalog
             </span>
-            {TABS.map(({ id, label, icon: Icon }) => (
-              <button
-                key={id}
-                type="button"
-                onClick={() => {
-                  window.location.hash = id;
-                  setTab(id);
-                }}
-                className={`flex items-center gap-1.5 border-b-2 px-3 py-3 text-sm transition-colors ${
-                  tab === id
-                    ? 'border-violet-600 text-zinc-950 dark:text-zinc-50'
-                    : 'border-transparent text-zinc-500 hover:text-zinc-950 dark:hover:text-zinc-50'
-                }`}
-              >
-                <Icon size={14} />
-                {label}
-              </button>
-            ))}
-            <EnvironmentPicker />
-            <StoreBadge />
+            {/* `min-w-0` is what makes the overflow work at all: a flex item
+                defaults to `min-width: auto`, so without it this box refuses to
+                shrink below its content and pushes the parent wide instead of
+                scrolling.
+
+                The scrollbar is hidden, not the scrolling. A native horizontal
+                bar here is as tall as the tabs themselves and sits between them
+                and their underline — it reads as a broken layout rather than as
+                an affordance. The half-cut tab at the edge is the affordance,
+                same as every other tab strip that does this. */}
+            <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+              {TABS.map(({ id, label, icon: Icon }) => (
+                <button
+                  key={id}
+                  // Selecting a tab that is scrolled out of sight would
+                  // otherwise change the screen and leave the strip showing a
+                  // different tab as if nothing had happened — and arriving on
+                  // `#access` directly opens the last tab with the strip parked
+                  // at the first.
+                  ref={id === tab ? scrollActiveIntoView : undefined}
+                  type="button"
+                  onClick={() => {
+                    window.location.hash = id;
+                    setTab(id);
+                  }}
+                  className={`flex shrink-0 items-center gap-1.5 whitespace-nowrap border-b-2 px-3 py-3 text-sm transition-colors ${
+                    tab === id
+                      ? 'border-sky-500 text-zinc-950 dark:text-zinc-50'
+                      : 'border-transparent text-zinc-500 hover:text-zinc-950 dark:hover:text-zinc-50'
+                  }`}
+                >
+                  <Icon size={14} />
+                  {label}
+                </button>
+              ))}
+            </div>
+            <div className="flex shrink-0 items-center gap-1 pl-2">
+              <EnvironmentPicker />
+              <StoreBadge />
+            </div>
           </nav>
 
           <main className="min-h-0 flex-1 overflow-hidden">

@@ -157,7 +157,7 @@ export function QueryConsole({ onGenerate, maxRows = 500 }: QueryConsoleProps) {
                   'flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs transition-colors',
                   RULE,
                   'hover:bg-zinc-50 dark:hover:bg-zinc-800',
-                  askOpen && 'bg-violet-100 dark:bg-violet-950',
+                  askOpen && 'bg-sky-100 dark:bg-sky-950',
                 )}
               >
                 <Sparkles size={12} />
@@ -175,10 +175,7 @@ export function QueryConsole({ onGenerate, maxRows = 500 }: QueryConsoleProps) {
 
           {askOpen && onGenerate && (
             <div
-              className={cn(
-                'shrink-0 border-b bg-violet-50/60 px-4 py-3 dark:bg-violet-950/20',
-                RULE,
-              )}
+              className={cn('shrink-0 border-b bg-sky-50/60 px-4 py-3 dark:bg-sky-950/20', RULE)}
             >
               <form
                 className="flex gap-2"
@@ -196,13 +193,13 @@ export function QueryConsole({ onGenerate, maxRows = 500 }: QueryConsoleProps) {
                     'flex-1 rounded-md border px-3 py-1.5 text-sm outline-none',
                     RULE,
                     PANEL,
-                    'focus:border-violet-500 focus:ring-2 focus:ring-violet-500/15',
+                    'focus:border-sky-500 focus:ring-2 focus:ring-sky-500/15',
                   )}
                 />
                 <button
                   type="submit"
                   disabled={generate.isPending || prompt.trim().length === 0}
-                  className="rounded-md bg-violet-600 px-3 py-1.5 text-xs text-white disabled:opacity-40"
+                  className="rounded-md bg-sky-600 px-3 py-1.5 text-xs text-white disabled:opacity-40"
                 >
                   {generate.isPending ? 'Writing…' : 'Write the SQL'}
                 </button>

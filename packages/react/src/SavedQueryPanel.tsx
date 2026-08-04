@@ -108,7 +108,7 @@ export function SavedQueryPanel({
             className={cn(
               'w-full rounded-md border bg-white px-2 py-1 text-xs outline-none dark:bg-zinc-900',
               RULE,
-              'focus:border-violet-500',
+              'focus:border-sky-500',
             )}
           />
           <input
@@ -119,7 +119,7 @@ export function SavedQueryPanel({
             className={cn(
               'w-full rounded-md border bg-white px-2 py-1 text-xs outline-none dark:bg-zinc-900',
               RULE,
-              'focus:border-violet-500',
+              'focus:border-sky-500',
             )}
           />
           <div className="flex gap-1.5">
@@ -176,7 +176,7 @@ export function SavedQueryPanel({
               type="checkbox"
               checked={draft.shared ?? false}
               onChange={(e) => setDraft({ ...draft, shared: e.target.checked })}
-              className="accent-violet-500"
+              className="accent-sky-500"
             />
             Let other apps embed this
           </label>

@@ -41,7 +41,7 @@ export function CssBarChart({ result, visualization }: ChartRendererProps) {
             <span className="w-24 shrink-0 truncate text-[11px]">{String(row[label] ?? '—')}</span>
             <div className="h-3 flex-1 overflow-hidden rounded-sm bg-zinc-100 dark:bg-zinc-800">
               <div
-                className="h-full rounded-sm bg-violet-500/80"
+                className="h-full rounded-sm bg-sky-500/80"
                 style={{ width: max > 0 ? `${(raw / max) * 100}%` : '0%' }}
               />
             </div>

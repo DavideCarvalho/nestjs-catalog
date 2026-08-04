@@ -63,7 +63,7 @@ export function Select({
           'flex w-full items-center justify-between gap-2 rounded-md border px-2 py-1.5 text-left text-xs',
           'border-zinc-200 bg-white text-zinc-900 outline-none',
           'dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-100',
-          'focus-visible:border-violet-500 focus-visible:ring-2 focus-visible:ring-violet-500/15',
+          'focus-visible:border-sky-500 focus-visible:ring-2 focus-visible:ring-sky-500/15',
           'disabled:opacity-40',
           className,
         )}
@@ -112,7 +112,7 @@ export function Select({
                   )}
                 >
                   <BaseSelect.ItemIndicator className="mt-0.5 shrink-0">
-                    <Check size={11} className="text-violet-600" />
+                    <Check size={11} className="text-sky-600" />
                   </BaseSelect.ItemIndicator>
                   <span className="min-w-0 flex-1">
                     <BaseSelect.ItemText className="block truncate">

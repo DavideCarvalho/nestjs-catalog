@@ -560,7 +560,7 @@ const AUTH_METHODS = {
   },
   session: {
     icon: ShieldHalf,
-    tone: 'text-violet-600',
+    tone: 'text-sky-600',
     hint: 'Holds no credential of its own. Reachable only by a person signing in, and it caps what any of them can do.',
   },
 } as const;
@@ -678,7 +678,7 @@ function Failed({
 
 const TONES = {
   neutral: 'bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300',
-  write: 'bg-violet-100 text-violet-700 dark:bg-violet-950 dark:text-violet-300',
+  write: 'bg-sky-100 text-sky-700 dark:bg-sky-950 dark:text-sky-300',
   own: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300',
   classified: 'bg-amber-100 text-amber-700 dark:bg-amber-950 dark:text-amber-300',
 } as const;

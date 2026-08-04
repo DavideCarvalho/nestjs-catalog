@@ -75,8 +75,8 @@ export function EditableField({
         }
       },
       className: cn(
-        'w-full rounded-sm border border-violet-500 bg-white px-1.5 py-0.5 dark:bg-zinc-900',
-        'outline-none ring-2 ring-violet-500/20',
+        'w-full rounded-sm border border-sky-500 bg-white px-1.5 py-0.5 dark:bg-zinc-900',
+        'outline-none ring-2 ring-sky-500/20',
         inputClassName,
       ),
     };
@@ -119,7 +119,7 @@ export function EditableField({
         'group/edit flex w-full items-start gap-1.5 rounded-sm px-1.5 py-0.5 text-left',
         'border border-transparent hover:border-zinc-200 hover:bg-zinc-50',
         'dark:hover:border-zinc-800 dark:hover:bg-zinc-950',
-        'focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-violet-500',
+        'focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-sky-500',
         className,
       )}
     >

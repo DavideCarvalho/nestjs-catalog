@@ -71,8 +71,8 @@ const KIND_STYLE: Record<
     noun: 'source',
   },
   transform: {
-    accent: 'bg-violet-500',
-    chip: 'text-violet-700 dark:text-violet-300',
+    accent: 'bg-sky-500',
+    chip: 'text-sky-700 dark:text-sky-300',
     icon: Repeat,
     noun: 'transform',
   },
@@ -155,7 +155,7 @@ export function WorkflowNodeBody({ id, data, selected }: NodeProps<WorkflowFlowN
         'relative w-56 overflow-hidden rounded-lg border shadow-sm transition-shadow',
         RULE,
         PANEL,
-        selected && 'ring-2 ring-violet-500/40',
+        selected && 'ring-2 ring-sky-500/40',
         errors.length > 0 && 'border-red-400 dark:border-red-800',
         errors.length === 0 && warnings.length > 0 && 'border-amber-300 dark:border-amber-800',
       )}

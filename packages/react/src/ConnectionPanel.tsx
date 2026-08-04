@@ -321,7 +321,7 @@ function ConnectionCard({
                   type="button"
                   onClick={onEdit}
                   aria-label={`Edit ${connection.name}`}
-                  className={cn('rounded-sm p-1.5 hover:text-violet-600', MUTED)}
+                  className={cn('rounded-sm p-1.5 hover:text-sky-600', MUTED)}
                 >
                   <Pencil size={12} />
                 </button>

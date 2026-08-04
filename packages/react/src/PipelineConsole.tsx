@@ -438,11 +438,7 @@ function ConnectorCard({
         <button
           type="button"
           onClick={onEdit}
-          className={cn(
-            'mt-3 flex items-center gap-1.5 text-[11px]',
-            MUTED,
-            'hover:text-violet-600',
-          )}
+          className={cn('mt-3 flex items-center gap-1.5 text-[11px]', MUTED, 'hover:text-sky-600')}
         >
           <Code2 size={11} />
           {transform.name}
