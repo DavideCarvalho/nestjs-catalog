@@ -32,9 +32,11 @@ import {
   type Dashboard,
   type DashboardCard,
   type EmbeddedChart,
+  type EmbeddedChartPlacement,
   type EmbeddedDashboard,
   type SaveQueryInput,
   type SavedQuery,
+  embeddedVisualization,
 } from './catalog.workspace';
 
 const DEFAULT_PAGE_SIZE = 25;
@@ -313,8 +315,18 @@ export class CatalogService {
     return found;
   }
 
+  /**
+   * `shared` is declared here, and that is not cosmetic.
+   *
+   * The store has always accepted it, so it worked as long as the body reached
+   * the store untouched. A host with a whitelisting `ValidationPipe` — the
+   * normal, recommended configuration — strips a property no type declares, and
+   * the symptom is a dashboard that cannot be shared with no error anywhere:
+   * the toggle saves, the response says `shared: false`, and the embed API
+   * keeps answering 403 for a board somebody just shared.
+   */
   saveDashboard(
-    input: { name: string; description?: string; cards?: DashboardCard[] },
+    input: { name: string; description?: string; cards?: DashboardCard[]; shared?: boolean },
     createdBy: string,
   ): Promise<Dashboard> {
     if (!input?.name?.trim()) {
@@ -329,6 +341,7 @@ export class CatalogService {
       name: string;
       description: string;
       cards: DashboardCard[];
+      shared: boolean;
     }>,
   ): Promise<Dashboard> {
     const updated = await this.requireWorkspace().updateDashboard(id, input);
@@ -378,10 +391,18 @@ export class CatalogService {
     };
   }
 
-  /** One chart, rendered. */
+  /**
+   * One chart, rendered.
+   *
+   * `placement` is what the dashboard card said, and it is honoured rather than
+   * merely carried: a card's `title` and `library` exist to override the saved
+   * query on THIS board, so an embed that ignored them would show a different
+   * heading and a different chart from the console for the same dashboard —
+   * silently, with nothing thrown and nothing logged.
+   */
   async embedChart(
     savedQueryId: string,
-    layout?: { width: number; position: number },
+    placement?: EmbeddedChartPlacement,
   ): Promise<EmbeddedChart> {
     const saved = await this.getSavedQuery(savedQueryId);
     if (!saved.shared) {
@@ -393,12 +414,15 @@ export class CatalogService {
       sql: saved.sql,
       cacheTtlSeconds: saved.cacheTtlSeconds,
     });
+    // A card whose title was cleared falls back to the query's name rather than
+    // embedding a blank heading — an empty override is the absence of one.
+    const overridden = placement?.title?.trim();
     return {
       id: saved.id,
-      title: saved.name,
+      title: overridden ? overridden : saved.name,
       description: saved.description,
-      visualization: saved.visualization,
-      layout,
+      visualization: embeddedVisualization(saved.visualization, placement?.library),
+      layout: placement ? { width: placement.width, position: placement.position } : undefined,
       columns: result.columns,
       rows: result.rows,
       rowCount: result.rowCount,
@@ -424,6 +448,10 @@ export class CatalogService {
           await this.embedChart(card.savedQueryId, {
             width: card.width,
             position: card.position,
+            // Everything the card says about this chart, not only where it
+            // sits. See `EmbeddedChartPlacement`.
+            ...(card.title !== undefined ? { title: card.title } : {}),
+            ...(card.library !== undefined ? { library: card.library } : {}),
           }),
         );
       } catch {
