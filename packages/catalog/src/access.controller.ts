@@ -19,6 +19,7 @@ import {
   type CatalogPersonInput,
   type CatalogPersonRole,
 } from './catalog.access';
+import { RequireScopes } from './catalog.route-auth';
 
 const ROLES: readonly CatalogPersonRole[] = ['viewer', 'curator', 'administrator'];
 
@@ -60,12 +61,35 @@ export function createAccessController(
       return this.directory;
     }
 
+    /**
+     * Every route here is `catalog:admin`, and the screen is the reason.
+     *
+     * `listApplications` enumerates each application that can reach the catalog
+     * together with its scopes, its `writeTypes` and its `classifications` —
+     * which is to say, the map of what a stolen credential would be worth and
+     * which one to steal. `upsertPerson` writes into the host's directory and
+     * accepts `role: 'administrator'`, so an unscoped POST here is a way to
+     * grant yourself the scope this endpoint is protecting.
+     *
+     * Nothing weaker fits: `catalog:curate` is documented as editing labels and
+     * units, and reading who may write to the catalog is not a curation act.
+     * The console already hides this screen behind `catalog:admin`; until now
+     * that client-side check was the ONLY check, and a hidden tab is not an
+     * access control — anybody authenticated could call these three paths
+     * directly. `catalog.route-auth.ts` is explicit that a route declaring no
+     * scope means "authenticated is enough", so the absence was not an
+     * oversight the framework would catch. It is caught now: the completeness
+     * sweep in `catalog.route-scopes.integration.spec.ts` reads THIS factory
+     * too, which is what let these three escape it in the first place.
+     */
     @Get('principals')
+    @RequireScopes('catalog:admin')
     principals() {
       return this.require().listApplications();
     }
 
     @Get('people')
+    @RequireScopes('catalog:admin')
     people(
       @Query('search') search?: string,
       @Query('limit') limit?: string,
@@ -92,6 +116,7 @@ export function createAccessController(
     }
 
     @Post('people')
+    @RequireScopes('catalog:admin')
     upsertPerson(@Body() body: unknown) {
       const directory = this.require();
       if (!directory.upsertPerson) {

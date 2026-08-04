@@ -505,4 +505,38 @@ describe('Every catalog route declares what it needs (integration)', () => {
     expect(undeclared).toEqual([]);
     expect(handlers).toHaveLength(ROUTES.length);
   });
+
+  it('leaves no handler on the ACCESS controller undeclared either', async () => {
+    // A second factory, and the reason this test exists rather than being
+    // folded into the one above: the sweep knew about `createCatalogController`
+    // and nothing else, so all three access routes sat unscoped — `authenticated
+    // is enough` for the endpoint that enumerates every application's scopes and
+    // grants, and for the one that mints an administrator — while a sweep named
+    // "leaves no handler undeclared" passed. A completeness check that knows
+    // about some of the controllers is not a completeness check; it is a
+    // statement that the ones it forgot are fine.
+    //
+    // Whoever adds a third factory must add it here. There is no way to
+    // enumerate them from the module without booting it, and booting it needs
+    // the stores these routes are declared independently of.
+    const { createAccessController } = await import('./access.controller');
+    const prototype = createAccessController('api/catalog/access', []).prototype;
+
+    const handlers = Object.getOwnPropertyNames(prototype).filter((name) => {
+      if (name === 'constructor') return false;
+      const method = Reflect.get(prototype, name);
+      return (
+        typeof method === 'function' && Reflect.getMetadata(PATH_METADATA, method) !== undefined
+      );
+    });
+
+    expect(handlers.length).toBeGreaterThan(0);
+    // Every one of them, and every one of them `catalog:admin` — the whole
+    // surface is the governance screen, so a route here that asked for less
+    // would be a route that lets a curator read what a stolen key is worth.
+    for (const name of handlers) {
+      const scopes = Reflect.getMetadata(REQUIRED_SCOPES, Reflect.get(prototype, name));
+      expect(`${name} -> ${JSON.stringify(scopes)}`).toBe(`${name} -> ["catalog:admin"]`);
+    }
+  });
 });

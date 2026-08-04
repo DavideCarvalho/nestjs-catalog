@@ -42,6 +42,6 @@ every save teaches people to ignore it. Un-sharing is recorded too and is
 distinguishable. The actor is the resolved principal rather than anything the
 body claimed.
 
-Still true and worth knowing: `PROMOTION_AUDIT_EVENT` is referenced nowhere, so
-promoting into production is unaudited while its docblock says otherwise. That
-one spans another package and is not fixed here.
+`PROMOTION_AUDIT_EVENT` was the third instance of the same pattern —
+referenced nowhere, while its docblock explained where the record is written. It
+is fixed in the same release; see the store adapter's entry.

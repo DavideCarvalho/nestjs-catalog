@@ -115,3 +115,24 @@ revocation from a cascade.
 say who renamed a column but not who reverted every name at once. It needs an
 event `CATALOG_EVENTS` does not have — `type.curated` requires a `typeName` and a
 reset has no single one — so it is named rather than papered over.
+
+## The Access screen's three routes, which were the same hole one file over
+
+`createAccessController` declared no scope on any of its routes. By the rule
+above — absence means "authenticated is enough" — `GET access/principals`
+handed any authenticated caller the list of every application that can reach the
+catalog, with its scopes, its `writeTypes` and its `classifications`: the map of
+what a stolen credential is worth and which one to take. `POST access/people`
+wrote into the host's directory and accepts `role: 'administrator'`, so it was a
+way to grant yourself the scope it should have been protecting.
+
+All three are `catalog:admin` now. The console had always hidden this screen
+behind `catalog:admin`, and that check was the only one there was — a hidden tab
+is not an access control, and the three paths answered a direct request.
+
+The reason it survived a test named *leaves no handler undeclared* is worth more
+than the fix: the sweep read `createCatalogController` and knew nothing about the
+second factory. A completeness check that knows about some of the controllers is
+not a completeness check; it is a statement that the ones it forgot are fine. It
+reads both now, and a third factory has to be added to it by hand — there is no
+way to enumerate them without booting the module.
