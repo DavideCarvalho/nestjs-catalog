@@ -20,6 +20,7 @@ export {
   DashboardRow,
   SavedQueryRow,
 } from './entities/workspace';
+export { MikroOrmCatalogDirectory } from './directory.service';
 export { MySqlWorkspaceStore } from './workspace.store';
 export { MySqlPipelineStore } from './pipeline.store';
 export {

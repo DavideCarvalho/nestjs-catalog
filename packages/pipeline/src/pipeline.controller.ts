@@ -30,6 +30,9 @@ import {
 } from '@nestjs/common';
 import { ConnectionChecker } from './connection-checker.service';
 import { ConnectorRunnerService } from './connector-runner.service';
+import { WorkflowLauncher } from './workflow-launcher.service';
+import { WorkflowRunnerService } from './workflow-runner.service';
+import { type CanvasWorkflowInput, toGraph, toRunView } from './workflow-view';
 
 /**
  * Connectors, transforms and their runs.
@@ -59,6 +62,8 @@ export function createPipelineController(
       private readonly transforms: SubprocessTransformRunner,
       private readonly runner: ConnectorRunnerService,
       private readonly checker: ConnectionChecker,
+      private readonly workflows: WorkflowRunnerService,
+      private readonly launcher: WorkflowLauncher,
     ) {}
 
     /** Which transform languages this deployment can actually execute. */
@@ -253,8 +258,75 @@ export function createPipelineController(
         throw new BadRequestException(error instanceof Error ? error.message : String(error));
       }
     }
-  }
 
+    @Get('workflows')
+    @RequireScopes('catalog:read')
+    async workflowList() {
+      const store = this.workflows.requireStore();
+      // Served verbatim. The view that used to sit here flattened a source down
+      // to a connector id, renamed `name` to `label`, and turned a missing
+      // position into the origin — three lies the screen then repeated back, one
+      // of which would have erased a source's configuration on the next save.
+      return store.listWorkflows();
+    }
+    @Post('workflows')
+    @RequireScopes('catalog:write')
+    async saveWorkflow(
+      @Req() request: { principal?: CatalogPrincipal },
+      @Body() body: CanvasWorkflowInput,
+    ) {
+      const store = this.workflows.requireStore();
+      const name = typeof body.name === 'string' ? body.name.trim() : '';
+      if (!name) {
+        throw new BadRequestException('A workflow needs a name.');
+      }
+      // No workflow-level target type: a sink carries the type it commits, and a
+      // graph may now have several sinks writing different ones.
+      const graph = toGraph(body);
+      const saved = await store.saveWorkflow(
+        {
+          id: body.id,
+          name,
+          description:
+            typeof body.description === 'string' && body.description.length > 0
+              ? body.description
+              : undefined,
+          nodes: graph.nodes,
+          edges: graph.edges,
+        },
+        request.principal?.id ?? 'console',
+      );
+      return saved;
+    }
+    @Delete('workflows/:id')
+    @RequireScopes('catalog:write')
+    async deleteWorkflow(@Param('id') id: string) {
+      const store = this.workflows.requireStore();
+      return { deleted: await store.deleteWorkflow(id) };
+    }
+    @Post('workflows/:id/run')
+    @RequireScopes('catalog:write')
+    async runWorkflow(
+      @Req() request: { principal?: CatalogPrincipal },
+      @Param('id') id: string,
+      @Body() body?: { snapshotId?: string },
+    ) {
+      const workflow = await this.workflows.requireWorkflow(id);
+      const run = await this.launcher.run({
+        workflowId: id,
+        principalId: request.principal?.id ?? 'console',
+        // Almost always absent — the console posts an empty body. Present when
+        // somebody is re-driving a load they already own the identity of.
+        snapshotId: body?.snapshotId,
+      });
+      return toRunView(workflow, run);
+    }
+    @Get('workflows/:id/connectors')
+    @RequireScopes('catalog:read')
+    async workflowUsers(@Param('id') id: string) {
+      return this.workflows.requireStore().connectorsUsingWorkflow(id);
+    }
+  }
   if (guards.length > 0) {
     UseGuards(...guards)(PipelineController);
   }

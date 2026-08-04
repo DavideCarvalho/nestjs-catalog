@@ -23,7 +23,15 @@ export {
 export { createPipelineController } from './pipeline.controller';
 export { createPublishController } from './publish.controller';
 export { PublishService, type PublishedType } from './publish.service';
+export { WorkflowLauncher, type WorkflowDurability } from './workflow-launcher.service';
 export {
+  toGraph,
+  toRunView,
+  type CanvasWorkflowInput,
+  type CanvasWorkflowRun,
+} from './workflow-view';
+export {
+  CATALOG_PIPELINE_DURABILITY_DETAIL,
   CATALOG_PIPELINE_EM,
   CATALOG_PIPELINE_REGISTRY,
   CATALOG_PIPELINE_SCOPE,

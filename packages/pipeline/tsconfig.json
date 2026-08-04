@@ -1,9 +1,5 @@
 {
   "compilerOptions": {
-    // Mirrors the host tsconfig's module settings on purpose. The root config
-    // has no `include`, so it typechecks this package too — and a package that
-    // resolves modules differently from the app compiling it produces errors in
-    // one run and not the other.
     "module": "nodenext",
     "moduleResolution": "nodenext",
     "resolvePackageJsonExports": true,
@@ -18,8 +14,20 @@
     "strict": true,
     "strictPropertyInitialization": false,
     "skipLibCheck": true,
-    "types": ["node"]
+    "types": [
+      "node"
+    ]
   },
-  "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist"]
+  "include": [
+    "src/**/*"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "**/*.spec.ts",
+    "**/*.spec.tsx",
+    "**/*.test.ts",
+    "**/*.test.tsx",
+    "test"
+  ]
 }

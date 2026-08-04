@@ -19,6 +19,21 @@ export interface CatalogModuleOptions {
    */
   path?: string;
   /**
+   * Route prefix for the Access endpoints, which the console's Access screen
+   * reads.
+   *
+   * A sibling of {@link path} by default — `api/catalog` gives `api/access` —
+   * because that is the shape `@dudousxd/nestjs-catalog-react` builds by
+   * default: it prepends the console's `apiPath` to a base of `/access`, so
+   * the two land side by side under the same API root.
+   *
+   * The endpoints are served only when something provides `CATALOG_DIRECTORY`;
+   * see {@link CatalogDirectory}. Mounted regardless, so the console gets a
+   * 501 explaining what is unwired rather than a 404 that reads as a broken
+   * build.
+   */
+  accessPath?: string;
+  /**
    * Guards applied to every catalog route. The library ships none: an
    * introspection endpoint that lists every table in the system is exactly the
    * kind of thing that should never be open by default, and only the host app
@@ -57,6 +72,20 @@ export interface CatalogModuleOptions {
    * implementation here instead.
    */
   registry?: Provider;
+  /**
+   * Who may reach this catalog. A provider for `CATALOG_DIRECTORY`.
+   *
+   * Bound here rather than only exported from an imported module for the same
+   * reason `store` and `registry` are: a provider declared inside this module
+   * SHADOWS the same token exported by one of its imports, so a host that
+   * merely imports `CatalogMikroOrmStoreModule` alongside its own
+   * implementation gets the shipped applications-only one and no error.
+   *
+   * The common shape is to extend the shipped `MikroOrmCatalogDirectory` —
+   * which reads `catalog_principal` — and add `listPeople` over the user store
+   * the host already has. See {@link CatalogDirectory}.
+   */
+  directory?: Provider;
   /**
    * Mount the built-in controller. Default true.
    *

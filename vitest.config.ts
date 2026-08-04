@@ -10,6 +10,12 @@ export default defineConfig({
   // stale `dist/`. Production builds still go through `tsc` per package.
   resolve: {
     alias: {
+      // The subpath FIRST: Vite matches string aliases as a prefix, so the bare
+      // entry below would rewrite `@dudousxd/nestjs-catalog/client` to
+      // `.../src/index.ts/client` and fail to resolve. Every screen in the React
+      // package imports that subpath for real, not just for types, so without
+      // this line none of them can be tested at all.
+      '@dudousxd/nestjs-catalog/client': pkg('catalog', 'src/client.ts'),
       '@dudousxd/nestjs-catalog': pkg('catalog'),
       '@dudousxd/nestjs-catalog-pipeline': pkg('pipeline'),
       '@dudousxd/nestjs-catalog-store-mikro-orm': pkg('store-mikro-orm'),

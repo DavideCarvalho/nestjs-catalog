@@ -84,6 +84,46 @@ overlay store (a JSON file by default; bring your own via `overlayStore`).
 searched columns against the catalog before anything reaches SQL, selects only
 the columns the catalog says are visible, and caps the page size.
 
+## Who may reach it
+
+The console's Access screen asks two questions with different owners, and the
+library treats them differently on purpose.
+
+**Applications** are the catalog's own. `catalog_principal` is a table this
+library defines and the grants on it are catalog grants, so
+`CatalogMikroOrmStoreModule` ships the implementation and you get
+`GET /access/principals` by mounting it.
+
+**People are almost certainly not the catalog's.** A catalog embedded in an
+application is embedded in one that already knows who its users are, and a
+second user store beside it is how you get two lists of employees that disagree
+about who was offboarded. So implement `listPeople` over what you already have:
+
+```ts
+class MyDirectory extends MikroOrmCatalogDirectory {   // applications, inherited
+  async listPeople() { return this.users.findAll().map(toPersonSummary); }
+}
+
+CatalogModule.forRoot({
+  directory: { provide: CATALOG_DIRECTORY, useClass: MyDirectory },
+});
+```
+
+Bind it through `directory` rather than only exporting it from an imported
+module: a provider declared inside `CatalogModule` **shadows** the same token
+exported by one of its imports, so a host that does both gets the shipped
+applications-only one and no error.
+
+Leave `listPeople` out and `GET /access/people` answers **501** naming the seam,
+rather than an empty list. That distinction is load-bearing — "nobody can sign in
+yet" and "we did not ask" send an operator to different places, and the first
+invites them to create an account that already exists. Same for `upsertPerson`,
+which most hosts should *not* implement: creating a user from a catalog console
+is a way to create one your IdP has never heard of.
+
+The routes mount at `accessPath`, a sibling of `path` by default — `api/catalog`
+gives `api/access`, which is the shape the React screens build.
+
 ## Build your own endpoints, or use ours
 
 The built-in controller is a convenience, not the interface. Pass
