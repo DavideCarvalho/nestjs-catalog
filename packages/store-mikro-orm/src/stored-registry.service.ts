@@ -11,6 +11,7 @@ import type { MikroORM } from '@mikro-orm/core';
 import type { EntityManager } from '@mikro-orm/mysql';
 import { Inject, Injectable, Logger, type OnModuleInit } from '@nestjs/common';
 import { CATALOG_STORE_ENTITY_MANAGER, CATALOG_STORE_MIKRO_ORM } from './context';
+import { SnapshotRow } from './entities/governance';
 import { ObjectTypeRow, PropertyRow } from './entities/model';
 import { CATALOG_STORE_OPTIONS, type CatalogStoreModuleOptions } from './options';
 import { ensureCatalogSchema } from './schema';
@@ -78,7 +79,8 @@ export class StoredCatalogRegistry extends CatalogRegistry implements OnModuleIn
       { populate: ['properties'], orderBy: { group: 'asc', displayName: 'asc' } },
     );
 
-    const types = rows.map((row) => this.toDef(row));
+    const serving = await this.servingSnapshots(em);
+    const types = rows.map((row) => this.toDef(row, serving.get(row.name)));
     this.snapshot = {
       version: this.snapshot.version + 1,
       generatedAt: new Date().toISOString(),
@@ -191,7 +193,33 @@ export class StoredCatalogRegistry extends CatalogRegistry implements OnModuleIn
     );
   }
 
-  private toDef(row: ObjectTypeRow): CatalogObjectTypeDef {
+  /**
+   * The newest COMMITTED snapshot per type, in one query.
+   *
+   * One query rather than one per type, because this runs on every reload and a
+   * catalog with two hundred types would otherwise pay two hundred round trips
+   * to answer a question nobody asked yet. Ordered newest-first and kept on
+   * first sight, so the map holds the serving snapshot for each type.
+   *
+   * `committed: true` is the filter that makes this mean anything: an
+   * uncommitted snapshot is a load in flight or a load that failed, and neither
+   * is what readers are being served.
+   */
+  private async servingSnapshots(em: EntityManager): Promise<Map<string, SnapshotRow>> {
+    const rows = await em.find(
+      SnapshotRow,
+      { committed: true },
+      { orderBy: { committedAt: 'desc' } },
+    );
+
+    const serving = new Map<string, SnapshotRow>();
+    for (const row of rows) {
+      if (!serving.has(row.typeName)) serving.set(row.typeName, row);
+    }
+    return serving;
+  }
+
+  private toDef(row: ObjectTypeRow, serving?: SnapshotRow): CatalogObjectTypeDef {
     const properties = row.properties
       .getItems()
       .sort((a, b) => a.position - b.position)
@@ -221,6 +249,17 @@ export class StoredCatalogRegistry extends CatalogRegistry implements OnModuleIn
       titleProperty: row.titleProperty,
       primaryKey: row.primaryKey ?? [],
       enriched: Boolean(row.description) || properties.some((p) => p.enriched),
+      // Spread so a type with no committed snapshot carries no key at all
+      // rather than three explicit `undefined`s. The absence is the statement —
+      // "never loaded" and "loaded long ago" have to stay distinguishable, and
+      // a key present-and-empty muddies that the moment anything serialises it.
+      ...(serving?.committedAt
+        ? {
+            lastCommittedAt: serving.committedAt.toISOString(),
+            rowCount: serving.rowCount,
+            lastPrincipalId: serving.principalId,
+          }
+        : {}),
       properties,
       relations: [],
     };

@@ -102,6 +102,44 @@ export interface CatalogObjectTypeDef {
    * came from a regex and are probably wrong.
    */
   enriched: boolean;
+
+  /**
+   * When readers started seeing the data this type currently serves.
+   *
+   * `committedAt` of the newest committed snapshot, not `createdAt`: a load that
+   * was written and never committed is not what anybody is reading, and dating
+   * the type by it would report freshness nobody has.
+   *
+   * **Absent means no committed snapshot ever**, which is a different statement
+   * from "committed a year ago" — a type published by a schema and never loaded
+   * looked exactly like a type loaded daily until this field existed, and both
+   * looked exactly like a type whose publisher was deleted six months ago.
+   *
+   * Carried on the type rather than fetched per type on demand. The value of
+   * this signal is that it arrives without anybody going to look for it, and a
+   * field costing one request per row on a screen listing every type is a field
+   * that screen will not use.
+   */
+  lastCommittedAt?: string;
+
+  /**
+   * Rows in that snapshot.
+   *
+   * Here for a failure the timestamp cannot show: a connector that starts
+   * returning 12 rows where it returned 40,000 produces data that is wrong and
+   * *fresh*, so every staleness signal reports it as healthy. The count next to
+   * the date is what makes that visible, and it is the same read.
+   */
+  rowCount?: number;
+
+  /**
+   * Which application committed it.
+   *
+   * Because "stale since March" is never the last question — "so who was
+   * loading this?" is — and the answer is already in the row being read.
+   */
+  lastPrincipalId?: string;
+
   properties: CatalogPropertyDef[];
   relations: CatalogRelationDef[];
 }

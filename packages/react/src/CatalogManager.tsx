@@ -12,6 +12,7 @@ import { CoverageLedger } from './CoverageLedger';
 import { EditableField } from './EditableField';
 import { cn } from './cn';
 import { catalogQueryKeys, useCatalogClient } from './context';
+import { type Freshness, freshnessOf, isWorthFlagging } from './freshness';
 import { DataTable } from './ui/data-table';
 import { RichTextField } from './ui/rich-text-field';
 import { Tooltip, TooltipProvider } from './ui/tooltip';
@@ -293,6 +294,7 @@ export function CatalogManager({
                         </span>
                         <span className={cn('block truncate font-mono text-[10px]', MUTED)}>
                           {type.tableName}
+                          <FreshnessNote type={type} />
                         </span>
                       </span>
                     </button>
@@ -676,4 +678,42 @@ function VisibilityToggle({
       </button>
     </Tooltip>
   );
+}
+
+/**
+ * The age of a type's data, beside its table name.
+ *
+ * Here rather than behind a hover or a detail pane, because the whole failure
+ * this addresses is that nobody thinks to look: a type whose publisher was
+ * deleted in January renders identically to one loaded ten minutes ago, and
+ * somebody reads a number off it in June.
+ *
+ * A tooltip carries the row count and the publisher — the two questions that
+ * follow "this is old" — without spending width on them for the types where
+ * nobody is asking.
+ */
+function FreshnessNote({ type }: { type: CatalogObjectTypeDef }) {
+  const freshness = freshnessOf(type);
+  const flag = isWorthFlagging(freshness);
+
+  return (
+    <span
+      className={cn('ml-2', flag && 'text-amber-600 dark:text-amber-400')}
+      title={titleFor(type, freshness)}
+    >
+      {freshness.kind === 'never' ? '· never loaded' : `· ${freshness.label}`}
+    </span>
+  );
+}
+
+function titleFor(type: CatalogObjectTypeDef, freshness: Freshness): string {
+  if (freshness.kind === 'never') {
+    // Said plainly, because this is the state most often mistaken for a
+    // problem: a type can be published by a schema and legitimately never
+    // loaded, and that is not the same as a load that failed.
+    return 'This type has a schema but no committed snapshot — nothing has ever been loaded into it.';
+  }
+  const rows = type.rowCount === undefined ? 'unknown rows' : `${type.rowCount} rows`;
+  const who = type.lastPrincipalId ? ` by ${type.lastPrincipalId}` : '';
+  return `Serving ${rows}, committed ${freshness.label}${who}.`;
 }
