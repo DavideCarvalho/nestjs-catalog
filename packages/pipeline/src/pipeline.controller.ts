@@ -31,6 +31,9 @@ import {
 import { redactConnection, redactConnector, restoreRedactedSecrets } from './config-secrets';
 import { ConnectionChecker } from './connection-checker.service';
 import { ConnectorRunnerService } from './connector-runner.service';
+import { discoverConnectorSchema } from './schema-discovery';
+import { CATALOG_PIPELINE_REGISTRY, type CatalogPipelineRegistry } from './seams';
+import { applyConnection, resolveSecret } from './sources';
 import { WorkflowLauncher } from './workflow-launcher.service';
 import { WorkflowRunnerService } from './workflow-runner.service';
 import { type CanvasWorkflowInput, toGraph, toRunView } from './workflow-view';
@@ -66,6 +69,13 @@ export function createPipelineController(
       private readonly checker: ConnectionChecker,
       private readonly workflows: WorkflowRunnerService,
       private readonly launcher: WorkflowLauncher,
+      // Read-only here, and only by `discoverSchema`: it is how this controller
+      // answers "does the target type exist yet, and what does it say", which is
+      // the difference between a discovery that proposes a type and one that
+      // reports drift. The same instance the engine loads through, so the two
+      // can never disagree about what is published.
+      @Inject(CATALOG_PIPELINE_REGISTRY)
+      private readonly registry: CatalogPipelineRegistry,
     ) {}
 
     /** Which transform languages this deployment can actually execute. */
@@ -237,6 +247,81 @@ export function createPipelineController(
         principal.id,
         body?.snapshotId ?? `manual-${randomUUID().slice(0, 8)}`,
       );
+    }
+
+    /**
+     * Ask a connector what its source looks like. Creates nothing.
+     *
+     * The route that lets somebody point the catalog at a table nobody has
+     * written an entity for. It runs the connector's own read — the driver's
+     * column description for SQL, a bounded sample for everything else — and
+     * answers with the columns, the types it could conclude, the ones it could
+     * not, and how what it found differs from the type as it stands today. See
+     * `schema-discovery.ts` for why each of those is what it is.
+     *
+     * **It writes nothing, and it must stay that way.** Creating the type is a
+     * separate act by a person against `PUT /publish/:type/schema`, which does
+     * its own `mayWrite` check. A connector that created the type it loads into
+     * would grow the catalog by accident, and the names it invented would come
+     * from the shape of a query rather than from somebody who meant them.
+     *
+     * `POST` rather than `GET` for the same reason `connections/:id/check` is:
+     * this reaches out over the network, takes as long as the source takes, and
+     * is nobody's idea of a cacheable read.
+     *
+     * Authorised exactly as running it is, and that is not belt-and-braces.
+     * Saving a connector and running one both require a grant on its target
+     * type, so today a principal with `catalog:write` and no grants cannot cause
+     * the server to read any source at all. Discovery without the same check
+     * would be the first route that could: press it against somebody else's
+     * connector and the answer is the column names of a database this caller was
+     * never allowed near.
+     */
+    @Post('connectors/:id/discover')
+    @RequireScopes('catalog:write')
+    async discoverSchema(
+      @Req() request: { principal?: CatalogPrincipal },
+      @Param('id') id: string,
+    ) {
+      const principal = requirePrincipal(request);
+      const connector = await this.pipeline.getConnector(id);
+      if (!connector) throw new NotFoundException(`No connector ${id}`);
+      await this.assertMayCommit(
+        principal,
+        connector.targetType,
+        connector.workflowId,
+        `discovering the schema behind "${connector.name}"`,
+      );
+
+      // Resolved here rather than at save time, exactly as a run resolves it: an
+      // edited connection has to take effect on the next read, and a discovery
+      // that described the old address would describe a source the load no
+      // longer touches.
+      const connection = connector.connectionId
+        ? await this.pipeline.getConnection(connector.connectionId)
+        : undefined;
+      if (connector.connectionId && !connection) {
+        throw new BadRequestException(
+          `"${connector.name}" reads through a connection that no longer exists (${connector.connectionId}). Point it at one that does — there is nothing to describe until then.`,
+        );
+      }
+      const resolved = applyConnection(connector, connection);
+
+      try {
+        return await discoverConnectorSchema({
+          connector: resolved,
+          secret: resolveSecret(resolved),
+          // The registry, not the store: drift is measured against the type as
+          // the engine currently sees it, which is the same object a load would
+          // be written through.
+          existing: this.registry.getType(connector.targetType),
+        });
+      } catch (error) {
+        // A source that refuses, a query that does not parse, a missing
+        // credential: all of them are this connector's configuration, not the
+        // server's fault, and a 500 would hide the one sentence that says which.
+        throw new BadRequestException(error instanceof Error ? error.message : String(error));
+      }
     }
 
     @Get('runs')

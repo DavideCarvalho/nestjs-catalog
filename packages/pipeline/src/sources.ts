@@ -238,16 +238,7 @@ export const fetchS3: SourceFetcher = async ({ connector, secret, state, mode })
  * honestly offer.
  */
 export const fetchSql: SourceFetcher = async ({ connector, secret, state, mode }) => {
-  const url = secret ?? String(connector.config.url ?? '');
-  const sql = String(connector.config.query ?? '');
-  if (!url) {
-    throw new Error(
-      'This connector has no connection URL. Put it in an environment variable and name it in `Credential env var`, so the catalog never stores it.',
-    );
-  }
-  if (!sql.trim()) throw new Error('This connector has no query configured.');
-
-  const dialect = url.startsWith('postgres') ? 'postgres' : 'mysql';
+  const { url, sql, dialect } = sqlTarget(connector, secret);
   const column = String(connector.config.watermarkColumn ?? '').trim();
   const bounded = mode === 'incremental' && column.length > 0;
 
@@ -270,6 +261,218 @@ export const fetchSql: SourceFetcher = async ({ connector, secret, state, mode }
   const next = maxWatermark(rows, column, previous);
   return next === undefined ? { records: rows } : { records: rows, state: { watermark: next } };
 };
+
+/**
+ * Where a SQL connector reads from, and in whose dialect.
+ *
+ * One place rather than one per caller: the fetcher and the schema description
+ * have to agree about which database they are talking to and which query, or a
+ * discovery would describe a source the load never reads. The refusals are the
+ * fetcher's original ones, kept verbatim — they are what an author sees when the
+ * connector is half-configured.
+ */
+function sqlTarget(
+  connector: CatalogConnector,
+  secret: string | undefined,
+): { url: string; sql: string; dialect: SqlDialect } {
+  const url = secret ?? String(connector.config.url ?? '');
+  const sql = String(connector.config.query ?? '');
+  if (!url) {
+    throw new Error(
+      'This connector has no connection URL. Put it in an environment variable and name it in `Credential env var`, so the catalog never stores it.',
+    );
+  }
+  if (!sql.trim()) throw new Error('This connector has no query configured.');
+
+  return { url, sql, dialect: url.startsWith('postgres') ? 'postgres' : 'mysql' };
+}
+
+export type SqlDialect = 'postgres' | 'mysql';
+
+/**
+ * One column of a result set, as the driver described it.
+ *
+ * Everything here is optional except the name, and that is the shape of the
+ * truth rather than defensiveness: Postgres reports a type oid and says nothing
+ * about nullability, MySQL reports a type id, a display width, a character set
+ * and a NOT NULL flag, and the two are not going to be made to agree by
+ * pretending. Absent means the driver did not say. Mapping these onto catalog
+ * types is `schema-discovery.ts`'s job, so a driver quirk is decoded in exactly
+ * one place.
+ */
+export interface SqlFieldDescription {
+  name: string;
+  /** Postgres: the type oid. MySQL: the protocol's column type id. */
+  typeId?: number;
+  /** MySQL only: the declared display width, which is what separates `TINYINT(1)`. */
+  length?: number;
+  /** MySQL only, from the NOT_NULL flag. Undefined where the driver did not say. */
+  nullable?: boolean;
+  /** MySQL only: the character set number. 63 is `binary`, which is what tells a BLOB from a TEXT. */
+  charset?: number;
+}
+
+export interface SqlDescription {
+  dialect: SqlDialect;
+  fields: SqlFieldDescription[];
+}
+
+/**
+ * What the connector's query would return, without returning any of it.
+ *
+ * `LIMIT 0` is the whole trick: both drivers describe the result set before the
+ * first row, so the statement is planned, described and never materialised — a
+ * query over a billion-row table costs the same as one over an empty one. The
+ * alternative is reading a row and guessing from the values in it, which is what
+ * the non-SQL kinds are stuck with and is strictly worse: it cannot see a column
+ * that is null in that row, and it cannot tell a `VARCHAR` holding "12" from an
+ * `INT`.
+ *
+ * Read-only by construction, exactly as {@link fetchSql} is, and for the same
+ * reason: the transaction refuses a write whatever the author's query turns out
+ * to parse as. Discovery is a read of somebody else's database, and a route a
+ * console can press must not be able to become anything else.
+ */
+export async function describeSql(
+  context: Pick<FetchContext, 'connector' | 'secret'>,
+): Promise<SqlDescription> {
+  const { url, sql, dialect } = sqlTarget(context.connector, context.secret);
+  const statement = zeroRowStatement(sql);
+  return {
+    dialect,
+    fields:
+      dialect === 'postgres'
+        ? await describePostgres(url, statement)
+        : await describeMysql(url, statement),
+  };
+}
+
+/**
+ * The author's query, wrapped so it returns its own columns and no rows.
+ *
+ * Wrapped rather than appended, for the reason {@link boundStatement} spells
+ * out at length: the author's SQL is left exactly as written, and a query that
+ * already ends in its own `LIMIT`, or in a `UNION`, still means what it meant.
+ * The trailing semicolon goes for the same reason it does there — legal on its
+ * own, a syntax error inside a derived table, and the single most likely thing
+ * to have been pasted in.
+ */
+export function zeroRowStatement(sql: string): string {
+  const body = sql.trim().replace(/;+\s*$/, '');
+  return `SELECT * FROM (${body}) AS catalog_discovery LIMIT 0`;
+}
+
+async function describePostgres(url: string, sql: string): Promise<SqlFieldDescription[]> {
+  const pg = await importOptional<{
+    Client: new (c: { connectionString: string }) => PostgresClientLike;
+  }>('pg', 'postgres');
+  const client = new pg.Client({ connectionString: url });
+  await client.connect();
+  try {
+    await client.query('BEGIN READ ONLY');
+    return readPostgresFields(await client.query(sql, []));
+  } finally {
+    await client.query('ROLLBACK').catch(() => undefined);
+    await client.end().catch(() => undefined);
+  }
+}
+
+async function describeMysql(url: string, sql: string): Promise<SqlFieldDescription[]> {
+  const mysql = await importOptional<{
+    createConnection: (url: string) => Promise<MysqlConnectionLike>;
+  }>('mysql2/promise', 'mysql');
+  const connection = await mysql.createConnection(url);
+  try {
+    await connection.query('START TRANSACTION READ ONLY');
+    // `query`, not `execute`: there is nothing to bind, and a prepared statement
+    // would be one more thing the server has to hold for a call whose entire
+    // purpose is to be cheap.
+    const [, fields] = await connection.query(sql);
+    return readMysqlFields(fields);
+  } finally {
+    await connection.query('ROLLBACK').catch(() => undefined);
+    await connection.end().catch(() => undefined);
+  }
+}
+
+/**
+ * `pg`'s `result.fields`, narrowed rather than trusted.
+ *
+ * Each entry carries `name` and `dataTypeID`, and that is all Postgres sends
+ * over the wire in a `RowDescription` that a plain query can produce. There is
+ * no nullability in it — the flag lives on `pg_attribute`, which would be a
+ * second query against the source's system catalogue — so every field here
+ * leaves `nullable` unset, and the discovery says so rather than defaulting to
+ * something that reads as an answer.
+ */
+export function readPostgresFields(result: unknown): SqlFieldDescription[] {
+  if (!result || typeof result !== 'object') return [];
+  const fields: unknown = Reflect.get(result, 'fields');
+  if (!Array.isArray(fields)) return [];
+
+  const described: SqlFieldDescription[] = [];
+  for (const field of fields) {
+    if (!field || typeof field !== 'object') continue;
+    const name: unknown = Reflect.get(field, 'name');
+    if (typeof name !== 'string') continue;
+    const oid = numberAt(field, 'dataTypeID');
+    described.push({ name, ...(oid === undefined ? {} : { typeId: oid }) });
+  }
+  return described;
+}
+
+/** MySQL's NOT_NULL flag, bit 0 of the field's flags. */
+const MYSQL_NOT_NULL_FLAG = 1;
+
+/**
+ * `mysql2`'s field packets, narrowed rather than trusted.
+ *
+ * Three keys are read under two names each, and none of that is paranoia. The
+ * column type is `columnType` in mysql2 v3 and `type` in v1 and v2, and this
+ * package declares mysql2 as an optional peer — so both spellings are in
+ * deployments right now. The character set is `characterSet` or `charsetNr` for
+ * the same reason, and it is not optional information: it is the only thing that
+ * distinguishes a `TEXT` column from a binary blob, since both arrive as blob
+ * type ids.
+ */
+export function readMysqlFields(fields: unknown): SqlFieldDescription[] {
+  if (!Array.isArray(fields)) return [];
+
+  const described: SqlFieldDescription[] = [];
+  for (const field of fields) {
+    const one = readMysqlField(field);
+    if (one) described.push(one);
+  }
+  return described;
+}
+
+/** One field packet, or nothing if it does not describe a column. */
+function readMysqlField(field: unknown): SqlFieldDescription | undefined {
+  if (!field || typeof field !== 'object') return undefined;
+  const name: unknown = Reflect.get(field, 'name');
+  if (typeof name !== 'string') return undefined;
+
+  const typeId = numberAt(field, 'columnType') ?? numberAt(field, 'type');
+  const length = numberAt(field, 'columnLength');
+  const charset = numberAt(field, 'characterSet') ?? numberAt(field, 'charsetNr');
+  const flags = numberAt(field, 'flags');
+
+  return {
+    name,
+    ...(typeId === undefined ? {} : { typeId }),
+    ...(length === undefined ? {} : { length }),
+    ...(charset === undefined ? {} : { charset }),
+    // Absent flags mean the driver did not say, which is not the same as
+    // nullable: a column reported as nullable when it is not is a schema a
+    // person approves without noticing the claim was invented.
+    ...(flags === undefined ? {} : { nullable: (flags & MYSQL_NOT_NULL_FLAG) === 0 }),
+  };
+}
+
+function numberAt(source: object, key: string): number | undefined {
+  const value: unknown = Reflect.get(source, key);
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
 
 /**
  * The incremental form of an author's query.

@@ -39,6 +39,19 @@ export {
   type CanvasWorkflowRun,
 } from './workflow-view';
 export {
+  SAMPLE_LIMIT,
+  columnsFromSqlDescription,
+  discoverConnectorSchema,
+  driftFrom,
+  flagUnusableNames,
+  type ColumnConfidence,
+  type ConnectorSchemaDiscovery,
+  type DiscoverSchemaInput,
+  type DiscoveredColumn,
+  type DiscoveryBasis,
+  type SchemaDrift,
+} from './schema-discovery';
+export {
   CATALOG_PIPELINE_DURABILITY_DETAIL,
   CATALOG_PIPELINE_EM,
   CATALOG_PIPELINE_REGISTRY,
@@ -51,9 +64,14 @@ export {
 export {
   SOURCES,
   applyConnection,
+  describeSql,
   resolveSecret,
   toFetchResult,
+  zeroRowStatement,
   type FetchResult,
+  type SqlDescription,
+  type SqlDialect,
+  type SqlFieldDescription,
 } from './sources';
 export {
   WORKFLOW_FINISH_STEP,
