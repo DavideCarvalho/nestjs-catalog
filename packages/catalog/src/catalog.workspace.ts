@@ -271,11 +271,17 @@ export interface CatalogTrace {
   /**
    * True when the whole story fits inside one tick of the recorder's clock.
    *
-   * Worth saying out loud rather than quietly drawing zero-width bars: with a
-   * second-resolution timestamp column a fast load has no measurable internal
-   * timing at all, and a waterfall drawn from it would be a picture of rounding
-   * error. Ordering is still correct — see the lifecycle rank the store sorts
-   * by — but proportions are not, and a consumer should say so.
+   * Worth saying out loud rather than quietly drawing zero-width bars: when a
+   * load finishes inside one tick it has no measurable internal timing at all,
+   * and a waterfall drawn from it would be a picture of rounding error.
+   * Ordering is still correct — see the lifecycle rank the store sorts by — but
+   * proportions are not, and a consumer should say so.
+   *
+   * How coarse a tick is belongs to the store, not to this field: read
+   * `clockResolutionMs` rather than assuming. The bundled MySQL store keeps
+   * milliseconds, so this is now true only of loads that really did finish
+   * inside one — and of rows written before that column was widened, which
+   * collapse onto a whole second and are honestly still coarse.
    */
   coarse: boolean;
   /** Ordered: what started it first, how it ended last. */

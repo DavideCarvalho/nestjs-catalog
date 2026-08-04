@@ -38,8 +38,9 @@ export type CatalogEvent = (typeof CATALOG_EVENTS)[number];
  *
  * This exists because a timestamp is not enough to order a trace. A fast load
  * emits its whole story inside a single tick of whatever clock the recorder
- * writes — the bundled MySQL store keeps whole seconds — so sorting by time
- * alone leaves the events in insertion order, and insertion order is arbitrary.
+ * writes — the bundled MySQL store keeps milliseconds, and a commit of a few
+ * hundred rows lands well inside one — so sorting by time alone leaves the
+ * events in insertion order, and insertion order is arbitrary.
  * The observed result is a trace that reads `finished → written → committed →
  * started`: causally impossible, rendered with total confidence. Sorting by
  * time *and then* by this rank puts a same-tick story back in the only order it
