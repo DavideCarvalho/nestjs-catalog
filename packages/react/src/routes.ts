@@ -58,6 +58,18 @@ export const embedRoutes = {
 /** Where the pipeline endpoints sit unless the host says otherwise. */
 export const DEFAULT_PIPELINE_BASE_PATH = '/pipeline';
 
+/**
+ * Where the publish endpoints sit unless the host says otherwise.
+ *
+ * A sibling of the pipeline's base, not a child, because that is how the
+ * library mounts them: one `path` given to `CatalogPipelineModule.forRoot`
+ * yields `<path>/pipeline` and `<path>/publish`. Its own constant rather than a
+ * string derived from the other, because deriving would mean rewriting
+ * `/pipeline` into `/publish` inside whatever the host passed — which is right
+ * until the day a host passes a base that contains the word twice.
+ */
+export const DEFAULT_PUBLISH_BASE_PATH = '/publish';
+
 /** Where the access endpoints sit unless the host says otherwise. */
 export const DEFAULT_ACCESS_BASE_PATH = '/access';
 
@@ -83,6 +95,17 @@ export interface PipelineRoutes {
   connectors(): string;
   connector(id: string): string;
   runConnector(id: string): string;
+  /**
+   * What the source behind a connector looks like right now.
+   *
+   * A read that writes nothing: it runs the connector's own configured query
+   * with no rows asked for, and reports the columns. Here rather than on a
+   * generic "describe this database" route because the connector is what
+   * already holds the address, the credential reference and the statement —
+   * a route taking those as arguments would be a way to point the server at
+   * any database at all.
+   */
+  discoverConnectorSchema(id: string): string;
   runs(): string;
   transforms(): string;
   transform(id: string): string;
@@ -113,6 +136,7 @@ export function pipelineRoutes(basePath: string = DEFAULT_PIPELINE_BASE_PATH): P
     connectors: () => `${base}/connectors`,
     connector: (id) => `${base}/connectors/${encodeURIComponent(id)}`,
     runConnector: (id) => `${base}/connectors/${encodeURIComponent(id)}/run`,
+    discoverConnectorSchema: (id) => `${base}/connectors/${encodeURIComponent(id)}/discover`,
     runs: () => `${base}/runs`,
     transforms: () => `${base}/transforms`,
     transform: (id) => `${base}/transforms/${encodeURIComponent(id)}`,

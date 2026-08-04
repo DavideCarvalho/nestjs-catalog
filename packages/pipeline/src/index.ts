@@ -96,3 +96,11 @@ export {
   committedTypes,
   requirePrincipal,
 } from './write-grants';
+
+// Everything, deliberately. This surface is how a host declares what it expects
+// of a load — the deletion strategy for a type and the bound a snapshot may not
+// shrink past — and a hand-maintained list is how the catalog package's barrel
+// came to export an interface without the two types its one method takes.
+// Nothing here is internal: a host that cannot name `CATALOG_LOAD_EXPECTATIONS`
+// cannot bind it, and a token nobody can bind is a feature nobody can switch on.
+export * from './load-expectations';

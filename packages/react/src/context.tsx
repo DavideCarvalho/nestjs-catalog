@@ -27,6 +27,7 @@ import type { EmbeddedChartPayload, EmbeddedDashboardPayload } from './embed/pay
 import {
   DEFAULT_ACCESS_BASE_PATH,
   DEFAULT_PIPELINE_BASE_PATH,
+  DEFAULT_PUBLISH_BASE_PATH,
   type PeopleQuery,
   accessRoutes,
   embedRoutes,
@@ -79,6 +80,21 @@ export interface CatalogTransport {
    * the console's own does it in one line.
    */
   url?(path: string): string;
+  /**
+   * `PUT`, for the one route that has to be one.
+   *
+   * Optional for the same reason `url` is: a transport written before this
+   * existed keeps compiling. Publishing a type is an idempotent upsert of the
+   * whole shape — the same body twice is the same result — and the publish
+   * route says so with its method. Adding a `POST` alias to spare this
+   * three-line addition would have put a second name on one act, and the two
+   * would eventually mean different things.
+   *
+   * A client that needs it and does not find it refuses by name rather than
+   * silently doing nothing, because a "Create type" button that returns without
+   * creating a type is the failure this whole panel exists to prevent.
+   */
+  put?<T>(path: string, body: unknown): Promise<T>;
 }
 
 /**
@@ -360,6 +376,29 @@ export interface CatalogClient {
   saveConnector(input: ConnectorInput): Promise<CatalogConnector>;
   deleteConnector(id: string): Promise<{ deleted: boolean }>;
   runConnector(id: string): Promise<ConnectorRun>;
+  /**
+   * What the source behind a connector looks like right now. Writes nothing.
+   *
+   * Typed loosely on purpose. The shape comes from
+   * `@dudousxd/nestjs-catalog-pipeline`, and this package must not import that
+   * one — it would drag a package built for a Node process, with database
+   * drivers behind optional imports, into a browser bundle. `PipelineCapabilities`
+   * above is mirrored for exactly the same reason.
+   */
+  discoverConnectorSchema(id: string): Promise<unknown>;
+  /**
+   * Publish an object type's schema — create it, or update the shape of one
+   * that exists.
+   *
+   * The only write on this client that does not go through the catalog's own
+   * routes: publishing is how a type comes into existence at all, and there is
+   * deliberately no `POST /catalog/types`, because structure follows a
+   * publisher and curation follows a person.
+   *
+   * Refuses by name when the transport cannot `PUT`, rather than resolving
+   * having done nothing.
+   */
+  publishType(name: string, schema: unknown): Promise<unknown>;
   listRuns(connectorId?: string): Promise<ConnectorRun[]>;
 
   listTransforms(): Promise<CatalogTransform[]>;
@@ -430,6 +469,8 @@ export interface CatalogProviderProps {
    * the README passes nothing.
    */
   pipelineBasePath?: string;
+  /** Where `/publish` is mounted — a sibling of {@link pipelineBasePath}. */
+  publishBasePath?: string;
   /** Same, for the access endpoints. */
   accessBasePath?: string;
   children: ReactNode;
@@ -438,6 +479,7 @@ export interface CatalogProviderProps {
 export function CatalogProvider({
   transport,
   pipelineBasePath = DEFAULT_PIPELINE_BASE_PATH,
+  publishBasePath = DEFAULT_PUBLISH_BASE_PATH,
   accessBasePath = DEFAULT_ACCESS_BASE_PATH,
   children,
 }: CatalogProviderProps) {
@@ -500,6 +542,21 @@ export function CatalogProvider({
       saveConnector: (input) => transport.post<CatalogConnector>(pipeline.connectors(), input),
       deleteConnector: (id) => transport.delete<{ deleted: boolean }>(pipeline.connector(id)),
       runConnector: (id) => transport.post<ConnectorRun>(pipeline.runConnector(id), {}),
+      discoverConnectorSchema: (id) =>
+        transport.post<unknown>(pipeline.discoverConnectorSchema(id), {}),
+      publishType: (name, schema) => {
+        if (!transport.put) {
+          throw new Error(
+            'This transport cannot PUT, so it cannot publish a type. Implement `put` on the ' +
+              'transport you passed to CatalogProvider — publishing is an idempotent upsert of ' +
+              'the whole shape, which is why the route is a PUT and not a POST.',
+          );
+        }
+        return transport.put<unknown>(
+          `${publishBasePath}/${encodeURIComponent(name)}/schema`,
+          schema,
+        );
+      },
       // The parameter is omitted rather than sent empty when no connector is
       // named, because a transport that serialises `connector=` turns "every
       // run" into "runs of the connector whose id is the empty string", which
@@ -521,7 +578,7 @@ export function CatalogProvider({
       listPeople: (query) => transport.get(access.people(query)),
       upsertPerson: (input) => transport.post<PersonUpsertResult>(access.people(), input),
     };
-  }, [transport, pipelineBasePath, accessBasePath]);
+  }, [transport, pipelineBasePath, publishBasePath, accessBasePath]);
 
   return <CatalogContext.Provider value={client}>{children}</CatalogContext.Provider>;
 }
