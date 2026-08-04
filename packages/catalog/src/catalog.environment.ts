@@ -473,6 +473,46 @@ export interface PromotableObjectType {
     unit?: string;
     classification?: string;
   }>;
+
+  /**
+   * The links the type declares, in the shape they are stored in.
+   *
+   * Absent from this interface until it was noticed that a promoted type arrived
+   * complete in every visible way — right properties, right table, right owner —
+   * and sat in the target's graph as an island. Nothing errored, nothing was
+   * reported, and the plan the operator approved said "nothing to promote" for a
+   * release whose only content was a link.
+   *
+   * Spelled out here rather than imported from the store package, which is the
+   * same reason `properties` is: the dependency runs the other way, and this
+   * side is the one both a MikroORM environment and anything else that ever
+   * holds a catalog have to satisfy. `kind` is a bare `string` for the reason the
+   * stored row gives — what comes back out of a JSON column is whatever some
+   * earlier version of some publisher put in, and it is narrowed where it is
+   * read, not asserted here.
+   *
+   * Optional, and read as `[]` wherever it is used. An environment whose rows
+   * predate the relations column holds `NULL` there, and requiring the field
+   * would force every hand-built promotable set to name something it has nothing
+   * to say about. "Absent" and "empty" are deliberately the same statement here,
+   * unlike on the publish wire: this shape is built by `readPromotable` in this
+   * process rather than arriving from a client of unknown vintage, and the plan
+   * an operator approves has to describe exactly what the apply will do. See
+   * `promoteType`.
+   */
+  relations?: Array<{
+    name: string;
+    displayName: string;
+    description?: string;
+    kind: string;
+    targetType: string;
+    localKey?: string;
+    nullable: boolean;
+    hidden: boolean;
+    position: number;
+    owner: boolean;
+    inverseName?: string;
+  }>;
 }
 
 export interface PromotableTransform {
@@ -1207,6 +1247,64 @@ function diffObjectType(
       from: gone,
       to: gone,
     });
+  }
+
+  diffs.push(...diffRelations(existing, incoming));
+
+  return diffs;
+}
+
+/**
+ * The links, compared the same way the properties above are — and named
+ * differently on purpose.
+ *
+ * **Why this exists at all.** Without it a promotion whose only difference is a
+ * link reports `unchanged`, so the plan says there is nothing to promote and the
+ * apply, driven by that plan, does nothing. The change is real, the operator is
+ * shown an empty diff, and the link stays behind in dev. A plan is what somebody
+ * approves; a change invisible in the plan is a change nobody approved.
+ *
+ * **`relations.removed`, not `relations.absentFromSource`.** The properties
+ * above borrow the softer word because nothing acts on them: `ensureType` is
+ * additive, so a column that vanished from the source keeps its data in the
+ * target. A link that vanished really is deleted there — `promoteType` assigns
+ * the source's links rather than merging them, because a link holds no data and
+ * keeping one the source deliberately dropped means the target asserts a join
+ * the schema no longer has. The field name has to say which of those two a
+ * reviewer is looking at.
+ *
+ * **`to` repeats the removed names rather than being empty.** The fingerprint an
+ * approval is compared against hashes each field's `to` value; an empty one
+ * would make "drops the link to Base" and "drops the link to Depot" hash
+ * identically, so a plan approved for one would be applicable as the other.
+ */
+function diffRelations(
+  existing: PromotableObjectType | undefined,
+  incoming: PromotableObjectType,
+): PromotionFieldDiff[] {
+  const diffs: PromotionFieldDiff[] = [];
+  // `?? []` on both sides, so an environment predating the relations column
+  // compares as holding none rather than as differing from everything.
+  const before = new Map((existing?.relations ?? []).map((relation) => [relation.name, relation]));
+  const after = new Map((incoming.relations ?? []).map((relation) => [relation.name, relation]));
+
+  const added = [...after.keys()].filter((name) => !before.has(name));
+  const changed = [...after.entries()]
+    .filter(([name, relation]) => {
+      const previous = before.get(name);
+      return previous !== undefined && stable(previous) !== stable(relation);
+    })
+    .map(([name]) => name);
+  const removed = [...before.keys()].filter((name) => !after.has(name));
+
+  if (added.length) {
+    diffs.push({ field: 'relations.added', from: [], to: added });
+  }
+  if (changed.length) {
+    diffs.push({ field: 'relations.changed', from: changed, to: changed });
+  }
+  if (removed.length) {
+    diffs.push({ field: 'relations.removed', from: removed, to: removed });
   }
 
   return diffs;

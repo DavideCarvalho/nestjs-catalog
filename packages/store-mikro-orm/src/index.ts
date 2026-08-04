@@ -52,7 +52,16 @@ export {
   type PromotionTarget,
   readPromotable,
 } from './environment.promotion';
-export { ObjectTypeRow, PropertyRow } from './entities/model';
+// Everything, deliberately, and for the reason the catalog package's barrel
+// gave when it stopped listing `catalog.access` by hand: a list maintained
+// beside the file it lists falls behind it silently. This one had — `relations`
+// shipped as a column on `ObjectTypeRow` with `StoredRelation`, `PublishedRelation`
+// and `relationsOf` reachable only by deep-importing the entity file, so the
+// publisher that has to *describe* a link could not name the type of one and the
+// reader that has to survive a row predating the column could not reach the
+// accessor that does. Under `export *` the two cannot diverge at all, and a type
+// added here is exportable the moment it exists.
+export * from './entities/model';
 export {
   BATCH_COLUMN,
   ident,
@@ -81,6 +90,11 @@ export {
 export {
   CATALOG_STORE_ENTITY_MANAGER,
   CATALOG_STORE_MIKRO_ORM,
+  // The function that binds those two tokens to a real connection. Absent until
+  // now, which left the pair of them exported and unusable by a host wiring the
+  // store into a module of its own: it could name the tokens and had no
+  // supported way to satisfy them.
+  catalogConnectionProviders,
 } from './context';
 export {
   CATALOG_STORE_OPTIONS,

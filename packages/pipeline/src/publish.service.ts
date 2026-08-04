@@ -9,7 +9,12 @@ import {
   mayWrite,
   supportsCarryForward,
 } from '@dudousxd/nestjs-catalog';
-import { ObjectTypeRow, PropertyRow, tableFor } from '@dudousxd/nestjs-catalog-store-mikro-orm';
+import {
+  ObjectTypeRow,
+  PropertyRow,
+  type PublishedRelation,
+  tableFor,
+} from '@dudousxd/nestjs-catalog-store-mikro-orm';
 import type { EntityManager } from '@mikro-orm/mysql';
 import {
   BadRequestException,
@@ -60,6 +65,32 @@ export interface PublishedType {
     classification?: string;
     unit?: string;
   }>;
+
+  /**
+   * The links this type declares — what makes the catalog an ontology rather
+   * than a list of tables.
+   *
+   * Structurally optional and semantically three-valued, which is the part worth
+   * reading. **Absent** means the publisher said nothing about links: an
+   * application on a client that predates this field, or one that only ever
+   * describes columns. **Present and empty** means it said there are none. The
+   * two cannot be collapsed, because a publishing application re-publishes its
+   * whole shape on every deploy — treating a missing key as "no links" would
+   * wipe every link and every label a curator had put on one, on the next deploy
+   * of a publisher that had simply not been upgraded. `primaryKey` above draws
+   * the same distinction, for the same reason.
+   *
+   * `PublishedRelation` rather than `StoredRelation`: name, kind and target are
+   * the link and a payload without them describes nothing, while a label is
+   * something the publisher may not have and the console can supply later.
+   *
+   * Note that `position` is what orders these, where a property above is ordered
+   * by `order`. The asymmetry is real and harmless: `mergeRelations` falls back
+   * to the array index, so a host sending its `CatalogRelationDef[]` verbatim —
+   * which carries `order`, not `position` — keeps the order it sent them in,
+   * because that array is already sorted by it.
+   */
+  relations?: PublishedRelation[];
 }
 
 @Injectable()
@@ -170,6 +201,27 @@ export class PublishService {
       em.persist(target);
     });
 
+    // The links, through the row's own merge rule rather than by assignment
+    // here: which fields follow the publisher and which stay with whoever
+    // curated them is a property of the column, and a second copy of that
+    // judgement in this file is a second copy that drifts. See
+    // `ObjectTypeRow.mergeRelations`.
+    //
+    // Only when the key is there at all — see the field's docblock. A publisher
+    // that says nothing about links leaves the ones already stored alone; one
+    // that sends an empty array has said there are none, and the merge drops
+    // them.
+    if (published.relations !== undefined) {
+      // The body is whatever arrived over HTTP, so this is the same guard
+      // `appendRows` puts on `rows`: without it a publisher that sent
+      // `"relations": {}` gets a 500 out of `.map` rather than being told what
+      // it sent wrong.
+      if (!Array.isArray(published.relations)) {
+        throw new BadRequestException('`relations` must be an array.');
+      }
+      row.mergeRelations(published.relations);
+    }
+
     em.persist(row);
     await em.flush();
 
@@ -180,7 +232,13 @@ export class PublishService {
     }
 
     await this.store.ensureType(def);
-    this.logger.log(`${principal.id} published ${def.name} (${def.properties.length} properties)`);
+    // Relations in the line for the same reason the registry prints them at
+    // boot: a publisher that stopped carrying links, or a wire that stopped
+    // accepting them, shows up here as a zero and nowhere else until somebody
+    // opens the graph and finds it bare.
+    this.logger.log(
+      `${principal.id} published ${def.name} (${def.properties.length} properties, ${def.relations.length} relations)`,
+    );
     return def;
   }
 

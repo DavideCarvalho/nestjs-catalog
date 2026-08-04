@@ -33,7 +33,7 @@ import {
 } from '@dudousxd/nestjs-catalog';
 import type { EntityManager } from '@mikro-orm/mysql';
 import { BadRequestException, Logger } from '@nestjs/common';
-import { ObjectTypeRow, PropertyRow } from './entities/model';
+import { ObjectTypeRow, PropertyRow, type StoredRelation, relationsOf } from './entities/model';
 import type { CatalogEnvironmentBundle } from './environment.bundle';
 import { tableFor } from './identifiers';
 import type { MySqlWarehouseStore } from './mysql-warehouse.store';
@@ -138,6 +138,45 @@ function toPromotableType(row: ObjectTypeRow): PromotableObjectType {
         unit: property.unit,
         classification: property.classification,
       })),
+    // Through `relationsOf`, so a row written before the column existed reads as
+    // no links rather than throwing here and taking the whole promotion preview
+    // down with it.
+    //
+    // Copied, and sorted onto a copy. The array on the row is the entity's own
+    // JSON value: sorting it in place would reorder what MikroORM is tracking,
+    // and handing the very objects out means the apply in the *other*
+    // environment would write the source environment's objects into the target's
+    // row. Sorted at all so that two environments holding the same links in a
+    // different stored order do not read as a difference.
+    relations: [...relationsOf(row)]
+      .sort((a, b) => a.position - b.position)
+      .map((relation) => storedRelation(relation)),
+  };
+}
+
+/**
+ * One link, copied into a fresh object with nothing undefined left behind.
+ *
+ * Used on both ends — reading a promotable set out of one environment and
+ * writing it into another — so a link makes the trip without either side sharing
+ * an object with the other, and without `"localKey": null` landing in the target's
+ * JSON column, where it would read as a decision somebody made.
+ */
+function storedRelation(
+  relation: NonNullable<PromotableObjectType['relations']>[number],
+): StoredRelation {
+  return {
+    name: relation.name,
+    kind: relation.kind,
+    targetType: relation.targetType,
+    displayName: relation.displayName,
+    nullable: relation.nullable,
+    hidden: relation.hidden,
+    position: relation.position,
+    owner: relation.owner,
+    ...(relation.description === undefined ? {} : { description: relation.description }),
+    ...(relation.localKey === undefined ? {} : { localKey: relation.localKey }),
+    ...(relation.inverseName === undefined ? {} : { inverseName: relation.inverseName }),
   };
 }
 
@@ -567,6 +606,24 @@ async function promoteType(target: PromotionTarget, type: PromotableObjectType):
   row.group = type.group;
   row.titleProperty = type.titleProperty;
   row.primaryKey = type.primaryKey;
+
+  // ASSIGNED, not merged, and this is the one place the two paths that write
+  // this column part company. `mergeRelations` exists for the publish wire,
+  // where an application redeploys constantly and re-sends its whole shape, so a
+  // label a curator wrote has to survive the sender. A promotion is the opposite
+  // act: somebody read a plan of what the source holds, approved that
+  // fingerprint, and asked for it to be released. Merging would mean a link the
+  // source deliberately dropped survives in the target — invisibly, because the
+  // plan says `relations.removed` and the apply would then not remove it, which
+  // is the one outcome worse than either behaviour on its own. It is also safe
+  // in a way dropping a property is not: a column may still hold rows, a link
+  // holds nothing.
+  //
+  // A NEW array of NEW objects. MikroORM decides a JSON property changed by
+  // comparing it against the snapshot taken at load, so mutating in place can
+  // flush nothing while appearing to succeed — and the objects come from the
+  // *source* environment's rows, which the target must not end up sharing.
+  row.relations = (type.relations ?? []).map((relation) => storedRelation(relation));
 
   const known = new Map((existing ? row.properties.getItems() : []).map((p) => [p.name, p]));
 
