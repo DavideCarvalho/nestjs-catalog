@@ -30,7 +30,9 @@ import { WORKFLOW_NAME } from './name';
  * - **A sink with no object type.** Core's type requires `targetType` on a sink
  *   but its validator never checks that the string is non-empty, and the server
  *   refuses one that is. The check is additive, not contradictory.
- * - **Two sinks writing the same type.** Core reports it as `duplicate-sink-type`.
+ *
+ * Two sinks writing the same type is NOT in that list: core reports it itself,
+ * as `duplicate-sink-type`, and is passed straight through.
  *
  * The consequence worth stating: nothing in the canvas may *skip* a server check
  * because this passed. Save always goes to the server, the server's refusal
@@ -90,9 +92,10 @@ export interface ValidateOptions {
  * each sink commits its own type independently, which this screen is, rather
  * than to forbid the shape.
  *
- * The half of the rule that survives is enforced below as `duplicate-sink-type`:
- * two sinks writing the *same* type really is ambiguous, because it is two
- * snapshots of one type in one run with nothing to say which won.
+ * The half of the rule that survives is `duplicate-sink-type`: two sinks writing
+ * the *same* type really is ambiguous, because it is two snapshots of one type
+ * in one run with nothing to say which won. It is core's to raise, and this file
+ * raises no copy of it — see `validateWorkflow` below.
  *
  * Core now agrees: it emits `duplicate-sink-type` and no longer has
  * `multiple-sinks` or `mixed-output-types`. There is consequently nothing left
@@ -145,8 +148,18 @@ export function validateWorkflow(
   // Everything below is canvas-only. It runs whatever core said, because these
   // are different questions and suppressing them behind a structural error would
   // make somebody fix one problem to be told about the next.
-  const sinkTypes = new Map<string, string[]>();
-
+  //
+  // `duplicate-sink-type` is deliberately NOT among them any more. This file
+  // used to raise it as well, from the days when core did not — and once core
+  // started emitting it the canvas showed the same complaint twice, in two
+  // different wordings, ringing the same two nodes. Which is the drift this
+  // module's whole doctrine exists to prevent: the rules are core's.
+  //
+  // The one case the deleted copy caught and core does not is two sinks whose
+  // types differ only by surrounding whitespace, because it trimmed and core
+  // does not. That is a case core deliberately treats as two types, and a canvas
+  // that refused a graph the server accepts is the failure this file opens by
+  // describing.
   for (const node of nodes) {
     const name = nodeName(node);
 
@@ -177,26 +190,7 @@ export function validateWorkflow(
         nodeIds: [node.id],
         edgeIds: [],
       });
-      continue;
     }
-    sinkTypes.set(type, [...(sinkTypes.get(type) ?? []), node.id]);
-  }
-
-  for (const [type, ids] of sinkTypes) {
-    if (ids.length < 2) continue;
-    const named = ids
-      .map((id) => {
-        const node = nodes.find((candidate) => candidate.id === id);
-        return node ? `"${nodeName(node)}"` : `"${id}"`;
-      })
-      .join(' and ');
-    problems.push({
-      level: 'error',
-      code: 'duplicate-sink-type',
-      message: `${named} both write ${type}. Two sinks may write two different types — that is the point of a ${WORKFLOW_NAME.singular}, one read feeding several outputs — but two writing the same type would commit two snapshots of ${type} in one run with nothing to say which one won. Merge the branches into a single ${type} sink.`,
-      nodeIds: ids,
-      edgeIds: [],
-    });
   }
 
   return problems;

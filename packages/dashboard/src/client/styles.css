@@ -7,7 +7,13 @@
    living in `dist/ui/` and `dist/charts/` was invisible to the scanner and
    those components rendered unstyled — which does not error, so nothing says
    so. */
-@source "../node_modules/@dudousxd/nestjs-catalog-react/dist/**/*.js";
+/* Relative to THIS file. It was `../node_modules/…`, which was right when this
+   stylesheet lived at the repo root of the application it came from and points
+   at `src/node_modules/` here — a directory that does not exist. A missing
+   @source is not an error: Tailwind simply emits nothing for those classes and
+   every screen renders unstyled, which looks like a broken design rather than a
+   broken path. */
+@source "../../node_modules/@dudousxd/nestjs-catalog-react/dist/**/*.js";
 
 @plugin "tailwindcss-animate";
 

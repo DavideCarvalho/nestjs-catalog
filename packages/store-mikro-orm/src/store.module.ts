@@ -1,4 +1,5 @@
 import {
+  CATALOG_DIRECTORY,
   CATALOG_PIPELINE_STORE,
   CATALOG_STORE,
   CATALOG_TRACE_STORE,
@@ -12,6 +13,7 @@ import {
   CATALOG_STORE_MIKRO_ORM,
   catalogConnectionProviders,
 } from './context';
+import { MikroOrmCatalogDirectory } from './directory.service';
 import { MySqlWarehouseStore } from './mysql-warehouse.store';
 import { CATALOG_STORE_OPTIONS, type CatalogStoreModuleOptions } from './options';
 import { MySqlPipelineStore } from './pipeline.store';
@@ -52,6 +54,12 @@ export class CatalogMikroOrmStoreModule {
         // read like any other.
         MySqlCatalogTraceStore,
         { provide: CATALOG_TRACE_STORE, useExisting: MySqlCatalogTraceStore },
+        // The applications half of the Access screen. Overridable by name so a
+        // host that adds people extends this class rather than reimplementing
+        // the principals query — `{ provide: MikroOrmCatalogDirectory, useClass:
+        // MyDirectory }` in the host's own module.
+        MikroOrmCatalogDirectory,
+        { provide: CATALOG_DIRECTORY, useExisting: MikroOrmCatalogDirectory },
       ],
       exports: [
         // Exported so a host that adds its own services on top of this store —
@@ -70,6 +78,8 @@ export class CatalogMikroOrmStoreModule {
         CATALOG_WORKSPACE_STORE,
         CATALOG_PIPELINE_STORE,
         CATALOG_TRACE_STORE,
+        MikroOrmCatalogDirectory,
+        CATALOG_DIRECTORY,
       ],
     };
   }

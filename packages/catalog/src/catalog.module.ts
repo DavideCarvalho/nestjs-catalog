@@ -1,5 +1,6 @@
 import { join } from 'node:path';
 import { type DynamicModule, Module } from '@nestjs/common';
+import { createAccessController } from './access.controller';
 import { createCatalogController } from './catalog.controller';
 import { CATALOG_OPTIONS, type CatalogModuleOptions } from './catalog.options';
 import { type CatalogOverlayStore, FileCatalogOverlayStore } from './catalog.overlay-store';
@@ -16,7 +17,14 @@ export class CatalogModule {
     const path = options.path ?? 'api/catalog';
     const mountController = options.controller !== false;
     const controllers = mountController
-      ? [createCatalogController(path, options.guards ?? [], options.decorators ?? [])]
+      ? [
+          createCatalogController(path, options.guards ?? [], options.decorators ?? []),
+          createAccessController(
+            options.accessPath ?? siblingPath(path, 'access'),
+            options.guards ?? [],
+            options.decorators ?? [],
+          ),
+        ]
       : [];
 
     const overlayStore: CatalogOverlayStore =
@@ -56,9 +64,28 @@ export class CatalogModule {
         ...(options.store
           ? [options.store]
           : [MikroOrmReadStore, { provide: CATALOG_STORE, useExisting: MikroOrmReadStore }]),
+        // No default. Unlike the store and the registry there is nothing
+        // sensible to derive: who may reach a catalog is not a fact about its
+        // model. Absent, the Access routes answer 501 naming the token, which
+        // is the honest state for a host that has not decided yet.
+        ...(options.directory ? [options.directory] : []),
         CatalogService,
       ],
       exports: [CatalogRegistry, CatalogService, CATALOG_STORE],
     };
   }
+}
+
+/**
+ * `api/catalog` + `access` -> `api/access`.
+ *
+ * Replacing the last segment rather than appending, because the console builds
+ * the two paths as siblings under one API root. Appending would give
+ * `api/catalog/access`, which the console never asks for — and the symptom is a
+ * screen that 404s while the module reports itself mounted.
+ */
+function siblingPath(path: string, segment: string): string {
+  const trimmed = path.replace(/\/+$/, '');
+  const parent = trimmed.slice(0, trimmed.lastIndexOf('/') + 1);
+  return `${parent}${segment}`;
 }

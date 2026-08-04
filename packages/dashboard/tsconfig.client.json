@@ -3,11 +3,23 @@
   "compilerOptions": {
     "module": "ESNext",
     "moduleResolution": "Bundler",
-    "lib": ["ES2022", "DOM"],
+    "lib": [
+      "ES2022",
+      "DOM"
+    ],
     "declaration": true,
     "outDir": "dist/client",
     "rootDir": "src/client"
   },
-  "include": ["src/client/**/*.ts"],
-  "exclude": ["src/client/**/*.spec.ts"]
+  "include": [
+    "src/client/**/*.ts"
+  ],
+  "exclude": [
+    "src/client/**/*.spec.ts",
+    "**/*.spec.ts",
+    "**/*.spec.tsx",
+    "**/*.test.ts",
+    "**/*.test.tsx",
+    "test"
+  ]
 }

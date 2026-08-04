@@ -136,6 +136,15 @@ export {
   StaticKeyPrincipalResolver,
 } from './catalog.principal';
 export {
+  CATALOG_DIRECTORY,
+  type CatalogApplicationSummary,
+  type CatalogDirectory,
+  type CatalogPersonInput,
+  type CatalogPersonRole,
+  type CatalogPersonSummary,
+  type CatalogPersonUpsertResult,
+} from './catalog.access';
+export {
   assertNoColumnCollisions,
   CATALOG_RESERVED_COLUMNS,
   CATALOG_SNAPSHOT_MODES,

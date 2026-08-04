@@ -13,3 +13,9 @@ __pycache__/
 # prisma adapter generated client + sqlite test db
 packages/store-prisma/generated/
 packages/store-prisma/prisma/*.db
+
+# `tsc` run by hand next to the shared contract emits these, and a stray
+# `test/*.js` shadows the `.ts` under Vite, breaking the suite with a confusing
+# "Vitest cannot be imported in a CommonJS module".
+test/*.js
+test/*.d.ts

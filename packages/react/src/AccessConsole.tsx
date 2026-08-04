@@ -4,6 +4,7 @@ import { type ReactNode, useState } from 'react';
 import { cn } from './cn';
 import {
   type CatalogIdentity,
+  type CatalogPeoplePage,
   type CatalogPersonRole,
   type CatalogPersonSummary,
   type CatalogPrincipalSummary,
@@ -49,6 +50,85 @@ export interface AccessConsoleProps {
   intro?: string;
 }
 
+function PeopleSearch({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (next: string) => void;
+}) {
+  return (
+    <label className="mt-3 block">
+      <span className="sr-only">Search people</span>
+      <input
+        type="search"
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        placeholder="Search by name or email"
+        className={cn(
+          'w-full rounded-md border px-3 py-1.5 text-sm',
+          RULE,
+          PANEL,
+          'placeholder:text-zinc-400 dark:placeholder:text-zinc-600',
+        )}
+      />
+    </label>
+  );
+}
+
+/**
+ * What the page is NOT showing.
+ *
+ * Rendered whenever there is a page at all, not only when there is more than
+ * one: a bounded list that looks complete is the failure worth spending a line
+ * of UI on, because an operator who reads it as complete concludes somebody has
+ * no access when they were merely on the next page.
+ */
+function PageBar({
+  page,
+  onOffset,
+  busy,
+}: {
+  page: CatalogPeoplePage;
+  onOffset: (next: number) => void;
+  busy: boolean;
+}) {
+  const shown = page.people.length;
+  const first = page.total === 0 ? 0 : page.offset + 1;
+  const last = page.offset + shown;
+  const hasMore = last < page.total;
+
+  return (
+    <div className={cn('mt-3 flex items-center justify-between text-xs', MUTED)}>
+      <span>
+        {page.total === 0
+          ? 'No people'
+          : `Showing ${first}–${last} of ${page.total.toLocaleString()}`}
+      </span>
+      {(page.offset > 0 || hasMore) && (
+        <span className="flex gap-2">
+          <button
+            type="button"
+            disabled={page.offset === 0 || busy}
+            onClick={() => onOffset(Math.max(0, page.offset - page.limit))}
+            className="disabled:opacity-40"
+          >
+            Previous
+          </button>
+          <button
+            type="button"
+            disabled={!hasMore || busy}
+            onClick={() => onOffset(page.offset + page.limit)}
+            className="disabled:opacity-40"
+          >
+            Next
+          </button>
+        </span>
+      )}
+    </div>
+  );
+}
+
 /**
  * One page answering the two questions a shared catalog creates: which
  * application is allowed to touch what, and which person is behind it.
@@ -75,10 +155,20 @@ export function AccessConsole({
     // from here. Long enough that moving between tabs is instant.
     staleTime: 30_000,
   });
+  // Paged, because a host's user table is its whole directory: this screen is
+  // embedded in applications with thousands of employees, and the endpoint caps
+  // what it will return regardless of what is asked for. The key carries the
+  // query so a search does not read a previous search's page from the cache.
+  const [search, setSearch] = useState('');
+  const [offset, setOffset] = useState(0);
   const people = useQuery({
-    queryKey: catalogQueryKeys.people,
-    queryFn: () => client.listPeople(),
+    queryKey: [...catalogQueryKeys.people, { search, offset }],
+    queryFn: () => client.listPeople({ ...(search ? { search } : {}), offset }),
     staleTime: 30_000,
+    // The count and the page it describes must not be shown apart. Without
+    // this, typing into the search blanks the list to a spinner and then shows
+    // a total for a different query for one frame.
+    placeholderData: (previous) => previous,
   });
 
   const mayAdminister = canAddPeople ?? identity?.scopes.includes('catalog:admin') ?? false;
@@ -98,6 +188,15 @@ export function AccessConsole({
           title="People"
           note="Sign in to the console. Capped by the application they sign in through."
         >
+          <PeopleSearch
+            value={search}
+            onChange={(next) => {
+              setSearch(next);
+              // Back to the first page. Staying on page 3 of the previous
+              // search shows an empty list for a search that has matches.
+              setOffset(0);
+            }}
+          />
           {mayAdminister && <AddPerson />}
           {people.isPending && <Placeholder>Reading people…</Placeholder>}
           {/* A failed read must never render as an empty list. "Nobody can sign
@@ -114,14 +213,24 @@ export function AccessConsole({
               onRetry={() => people.refetch()}
             />
           )}
-          {people.data?.map((person) => (
+          {people.data?.people.map((person) => (
             <PersonCard key={person.email} person={person} />
           ))}
-          {people.data?.length === 0 && (
-            <Placeholder>
-              Nobody can sign in yet. Seed the first administrator from the environment before
-              anybody can reach this console as a person.
-            </Placeholder>
+          {/* Two different empty lists, and conflating them is the bug this
+              splits: with a search typed, "no matches" is a fact about the
+              search. Without one it is a fact about the directory, and the
+              advice below only makes sense for the second. */}
+          {people.data?.people.length === 0 &&
+            (search ? (
+              <Placeholder>Nobody matches “{search}”.</Placeholder>
+            ) : (
+              <Placeholder>
+                Nobody can sign in yet. Seed the first administrator from the environment before
+                anybody can reach this console as a person.
+              </Placeholder>
+            ))}
+          {people.data && (
+            <PageBar page={people.data} onOffset={setOffset} busy={people.isFetching} />
           )}
         </Section>
 

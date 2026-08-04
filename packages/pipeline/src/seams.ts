@@ -55,3 +55,14 @@ export interface CatalogPipelineScope {
   run<T>(fn: () => Promise<T>): Promise<T>;
 }
 export const passthroughScope: CatalogPipelineScope = { run: (fn) => fn() };
+
+/**
+ * What a host wants the console to say about restartability.
+ *
+ * Optional, and only ever ADDS to what the package observed. A host knows things
+ * a library cannot — that this process registers no workflow handlers, that its
+ * engine serves a different environment — and the console renders this line as a
+ * promise about whether a failed run can resume. Saying nothing is better than
+ * saying "checkpointed" on the strength of an engine merely being injectable.
+ */
+export const CATALOG_PIPELINE_DURABILITY_DETAIL = Symbol('CATALOG_PIPELINE_DURABILITY_DETAIL');

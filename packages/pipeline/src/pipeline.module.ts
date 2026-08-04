@@ -14,6 +14,7 @@ import {
   CATALOG_PIPELINE_SCOPE,
   passthroughScope,
 } from './seams';
+import { WorkflowLauncher } from './workflow-launcher.service';
 import { WorkflowRunSteps } from './workflow-run.steps';
 import { CatalogWorkflowRunWorkflow } from './workflow-run.workflow';
 import { WorkflowRunnerService } from './workflow-runner.service';
@@ -99,6 +100,7 @@ export class CatalogPipelineModule {
       PublishService,
       ConnectorRunnerService,
       WorkflowRunnerService,
+      WorkflowLauncher,
       ConnectionChecker,
       ConnectorScheduler,
       ConnectorRunSteps,
@@ -125,6 +127,7 @@ export class CatalogPipelineModule {
         PublishService,
         ConnectorRunnerService,
         WorkflowRunnerService,
+        WorkflowLauncher,
         ConnectionChecker,
         // Exported because a host's own controllers need it: this module owns the
         // instance (it is the one configured with `pythonVenv`), and a host that

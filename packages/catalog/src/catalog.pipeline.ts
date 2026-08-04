@@ -720,7 +720,7 @@ export function validateWorkflow(graph: WorkflowGraph): WorkflowValidationIssue[
       });
       continue;
     }
-    const key = `${edge.from} ${edge.to}`;
+    const key = `${edge.from}\0${edge.to}`;
     if (seenEdges.has(key)) {
       issues.push({
         code: 'duplicate-edge',

@@ -26,6 +26,7 @@ import { type ReactNode, createContext, useContext, useMemo } from 'react';
 import {
   DEFAULT_ACCESS_BASE_PATH,
   DEFAULT_PIPELINE_BASE_PATH,
+  type PeopleQuery,
   accessRoutes,
   pipelineRoutes,
 } from './routes';
@@ -164,6 +165,14 @@ export interface CatalogPrincipalSummary {
   authMethod: 'key' | 'token' | 'session';
   lastSeenAt: string | null;
   ownedTypes: string[];
+}
+
+export interface CatalogPeoplePage {
+  people: CatalogPersonSummary[];
+  /** How many match, ignoring the page. */
+  total: number;
+  limit: number;
+  offset: number;
 }
 
 /** A person: signs in, and acts through an application that caps them. */
@@ -327,7 +336,12 @@ export interface CatalogClient {
    * becomes a button it stops leaving a reviewable trail.
    */
   listPrincipals(): Promise<CatalogPrincipalSummary[]>;
-  listPeople(): Promise<CatalogPersonSummary[]>;
+  /**
+   * A PAGE, not the list. The server bounds it whatever is asked for, so a
+   * caller that ignores `total` is a screen that silently under-reports who has
+   * access — which reads as "this person has none" rather than "look further".
+   */
+  listPeople(query?: PeopleQuery): Promise<CatalogPeoplePage>;
   upsertPerson(input: PersonInput): Promise<PersonUpsertResult>;
 }
 
@@ -424,7 +438,7 @@ export function CatalogProvider({
       runWorkflow: (id) => transport.post<WorkflowRun>(pipeline.runWorkflow(id), {}),
 
       listPrincipals: () => transport.get(access.principals()),
-      listPeople: () => transport.get(access.people()),
+      listPeople: (query) => transport.get(access.people(query)),
       upsertPerson: (input) => transport.post<PersonUpsertResult>(access.people(), input),
     };
   }, [transport, pipelineBasePath, accessBasePath]);

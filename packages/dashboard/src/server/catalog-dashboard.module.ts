@@ -13,6 +13,7 @@ import {
   resolveDashboardAuth,
 } from './auth/dashboard-auth-config.js';
 import { CatalogAuthController } from './catalog-auth.controller.js';
+import { CatalogUiSessionGuard } from './catalog-session.guard.js';
 import {
   CatalogUiController,
   DASHBOARD_API_PATH,
@@ -129,6 +130,9 @@ export class CatalogDashboardModule {
   }
 }
 
+/** See the note where this is set: `UseGuards` appends, and these classes are shared. */
+let sessionGuardStamped = false;
+
 function build(
   options: CatalogDashboardOptions | CatalogDashboardAsyncOptions,
   auth: Provider,
@@ -136,9 +140,32 @@ function build(
   const path = normalise(options.path ?? '/catalog');
   const apiPath = normalise(options.apiPath ?? '/api/catalog-service');
 
-  // Applied to the mounted controllers rather than asked for globally, so a host
-  // can shut this console without touching the rest of its app. `UseGuards` at
-  // definition time is why `guards` cannot come from DI.
+  // The session guard, on the SPA and its assets.
+  //
+  // This was missing, and its absence was not visible from anywhere: `auth`
+  // configures how a session is minted and validated, the docblocks describe it
+  // as the thing that closes an otherwise-open console, and nothing ever stamped
+  // the guard that enforces it. A host that configured `auth` correctly still
+  // served the console shell to anyone who could reach the URL.
+  //
+  // NOT on `CatalogAuthController`: that is where a session is obtained, and
+  // gating it on already having one locks the door from the inside.
+  //
+  // The guard is a no-op when `auth` is absent, so this is safe on an
+  // intentionally open mount — "open" then remains a decision the host made by
+  // omitting `auth`, rather than one the module made by forgetting.
+  //
+  // Stamped once per process, not once per mount. `UseGuards` APPENDS to the
+  // controller's metadata and these controller classes are module-level, so a
+  // second `forRoot` in the same process would run the guard twice per request.
+  if (!sessionGuardStamped) {
+    UseGuards(CatalogUiSessionGuard)(CatalogUiController);
+    sessionGuardStamped = true;
+  }
+
+  // Host guards on top, applied to both controllers so a host can shut the whole
+  // console — including the way in — without touching the rest of its app.
+  // `UseGuards` at definition time is why `guards` cannot come from DI.
   for (const guard of options.guards ?? []) {
     UseGuards(guard)(CatalogUiController);
     UseGuards(guard)(CatalogAuthController);
@@ -148,6 +175,9 @@ function build(
     { provide: DASHBOARD_BASE_PATH, useValue: path },
     { provide: DASHBOARD_API_PATH, useValue: apiPath },
     auth,
+    // Constructed by Nest, so it must be declared here — a guard stamped by
+    // `UseGuards` is still resolved from the declaring module's injector.
+    CatalogUiSessionGuard,
   ];
 
   return {

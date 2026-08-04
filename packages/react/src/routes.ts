@@ -100,14 +100,33 @@ export function pipelineRoutes(basePath: string = DEFAULT_PIPELINE_BASE_PATH): P
 
 export interface AccessRoutes {
   principals(): string;
-  /** GET lists people; POST creates or updates one. */
-  people(): string;
+  /**
+   * GET lists people; POST creates or updates one.
+   *
+   * The GET is PAGED — a host's user table is its whole directory, and the
+   * server caps whatever is asked for. Omitting the query is asking for the
+   * server's default page, never for all of them.
+   */
+  people(query?: PeopleQuery): string;
+}
+
+export interface PeopleQuery {
+  search?: string;
+  limit?: number;
+  offset?: number;
 }
 
 export function accessRoutes(basePath: string = DEFAULT_ACCESS_BASE_PATH): AccessRoutes {
   const base = normalise(basePath);
   return {
     principals: () => `${base}/principals`,
-    people: () => `${base}/people`,
+    people: (query) => {
+      const params = new URLSearchParams();
+      if (query?.search) params.set('search', query.search);
+      if (query?.limit !== undefined) params.set('limit', String(query.limit));
+      if (query?.offset !== undefined) params.set('offset', String(query.offset));
+      const search = params.toString();
+      return search ? `${base}/people?${search}` : `${base}/people`;
+    },
   };
 }
