@@ -145,6 +145,11 @@ export { Select, SelectField, type SelectOption } from './ui/select';
 export { Switch } from './ui/switch';
 export { Sheet } from './ui/sheet';
 export { CodeEditor, type CodeEditorProps } from './ui/code-editor';
+export {
+  RichTextField,
+  RichTextView,
+  type RichTextFieldProps,
+} from './ui/rich-text-field';
 export { Button, type ButtonProps, type ButtonSize, type ButtonVariant } from './ui/button';
 export { Tabs, TabsList, TabsPanel, TabsTab } from './ui/tabs';
 export { Tooltip, TooltipProvider } from './ui/tooltip';

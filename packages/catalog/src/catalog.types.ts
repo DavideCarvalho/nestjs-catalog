@@ -26,7 +26,20 @@ export interface CatalogPropertyDef {
   name: string;
   /** Human label. Tier 0: editable at runtime, no migration. */
   displayName: string;
-  /** What this field means in the business. Tier 0. */
+  /**
+   * What this field means in the business. Tier 0.
+   *
+   * **Markdown**, since the console started editing it as rich text. Plain text
+   * is still valid markdown, so anything written before — or declared by a
+   * decorator — is unchanged and renders as itself.
+   *
+   * Consumers that print it raw keep working: the worst they will see is
+   * `**bold**`, which reads. That is the whole reason it is not HTML — `<strong>`
+   * in a tooltip is noise, and a consumer that decided to render it as HTML
+   * would have an injection point. Render it with a markdown renderer if you
+   * want the formatting; `RichTextView` in `@dudousxd/nestjs-catalog-react` is
+   * the one this console uses.
+   */
   description?: string;
   type: ScalarType;
   /** The physical column. Derived from the ORM; shown so engineers can trace it. */
