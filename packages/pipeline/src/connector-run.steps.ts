@@ -1,8 +1,24 @@
-import type { ConnectorRun } from '@dudousxd/nestjs-catalog';
+import {
+  CATALOG_PIPELINE_STORE,
+  type CatalogPipelineStore,
+  type ConnectorRun,
+} from '@dudousxd/nestjs-catalog';
 import { Step } from '@dudousxd/nestjs-durable';
 import { FatalError, type StepLogger } from '@dudousxd/nestjs-durable-core';
-import { BadRequestException, Inject, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  Inject,
+  Injectable,
+  NotFoundException,
+  Optional,
+} from '@nestjs/common';
 import { ConnectorRunnerService } from './connector-runner.service';
+import {
+  CATALOG_LOAD_EXPECTATIONS,
+  type CatalogLoadExpectations,
+  expectationFor,
+  refuseUndeclaredDeletes,
+} from './load-expectations';
 import { CATALOG_PIPELINE_SCOPE, type CatalogPipelineScope } from './seams';
 
 /**
@@ -47,6 +63,19 @@ export class ConnectorRunSteps {
     // pass-through and pays nothing.
     @Inject(CATALOG_PIPELINE_SCOPE)
     private readonly scope: CatalogPipelineScope,
+    // Both optional, and both only ever used by the preflight below. A host
+    // that binds neither loses the early refusal and keeps the real one:
+    // `PublishService.carryForwardAsSystem` asks the same question at the merge,
+    // which no incremental load can avoid. What is bought here is *where* the
+    // refusal happens — before a source is read, and without burning three
+    // retries on a configuration that will be exactly as wrong in fifteen
+    // minutes.
+    @Optional()
+    @Inject(CATALOG_PIPELINE_STORE)
+    private readonly pipeline?: CatalogPipelineStore,
+    @Optional()
+    @Inject(CATALOG_LOAD_EXPECTATIONS)
+    private readonly expectations?: CatalogLoadExpectations,
   ) {}
 
   /**
@@ -69,6 +98,9 @@ export class ConnectorRunSteps {
     input: ConnectorRunStepInput,
     log?: StepLogger,
   ): Promise<ConnectorRunStepOutput> {
+    const unreconciled = await this.scope.run(() => this.preflightDeletes(input.connectorId));
+    if (unreconciled) throw new UnmetLoadExpectationError(unreconciled);
+
     let run: ConnectorRun;
     try {
       run = await this.scope.run(() =>
@@ -100,6 +132,61 @@ export class ConnectorRunSteps {
     }
 
     return { runId: run.id, fetched: run.fetched, written: run.written };
+  }
+
+  /**
+   * Whether this connector may run incrementally at all, asked before it reads.
+   *
+   * An incremental connector is blind to deletes by construction — it asks its
+   * source for what changed since a watermark, and a deleted row never changes
+   * again — so a type loaded this way accumulates rows that no longer exist
+   * upstream until somebody notices the count drifting. The refusal itself
+   * lives at the merge in `PublishService`, which every incremental load has to
+   * pass through; this is the same question asked where it is cheapest to
+   * answer.
+   *
+   * Worth asking twice for two reasons, neither cosmetic. The source is not
+   * read, so a connector pointed at a production database does not pull forty
+   * thousand rows on the way to being refused. And the refusal is *fatal* here:
+   * a failure raised inside the run is recorded on the run row and rethrown as
+   * an ordinary error, which this step retries three times over roughly fifteen
+   * minutes — and a missing declaration will be exactly as missing on the third
+   * attempt as on the first.
+   *
+   * Returns the sentence to refuse with, or nothing. Nothing is also the answer
+   * when the store is unbound or the connector is gone: neither is a question
+   * this method can answer, and the run's own `NotFoundException` says far more
+   * about a deleted connector than a preflight guessing at it would.
+   */
+  private async preflightDeletes(connectorId: string): Promise<string | undefined> {
+    if (!this.pipeline) return undefined;
+    const connector = await this.pipeline.getConnector(connectorId);
+    if (!connector || connector.mode !== 'incremental') return undefined;
+    return refuseUndeclaredDeletes(
+      connector.targetType,
+      expectationFor(this.expectations, connector.targetType),
+    );
+  }
+}
+
+/**
+ * A connector whose load has been refused before it started.
+ *
+ * Non-retryable for the same reason {@link UnavailableConnectorError} is, by
+ * the same mechanism and with the same caveat about `retryable` being the only
+ * field the dispatch boundary carries across — see the note on that class. It
+ * is a separate class rather than a reuse because the two are opposite facts
+ * about the connector: one says it is gone or switched off, this one says it is
+ * there, enabled, and configured to do something nobody has authorised. An
+ * operator filtering a failed-run list on `connector_unavailable` and finding
+ * these in it would go looking for a deleted connector.
+ */
+class UnmetLoadExpectationError extends FatalError {
+  /** The field the dispatch boundary serialises and the engine acts on. */
+  readonly retryable = false;
+
+  constructor(message: string) {
+    super(message, 'load_expectation_unmet');
   }
 }
 

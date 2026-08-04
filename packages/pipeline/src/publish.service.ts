@@ -18,7 +18,18 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  Optional,
 } from '@nestjs/common';
+import {
+  CATALOG_LOAD_EXPECTATIONS,
+  type CatalogLoadExpectations,
+  LoadExpectationError,
+  expectationFor,
+  refuseRowCountDrift,
+  refuseStaleReconciliation,
+  refuseUndeclaredDeletes,
+  rowCountBoundFor,
+} from './load-expectations';
 import {
   CATALOG_PIPELINE_EM,
   CATALOG_PIPELINE_REGISTRY,
@@ -54,6 +65,8 @@ export interface PublishedType {
 @Injectable()
 export class PublishService {
   private readonly logger = new Logger(PublishService.name);
+  /** Types already warned about a store that cannot answer. See `warnOnce`. */
+  private readonly warned = new Set<string>();
 
   constructor(
     // Resolved per call rather than injected as a value: a host that serves
@@ -66,6 +79,14 @@ export class PublishService {
     @Inject(CATALOG_PIPELINE_REGISTRY)
     private readonly registry: CatalogPipelineRegistry,
     @Inject(CATALOG_STORE) private readonly store: CatalogWriteStore,
+    // Optional so that binding nothing is a boot that succeeds rather than a
+    // host that cannot start after upgrading. What it is not is a host that
+    // keeps its old behaviour: an unbound policy declares nothing about
+    // deletes, and an incremental load of a type nobody has declared anything
+    // about is refused. See `load-expectations.ts`.
+    @Optional()
+    @Inject(CATALOG_LOAD_EXPECTATIONS)
+    private readonly expectations?: CatalogLoadExpectations,
   ) {}
 
   /**
@@ -189,6 +210,7 @@ export class PublishService {
     snapshotId: string,
   ): Promise<SnapshotRef> {
     const def = this.requireOwnedType(principal, typeName);
+    await this.assertRowCountIsPlausible(def, snapshotId);
     const ref = await this.store.commit(def, snapshotId);
     await this.registry.reload();
     this.logger.log(
@@ -245,6 +267,15 @@ export class PublishService {
    * has to make the run fail here: carrying on would commit whatever slice the
    * source handed over as the entire dataset, and the load would look like a
    * success while quietly deleting everything that did not change.
+   *
+   * **This is also the one place every incremental load passes through**, which
+   * is why the delete-reconciliation gate is here and not in the connector
+   * runner. A connector run, a workflow sink and anything written against this
+   * service later all reach an incremental load by calling this method — the
+   * merge IS the incremental load — so a check here cannot be routed around,
+   * and one in the runner would have covered a third of the paths.
+   * `ConnectorRunSteps` asks the same question earlier and more cheaply for a
+   * scheduled run; it does not replace this.
    */
   async carryForwardAsSystem(
     principalId: string,
@@ -259,6 +290,22 @@ export class PublishService {
         `The configured store cannot carry a snapshot forward, so an incremental load of ${typeName} would commit only the rows that changed as if they were the whole dataset. Run this connector in "full" mode until a store that can merge is configured.`,
       );
     }
+
+    const expectation = expectationFor(this.expectations, typeName);
+    const undeclared = refuseUndeclaredDeletes(typeName, expectation);
+    if (undeclared) throw new LoadExpectationError(typeName, 'deletes', undeclared);
+
+    // Only asked once the declaration is in hand, and only when that
+    // declaration was `periodic-full-reload` — the snapshot list costs a query,
+    // and the other two strategies have nothing for it to date.
+    const stale = refuseStaleReconciliation(
+      typeName,
+      expectation,
+      await this.snapshotsOf(def),
+      Date.now(),
+    );
+    if (stale) throw new LoadExpectationError(typeName, 'deletes', stale);
+
     return this.store.carryForward(def, snapshotId, { principalId, labels });
   }
 
@@ -269,12 +316,93 @@ export class PublishService {
   ): Promise<SnapshotRef> {
     const def = this.registry.getType(typeName);
     if (!def) throw new NotFoundException(`Unknown object type: ${typeName}`);
+    await this.assertRowCountIsPlausible(def, snapshotId);
     const ref = await this.store.commit(def, snapshotId);
     await this.registry.reload();
     this.logger.log(
       `${principalId} committed ${typeName} snapshot ${snapshotId} (${ref.rowCount} rows)`,
     );
     return ref;
+  }
+
+  /**
+   * Refuse a commit that would replace the live dataset with something too far
+   * from it to be an accident of the data.
+   *
+   * Both commit paths call it, and that is the point: an application POSTing
+   * twelve rows to the publish API and a connector fetching twelve rows are the
+   * same failure, and gating only the connector would leave the other half of
+   * the write surface unguarded.
+   *
+   * Before the commit rather than after, because the commit is atomic and by
+   * the time it returns the wrong data is what everybody is reading. What a
+   * refusal leaves behind is exactly right on its own: the snapshot stays
+   * written and uncommitted, the previously served one keeps serving, and the
+   * rows are still there to be looked at while working out what the source did.
+   *
+   * **Skipped, loudly, when the store cannot answer.** Both `listSnapshots` and
+   * `currentSnapshot` are optional on the store interface. Without the first
+   * there is no count for the pending snapshot; without the second there is no
+   * baseline, and `catalog.store.ts` is explicit that reconstructing one from
+   * the snapshot list names the wrong row the moment somebody has rolled a bad
+   * load back — which is precisely when a load is being watched. Refusing
+   * instead would turn an additive safety check into a hard break for every
+   * adapter compiled against an older version of that interface, including ones
+   * this repository does not own, so it warns and stands aside.
+   */
+  private async assertRowCountIsPlausible(
+    def: CatalogObjectTypeDef,
+    snapshotId: string,
+  ): Promise<void> {
+    const listSnapshots = this.store.listSnapshots?.bind(this.store);
+    const currentSnapshot = this.store.currentSnapshot?.bind(this.store);
+    if (!listSnapshots || !currentSnapshot) {
+      this.warnOnce(
+        def.name,
+        `The configured store cannot say ${!currentSnapshot ? 'which snapshot it is serving' : 'what it has written'}, so the row-count expectation on ${def.name} cannot be enforced and a load that collapses will commit unnoticed.`,
+      );
+      return;
+    }
+
+    const previous = await currentSnapshot(def);
+    // Nothing has ever committed. The first load of a type IS the baseline, and
+    // inventing one to measure it against would be inventing the answer.
+    if (!previous) return;
+
+    const pending = (await listSnapshots(def)).find((snapshot) => snapshot.id === snapshotId);
+    // The store does not report the snapshot about to be committed — an
+    // adapter that lists only committed ones, or a window too short to reach
+    // it. Left to `commit`, which knows whether the snapshot exists and says so
+    // far better than a guess from here would.
+    if (!pending) return;
+
+    const refusal = refuseRowCountDrift({
+      typeName: def.name,
+      snapshotId,
+      previous,
+      pending: pending.rowCount,
+      pendingLabels: pending.labels,
+      bound: rowCountBoundFor(this.expectations, def.name),
+    });
+    if (refusal) throw new LoadExpectationError(def.name, 'row-count', refusal);
+  }
+
+  /** Snapshots of a type, or none when the store does not keep a list. */
+  private async snapshotsOf(def: CatalogObjectTypeDef): Promise<SnapshotRef[]> {
+    return (await this.store.listSnapshots?.(def)) ?? [];
+  }
+
+  /**
+   * One line per type per process, not one per load.
+   *
+   * A capability gap does not change between two loads of the same type, and a
+   * warning repeated on every run of an hourly connector is a warning that gets
+   * filtered out — which would lose the one reader it was written for.
+   */
+  private warnOnce(key: string, message: string): void {
+    if (this.warned.has(key)) return;
+    this.warned.add(key);
+    this.logger.warn(message);
   }
 
   private requireOwnedType(principal: CatalogPrincipal, typeName: string): CatalogObjectTypeDef {

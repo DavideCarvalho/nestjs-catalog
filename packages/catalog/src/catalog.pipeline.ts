@@ -101,6 +101,25 @@ export interface CatalogConnector {
    * view atomically. `incremental` reads only what changed since the last run
    * and carries the rest forward, which is cheaper but needs the source to
    * offer a watermark and the type to have a primary key to merge on.
+   *
+   * **`incremental` is blind to deletes, and that is structural rather than a
+   * gap in any particular fetcher.** A run asks its source for what changed
+   * since a watermark; a row physically removed from the source never changes
+   * again, so it is never returned again, so the carry-forward copies it into
+   * every subsequent snapshot indefinitely. Nothing goes wrong at any single
+   * step — the catalog simply never finds out, and every count and dashboard
+   * built on the type is quietly wrong from then on.
+   *
+   * Because that failure is silent, the pipeline **refuses an incremental load
+   * of a type for which no reconciliation strategy has been declared**: a full
+   * read on an interval, a source that soft-deletes where the watermark can see
+   * it, or an explicit "stale rows are acceptable here, because …". The
+   * declaration is per object type and lives in the host's
+   * `CATALOG_LOAD_EXPECTATIONS` (see `load-expectations.ts` in
+   * `@dudousxd/nestjs-catalog-pipeline`), because it is a statement about the
+   * data rather than about the connector reading it — the same type loaded by a
+   * workflow sink or by an application POSTing to the publish API has exactly
+   * the same problem.
    */
   mode?: 'full' | 'incremental';
   /**
