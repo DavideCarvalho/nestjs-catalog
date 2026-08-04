@@ -52,6 +52,18 @@ export function TabStrip({
     };
   }, [measure]);
 
+  // A ref callback on the tab ITSELF, not a marker element inside it. The
+  // marker this replaces was `sr-only`, which is `position: absolute` — so it
+  // escaped the strip's `overflow-x` clipping and reported the strip's whole
+  // scroll extent as the document's width, making the page scroll sideways by
+  // exactly the amount the strip was hiding. The bug the scrolling was added to
+  // fix, reintroduced by the scrolling.
+  const scrollActiveIntoView = useCallback((node: HTMLButtonElement | null) => {
+    // `nearest` so a tab already on screen is left alone; recentering on every
+    // click makes the whole strip jump under the cursor.
+    node?.scrollIntoView({ inline: 'nearest', block: 'nearest' });
+  }, []);
+
   const nudge = (direction: -1 | 1) => {
     const node = strip.current;
     if (!node) return;
@@ -76,8 +88,16 @@ export function TabStrip({
         className="min-w-0 flex-1 border-b-0 overflow-x-auto [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
       >
         {tabs.map(({ id, label, icon: Icon }) => (
-          <TabsTab key={id} value={id} className="py-3">
-            <ScrollIntoViewWhenActive active={id === value} />
+          <TabsTab
+            key={id}
+            value={id}
+            className="py-3"
+            // Spread rather than `ref={cond ? fn : undefined}`: under
+            // `exactOptionalPropertyTypes` an optional prop does not accept an
+            // explicit `undefined`, and a factory would hand React a new
+            // function every render, detaching and reattaching the ref each time.
+            {...(id === value ? { ref: scrollActiveIntoView } : {})}
+          >
             <Icon size={14} />
             {label}
           </TabsTab>
@@ -121,23 +141,4 @@ function Arrow({
       <Icon size={16} />
     </Button>
   );
-}
-
-/**
- * Brings the active tab into view when it is the one selected.
- *
- * A zero-size child rather than a ref on the tab itself, because `TabsTab`
- * renders a Base UI component that does not forward one. Selecting a tab that
- * is scrolled out of sight would otherwise change the screen and leave the strip
- * looking untouched — and arriving on `#access` directly opens the last screen
- * with the strip parked at the first.
- */
-function ScrollIntoViewWhenActive({ active }: { active: boolean }) {
-  const ref = useRef<HTMLSpanElement | null>(null);
-  useEffect(() => {
-    // `nearest` so a tab already on screen is left alone; recentering on every
-    // click makes the whole strip jump under the cursor.
-    if (active) ref.current?.scrollIntoView({ inline: 'nearest', block: 'nearest' });
-  }, [active]);
-  return <span ref={ref} aria-hidden className="sr-only" />;
 }
