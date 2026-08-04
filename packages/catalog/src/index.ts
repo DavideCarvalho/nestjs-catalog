@@ -108,6 +108,13 @@ export {
   type CatalogWorkspaceStore,
   type Dashboard,
   type DashboardCard,
+  // The embed payload types. Absent until now, which made the one surface
+  // another company's frontend consumes the one surface whose response shape a
+  // host had to restate by hand — the same gap the barrel spec was written for.
+  type EmbeddedChart,
+  type EmbeddedChartPlacement,
+  type EmbeddedDashboard,
+  embeddedVisualization,
   isCatalogTraceOutcome,
   isTraceStore,
   isWorkspaceStore,
