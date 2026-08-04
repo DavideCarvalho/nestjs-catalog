@@ -6,7 +6,9 @@ allowBuilds:
   '@nestjs/core': true
   '@swc/core': true
   better-sqlite3: true
+  cpu-features: false
   esbuild: true
+  ssh2: false
 
 minimumReleaseAgeExclude:
   # First-party packages: the minimum-release-age policy guards against recently-published

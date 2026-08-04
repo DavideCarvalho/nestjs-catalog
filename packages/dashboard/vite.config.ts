@@ -5,6 +5,14 @@ import { defineConfig } from 'vite';
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
+  // One copy of each, and this is not tidiness: React context is per module
+  // instance, so a second `@tanstack/react-query` makes the provider this SPA
+  // mounts invisible to the hooks inside `@dudousxd/nestjs-catalog-react`. The
+  // console then dies at first render with "No QueryClient set, use
+  // QueryClientProvider to set one" — pointing at the provider, which is there.
+  resolve: {
+    dedupe: ['react', 'react-dom', '@tanstack/react-query'],
+  },
   // The SPA is served under /catalog; the controller rewrites this base when mounted elsewhere.
   base: '/catalog/',
   build: {

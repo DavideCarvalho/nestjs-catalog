@@ -10,7 +10,10 @@
     "format": "biome format --write .",
     "changeset": "changeset",
     "version-packages": "changeset version",
-    "release": "turbo run build && changeset publish"
+    "release": "turbo run build && changeset publish",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:db": "vitest run --config vitest.db.config.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "1.9.4",
@@ -22,6 +25,13 @@
     "@swc/core": "1.15.41",
     "unplugin-swc": "1.5.9",
     "reflect-metadata": "0.2.2",
-    "zod": "3.25.76"
+    "zod": "3.25.76",
+    "@vitest/coverage-v8": "2.1.9",
+    "testcontainers": "10.16.0",
+    "@testcontainers/mysql": "10.16.0",
+    "supertest": "7.0.0",
+    "@types/supertest": "6.0.2",
+    "@nestjs/testing": "11.1.19",
+    "@nestjs/platform-express": "11.1.19"
   }
 }
