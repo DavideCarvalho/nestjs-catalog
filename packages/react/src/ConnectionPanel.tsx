@@ -612,27 +612,38 @@ function HttpFields({ draft, update }: { draft: ConnectionDraft; update: UpdateD
   );
 }
 
-/** Either an inline URL or the variable holding one. */
+/**
+ * The connection string, and nothing beside it.
+ *
+ * This was two fields — an inline URL and the name of an environment variable
+ * holding one — presented side by side with a paragraph explaining when each
+ * applied. Two doors for one decision, and only one of them worked for a
+ * database with a password, which is every database anybody connects to. The
+ * question it produced was "what is this second field", which is the form
+ * asking the reader to understand its implementation.
+ *
+ * One field now. Whether the URL may REST in the catalog's own table is the
+ * store's decision (`allowInlineCredentials`) and not something to ask on a
+ * form — and it is a decision about the deployment, not about this connection.
+ * The server refuses and says why if the answer is no, which is a better place
+ * to learn it than a hint nobody reads until afterwards.
+ *
+ * `secretEnvVar` still exists on the model and is still what a hardened
+ * deployment should use; it is not on this screen. A host that wants it back
+ * has the field on the record.
+ */
 function SqlFields({ draft, update }: { draft: ConnectionDraft; update: UpdateDraft }) {
   return (
     <FieldGroup
       title="Address"
-      hint="Name the variable holding the connection URL — that is the whole credential for most databases, so the catalog stores its name and never its value. The inline URL is here for local work."
+      hint="The connection string, as your database gives it to you. It is served back redacted, so the password never travels in a response — but it does rest in this catalog's own table, and a deployment can refuse that."
     >
-      <div className="grid gap-3 sm:grid-cols-2">
-        <TextField
-          label="URL (optional)"
-          value={draft.url}
-          onChange={(url) => update({ url })}
-          placeholder="mysql://user:pass@host/db"
-        />
-        <TextField
-          label="Env var holding the URL"
-          value={draft.secretEnvVar}
-          onChange={(secretEnvVar) => update({ secretEnvVar })}
-          placeholder="FLEET_DATABASE_URL"
-        />
-      </div>
+      <TextField
+        label="Connection URL"
+        value={draft.url}
+        onChange={(url) => update({ url })}
+        placeholder="mysql://user:pass@host:3306/database"
+      />
     </FieldGroup>
   );
 }

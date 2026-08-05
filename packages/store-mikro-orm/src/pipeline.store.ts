@@ -27,7 +27,7 @@ import {
   workflowGraphHash,
 } from '@dudousxd/nestjs-catalog';
 import type { EntityManager } from '@mikro-orm/mysql';
-import { BadRequestException, Inject, Injectable } from '@nestjs/common';
+import { BadRequestException, Inject, Injectable, Optional } from '@nestjs/common';
 import { CATALOG_STORE_ENTITY_MANAGER } from './context';
 import {
   ConnectionRow,
@@ -37,6 +37,7 @@ import {
   WorkflowRow,
   WorkflowStageRow,
 } from './entities/pipeline';
+import { CATALOG_STORE_OPTIONS, type CatalogStoreModuleOptions } from './options';
 
 @Injectable()
 export class MySqlPipelineStore
@@ -48,7 +49,35 @@ export class MySqlPipelineStore
     // not this catalog's.
     @Inject(CATALOG_STORE_ENTITY_MANAGER)
     private readonly em: EntityManager,
+    // Optional so a host that constructs this store by hand — several specs do
+    // — keeps working, and an absent options object reads as every default,
+    // which for this one is the refusing side.
+    @Optional()
+    @Inject(CATALOG_STORE_OPTIONS)
+    private readonly options?: CatalogStoreModuleOptions,
   ) {}
+
+  /**
+   * The refusal, unless this deployment said otherwise.
+   *
+   * The check itself is the free function below; this only decides whether to
+   * ask it. Kept as a method rather than threading the flag through every call
+   * site because the flag is a property of the STORE — of which database these
+   * rows land in — and not of any one save.
+   *
+   * `allowInlineCredentials` turns it off, and its docblock argues the trade.
+   * Note what stays on either way: reads are redacted, so the password never
+   * travels in an HTTP response. This flag decides only whether it may rest in
+   * the catalog's own table.
+   */
+  private assertNoNewPlaintextCredential(
+    incoming: Record<string, unknown> | undefined,
+    stored: Record<string, unknown> | undefined,
+    subject: string,
+  ): void {
+    if (this.options?.allowInlineCredentials) return;
+    assertNoNewPlaintextCredential(incoming, stored, subject);
+  }
 
   async listConnectors(): Promise<CatalogConnector[]> {
     const em = this.em.fork();
@@ -97,7 +126,7 @@ export class MySqlPipelineStore
 
     const existing = input.id ? await em.findOne(ConnectorRow, { id: input.id }) : null;
 
-    assertNoNewPlaintextCredential(input.config, existing?.config, `"${input.name}"`);
+    this.assertNoNewPlaintextCredential(input.config, existing?.config, `"${input.name}"`);
 
     const row =
       existing ??
@@ -177,7 +206,7 @@ export class MySqlPipelineStore
     const em = this.em.fork();
     const existing = input.id ? await em.findOne(ConnectionRow, { id: input.id }) : null;
 
-    assertNoNewPlaintextCredential(input.config, existing?.config, `"${input.name}"`);
+    this.assertNoNewPlaintextCredential(input.config, existing?.config, `"${input.name}"`);
 
     const row =
       existing ??

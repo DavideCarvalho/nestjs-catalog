@@ -20,6 +20,7 @@ import {
   Delete,
   Get,
   Inject,
+  Logger,
   NotFoundException,
   Param,
   Post,
@@ -61,6 +62,12 @@ export function createPipelineController(
 ): Type<unknown> {
   @Controller(`${path}/pipeline`)
   class PipelineController {
+    /**
+     * Named for the generated class rather than the factory, so a log line says
+     * which mount produced it in a host running more than one.
+     */
+    private readonly logger = new Logger(`${PipelineController.name}(${path})`);
+
     constructor(
       @Inject(CATALOG_PIPELINE_STORE)
       private readonly pipeline: CatalogPipelineStore,
@@ -120,6 +127,71 @@ export function createPipelineController(
     @RequireScopes('catalog:read')
     async connections() {
       return (await this.pipeline.listConnections()).map(redactConnection);
+    }
+
+    /**
+     * Reach a connection that has not been saved yet.
+     *
+     * Declared BEFORE `connections/:id/check`, and it has to be: Nest matches
+     * in declaration order, and `:id` would happily capture the literal
+     * "check".
+     *
+     * The reason this exists rather than the form telling you to save first:
+     * the field most likely to be wrong is the env var's NAME, and the way you
+     * find out is a connector run failing hours later. A connection saved to
+     * discover it was misspelled is a row somebody then has to remember to
+     * delete.
+     *
+     * `catalog:write`, not the `catalog:read` its saved sibling asks for, and
+     * the difference is the point. Checking a SAVED connection reaches an
+     * address somebody with `catalog:write` already chose and wrote down;
+     * checking a posted one reaches an address supplied in the request, which
+     * is the server connecting wherever the caller says. Under `catalog:read`
+     * that is a port scanner for anybody who may look at the catalog.
+     *
+     * Under `catalog:write` it grants no reach that did not exist — the same
+     * caller could save, check and delete — but that route leaves three
+     * records and this one leaves none, so it says what it did in the log. The
+     * address, never the credential.
+     *
+     * Records nothing on the connection, because there is no connection: the
+     * saved sibling writes its result so the list can show what is known to
+     * work, and there is nothing here to write it against.
+     */
+    @Post('connections/check')
+    @RequireScopes('catalog:write')
+    async checkUnsavedConnection(
+      @Req() request: { principal?: CatalogPrincipal },
+      @Body()
+      body: Omit<CatalogConnection, 'id' | 'createdAt' | 'updatedAt' | 'createdBy'> & {
+        id?: string;
+      },
+    ) {
+      const principal = requirePrincipal(request);
+      if (!isConnectorKind(body.kind)) {
+        throw new BadRequestException(
+          `"${body.kind}" is not a connection kind. Accepted: ${CONNECTOR_KINDS.join(', ')}.`,
+        );
+      }
+
+      // An edit of something already stored puts the real credential back, the
+      // same way saving does — otherwise testing a connection you only renamed
+      // would test the redaction placeholder and report it unreachable.
+      const stored = body.id ? await this.pipeline.getConnection(body.id) : undefined;
+      const connection: CatalogConnection = {
+        ...body,
+        id: body.id ?? 'unsaved',
+        kind: body.kind,
+        config: restoreRedactedSecrets(body.config ?? {}, stored?.config),
+        createdBy: principal.id,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+
+      this.logger.log(
+        `${principal.id} tested an unsaved "${body.kind}" connection named "${body.name}".`,
+      );
+      return this.checker.check(connection);
     }
 
     @Post('connections')
