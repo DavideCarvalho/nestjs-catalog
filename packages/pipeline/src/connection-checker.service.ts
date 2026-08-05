@@ -1,5 +1,6 @@
 import type { CatalogConnection, ConnectionCheck } from '@dudousxd/nestjs-catalog';
 import { Injectable, Logger } from '@nestjs/common';
+import { redactSecrets } from './run-logs';
 import { importOptional, resolveSecretEnv } from './sources';
 
 /**
@@ -27,12 +28,24 @@ export class ConnectionChecker {
       return { ok: true, detail, elapsedMs: Date.now() - started };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      // The process log gets it whole; the RESPONSE does not.
+      //
+      // `POST connections/:id/check` asks only `catalog:read`, and a probe that
+      // fails throws with the address in the message — `GET https://…` for an
+      // HTTP source, a driver's own text for a SQL one. A connection URL is the
+      // credential, so the softest scope in the system was reading the
+      // strongest secret in it through an error string, which is the same leak
+      // `config-secrets.ts` was written to close on the config itself.
+      //
+      // Redacted rather than replaced: which host refused, and as whom, is the
+      // whole value of a failed check. What goes is the password, the query
+      // string and the fragment.
       this.logger.warn(`${connection.name} unreachable: ${message}`);
       return {
         ok: false,
         detail: 'Could not reach it.',
         elapsedMs: Date.now() - started,
-        error: message,
+        error: redactSecrets(message),
       };
     }
   }
