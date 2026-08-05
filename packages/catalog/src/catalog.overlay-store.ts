@@ -22,14 +22,14 @@ export class FileCatalogOverlayStore implements CatalogOverlayStore {
     try {
       const raw = await readFile(this.path, 'utf8');
       const parsed: unknown = JSON.parse(raw);
-      if (
-        parsed &&
-        typeof parsed === 'object' &&
-        'types' in parsed &&
-        typeof (parsed as { types: unknown }).types === 'object'
-      ) {
-        return parsed as CatalogOverlay;
-      }
+      // Narrowed by a guard rather than asserted. The file on disk is edited by
+      // hand — that is the whole point of a JSON overlay — so its contents are
+      // exactly as trustworthy as whoever last opened it, and an assertion here
+      // would hand the registry a shape it promised to have rather than one it
+      // was checked for. The failure that buys is quiet: `types` arriving as
+      // `null` (an object, by `typeof`) or as an array reads as an overlay with
+      // no curation, and every label somebody wrote silently stops applying.
+      if (isOverlay(parsed)) return parsed;
       return { types: {} };
     } catch {
       return { types: {} };
@@ -74,4 +74,21 @@ export class InMemoryCatalogOverlayStore implements CatalogOverlayStore {
   async save(overlay: CatalogOverlay): Promise<void> {
     this.overlay = overlay;
   }
+}
+
+/**
+ * Whether a parsed file is an overlay, checked to the depth that matters.
+ *
+ * The nesting below `types` is deliberately NOT walked. Every consumer reads it
+ * defensively — an entry that is missing, or missing the key it wanted, is the
+ * ordinary case for a type nobody has curated — so validating each entry would
+ * be re-implementing a tolerance the readers already have, and refusing the
+ * whole file over one malformed entry would discard every good one beside it.
+ */
+function isOverlay(value: unknown): value is CatalogOverlay {
+  if (!value || typeof value !== 'object') return false;
+  const types = Reflect.get(value, 'types');
+  // Not `typeof types === 'object'`, which admits `null` and arrays. Both parse
+  // from a hand-edited file, and both read downstream as "nothing is curated".
+  return Boolean(types) && typeof types === 'object' && !Array.isArray(types);
 }
