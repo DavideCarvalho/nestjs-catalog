@@ -189,11 +189,20 @@ export {
   WORKFLOW_ISSUE_CODES,
   WORKFLOW_NODE_ID_PATTERN,
   WORKFLOW_NODE_KINDS,
+  // The draft/ready pair, for the same reason as the list above: a canvas that
+  // cannot see it restates it, and the copy is what drifts. Without this the
+  // editor could not tell a graph it is allowed to store from one the server
+  // would refuse — so it told everybody the second, which is wrong for every
+  // draft and is exactly the kind of confident-and-false sentence this codebase
+  // keeps removing.
+  WORKFLOW_STATUSES,
   workflowGraphHash,
   workflowRunOrder,
   isWorkflowExecutionMode,
   isWorkflowNodeKind,
+  isWorkflowStatus,
 } from './catalog.pipeline';
+export type { WorkflowStatus } from './catalog.pipeline';
 
 // Traces: the same grouping the shipped view renders, so a host writing its own
 // activity screen gets the shapes as well as the routes.

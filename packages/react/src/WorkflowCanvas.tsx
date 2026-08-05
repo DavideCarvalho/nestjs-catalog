@@ -607,16 +607,22 @@ function RefusalNote({ lead, error }: { lead: string; error: unknown }) {
  * sends somebody looking for a message that is not there. So that case names the
  * nodes instead, and says the thing they most need to know: pressing Save is
  * what stops the checks being held back.
+ *
+ * None of these say the server will refuse the graph any more, and that is a
+ * correction rather than a softening. Saving an unfinished graph SUCCEEDS — it
+ * is stored as a draft, which is the whole point of drafts existing. The
+ * refusal moved to publishing, so a hint that still promised one would be
+ * confidently wrong about the case it fires most often in.
  */
 function saveHint(blocked: boolean, unfinished: string[]): string {
   if (unfinished.length > 0) {
     const one = unfinished.length === 1;
-    return `Nothing is wrong yet, but ${one ? 'one node is' : `${unfinished.length} nodes are`} not finished: ${unfinished.join(', ')}. Saving sends ${one ? 'it' : 'them'} exactly as ${one ? 'it is' : 'they are'} and the server will refuse the graph. Save anyway to see what it says — the checks stop being held back the moment you do.`;
+    return `Nothing is wrong yet, but ${one ? 'one node is' : `${unfinished.length} nodes are`} not finished: ${unfinished.join(', ')}. Saving keeps ${one ? 'it' : 'them'} exactly as ${one ? 'it is' : 'they are'} — the graph is stored as a draft, and the checks stop being held back the moment you press it.`;
   }
   if (blocked) {
-    return 'There are errors listed beside the canvas, and the server will almost certainly refuse this. Sending it anyway is allowed — the server decides, not this screen.';
+    return 'There are errors listed beside the canvas. Saving still works — the graph is kept as a draft, which is what a draft is for. It will not run until it is finished and published, and publishing is where these checks are answered for real.';
   }
-  return 'Store it. The server checks it again, and its answer is the one that counts.';
+  return "Store it. Publishing is what validates it, and the server's answer there is the one that counts.";
 }
 
 /**

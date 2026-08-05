@@ -124,6 +124,9 @@ class MemoryPipelineStore implements CatalogPipelineStore {
       ...workflow,
       version: 1,
       graphHash: 'hash',
+      // Seeded graphs stand for rows already in a database, and every row there
+      // passed validation to get there — which is exactly what `ready` means.
+      status: 'ready',
       targetType: 'Mvr',
       createdBy: 'ana@example.com',
       createdAt: '2020-01-01T00:00:00.000Z',
@@ -148,8 +151,10 @@ class MemoryPipelineStore implements CatalogPipelineStore {
    * a workflow store — which is how this spec began failing when drafts landed,
    * rather than through anything it asserts.
    */
-  publishWorkflow(id: string): Promise<CatalogWorkflow | undefined> {
-    return Promise.resolve(this.workflows.get(id));
+  publishWorkflow(id: string, _publishedBy: string): Promise<CatalogWorkflow> {
+    const workflow = this.workflows.get(id);
+    if (!workflow) throw new Error(`No workflow ${id}`);
+    return Promise.resolve({ ...workflow, status: 'ready' });
   }
   saveWorkflow(
     input: Pick<CatalogWorkflow, 'name' | 'nodes' | 'edges'> & { id?: string },
@@ -161,6 +166,10 @@ class MemoryPipelineStore implements CatalogPipelineStore {
       id,
       version: 2,
       graphHash: 'hash',
+      // A save through this stub stands for an ordinary edit, not a draft: the
+      // spec is about what happens to a credential inside the graph, and a
+      // status it did not choose should not change that answer.
+      status: 'ready',
       targetType: 'Mvr',
       createdBy,
       createdAt: '2020-01-01T00:00:00.000Z',
