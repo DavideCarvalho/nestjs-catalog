@@ -201,6 +201,13 @@ export {
 // implemented only by a host willing to restate them — which nothing in this
 // repo would have caught: no consumer compiles against the built barrel here.
 export * from './catalog.access';
+// The filter rule, whole. A store implementing `CatalogFilteringReadStore` needs
+// the operator list to declare what it applies and `CatalogResolvedFilter` to
+// read what it was handed, and a host writing its own objects route needs
+// `resolveObjectFilters` — shipping the interface without them would be the same
+// unimplementable seam the barrel spec above was written after. It is also on
+// `/client`, because the console derives its controls from the same function.
+export * from './catalog.filters';
 export {
   assertNoColumnCollisions,
   assertSafeIdentifier,
@@ -210,6 +217,8 @@ export {
   type CarryForwardResult,
   type CatalogColumnCollision,
   CatalogColumnCollisionError,
+  type CatalogFilteringReadStore,
+  supportsObjectFilters,
   type CatalogMergeStore,
   type CatalogReadQuery,
   type CatalogReadResult,

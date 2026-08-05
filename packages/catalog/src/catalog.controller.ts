@@ -285,6 +285,17 @@ export function createCatalogController(
       // rather than quietly answering with current state — a reader who thinks
       // they are looking at last Tuesday and is not would rather be told.
       @Query('snapshot') snapshot?: string,
+      // `?filter=Asset_Id:contains:71&filter=miles:gte:1000`, ANDed.
+      //
+      // Repeated rather than one packed value, so a value containing a comma
+      // needs no escaping scheme of its own. Express hands back a string for one
+      // and an array for several — the same shape `events/traces` deals with one
+      // route up — so both have to be accepted whatever this parameter declares.
+      //
+      // Passed through as text: what a filter is allowed to name is a question
+      // about the type, and the type is what the service has. Nothing here tries
+      // to be the guard.
+      @Query('filter') filter?: string | string[],
     ) {
       return this.service.readObjects(name, {
         page: page ? Number(page) : undefined,
@@ -293,6 +304,7 @@ export function createCatalogController(
         sort,
         dir: dir === 'desc' ? 'desc' : 'asc',
         snapshot,
+        filters: repeatable(filter),
       });
     }
 
@@ -672,6 +684,20 @@ function actorOf(request: { principal?: CatalogPrincipal } | undefined, claimed?
   const resolved = request?.principal?.id?.trim();
   if (resolved) return resolved;
   return claimed?.trim() || 'console';
+}
+
+/**
+ * A query parameter that may appear once or many times, as a list either way.
+ *
+ * Unlike {@link parseOutcomes} below, nothing is split on commas and nothing is
+ * dropped. A filter's value is free text that may contain a comma — a
+ * description, a date range written by hand — and an unrecognised filter must
+ * reach the service so it can be refused by name rather than vanish into an
+ * unfiltered page.
+ */
+function repeatable(raw: string | string[] | undefined): string[] | undefined {
+  if (raw === undefined) return undefined;
+  return Array.isArray(raw) ? raw : [raw];
 }
 
 /**
