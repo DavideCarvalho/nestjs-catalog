@@ -50,8 +50,17 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { afterEach, describe, expect, it } from 'vitest';
+import { installCodeSurfaceDom } from '../../../test/jsdom-code-surface';
 import { WorkflowCanvas } from './WorkflowCanvas';
 import { CatalogProvider, type CatalogTransport } from './context';
+
+// This canvas opens a transform node's code, and the editor is a real code
+// surface: it needs canvas metrics, a firing ResizeObserver and constructable
+// stylesheets, none of which jsdom has. Without the shim it does not merely
+// render blank — React throws `sheet.replaceSync is not a function` from inside
+// `renderRootSync`, which lands as an UNHANDLED rejection rather than a failed
+// assertion, so vitest exits non-zero while every test still reports green.
+installCodeSurfaceDom();
 
 declare global {
   // React refuses to believe a test is a test without this, and warns on every state update.
