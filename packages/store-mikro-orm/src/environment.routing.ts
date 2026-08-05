@@ -63,9 +63,12 @@ import type {
 } from '@dudousxd/nestjs-catalog';
 import {
   CatalogRegistry,
+  type CatalogRevision,
   UnresolvedEnvironmentError,
   isQueryStore,
   stampEnvironment,
+  supportsSavedQueryRevisions,
+  supportsTransformRevisions,
   supportsWorkflowStages,
   supportsWorkflows,
 } from '@dudousxd/nestjs-catalog';
@@ -454,6 +457,36 @@ export class RoutingPipelineStore implements CatalogPipelineStore {
     return requireWorkflows(this.inner).deleteWorkflow(id);
   }
 
+  publishWorkflow(id: string, publishedBy: string): Promise<CatalogWorkflow> {
+    return requireWorkflows(this.inner).publishWorkflow(id, publishedBy);
+  }
+
+  unpublishWorkflow(id: string, unpublishedBy: string): Promise<CatalogWorkflow> {
+    return requireWorkflows(this.inner).unpublishWorkflow(id, unpublishedBy);
+  }
+
+  /**
+   * Optional on the interface, so probed rather than required — but forwarded,
+   * which is the part that was missing.
+   *
+   * A hand-written proxy that omits an optional member does not make the store
+   * answer "no"; it makes the member ABSENT, and a caller that probes
+   * structurally reads absent as "this store keeps none". So in a
+   * multi-environment deployment the revisions route answered "this store keeps
+   * no revisions" about a store that keeps them — true of the proxy, false of
+   * the thing behind it.
+   *
+   * This is the third time this proxy has lost a method that way. See the
+   * type-level guard at the bottom of this file, which now fails the build
+   * instead of waiting for somebody to notice.
+   */
+  listTransformRevisions(id: string): Promise<CatalogRevision[]> {
+    const inner = this.inner;
+    return supportsTransformRevisions(inner)
+      ? inner.listTransformRevisions(id)
+      : Promise.resolve([]);
+  }
+
   connectorsUsingWorkflow(id: string): Promise<CatalogConnector[]> {
     const inner = this.inner;
     return supportsWorkflows(inner) ? inner.connectorsUsingWorkflow(id) : Promise.resolve([]);
@@ -651,4 +684,40 @@ export class RoutingWorkspaceStore implements CatalogWorkspaceStore {
     const bundle = requireEnvironmentBundle();
     return stampEnvironment(bundle.environment.id, await bundle.workspace.listEvents(query));
   }
+
+  /** Optional on the interface, probed, and forwarded. See the pipeline proxy's note. */
+  listSavedQueryRevisions(id: string): Promise<CatalogRevision[]> {
+    const { workspace } = requireEnvironmentBundle();
+    return supportsSavedQueryRevisions(workspace)
+      ? workspace.listSavedQueryRevisions(id)
+      : Promise.resolve([]);
+  }
 }
+
+/**
+ * Every optional member of the interfaces these proxies stand in front of has
+ * to be forwarded, and this is what says so to the compiler.
+ *
+ * A required member is already enforced by `implements`. An OPTIONAL one is not:
+ * a class satisfies the interface without it, so the proxy compiles, and the
+ * member is simply absent — which a caller probing structurally reads as "this
+ * store cannot do that". The failure is a proxy answering NO on behalf of a
+ * store that answers yes, and it has happened three times now: `currentSnapshot`,
+ * then the revision readers, then the workflow transitions.
+ *
+ * A comment asking the next person to remember was the previous mechanism, and
+ * it lost twice. This fails the build instead, and the error names the member.
+ */
+type OptionalKeyOf<T> = {
+  [K in keyof T]-?: Record<string, never> extends Pick<T, K> ? K : never;
+}[keyof T];
+
+type AssertNothingMissing<T extends never> = T;
+
+type _PipelineForwarded = AssertNothingMissing<
+  Exclude<OptionalKeyOf<CatalogPipelineStore & CatalogWorkflowStore>, keyof RoutingPipelineStore>
+>;
+
+type _WorkspaceForwarded = AssertNothingMissing<
+  Exclude<OptionalKeyOf<CatalogWorkspaceStore>, keyof RoutingWorkspaceStore>
+>;
