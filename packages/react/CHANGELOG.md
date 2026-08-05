@@ -1,5 +1,191 @@
 # @dudousxd/nestjs-catalog-react
 
+## 0.17.0
+
+### Minor Changes
+
+- 220918f: A real code editor, and a diff against the version you have not saved yet
+
+  **The bug.** Selecting `checked_fields` in the SQL box and cutting gave back
+  `checked_fields-` — one character more than was selected — and the caret reported
+  being on "the final line + 1". The two-layer editor (a transparent `<textarea>`
+  over a Prism `<pre>`) was the obvious suspect and was innocent: measured in
+  Chrome, the two layers chose identical wrap positions on 3,725 fuzzed bodies at
+  fifteen widths, plus tabs, CJK, emoji, RTL, combining marks, unbreakable runs,
+  trailing spaces at a wrap point, blank lines and a trailing newline. The cause
+  was soft wrapping itself. `Home`/`End`/`Shift+End` and the vertical arrows move
+  by VISUAL row, the line wrapped after `checked_fields-`, and with no gutter
+  nothing on screen admitted that a thirteen-line query was occupying fourteen
+  rows.
+
+  **The change.** `ui/code-editor.tsx` is now `@pierre/diffs` in edit mode:
+  horizontal scrolling instead of soft wrap, line numbers, Shiki highlighting, a
+  real document model and a real undo stack. One component, used by the query
+  console, the transform editor, and the transform code sheet on the workflow
+  canvas. The history sheet's comparison is the same library's diff, with
+  word-level highlighting inside a changed line.
+
+  **New.** The history sheet can now diff the buffer in the editor against the
+  newest recorded revision, as `Unsaved edits` — the answer to "what have I changed
+  since I last saved", which this console could not give. `SavedQuery` still has no
+  `version` field, so the buffer is not given a number; not being nameable was
+  never a reason not to compare it.
+
+  **Breaking, in the 0.x sense.**
+
+  - `prism-react-renderer` is no longer a peer dependency. `@pierre/diffs`
+    (`>=1.3.3`) is.
+  - `diffLines`, `foldUnchanged`, `DIFF_MAX_CELLS`, `DIFF_CONTEXT_LINES`,
+    `DIFF_MIN_FOLD` and the `DiffLine`/`DiffOp`/`DiffSection`/`LineDiff` types are
+    gone, with `diff/line-diff.ts`. Their docblock argued that a diff of somebody's
+    code and SQL was not worth a supply-chain question mark, so there was no
+    dependency at all; that argument does not survive the same package becoming the
+    editor those strings are typed into.
+  - `CodeEditor` drops `textareaRef`, `padding` and `fontSize`, and gains
+    `handleRef` (`focus`, `insertAtCursor`). `onKeyDown` now fires in the capture
+    phase on the wrapper and takes a `KeyboardEvent<HTMLDivElement>`.
+  - New exports `codeEditorRoot` and `codeEditorText`: the editor renders into a
+    shadow root, so Testing Library queries do not reach its content.
+
+  **What contentEditable costs.** Checked in Chrome rather than assumed. Screen
+  readers still get a labelled multiline textbox: the editable element is
+  `role="textbox" aria-multiline="true" aria-label="<label>"`, and its accessible
+  value is the whole document — nothing here is virtualised. What is gone is
+  form-control semantics: it is a `<div>`, with no `value` property, no form
+  participation, no `<label>` to associate, and each line is a row of per-token
+  `<span>`s rather than one text node. Tab indents rather than moving focus, which
+  was a keyboard trap until `CodeEditor` took Escape (park focus on the wrapper)
+  and Tab (leave for the next tab stop outside the component).
+
+  **Size.** `prism-react-renderer` was ~86 KB minified / 26 KB gzipped, in one
+  piece. `@pierre/diffs` brings Shiki, which is a different order of thing.
+  Measured by bundling exactly the imports `ui/code-editor.tsx` and
+  `diff/RevisionDiff.tsx` make, with React external (`vite build --lib`,
+  esbuild-minified): the entry chunk is 943 KB minified / 234 KB gzipped, and
+  Shiki's language and theme registries split into a further 318 chunks — 10.6 MB
+  minified, 2.0 MB gzipped, of which a SQL console touches four. Installed, the new
+  subtree is 26 MB (`@pierre/diffs` 10, `@shikijs/langs` 9, the rest 7).
+
+  Those lazy chunks are pruned by the `shikiSubset()` build plugin in the changeset
+  beside this one, which takes the same measurement to 8 chunks / 1.8 MB. The entry
+  figure is not improved by it and is the honest cost of the dependency.
+
+- 220918f: Filter a type by its own columns, and read it as of an earlier load
+
+  The object explorer offered paging, a search box and a sort. Two things it did
+  not offer are now here, and both are derived rather than configured.
+
+  **Filters come from the type.** `GET objects/:name` now answers with
+  `filterOperators` on every column — computed from the column's own scalar type
+  by `filterOperatorsFor`, then narrowed to what the mounted store declares it can
+  apply. Nothing anywhere lists a filterable column, which matters because these
+  types are created at runtime by `PUT publish/:type/schema`: a column published
+  this morning is filterable this morning, with no list for it to be missing from.
+  `?filter=property:operator:value` may be repeated, and a range is `gte` and
+  `lte` on one property. A filter is resolved against the type before any store
+  sees it and carries the property _definition_, so a caller's string is never a
+  column name; a filter that cannot be honoured is refused by name rather than
+  dropped, because a dropped filter comes back as an unfiltered page presented as
+  the matching rows. Classified columns take no filters at all — a range filter
+  lets a reader binary-search a value they may not see.
+
+  **A store says whether it filters.** `CatalogFilteringReadStore` +
+  `supportsObjectFilters`; the MikroORM read store and the MySQL warehouse store
+  declare all nine operators. A store that declares none offers no controls and
+  refuses a filter rather than answering unfiltered.
+
+  **And a snapshot picker.** Every earlier load is still in the type's physical
+  table — the machine for time travel was already built and nothing exposed it.
+  The explorer now lists a type's loads and reads as of one, defaulting to
+  current, saying unmistakably when it is not, and never touching the SQL view the
+  query console selects from. `CatalogReadResult` and the object page carry
+  `{ id, current }` from the store, so the warning is driven by what was read
+  rather than by what the screen believes it asked for.
+
+- 220918f: Only the four grammars this console renders
+
+  **The defect.** The changeset beside this one swapped a hand-rolled editor for
+  `@pierre/diffs`, which resolves a language by looking its name up in Shiki's
+  `bundledLanguages` — ~240 entries whose values are
+  `() => import('@shikijs/langs/<name>')` — and a theme the same way through
+  `@pierre/theming`. A bundler cannot tree-shake a dynamic import selected by a
+  runtime key, so it emits a chunk for every entry. `packages/dashboard`'s SPA came
+  out as **319 JS chunks, 12.42 MB minified**, of which 242 were grammars (7.47 MB)
+  and 75 were themes (1.58 MB), for a console that renders SQL, JSON, TSX and
+  Python in two palettes. This library's contract is that embedding it must not
+  degrade the host, so that is a defect and not a tradeoff.
+
+  **The measurement, and what it does not say.** Built twice from the same tree,
+  with and without the fix:
+
+  | `packages/dashboard/dist/spa` | before                        | after                |
+  | ----------------------------- | ----------------------------- | -------------------- |
+  | entry chunk                   | 2836.1 KB min / 867.1 KB gzip | 2826.5 KB / 861.8 KB |
+  | JS chunks                     | 319                           | 8                    |
+  | total                         | 12.42 MB min / 2.62 MB gzip   | 3.67 MB / 1.10 MB    |
+  | on disk                       | 12.50 MB                      | 3.75 MB              |
+
+  **The entry barely moves, and that is the honest headline.** Every one of those
+  grammar chunks was already lazy — none of them was on the first-paint path — so
+  this buys nothing at all for time-to-interactive. What it buys is 8.75 MB and 311
+  files that a host no longer builds, uploads, caches or pays for at the CDN, and a
+  `dist/` whose contents can be accounted for. Installed size is unchanged: the
+  grammars are still in `node_modules`, they are simply no longer bundled.
+
+  **How.** A new build plugin, on its own subpath so it never reaches a browser
+  graph:
+
+  ```ts
+  import { shikiSubset } from "@dudousxd/nestjs-catalog-react/bundler";
+
+  export default defineConfig({ plugins: [react(), shikiSubset()] });
+  ```
+
+  It rewrites every `import('@shikijs/langs/…')`, `import('@shikijs/themes/…')` and
+  `import('@pierre/theme/…')` outside the subset into a loader that rejects naming
+  the grammar it wanted. There is then no `import()` for Rollup to split on, so
+  there is no chunk — where resolving those specifiers to a stub module would have
+  left ~320 chunks, only tiny ones.
+
+  **It cannot quietly stop working**, which is the part that matters more than the
+  megabytes. Four independent gates:
+
+  - `CodeEditor`'s `language` prop and `DiffBody`'s are now `CatalogCodeLanguage`,
+    derived from the set. A grammar the bundle does not carry is a compile error at
+    the call site. **This is breaking in the 0.x sense** — the prop was `string`.
+  - `TRANSFORM_HIGHLIGHTED_AS` says what each transform language is highlighted as
+    and `satisfies Record<TransformLanguage, CatalogCodeLanguage>`, so a fourth
+    entry in `TRANSFORM_LANGUAGES` is a compile error until somebody answers for
+    it. It replaces `language === 'python' ? 'python' : 'tsx'` in
+    `TransformEditor`, which answered a fourth language silently and wrongly.
+  - `shikiSubset()` fails the **build** if any kept name is missing from the
+    registry it prunes, or if a registry never reaches it at all — so a Shiki
+    rename, a typo, or a generated shape this no longer matches stops the build
+    instead of silently pruning nothing.
+  - A spec scans this package's sources for `language="…"` and `lang: '…'` literals
+    and fails on one the bundle does not carry, which is the only gate that sees a
+    `lang` handed straight to `@pierre/diffs` past our own prop types.
+
+  **New exports.** `shikiSubset` and `ShikiSubsetPlugin` from
+  `@dudousxd/nestjs-catalog-react/bundler`; `CATALOG_CODE_LANGUAGES`,
+  `CATALOG_CODE_THEMES`, `CatalogCodeLanguage`, `CatalogCodeTheme` and
+  `TRANSFORM_HIGHLIGHTED_AS` from the main entry.
+
+  **The set, and why it is that set.** `sql` (the query console and a saved query's
+  diff), `json` (the transform editor's sample pane), `python` and `tsx` (its code
+  pane). TSX covers both JavaScript and TypeScript transforms because it is a
+  superset of each; shipping those two grammars beside it would be another 366 KB
+  of `@shikijs/langs` for output no reader could tell apart. The themes are `pierre-light` and
+  `pierre-dark`, which is what `@pierre/diffs`' `DEFAULT_THEMES` resolves to and
+  what this package never overrides — Shiki's own 65 and Pierre's other eight are
+  reachable only by naming one, which nothing here does.
+
+  **Still there:** the 622 KB `shiki/wasm` chunk. `@pierre/diffs` defaults to the
+  JavaScript regex engine and only fetches the WASM one if a caller asks for
+  `preferredHighlighter: 'shiki-wasm'`, so it is emitted and never loaded — but it
+  is a capability a caller can legitimately want, and pruning it would take that
+  away rather than take away waste.
+
 ## 0.16.0
 
 ### Minor Changes
