@@ -14,7 +14,6 @@ import type { CatalogOverlayStore } from './catalog.overlay-store';
 import { CATALOG_OVERLAY_STORE } from './catalog.overlay-store.token';
 import { CatalogRegistry } from './catalog.registry.base';
 import type {
-  CatalogGraph,
   CatalogObjectTypeDef,
   CatalogOverlay,
   CatalogPropertyDef,
@@ -50,25 +49,6 @@ function isOwningSide(prop: EntityProperty, kind: RelationKind): boolean {
   if (kind === '1:m') return false;
   if (kind === 'm:1') return true;
   return Boolean(prop.owner);
-}
-
-/**
- * A key both ends of one link agree on, so the graph can draw it once.
- *
- * The owning end names the link — `Mvr.base` — and the inverse end, which knows
- * the owner's property through `mappedBy`, arrives at the same string. That is
- * the whole trick, and it is why `inverseName` is carried on the def at all.
- *
- * The fallback covers metadata that names neither end of the pair: both rows
- * then reduce to the unordered pair plus the property name, which collapses the
- * symmetric case (two `m:n` sides spelled alike) and leaves genuinely different
- * names as two links. Guessing harder than that would mean pairing links by
- * shape, and drawing one line where the schema has two is the worse error.
- */
-function linkKey(holder: string, relation: CatalogRelationDef): string {
-  if (relation.owner) return `${holder}.${relation.name}`;
-  if (relation.inverseName) return `${relation.targetType}.${relation.inverseName}`;
-  return `${[holder, relation.targetType].sort().join('::')}::${relation.name}`;
 }
 
 /** Classify one type name. Returns "unknown" when nothing matches. */
@@ -202,19 +182,6 @@ export class MikroOrmCatalogRegistry extends CatalogRegistry implements OnModule
   getEntityClass(name: string): EntityClass<Record<string, unknown>> | undefined {
     if (!this.snapshot) this.rebuild();
     return this.entityClasses.get(name);
-  }
-
-  getGraph(): CatalogGraph {
-    const snapshot = this.getSnapshot();
-    const nodes = snapshot.types.map((t) => ({
-      id: t.name,
-      label: t.displayName,
-      group: t.group,
-      icon: t.icon,
-      propertyCount: t.properties.length,
-      relationCount: t.relations.length,
-    }));
-    return { nodes, edges: buildEdges(snapshot.types) };
   }
 
   /** Tier-0 edit on a type. Never touches the database. */
@@ -425,50 +392,6 @@ export class MikroOrmCatalogRegistry extends CatalogRegistry implements OnModule
       relations,
     };
   }
-}
-
-/**
- * The links, as lines to draw.
- *
- * Two rules, and both exist because the naive version of this drew a picture
- * that was wrong in a way nobody would notice:
- *
- * 1. **One edge per link.** A link declared at both ends produces two rows, and
- *    keying the de-duplication on the property name only caught the case where
- *    both ends happened to be spelled alike — so `Mvr.base` plus `Base.mvrs`,
- *    the ordinary shape, drew two lines between the same pair of nodes. See
- *    {@link linkKey}.
- * 2. **Drawn from the end that holds the key**, so the arrow points the way a
- *    join is written. Both ends are collected before either is chosen, because
- *    otherwise the direction depends on which type was discovered first.
- *
- * Hidden relations are deliberately still drawn. Hiding is a statement about a
- * table cell; a graph that quietly dropped edges would be a picture nobody could
- * read as complete, which is the only thing a graph is for.
- */
-function buildEdges(types: CatalogObjectTypeDef[]): CatalogGraph['edges'] {
-  const byLink = new Map<string, { holder: string; relation: CatalogRelationDef }>();
-
-  for (const type of types) {
-    for (const relation of type.relations) {
-      if (!relation.targetPublished) continue;
-      const key = linkKey(type.name, relation);
-      const seen = byLink.get(key);
-      // Replace only when this row is the owning one and the row already held
-      // is not: anything else keeps the first, so the edge order stays the type
-      // order rather than shuffling with every rebuild.
-      if (seen && (seen.relation.owner || !relation.owner)) continue;
-      byLink.set(key, { holder: type.name, relation });
-    }
-  }
-
-  return [...byLink.values()].map(({ holder, relation }) => ({
-    id: `${holder}.${relation.name}`,
-    source: holder,
-    target: relation.targetType,
-    label: relation.displayName,
-    kind: relation.kind,
-  }));
 }
 
 /**

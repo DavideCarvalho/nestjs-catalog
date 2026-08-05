@@ -1,5 +1,4 @@
 import {
-  type CatalogGraph,
   type CatalogObjectTypeDef,
   type CatalogOverlay,
   CatalogRegistry,
@@ -41,21 +40,6 @@ function toRelationKind(value: string): RelationKind {
 }
 
 /**
- * A key both ends of one link agree on.
- *
- * Deliberately the same rule as `linkKey` in `MikroOrmCatalogRegistry`, and the
- * duplication is the honest cost of the two registries living in different
- * packages with no shared graph builder between them — the right home is the
- * `CatalogRegistry` base class. If one of these changes, the two screens
- * disagree about how many links exist, so change both.
- */
-function linkKey(holder: string, relation: CatalogRelationDef): string {
-  if (relation.owner) return `${holder}.${relation.name}`;
-  if (relation.inverseName) return `${relation.targetType}.${relation.inverseName}`;
-  return `${[holder, relation.targetType].sort().join('::')}::${relation.name}`;
-}
-
-/**
  * The model, read from our own tables rather than reflected off entity classes.
  *
  * Held in memory and rebuilt on write. The whole model is a few hundred rows
@@ -68,6 +52,16 @@ function linkKey(holder: string, relation: CatalogRelationDef): string {
  * arrive over HTTP and are already just data, so a curator editing them is
  * editing the same column. What keeps a re-publish from stomping a curator's
  * work is that `upsertType` only fills in labels it has not seen before.
+ *
+ * Nothing about a link is derivable here and nothing ever will be: there are no
+ * entity classes and no foreign keys — every published type lands as a flat
+ * snapshot — so what a `@ManyToOne` says in the owning application has to arrive
+ * over the wire or be asserted by a curator. The one thing this must not do is
+ * guess. A `base_id` column beside a type called `Base` is a strong hint and a
+ * bad edge: an ontology that invents joins is worse than one with none, because
+ * the invented ones are indistinguishable from the real ones. Once the links are
+ * in the snapshot, though, drawing them is the same job everywhere — which is
+ * why the graph is built by the base class rather than here.
  */
 @Injectable()
 export class StoredCatalogRegistry extends CatalogRegistry implements OnModuleInit {
@@ -141,53 +135,11 @@ export class StoredCatalogRegistry extends CatalogRegistry implements OnModuleIn
     return this.snapshot.types.find((t) => t.name.toLowerCase() === name.toLowerCase());
   }
 
-  /**
-   * The ontology, as nodes and lines.
-   *
-   * Nothing about a link is derivable here and nothing ever will be: there are
-   * no entity classes and no foreign keys — every published type lands as a flat
-   * snapshot — so what a `@ManyToOne` says in the owning application has to
-   * arrive over the wire or be asserted by a curator. The one thing this must
-   * not do is guess. A `base_id` column beside a type called `Base` is a strong
-   * hint and a bad edge: an ontology that invents joins is worse than one with
-   * none, because the invented ones are indistinguishable from the real ones.
-   *
-   * One edge per link, drawn from the end that holds the key, and only where
-   * both ends are published. See `CatalogGraph` for why each of those matters.
-   */
-  getGraph(): CatalogGraph {
-    const byLink = new Map<string, { holder: string; relation: CatalogRelationDef }>();
-    for (const type of this.snapshot.types) {
-      for (const relation of type.relations) {
-        if (!relation.targetPublished) continue;
-        const key = linkKey(type.name, relation);
-        const seen = byLink.get(key);
-        // The owning row replaces a non-owning one and nothing else replaces
-        // anything, so the edge order follows the type order rather than
-        // shuffling on every reload.
-        if (seen && (seen.relation.owner || !relation.owner)) continue;
-        byLink.set(key, { holder: type.name, relation });
-      }
-    }
-
-    return {
-      nodes: this.snapshot.types.map((t) => ({
-        id: t.name,
-        label: t.displayName,
-        group: t.group,
-        icon: t.icon,
-        propertyCount: t.properties.length,
-        relationCount: t.relations.length,
-      })),
-      edges: [...byLink.values()].map(({ holder, relation }) => ({
-        id: `${holder}.${relation.name}`,
-        source: holder,
-        target: relation.targetType,
-        label: relation.displayName,
-        kind: relation.kind,
-      })),
-    };
-  }
+  // `getGraph` is deliberately absent: the base class draws the ontology from
+  // the snapshot above, and it is the same drawing the library registry gets.
+  // See `buildCatalogGraph` in `@dudousxd/nestjs-catalog` — this file used to
+  // hold a second copy of the edge rule, under a comment asking whoever changed
+  // one to change both.
 
   async patchType(
     typeName: string,
