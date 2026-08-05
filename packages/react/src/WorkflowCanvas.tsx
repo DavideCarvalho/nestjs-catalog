@@ -2,6 +2,7 @@ import type {
   CatalogConnection,
   CatalogTransform,
   ConnectorKind,
+  TransformLanguage,
 } from '@dudousxd/nestjs-catalog/client';
 import {
   Background,
@@ -12,7 +13,9 @@ import {
   type EdgeChange,
   MiniMap,
   type NodeChange,
+  NodeToolbar,
   type OnConnectEnd,
+  Position,
   ReactFlow,
   ReactFlowProvider,
   useReactFlow,
@@ -27,9 +30,11 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   ArrowRight,
   CircleAlert,
+  CircleDashed,
   Code2,
   Database,
   LayoutGrid,
+  Link2,
   Loader2,
   Play,
   Plug,
@@ -65,6 +70,8 @@ import { Select, SelectField, type SelectOption } from './ui/select';
 import { Sheet } from './ui/sheet';
 import { Tooltip, TooltipProvider } from './ui/tooltip';
 import {
+  NODE_HEIGHT,
+  NODE_WIDTH,
   type NodeDescriptions,
   type WorkflowFlowEdge,
   type WorkflowFlowNode,
@@ -77,6 +84,7 @@ import {
 } from './workflow/graph';
 import {
   type CatalogWorkflow,
+  WORKFLOW_NODE_KINDS,
   type WorkflowEdge,
   type WorkflowNode,
   type WorkflowNodeKind,
@@ -94,6 +102,7 @@ import { WORKFLOW_NAME } from './workflow/name';
 import { WorkflowNodeProvider, workflowNodeTypes } from './workflow/nodes';
 import {
   type WorkflowProblem,
+  type WorkflowProblemCode,
   canConnect,
   edgeId,
   hasBlockingProblem,
@@ -273,8 +282,8 @@ function newNodeOfKind(
   kind: WorkflowNodeKind,
   id: string,
   position: { x: number; y: number },
+  name: string,
 ): WorkflowNode {
-  const name = defaultLabel(kind);
   if (kind === 'source') {
     return { id, name, kind: 'source', sourceKind: 'http', config: {}, position };
   }
@@ -282,6 +291,296 @@ function newNodeOfKind(
     return { id, name, kind: 'transform', transformId: '', position };
   }
   return { id, name, kind: 'sink', targetType: '', position };
+}
+
+/**
+ * The code a transform created from this canvas starts as: the batch, unchanged.
+ *
+ * Keyed by the language union rather than by `string`, so a language added to
+ * the library without a line here is a type error rather than a transform that
+ * saves empty and fails at run time.
+ *
+ * Deliberately the identity and not a worked example. `TransformEditor` ships
+ * starters that teach the shape of a mapping, and they belong there — somebody
+ * who opened the editor came to write a transform. Somebody who pressed this
+ * button came to get *past* an empty picker, and the useful default is the
+ * smallest thing that actually runs: the graph is now complete, it commits what
+ * the source produced, and the mapping is an edit rather than a prerequisite.
+ */
+const IDENTITY_TRANSFORM: Record<TransformLanguage, string> = {
+  javascript: '// Whatever is wired into this step arrives as `records`.\nreturn records;',
+  typescript: '// Whatever is wired into this step arrives as `records`.\nreturn records;',
+  python: '# Whatever is wired into this step arrives as `records`.\nreturn records',
+};
+
+/**
+ * The transform to create for a node that has none, ready to send.
+ *
+ * Named after the node, so the two are findable from each other in a Transforms
+ * list that knows nothing about graphs. In the deployment's own first language,
+ * because offering one the image cannot execute turns a deployment difference
+ * into a traceback the author cannot act on — the same reason `TransformEditor`
+ * takes its languages from `pipelineCapabilities()` rather than listing all
+ * three.
+ */
+function starterTransform(
+  node: WorkflowNode | undefined,
+  languages: TransformLanguage[] | undefined,
+): { name: string; language: TransformLanguage; code: string } {
+  const language = languages?.[0] ?? 'javascript';
+  return {
+    name: node ? nodeName(node) : defaultLabel('transform'),
+    language,
+    code: IDENTITY_TRANSFORM[language],
+  };
+}
+
+/**
+ * The node a "make one and wire it" action would create, and whether it is legal.
+ *
+ * Pure, and separate from the state update it feeds, so the decision can be
+ * described in one place and tested without a canvas. The verdict is asked even
+ * though the menu only offers kinds `newKindsFrom` already approved: the menu
+ * asking one question and the action taking a different answer is the class of
+ * bug that puts an illegal edge into a saved graph.
+ *
+ * `reason: null` distinguishes "that node is not on this canvas" — nothing
+ * happened, and there is nothing to say about it — from a refusal somebody
+ * should hear.
+ */
+function nodeWiredFrom(
+  draft: Draft,
+  fromId: string,
+  kind: WorkflowNodeKind,
+): { ok: true; node: WorkflowNode; from: WorkflowNode } | { ok: false; reason: string | null } {
+  const from = draft.nodes.find((node) => node.id === fromId);
+  if (!from) return { ok: false, reason: null };
+  const node = newNodeOfKind(
+    kind,
+    newLocalId(kind),
+    placeNextTo(from, draft.nodes),
+    uniqueName(draft.nodes, kind),
+  );
+  const verdict = canConnect([...draft.nodes, node], draft.edges, fromId, node.id);
+  return verdict.ok ? { ok: true, node, from } : { ok: false, reason: verdict.reason };
+}
+
+/** The graph with one transform node pointed at the code it now runs. */
+function runningTransform(
+  nodes: WorkflowNode[],
+  nodeId: string,
+  transformId: string,
+): WorkflowNode[] {
+  return nodes.map((node) =>
+    node.id === nodeId && node.kind === 'transform' ? { ...node, transformId } : node,
+  );
+}
+
+/**
+ * A name nobody has used yet, so the fourth transform is not also "Transform".
+ *
+ * Every node used to be born called exactly `defaultLabel(kind)`, which is how
+ * a graph ends up with three boxes called "Transform" and a problem message
+ * that has to fall back to naming the id — `Sink (sink_3b5a…)` — because the
+ * name it was given identifies nothing. A message that names an id is a message
+ * whose reader has to go hunting for which box it means.
+ *
+ * Compared against what nodes are *called* rather than against a counter, so
+ * renaming "Transform 2" to "Join" frees the number again, and so a name typed
+ * by hand is never duplicated by one generated afterwards. `nodeName` is what
+ * the rest of the screen displays, so it is what has to be unique.
+ */
+function uniqueName(nodes: WorkflowNode[], kind: WorkflowNodeKind): string {
+  const base = defaultLabel(kind);
+  const taken = new Set(nodes.map((node) => nodeName(node)));
+  if (!taken.has(base)) return base;
+  // `taken.size + 1` candidates for `taken.size` names: one of them is free, so
+  // this always returns from inside the loop.
+  for (let n = 2; n <= taken.size + 1; n += 1) {
+    const candidate = `${base} ${n}`;
+    if (!taken.has(candidate)) return candidate;
+  }
+  return `${base} ${taken.size + 2}`;
+}
+
+/**
+ * The grid `layout` uses, restated because it keeps its gaps to itself.
+ *
+ * `NODE_WIDTH` and `NODE_HEIGHT` are exported from `workflow/graph`; the column
+ * and row gaps are not. They are repeated here so that a node created by wiring
+ * from another one lands on the same grid Tidy would have put it on — otherwise
+ * the two disagree and pressing Tidy shuffles everything by a few pixels for no
+ * reason a reader can see. If they ever drift, the consequence is spacing that
+ * looks slightly off, never a node in the wrong place: the placement below is
+ * defined by what is *occupied*, not by these numbers.
+ */
+const COLUMN_STEP = NODE_WIDTH + 96;
+const ROW_STEP = NODE_HEIGHT + 32;
+
+/**
+ * Where a node created *by wiring from another node* goes.
+ *
+ * One column to the right of the node that spawned it, because that is exactly
+ * what the canvas's arrangement means: `layout` puts a node one column past the
+ * deepest thing feeding it, and a node created by this action is fed by that
+ * node and nothing else. So the position that matches the picture is not a
+ * guess — it is the position the layout would have chosen anyway.
+ *
+ * Then down a row at a time until the spot is free. The three obvious
+ * alternatives are each wrong in their own way: under the cursor puts a node
+ * wherever a menu happened to be dismissed, on top of an existing node reads as
+ * "the button did nothing", and off-screen — which is what `nextPosition` does,
+ * correctly, for the toolbar's add buttons, since those have no parent to sit
+ * beside — leaves somebody looking at an unchanged canvas. Sitting beside its
+ * parent means it is on screen whenever its parent is, which is the only
+ * guarantee available without measuring the viewport.
+ */
+function placeNextTo(from: WorkflowNode, nodes: WorkflowNode[]): { x: number; y: number } {
+  const taken = new Set(nodes.map((node) => `${node.position?.x ?? 0},${node.position?.y ?? 0}`));
+  const x = (from.position?.x ?? 0) + COLUMN_STEP;
+  let y = from.position?.y ?? 0;
+  while (taken.has(`${x},${y}`)) y += ROW_STEP;
+  return { x, y };
+}
+
+/**
+ * Which kinds of new node this one could legally feed — asked, never restated.
+ *
+ * The menu must offer only edges the graph allows, and the temptation is to
+ * write that down: "a source may feed a transform or a sink; nothing follows a
+ * sink". Writing it down is how the canvas ends up with a second copy of rules
+ * that live in `canConnect`, and the first time the two disagree the menu either
+ * offers an edge that is then refused or hides one that was always fine.
+ *
+ * So this builds a throwaway node of each kind, drops it into a copy of the
+ * graph, and asks `canConnect` — the same function the drag uses, the same one
+ * the "send its output to" picker filters with. The probe is never stored and
+ * its id never leaves this function. When a rule changes, this follows.
+ */
+function newKindsFrom(
+  from: WorkflowNode,
+  nodes: WorkflowNode[],
+  edges: WorkflowEdge[],
+): WorkflowNodeKind[] {
+  const probeId = '__probe__';
+  return WORKFLOW_NODE_KINDS.filter((kind) => {
+    const probe = newNodeOfKind(kind, probeId, { x: 0, y: 0 }, probeId);
+    return canConnect([...nodes, probe], edges, from.id, probeId).ok;
+  });
+}
+
+/**
+ * Problems about a node nobody has finished, held back from the error list.
+ *
+ * THE DISTINCTION THIS DRAWS
+ * --------------------------
+ * A node that has just been added is unwired and unconfigured *by construction*.
+ * Clicking "+ Sink" and being told, in the same instant, that the sink "is not
+ * reachable from any source, so it would never run" and "does not say which
+ * object type it writes" is true and useless: nobody has had the chance to do
+ * either yet. Worse, it is expensive. That prose was written for somebody about
+ * to save a graph that would silently do nothing, and firing it at somebody
+ * mid-click is how a validator becomes something people learn to scroll past —
+ * which is the exact failure `workflow/validate.ts` opens by describing.
+ *
+ * So the split is between INCOMPLETE and WRONG. A node the author has not
+ * finished is a to-do. A node the author *thinks* is finished and is not is a
+ * problem, and only that deserves the checks' own language.
+ *
+ * WHAT COUNTS AS "NOT FINISHED"
+ * -----------------------------
+ * The only honest signal a browser has is: the node was created in this editing
+ * session and nothing has happened to it since. `unstarted` is that set. It is
+ * component state, so it survives re-render and dies on reload — which is right,
+ * because a node that came back from the server is one somebody saved and walked
+ * away from, and is therefore finished as far as its author was concerned.
+ *
+ * A node touched once and abandoned — renamed, or wired, and then left — is
+ * removed from the set and reports in full. That is not a gap in the rule, it is
+ * the rule: acting on a node and stopping is precisely "I think this is done".
+ *
+ * WHAT THIS DOES NOT DO
+ * ---------------------
+ * It does not suppress anything. `hasBlockingProblem` is still asked about every
+ * problem, held back or not, so the save button is coloured as blocked from the
+ * moment the graph would not run; the held-back items are listed on screen the
+ * whole time as work outstanding; and pressing Save clears `unstarted` outright,
+ * so a save attempt promotes every one of them to a full error before the
+ * request is even answered. A graph that would silently do nothing cannot be
+ * saved unnoticed, which is what these checks exist for.
+ *
+ * A problem naming several nodes is held back only when *every* node it names is
+ * unstarted. Two sinks writing the same type, one old and one new, is a fact
+ * about the old one too.
+ *
+ * Worth being honest about: under the touch rule above, `every` and `some`
+ * currently cannot disagree. The only check that names two nodes is
+ * `duplicate-sink-type`, and reaching it means setting a type on the new sink,
+ * which starts it. `every` is written anyway because it is the rule that is
+ * *correct* — if "touched" is ever loosened, `some` would start holding back
+ * complaints about nodes somebody finished months ago, and it would do it
+ * silently.
+ */
+function partitionProblems(
+  problems: WorkflowProblem[],
+  unstarted: ReadonlySet<string>,
+): { live: WorkflowProblem[]; pending: WorkflowProblem[] } {
+  const live: WorkflowProblem[] = [];
+  const pending: WorkflowProblem[] = [];
+  for (const problem of problems) {
+    // A problem with no node ids is about the graph, not about a box somebody is
+    // half-way through — nothing is "not finished yet" about an empty workflow.
+    const held = problem.nodeIds.length > 0 && problem.nodeIds.every((id) => unstarted.has(id));
+    (held ? pending : live).push(problem);
+  }
+  return { live, pending };
+}
+
+/**
+ * The same fact, said as work rather than as failure.
+ *
+ * Deliberately **not** the checks' own messages. Those are long, and they are
+ * long on purpose — they argue why the shape is refused, for a reader who
+ * believes their graph is finished. Repeating them under a friendlier heading
+ * would keep every word that makes them premature and change only the colour.
+ *
+ * A verb phrase instead, one per code. Which codes appear is still entirely the
+ * validators' decision; all this supplies is the imperative form, and the
+ * fallback means a code added later shows up as outstanding work rather than
+ * vanishing from this list.
+ */
+const TODO_FOR: Partial<Record<WorkflowProblemCode, string>> = {
+  unreachable: 'wire something into it',
+  'dead-end': 'wire it into something that ends at a sink',
+  'sink-has-no-type': 'choose the object type it commits',
+  'transform-not-named': 'choose the transform it runs',
+  'missing-transform': 'choose a transform that still exists',
+  'source-has-input': 'unwire whatever feeds it — a source reads, it is not fed',
+  'sink-has-output': 'unwire what it feeds — nothing runs after a sink',
+};
+
+function todoFor(problem: WorkflowProblem): string {
+  return TODO_FOR[problem.code] ?? 'finish setting it up';
+}
+
+/**
+ * A set with some ids taken out, and the same set back when none were in it.
+ *
+ * The identity return is what stops `unstarted` becoming a new object on every
+ * edit to an unrelated node, which would re-run `partitionProblems` and rebuild
+ * every React Flow node for nothing.
+ */
+function without(set: ReadonlySet<string>, ids: string[]): ReadonlySet<string> {
+  if (!ids.some((id) => set.has(id))) return set;
+  const next = new Set(set);
+  for (const id of ids) next.delete(id);
+  return next;
+}
+
+/** The nodes named by held-back checks, by the name the reader sees. */
+function unfinishedNames(pending: WorkflowProblem[], nodes: WorkflowNode[]): string[] {
+  const ids = new Set(pending.flatMap((problem) => problem.nodeIds));
+  return [...ids].map((id) => nodeLabelIn(nodes, id));
 }
 
 /**
@@ -300,6 +599,27 @@ function RefusalNote({ lead, error }: { lead: string; error: unknown }) {
 }
 
 /**
+ * What pressing Save will do, in the three states it can be in.
+ *
+ * The middle case is the one that had to be added. "There are errors listed
+ * beside the canvas" is exactly wrong when the list beside the canvas is empty
+ * and the only thing standing in the way is a node nobody has finished — it
+ * sends somebody looking for a message that is not there. So that case names the
+ * nodes instead, and says the thing they most need to know: pressing Save is
+ * what stops the checks being held back.
+ */
+function saveHint(blocked: boolean, unfinished: string[]): string {
+  if (unfinished.length > 0) {
+    const one = unfinished.length === 1;
+    return `Nothing is wrong yet, but ${one ? 'one node is' : `${unfinished.length} nodes are`} not finished: ${unfinished.join(', ')}. Saving sends ${one ? 'it' : 'them'} exactly as ${one ? 'it is' : 'they are'} and the server will refuse the graph. Save anyway to see what it says — the checks stop being held back the moment you do.`;
+  }
+  if (blocked) {
+    return 'There are errors listed beside the canvas, and the server will almost certainly refuse this. Sending it anyway is allowed — the server decides, not this screen.';
+  }
+  return 'Store it. The server checks it again, and its answer is the one that counts.';
+}
+
+/**
  * Save, run, delete.
  *
  * Save is deliberately **not** disabled when the local checks fail. Disabling
@@ -308,11 +628,19 @@ function RefusalNote({ lead, error }: { lead: string; error: unknown }) {
  * graph nobody can save at all, with no error to read. The button is coloured to
  * warn and the tooltip says what will happen; the refusal, when it comes, comes
  * from the server with its reasons.
+ *
+ * `blocked` is asked about every check, including the ones held back from the
+ * error list while their node is still being worked on — so the colour never
+ * lags behind the graph. What `unfinished` changes is only what the tooltip
+ * *says*: "there are errors listed beside the canvas" would be a lie when the
+ * list beside the canvas is empty and the real answer is "two boxes are not
+ * finished", so that case gets its own sentence and names them.
  */
 function CanvasActions({
   draft,
   canEdit,
   blocked,
+  unfinished,
   saving,
   running,
   durabilityDetail,
@@ -323,6 +651,7 @@ function CanvasActions({
   draft: Draft;
   canEdit: boolean;
   blocked: boolean;
+  unfinished: string[];
   saving: boolean;
   running: boolean;
   durabilityDetail: string;
@@ -332,13 +661,7 @@ function CanvasActions({
 }) {
   return (
     <div className="flex flex-wrap items-start gap-2 self-end pb-1">
-      <Tooltip
-        content={
-          blocked
-            ? 'There are errors listed beside the canvas, and the server will almost certainly refuse this. Sending it anyway is allowed — the server decides, not this screen.'
-            : 'Store it. The server checks it again, and its answer is the one that counts.'
-        }
-      >
+      <Tooltip content={saveHint(blocked, unfinished)}>
         <button
           type="button"
           onClick={onSave}
@@ -506,6 +829,10 @@ function GraphSurface({
   onConnect,
   isValidConnection,
   onConnectEnd,
+  onNodeEnter,
+  onNodeLeave,
+  onPaneClick,
+  nodeMenu,
 }: {
   loading: boolean;
   failed: boolean;
@@ -522,6 +849,11 @@ function GraphSurface({
   onConnect: (connection: Connection) => void;
   isValidConnection: (candidate: { source: string | null; target: string | null }) => boolean;
   onConnectEnd: OnConnectEnd;
+  onNodeEnter: (id: string) => void;
+  onNodeLeave: () => void;
+  onPaneClick: () => void;
+  /** The wiring menu, which has to be a child of `ReactFlow` to be placed. */
+  nodeMenu: ReactNode;
 }) {
   return (
     <div
@@ -547,6 +879,9 @@ function GraphSurface({
             onConnect={onConnect}
             isValidConnection={isValidConnection}
             onConnectEnd={onConnectEnd}
+            onNodeMouseEnter={(_event, node) => onNodeEnter(node.id)}
+            onNodeMouseLeave={onNodeLeave}
+            onPaneClick={onPaneClick}
             connectionLineType={ConnectionLineType.SmoothStep}
             nodesDraggable={canEdit}
             nodesConnectable={canEdit}
@@ -566,11 +901,310 @@ function GraphSurface({
             <Background variant={BackgroundVariant.Dots} gap={18} size={1} />
             <Controls showInteractive={false} />
             <MiniMap pannable zoomable nodeColor={(node) => miniMapColor(node.data)} />
+            {nodeMenu}
           </ReactFlow>
         </WorkflowNodeProvider>
       )}
     </div>
   );
+}
+
+/**
+ * The wiring control that lives on a node, and the menu behind it.
+ *
+ * WHY THIS EXISTS
+ * ---------------
+ * Until this, the only way to make an edge on this canvas was to drag from one
+ * handle to another. That is React Flow's gesture, it is perfectly good, and it
+ * is invisible: nothing on the screen says the small circles are draggable, so
+ * the canvas worked for people who had used a node editor before and read as
+ * broken to everybody else. The wiring rail and the inspector's picker were the
+ * answers for keyboard users — they are still the answers for keyboard users —
+ * but reaching either means knowing to open a panel first.
+ *
+ * A control on the node, offering "connect to something that exists" and "make
+ * the next thing and connect it", is the ordinary affordance for this kind of
+ * editor. Its absence was the whole complaint.
+ *
+ * WHAT IT OFFERS
+ * --------------
+ * Only edges the graph allows, and it does not know which those are. Every
+ * option — existing target, new kind, all of it — is filtered by `canConnect`,
+ * the same function the drag is refused by. Offering an edge that is then
+ * rejected teaches somebody the menu is a guess; restating the node-kind rules
+ * here so the menu could be "smart" would be the same rules in a second place,
+ * which is how they drift.
+ *
+ * Disconnect is here too. Removing a wire otherwise means finding a two-pixel
+ * line on a canvas and pressing Delete, or scrolling the rail to the right row;
+ * the node is where somebody knows *which* wire they mean, so it is where the
+ * offer belongs.
+ *
+ * HOW IT IS PLACED
+ * ----------------
+ * `NodeToolbar` with an explicit `nodeId`, which is React Flow's documented way
+ * of rendering a toolbar for a node from outside that node's own component. So
+ * the position comes from the same measurements the canvas draws with, and this
+ * file does not do arithmetic on a viewport transform.
+ */
+function NodeWiringMenu({
+  node,
+  draft,
+  canEdit,
+  open,
+  onOpenChange,
+  onHoverChange,
+  onConnect,
+  onConnectToNew,
+  onDisconnect,
+}: {
+  /** Null whenever nothing is hovered or selected, which is most of the time. */
+  node: WorkflowNode | null;
+  draft: Draft;
+  canEdit: boolean;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onHoverChange: (hovering: boolean) => void;
+  onConnect: (from: string, to: string) => void;
+  onConnectToNew: (from: string, kind: WorkflowNodeKind) => void;
+  onDisconnect: (edge: WorkflowEdge) => void;
+}) {
+  if (!node || !canEdit) return null;
+
+  const targets = draft.nodes.filter(
+    (candidate) => canConnect(draft.nodes, draft.edges, node.id, candidate.id).ok,
+  );
+  const kinds = newKindsFrom(node, draft.nodes, draft.edges);
+  const wires = draft.edges.filter((edge) => edge.from === node.id || edge.to === node.id);
+  const label = (id: string) => nodeLabelIn(draft.nodes, id);
+
+  return (
+    <NodeToolbar
+      nodeId={node.id}
+      isVisible
+      position={Position.Top}
+      align="end"
+      // Flush against the node. The pointer has to travel from the node to this
+      // toolbar to use it, and any gap is canvas — which means `onNodeMouseLeave`
+      // fires with nothing to catch it and the control vanishes on the way to
+      // itself. Touching, the leave and the enter land in the same React batch.
+      offset={0}
+      onMouseEnter={() => onHoverChange(true)}
+      onMouseLeave={() => onHoverChange(false)}
+      className="flex flex-col items-end gap-1"
+    >
+      <Tooltip content={`Wire ${nodeName(node)} to something, or make the next node from it.`}>
+        <button
+          type="button"
+          onClick={() => onOpenChange(!open)}
+          aria-expanded={open}
+          aria-haspopup="menu"
+          aria-label={`Wire ${nodeName(node)}`}
+          className={cn(
+            'flex items-center gap-1 rounded-md border px-1.5 py-1 text-[10px] shadow-sm',
+            RULE,
+            PANEL,
+            'hover:bg-zinc-50 dark:hover:bg-zinc-800',
+          )}
+        >
+          <Link2 size={11} />
+          Wire
+        </button>
+      </Tooltip>
+
+      {open && (
+        <div
+          role="menu"
+          aria-label={`Wiring for ${nodeName(node)}`}
+          onKeyDown={(event) => {
+            if (event.key === 'Escape') onOpenChange(false);
+          }}
+          className={cn(
+            'w-60 rounded-md border p-1 text-left shadow-lg',
+            RULE,
+            PANEL,
+            // Above the nodes, which React Flow gives a z-index of their own.
+            'z-10',
+          )}
+        >
+          <MenuGroup title="Send its output to">
+            {targets.length === 0 ? (
+              <MenuNote>
+                {/* Said rather than shown as an empty list: "nothing here" and
+                    "nothing is possible" look identical and mean different
+                    things, and for a sink the answer is permanent. */}
+                {node.kind === 'sink'
+                  ? 'A sink commits its rows. Nothing runs after one.'
+                  : 'Nothing on the canvas can take its output yet. Make one below.'}
+              </MenuNote>
+            ) : (
+              targets.map((target) => (
+                <MenuItem
+                  key={target.id}
+                  onClick={() => {
+                    onConnect(node.id, target.id);
+                    onOpenChange(false);
+                  }}
+                  icon={<ArrowRight size={11} className={MUTED} />}
+                  hint={target.kind}
+                >
+                  {nodeName(target)}
+                </MenuItem>
+              ))
+            )}
+          </MenuGroup>
+
+          {kinds.length > 0 && (
+            <MenuGroup title="Or make one">
+              {kinds.map((kind) => (
+                <MenuItem
+                  key={kind}
+                  onClick={() => onConnectToNew(node.id, kind)}
+                  icon={<Plus size={11} className={MUTED} />}
+                  hint="added and wired"
+                >
+                  New {kind}
+                </MenuItem>
+              ))}
+            </MenuGroup>
+          )}
+
+          {wires.length > 0 && (
+            <MenuGroup title="Already wired">
+              {wires.map((edge) => (
+                <MenuItem
+                  key={edgeId(edge)}
+                  onClick={() => {
+                    onDisconnect(edge);
+                    onOpenChange(false);
+                  }}
+                  icon={<Unplug size={11} className={MUTED} />}
+                  hint={edge.from === node.id ? 'feeds' : 'fed by'}
+                >
+                  Disconnect {label(edge.from === node.id ? edge.to : edge.from)}
+                </MenuItem>
+              ))}
+            </MenuGroup>
+          )}
+        </div>
+      )}
+    </NodeToolbar>
+  );
+}
+
+function MenuGroup({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <div className="py-0.5">
+      <p className={cn('px-1.5 pb-0.5 font-mono text-[9px] uppercase tracking-[0.14em]', MUTED)}>
+        {title}
+      </p>
+      {children}
+    </div>
+  );
+}
+
+function MenuNote({ children }: { children: ReactNode }) {
+  return <p className={cn('px-1.5 py-0.5 text-[11px] leading-relaxed', MUTED)}>{children}</p>;
+}
+
+function MenuItem({
+  onClick,
+  icon,
+  hint,
+  children,
+}: {
+  onClick: () => void;
+  icon: ReactNode;
+  hint: string;
+  children: ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      role="menuitem"
+      onClick={onClick}
+      className={cn(
+        'flex w-full items-center gap-1.5 rounded px-1.5 py-1 text-left text-[11px]',
+        'hover:bg-zinc-100 dark:hover:bg-zinc-800',
+      )}
+    >
+      {icon}
+      <span className="truncate">{children}</span>
+      <span className={cn('ml-auto shrink-0 font-mono text-[9px]', MUTED)}>{hint}</span>
+    </button>
+  );
+}
+
+/**
+ * Which node the wiring control is attached to right now.
+ *
+ * Three sources, in falling order of intent. An open menu wins outright — it was
+ * opened deliberately and must not close because the pointer moved. Then the
+ * node under the pointer, which is what makes the control discoverable at all.
+ * Then a single selected node, so the control is reachable without a pointer:
+ * hover-only affordances are invisible to anybody driving from the keyboard.
+ *
+ * A single selection only. Several selected nodes would mean several toolbars
+ * and a "wire this" offered against an ambiguous "this".
+ */
+function wiringAnchor(
+  nodes: WorkflowNode[],
+  menuFor: string | null,
+  hovered: string | null,
+  selected: string[],
+): WorkflowNode | null {
+  const wanted = menuFor ?? hovered ?? (selected.length === 1 ? selected[0] : null);
+  return nodes.find((node) => node.id === wanted) ?? null;
+}
+
+/**
+ * Which node the wiring control is on, and everything that moves it.
+ *
+ * Two pieces of state and not one, and that is the whole subtlety. `hovered` is
+ * what makes the control discoverable — a small button appearing on the node
+ * under the pointer is the ordinary affordance for this kind of editor, and its
+ * absence is the entire reason this canvas felt like it needed prior knowledge
+ * of React Flow. `openFor` is what keeps the menu open once it has been opened,
+ * because the pointer has to leave the node to reach the menu's own items, and a
+ * menu that closed on the way to itself would be unusable.
+ *
+ * A hook rather than four `useState` calls in the canvas, because these five
+ * handlers only make sense together: every one of them is "and therefore the
+ * anchor is now …", and split across a 700-line component they read as five
+ * unrelated setters.
+ */
+function useWiringMenu(nodes: WorkflowNode[], selectedNodeIds: string[]) {
+  const [hovered, setHovered] = useState<string | null>(null);
+  const [openFor, setOpenFor] = useState<string | null>(null);
+
+  const anchor = wiringAnchor(nodes, openFor, hovered, selectedNodeIds);
+  const anchorId = anchor?.id ?? null;
+
+  const onNodeLeave = useCallback(() => setHovered(null), []);
+  const close = useCallback(() => setOpenFor(null), []);
+  const reset = useCallback(() => {
+    setOpenFor(null);
+    setHovered(null);
+  }, []);
+
+  return {
+    anchor,
+    open: openFor !== null && openFor === anchorId,
+    onNodeEnter: setHovered,
+    onNodeLeave,
+    close,
+    reset,
+    onOpenChange: (next: boolean) => setOpenFor(next ? anchorId : null),
+    onHoverChange: (hovering: boolean) => setHovered(hovering ? anchorId : null),
+  };
+}
+
+/** The problems naming one node, or none when no node is open. */
+function problemsOf(
+  byNode: Map<string, WorkflowProblem[]>,
+  node: WorkflowNode | null,
+): WorkflowProblem[] {
+  return node ? (byNode.get(node.id) ?? []) : [];
 }
 
 /** A node's display name, falling back to its id when it is not in the graph. */
@@ -660,6 +1294,16 @@ function Canvas({
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [run, setRun] = useState<WorkflowRun | null>(null);
   /**
+   * Nodes added in this session that nobody has done anything to yet.
+   *
+   * The whole argument is on `partitionProblems`. What matters here is that this
+   * is component state and nothing else: it is not saved, not sent, and not
+   * restored, because a node that arrives from the server is by definition one
+   * somebody finished with.
+   */
+  const [unstarted, setUnstarted] = useState<ReadonlySet<string>>(() => new Set<string>());
+
+  /**
    * The last thing the canvas refused, and the last thing it did.
    *
    * One string, announced politely, because a canvas gives no other feedback to
@@ -667,6 +1311,8 @@ function Canvas({
    * screen is silence too.
    */
   const [announcement, setAnnouncement] = useState('');
+
+  const menu = useWiringMenu(draft.nodes, selectedNodeIds);
 
   /**
    * Which workflow the draft was built from.
@@ -689,7 +1335,11 @@ function Canvas({
     setSelectedEdgeIds([]);
     setInspecting(null);
     setRun(null);
-  }, [workflows.data, selected]);
+    // Everything in a freshly loaded draft came off the server, so nothing in it
+    // is "not finished yet" — see `partitionProblems`.
+    setUnstarted(new Set<string>());
+    menu.reset();
+  }, [workflows.data, selected, menu.reset]);
 
   // Fit after the graph swaps, on the frame after the new nodes have been laid
   // out. Calling it in the same tick fits an empty canvas, because React Flow
@@ -717,11 +1367,21 @@ function Canvas({
     () => validateWorkflow({ nodes: draft.nodes, edges: draft.edges }, { transformIds }),
     [draft.nodes, draft.edges, transformIds],
   );
-  const problemsFor = useMemo(() => problemsByNode(problems), [problems]);
-  const brokenEdgeIds = useMemo(
-    () => new Set(problems.flatMap((problem) => problem.edgeIds)),
-    [problems],
+  /**
+   * The same checks, split by whether the node they name is finished.
+   *
+   * `live` is what the canvas draws in red and what the Problems list says.
+   * `pending` is the same data presented as outstanding work. Nothing is thrown
+   * away — see `partitionProblems`, and note that `blocked` below is still
+   * computed from `problems`, not from `live`.
+   */
+  const { live, pending } = useMemo(
+    () => partitionProblems(problems, unstarted),
+    [problems, unstarted],
   );
+  const problemsFor = useMemo(() => problemsByNode(live), [live]);
+  const pendingFor = useMemo(() => problemsByNode(pending), [pending]);
+  const brokenEdgeIds = useMemo(() => new Set(live.flatMap((problem) => problem.edgeIds)), [live]);
   const runFor = useMemo(
     () => new Map((run?.nodes ?? []).map((node) => [node.nodeId, node])),
     [run],
@@ -782,6 +1442,10 @@ function Canvas({
       }));
 
       if (removed.size > 0) {
+        // Housekeeping, not a rule: a node that no longer exists cannot be
+        // unfinished, and leaving its id behind would hold back a later node
+        // that happened to be given the same one.
+        setUnstarted((current) => without(current, [...removed]));
         setAnnouncement(
           `${removed.size} node${removed.size === 1 ? '' : 's'} removed, along with their connections.`,
         );
@@ -806,6 +1470,18 @@ function Canvas({
     [edit],
   );
 
+  /**
+   * Somebody has acted on these nodes, so their checks stop being held back.
+   *
+   * Called from every path that changes a node or its wiring *after* it exists.
+   * Deliberately not called for a position change: dragging a box arranges the
+   * picture and says nothing about whether its author is done with it, and none
+   * of the checks read a position anyway.
+   */
+  const markStarted = useCallback((...ids: string[]) => {
+    setUnstarted((current) => without(current, ids));
+  }, []);
+
   const disconnect = useCallback(
     (edge: WorkflowEdge) => {
       const id = edgeId(edge);
@@ -813,9 +1489,10 @@ function Canvas({
         ...current,
         edges: current.edges.filter((candidate) => edgeId(candidate) !== id),
       }));
+      markStarted(edge.from, edge.to);
       setAnnouncement('Connection removed.');
     },
-    [edit],
+    [edit, markStarted],
   );
 
   const connect = useCallback(
@@ -829,11 +1506,12 @@ function Canvas({
       // edges receives its inputs in the order the edges appear in this array,
       // and that order is part of what the graph produces.
       edit((current) => ({ ...current, edges: [...current.edges, { from, to }] }));
+      markStarted(from, to);
       setAnnouncement(
         `${nodeLabelIn(draft.nodes, from)} now feeds ${nodeLabelIn(draft.nodes, to)}.`,
       );
     },
-    [draft.nodes, draft.edges, edit],
+    [draft.nodes, draft.edges, edit, markStarted],
   );
 
   const onConnect = useCallback(
@@ -918,6 +1596,61 @@ function Canvas({
     },
   });
 
+  /**
+   * Write the first transform without leaving the canvas.
+   *
+   * The detour this removes: leave the graph, go to Transforms, write one, come
+   * back, find the node again, pick it. On a deployment with no transforms at
+   * all that detour was not a convenience problem — the picker offered a choice
+   * that did not exist and the screen gave no hint that the way out was on
+   * another tab.
+   *
+   * Created here rather than by opening `TransformEditor` empty, because the
+   * editor reports that it saved and not *what* it saved: its `onSaved` takes no
+   * argument, so the canvas would have no id to put on the node and the person
+   * would come back to the same empty picker. One `saveTransform` gives an id,
+   * which goes on the node, and the editor then opens on a transform that
+   * exists.
+   *
+   * The new transform is named after the node so the two are findable from each
+   * other, and its code is the identity — return the batch unchanged. That runs,
+   * commits, and is the smallest thing that is not a placeholder;
+   * `TransformEditor`'s own starters teach the shape of a mapping and belong
+   * where somebody chose to write one, not where somebody clicked past a dead
+   * end.
+   */
+  const createTransform = useMutation({
+    mutationFn: async (nodeId: string) => {
+      const created = await client.saveTransform(
+        starterTransform(
+          draft.nodes.find((candidate) => candidate.id === nodeId),
+          capabilities?.languages,
+        ),
+      );
+      return { nodeId, created };
+    },
+    onSuccess: ({ nodeId, created }) => {
+      edit((current) => ({
+        ...current,
+        nodes: runningTransform(current.nodes, nodeId, created.id),
+      }));
+      markStarted(nodeId);
+      // Written into the cache as well as invalidated: the code sheet below
+      // resolves the transform out of this list, and opening it before the
+      // refetch lands would tell somebody the node names no transform one click
+      // after they created one.
+      queryClient.setQueryData<CatalogTransform[]>(catalogQueryKeys.transforms, (current) => [
+        ...(current ?? []),
+        created,
+      ]);
+      queryClient.invalidateQueries({ queryKey: catalogQueryKeys.transforms });
+      setEditingCodeFor(nodeId);
+      setAnnouncement(
+        `"${created.name}" was created and this node now runs it. Its code is open — it returns the batch unchanged until you change it.`,
+      );
+    },
+  });
+
   const remove = useMutation({
     mutationFn: (id: string) => client.deleteWorkflow(id),
     onSuccess: () => {
@@ -931,12 +1664,58 @@ function Canvas({
   const addNode = useCallback((kind: WorkflowNodeKind) => {
     const id = newLocalId(kind);
     setDraft((current) => {
-      const node = newNodeOfKind(kind, id, nextPosition(current.nodes));
+      const node = newNodeOfKind(
+        kind,
+        id,
+        nextPosition(current.nodes),
+        uniqueName(current.nodes, kind),
+      );
       return { ...current, nodes: [...current.nodes, node], dirty: true };
     });
+    setUnstarted((current) => new Set([...current, id]));
     setInspecting(id);
     setAnnouncement(`A ${kind} node was added. Its inspector is open.`);
   }, []);
+
+  /**
+   * Make the next node and wire it in, as one action.
+   *
+   * The thing the canvas could not do. Adding a node and connecting it were two
+   * separate gestures, the second of which was a drag between two handles — an
+   * interaction that is perfectly discoverable to somebody who already knows it
+   * is there, and invisible to everybody else.
+   *
+   * The edge made here is part of the node's *creation*, which is why the new
+   * node still goes into `unstarted`: nobody has acted on it, they have only
+   * brought it into being. Wiring it *afterwards* is what counts as acting on
+   * it, and that path goes through `connect`.
+   *
+   * The verdict is asked even though the menu only offers legal kinds, because
+   * the menu asking one question and the action taking another answer is the
+   * class of bug that puts an illegal edge in a saved graph.
+   */
+  const connectToNew = useCallback(
+    (fromId: string, kind: WorkflowNodeKind) => {
+      const made = nodeWiredFrom(draft, fromId, kind);
+      if (!made.ok) {
+        if (made.reason) setAnnouncement(made.reason);
+        return;
+      }
+      const { node, from } = made;
+      edit((current) => ({
+        ...current,
+        nodes: [...current.nodes, node],
+        edges: [...current.edges, { from: fromId, to: node.id }],
+      }));
+      setUnstarted((current) => new Set([...current, node.id]));
+      menu.close();
+      setInspecting(node.id);
+      setAnnouncement(
+        `${nodeName(node)} was added and ${nodeName(from)} now feeds it. Its inspector is open.`,
+      );
+    },
+    [draft, edit, menu.close],
+  );
 
   const tidy = useCallback(() => {
     edit((current) => ({
@@ -950,7 +1729,33 @@ function Canvas({
   }, [edit, fitView]);
 
   const durability = describeDurability(capabilities?.durable);
+  // Asked about EVERY problem, not about `live`. This is the guarantee: a graph
+  // that would silently do nothing is coloured as unsaveable from the moment it
+  // becomes one, whether or not the node responsible is still being worked on.
   const blocked = hasBlockingProblem(problems);
+  /**
+   * The nodes standing between this graph and a save that would be accepted,
+   * where the only thing wrong with them is that they are not finished.
+   *
+   * Named so the save tooltip can point at them. A button that goes amber
+   * without saying which box to go and look at is the same failure as a message
+   * that names an id.
+   */
+  const unfinished = useMemo(() => unfinishedNames(pending, draft.nodes), [pending, draft.nodes]);
+
+  /**
+   * Save says "I think this is finished", so nothing is held back after it.
+   *
+   * Cleared before the request rather than in `onSuccess` or `onError`, because
+   * the point is not what the server answers — it is that the person has
+   * declared the graph done, which is exactly the condition under which every
+   * check's own wording becomes the right wording. If the server refuses, the
+   * reasons are already on screen in full beside its refusal.
+   */
+  const saveNow = useCallback(() => {
+    setUnstarted(new Set<string>());
+    save.mutate();
+  }, [save]);
   const inspectingNode = draft.nodes.find((node) => node.id === inspecting) ?? null;
   const editingNode = draft.nodes.find((node) => node.id === editingCodeFor);
   const editingTransform: CatalogTransform | undefined =
@@ -1031,10 +1836,11 @@ function Canvas({
             draft={draft}
             canEdit={canEdit}
             blocked={blocked}
+            unfinished={unfinished}
             saving={save.isPending}
             running={runIt.isPending}
             durabilityDetail={durability.detail}
-            onSave={() => save.mutate()}
+            onSave={saveNow}
             onRun={() => draft.id && runIt.mutate(draft.id)}
             onAskDelete={() => setConfirmingDelete(true)}
           />
@@ -1079,11 +1885,28 @@ function Canvas({
           onConnect={onConnect}
           isValidConnection={isValidConnection}
           onConnectEnd={announceRefusedDrop}
+          onNodeEnter={menu.onNodeEnter}
+          onNodeLeave={menu.onNodeLeave}
+          onPaneClick={menu.close}
+          nodeMenu={
+            <NodeWiringMenu
+              node={menu.anchor}
+              draft={draft}
+              canEdit={canEdit}
+              open={menu.open}
+              onOpenChange={menu.onOpenChange}
+              onHoverChange={menu.onHoverChange}
+              onConnect={connect}
+              onConnectToNew={connectToNew}
+              onDisconnect={disconnect}
+            />
+          }
         />
 
         <WiringRail
           draft={draft}
-          problems={problems}
+          problems={live}
+          pending={pending}
           run={run}
           canEdit={canEdit}
           onInspect={setInspecting}
@@ -1109,16 +1932,24 @@ function Canvas({
         connections={connections}
         typeOptions={typeOptions}
         canEdit={canEdit}
-        problems={inspectingNode ? (problemsFor.get(inspectingNode.id) ?? []) : []}
+        problems={problemsOf(problemsFor, inspectingNode)}
+        pending={problemsOf(pendingFor, inspectingNode)}
         onClose={() => setInspecting(null)}
-        onChange={(next) =>
+        onChange={(next) => {
+          // Editing any field is the clearest statement there is that somebody
+          // is working on this node rather than looking at one they just made.
+          markStarted(next.id);
           edit((current) => ({
             ...current,
             nodes: current.nodes.map((node) => (node.id === next.id ? next : node)),
-          }))
-        }
+          }));
+        }}
         onConnect={connect}
+        onConnectToNew={connectToNew}
         onDisconnect={disconnect}
+        onCreateTransform={(nodeId) => createTransform.mutate(nodeId)}
+        creatingTransform={createTransform.isPending}
+        createTransformError={createTransform.error}
         onDelete={(nodeId) => {
           edit((current) => ({
             ...current,
@@ -1199,6 +2030,11 @@ function AddButton({
       <button
         type="button"
         onClick={onClick}
+        // The visible text is the noun alone, because three buttons reading
+        // "Add a source" / "Add a transform" / "Add a sink" in a row is three
+        // copies of one word. The accessible name has to say what the control
+        // does: heard on its own, "Sink" is a heading, not a button.
+        aria-label={`Add a ${label.toLowerCase()} node`}
         className={cn(
           'flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs',
           RULE,
@@ -1316,6 +2152,7 @@ function CanvasFailure({
 function WiringRail({
   draft,
   problems,
+  pending,
   run,
   canEdit,
   onInspect,
@@ -1323,6 +2160,7 @@ function WiringRail({
 }: {
   draft: Draft;
   problems: WorkflowProblem[];
+  pending: WorkflowProblem[];
   run: WorkflowRun | null;
   canEdit: boolean;
   onInspect: (nodeId: string) => void;
@@ -1381,6 +2219,8 @@ function WiringRail({
           </ul>
         )}
       </section>
+
+      <PendingWork pending={pending} label={label} onInspect={onInspect} />
 
       <section className={cn('rounded-lg border p-3', RULE, PANEL)}>
         <h2 className={cn('font-mono text-[10px] uppercase tracking-[0.14em]', MUTED)}>Problems</h2>
@@ -1518,6 +2358,68 @@ function WiringRail({
 }
 
 /**
+ * What is left to do on the nodes nobody has finished.
+ *
+ * The same checks as the Problems list below it, and deliberately not the same
+ * words. Grouped by node rather than listed one per check, because "Sink" with
+ * two things outstanding is one piece of work, not two complaints — and because
+ * the group heading is the node's name, which is what somebody needs in order to
+ * go and find it.
+ *
+ * Rendered as nothing at all when there is nothing outstanding, rather than as
+ * an empty panel: a heading that is permanently on screen with "nothing here"
+ * under it is a heading that stops being read, and this one has to be noticed on
+ * the occasions it is not empty.
+ */
+function PendingWork({
+  pending,
+  label,
+  onInspect,
+}: {
+  pending: WorkflowProblem[];
+  label: (id: string) => string;
+  onInspect: (nodeId: string) => void;
+}) {
+  const byNode = useMemo(() => problemsByNode(pending), [pending]);
+  if (byNode.size === 0) return null;
+
+  return (
+    <section className={cn('rounded-lg border p-3', RULE, PANEL)}>
+      <h2 className={cn('font-mono text-[10px] uppercase tracking-[0.14em]', MUTED)}>
+        Still to do
+      </h2>
+      <ul className="mt-2 space-y-1.5">
+        {[...byNode.entries()].map(([nodeId, items]) => (
+          <li key={nodeId} className="flex gap-1.5 text-[11px] leading-relaxed">
+            <CircleDashed size={11} className={cn('mt-0.5 shrink-0', MUTED)} />
+            <span>
+              <button
+                type="button"
+                onClick={() => onInspect(nodeId)}
+                className="font-medium hover:underline"
+              >
+                {label(nodeId)}
+              </button>
+              <span className={MUTED}>
+                {' — '}
+                {items.map((problem) => todoFor(problem)).join('; ')}.
+              </span>
+            </span>
+          </li>
+        ))}
+      </ul>
+      <p className={cn('mt-2 text-[10px] leading-relaxed', MUTED)}>
+        {/* Said once, here, rather than implied by the absence of red. Somebody
+            who has seen this canvas shout at a node they added a second ago
+            needs to know that the quiet is deliberate and temporary. */}
+        These are not problems yet — a node that was just added is unwired and unconfigured by
+        construction. They are checked in full the moment you save.
+      </p>
+    </section>
+  );
+}
+
+/**
  * One end of a node's wiring — everything feeding it, or everything it feeds.
  *
  * Both directions render the same list off the same edges, so they share one
@@ -1572,48 +2474,122 @@ function WiringList({
   );
 }
 
-/** Which transform runs here, and a way into its code. */
+/**
+ * Which code runs here, and a way into it.
+ *
+ * THE TWO THINGS THIS SCREEN KEPT CONFLATING
+ * ------------------------------------------
+ * A reader's complaint, verbatim: "the transform node needs another transform,
+ * it reads a bit strange". They are right, and the model is not wrong — a
+ * `CatalogTransform` is named, reusable code, deliberately shared between
+ * connectors and graphs, and a node is a *position* in a graph that runs some.
+ * Two different things. What made them look like one thing was this form: a
+ * field called "Transform", inside a sheet describing a transform node, asking
+ * you to choose a Transform.
+ *
+ * The field is therefore labelled by what it asks for — the code — and says in
+ * one line why the two are separate. What is deliberately **not** done is
+ * renaming the node: `defaultLabel` and the badge the node draws itself with
+ * both live in `workflow/`, so a rename here would produce a step called "Step"
+ * wearing a badge that says TRANSFORM, which is the same disease with an extra
+ * word in it. One vocabulary or the other, and half of it is not reachable from
+ * this file.
+ *
+ * A FRESH CATALOG
+ * ---------------
+ * With no transforms stored, the old form offered "Choose a transform…" over an
+ * empty list, and a disabled "Open the code" that `opacity-40` did not make look
+ * disabled. So the screen presented a promise it could not keep and a control
+ * that answered clicks with silence, on a node somebody had added ten seconds
+ * earlier. Now: the empty case says it is empty and offers the way out, and the
+ * code button is not rendered at all until there is code behind it — a control
+ * that cannot act is better absent than present and inert.
+ */
 function TransformInspector({
   node,
   transforms,
   canEdit,
+  creating,
+  createError,
   onChange,
   onEditCode,
+  onCreate,
 }: {
   node: WorkflowTransformNode;
   transforms: CatalogTransform[];
   canEdit: boolean;
+  creating: boolean;
+  createError: unknown;
   onChange: (node: WorkflowNode) => void;
   onEditCode: (nodeId: string) => void;
+  onCreate: (nodeId: string) => void;
 }) {
+  const empty = transforms.length === 0;
+
   return (
     <div className="space-y-2">
-      <SelectField
-        label="Transform"
-        ariaLabel="Which transform runs at this node"
-        value={node.transformId}
-        onValueChange={(transformId) => onChange({ ...node, transformId })}
-        options={transforms.map((transform) => ({
-          value: transform.id,
-          label: transform.name,
-          hint: `${transform.language} · v${transform.version}`,
-        }))}
-        placeholder="Choose a transform…"
-        disabled={!canEdit}
-      />
-      <button
-        type="button"
-        onClick={() => onEditCode(node.id)}
-        disabled={node.transformId.length === 0}
-        className={cn(
-          'flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs disabled:opacity-40',
-          RULE,
-          'hover:bg-zinc-50 dark:hover:bg-zinc-800',
+      {empty ? (
+        <div className={cn('rounded-md border p-2', RULE)}>
+          <p className="text-[11px] leading-relaxed">
+            There are no transforms in this catalog yet, so there is nothing to choose. Make one
+            here and its code opens straight away — it is stored on its own, and other steps and
+            connectors can run it afterwards.
+          </p>
+        </div>
+      ) : (
+        <SelectField
+          label="Code it runs"
+          ariaLabel="Which transform's code runs at this step"
+          value={node.transformId}
+          onValueChange={(transformId) => onChange({ ...node, transformId })}
+          options={transforms.map((transform) => ({
+            value: transform.id,
+            label: transform.name,
+            hint: `${transform.language} · v${transform.version}`,
+          }))}
+          placeholder="Choose the code…"
+          disabled={!canEdit}
+          hint="A transform is named code, stored on its own so a connector and several steps can run the same one. This node is a position in the graph; choosing here says which code runs at it, and does not copy it."
+        />
+      )}
+
+      <div className="flex flex-wrap items-center gap-2">
+        {/*
+         * Rendered only when there is something behind it. This was a disabled
+         * button at `opacity-40`, which reads as "faint" rather than as "off" —
+         * so it got clicked, and answered with nothing at all.
+         */}
+        {node.transformId.length > 0 && (
+          <button
+            type="button"
+            onClick={() => onEditCode(node.id)}
+            className={cn(
+              'flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs',
+              RULE,
+              'hover:bg-zinc-50 dark:hover:bg-zinc-800',
+            )}
+          >
+            <Code2 size={12} />
+            Open the code
+          </button>
         )}
-      >
-        <Code2 size={12} />
-        Open the code
-      </button>
+        {canEdit && (
+          <button
+            type="button"
+            onClick={() => onCreate(node.id)}
+            disabled={creating}
+            className={cn(
+              'flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs disabled:opacity-40',
+              RULE,
+              'hover:bg-zinc-50 dark:hover:bg-zinc-800',
+            )}
+          >
+            {creating ? <Loader2 size={12} className="animate-spin" /> : <Plus size={12} />}
+            {empty ? 'Write the first transform' : 'New transform'}
+          </button>
+        )}
+      </div>
+      {createError ? <RefusalNote lead="It could not be created:" error={createError} /> : null}
     </div>
   );
 }
@@ -1680,12 +2656,17 @@ function NodeInspector({
   typeOptions,
   canEdit,
   problems,
+  pending,
   onClose,
   onChange,
   onConnect,
+  onConnectToNew,
   onDisconnect,
   onDelete,
   onEditCode,
+  onCreateTransform,
+  creatingTransform,
+  createTransformError,
 }: {
   node: WorkflowNode | null;
   draft: Draft;
@@ -1694,12 +2675,17 @@ function NodeInspector({
   typeOptions: SelectOption[];
   canEdit: boolean;
   problems: WorkflowProblem[];
+  pending: WorkflowProblem[];
   onClose: () => void;
   onChange: (node: WorkflowNode) => void;
   onConnect: (from: string, to: string) => void;
+  onConnectToNew: (from: string, kind: WorkflowNodeKind) => void;
   onDisconnect: (edge: WorkflowEdge) => void;
   onDelete: (nodeId: string) => void;
   onEditCode: (nodeId: string) => void;
+  onCreateTransform: (nodeId: string) => void;
+  creatingTransform: boolean;
+  createTransformError: unknown;
 }) {
   const [pendingTarget, setPendingTarget] = useState('');
 
@@ -1731,6 +2717,20 @@ function NodeInspector({
       }));
   }, [node, draft.nodes, draft.edges]);
 
+  /**
+   * The keyboard half of "make the next node and wire it".
+   *
+   * The canvas menu is a pointer affordance and cannot be anything else, so the
+   * action it introduced has to exist here too or it is an action half the
+   * people using this screen cannot reach. Same function, same rules — the kinds
+   * come from `newKindsFrom`, which asks `canConnect` rather than restating what
+   * may follow what.
+   */
+  const newKinds = useMemo(
+    () => (node ? newKindsFrom(node, draft.nodes, draft.edges) : []),
+    [node, draft.nodes, draft.edges],
+  );
+
   return (
     <Sheet
       open={node !== null}
@@ -1755,6 +2755,27 @@ function NodeInspector({
             </ul>
           )}
 
+          {/*
+           * The same checks, in the state they are actually in for a node this
+           * sheet opened onto the instant it was created. Neutral, and phrased
+           * as work — see `partitionProblems`. Never rendered alongside the red
+           * box above: a check is in one list or the other, never both.
+           */}
+          {pending.length > 0 && (
+            <div className={cn('rounded-md border p-2', RULE)}>
+              <p className={cn('font-mono text-[10px] uppercase tracking-[0.14em]', MUTED)}>
+                Still to do
+              </p>
+              <ul className="mt-1 space-y-0.5">
+                {pending.map((problem) => (
+                  <li key={problem.code} className="text-[11px] leading-relaxed">
+                    {todoFor(problem)}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
           <TextField
             label="Name"
             value={node.name}
@@ -1769,8 +2790,11 @@ function NodeInspector({
               node={node}
               transforms={transforms}
               canEdit={canEdit}
+              creating={creatingTransform}
+              createError={createTransformError}
               onChange={onChange}
               onEditCode={onEditCode}
+              onCreate={onCreateTransform}
             />
           )}
 
@@ -1854,9 +2878,29 @@ function NodeInspector({
                 </button>
               </div>
             )}
+            {canEdit && newKinds.length > 0 && (
+              <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                {newKinds.map((kind) => (
+                  <button
+                    key={kind}
+                    type="button"
+                    onClick={() => onConnectToNew(node.id, kind)}
+                    className={cn(
+                      'flex items-center gap-1 rounded-md border px-2 py-1 text-[11px]',
+                      RULE,
+                      'hover:bg-zinc-50 dark:hover:bg-zinc-800',
+                    )}
+                  >
+                    <Plus size={10} />
+                    New {kind}
+                  </button>
+                ))}
+              </div>
+            )}
             <p className={cn('mt-1 text-[11px] leading-relaxed', MUTED)}>
               Only nodes that can legally take this one's output are listed — anything that would
-              close a loop, or feed a source, is left out.
+              close a loop, or feed a source, is left out. "New" makes one and wires it in the same
+              action, one column to the right of this node.
             </p>
           </WiringList>
 
@@ -2007,15 +3051,6 @@ function SourceInspector({
         onChange={update}
         disabled={!canEdit}
       />
-
-      {!viaConnection && (
-        <CredentialField
-          kind={kind}
-          value={node.secretEnvVar ?? ''}
-          onChange={(value) => push(source, { secretEnvVar: value.trim() ? value : undefined })}
-          disabled={!canEdit}
-        />
-      )}
 
       {incremental && (
         <p className={cn('text-[11px] leading-relaxed', MUTED)}>
