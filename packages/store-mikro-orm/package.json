@@ -1,6 +1,6 @@
 {
   "name": "@dudousxd/nestjs-catalog-store-mikro-orm",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "MikroORM warehouse store for @dudousxd/nestjs-catalog: a stored model, append-only snapshot loads, and its own tables managed at boot.",
   "license": "MIT",
   "author": "Davide Carvalho",
