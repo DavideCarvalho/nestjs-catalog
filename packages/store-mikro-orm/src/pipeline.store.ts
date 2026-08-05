@@ -3,6 +3,7 @@ import type {
   CatalogConnection,
   CatalogConnector,
   CatalogPipelineStore,
+  CatalogSecretVault,
   CatalogStageStore,
   CatalogTransform,
   CatalogWorkflow,
@@ -10,6 +11,8 @@ import type {
   ConnectionCheck,
   ConnectorKind,
   ConnectorRun,
+  SealedSecret,
+  SecretContext,
   TransformLanguage,
   WorkflowEdge,
   WorkflowExecutionMode,
@@ -17,8 +20,14 @@ import type {
   WorkflowNodeOutcome,
 } from '@dudousxd/nestjs-catalog';
 import {
+  CATALOG_SECRET_VAULT,
+  RefusingSecretVault,
+  SecretOpenFailedError,
+  SecretSealFailedError,
+  SecretVaultNotConfiguredError,
   emitCatalog,
   isConnectorKind,
+  isSealedSecret,
   isTransformLanguage,
   isWorkflowEdge,
   isWorkflowExecutionMode,
@@ -43,6 +52,15 @@ import { CATALOG_STORE_OPTIONS, type CatalogStoreModuleOptions } from './options
 export class MySqlPipelineStore
   implements CatalogPipelineStore, CatalogWorkflowStore, CatalogStageStore
 {
+  /**
+   * Every vault this store may open with. The first is the one it seals with.
+   *
+   * Never empty: an empty array binding is treated as no binding at all, so a
+   * host that wired one meets the refusing default's message — which names the
+   * token — rather than "no vault named X", which would be true and useless.
+   */
+  private readonly vaults: CatalogSecretVault[];
+
   constructor(
     // By token, never positionally. The default connection is whichever one the
     // host registered first, and in a host with a database of its own that is
@@ -55,7 +73,292 @@ export class MySqlPipelineStore
     @Optional()
     @Inject(CATALOG_STORE_OPTIONS)
     private readonly options?: CatalogStoreModuleOptions,
-  ) {}
+    // One vault, or several. Several is what makes rotation possible without an
+    // outage — seals go to the first, opens go to whichever one's `name` the
+    // row carries — and the token's docblock argues it. Optional so a host that
+    // binds nothing still boots and pays nothing: the refusing default is only
+    // ever reached by a deployment that asked for encryption.
+    @Optional()
+    @Inject(CATALOG_SECRET_VAULT)
+    vault?: CatalogSecretVault | CatalogSecretVault[],
+  ) {
+    this.vaults = toVaultList(vault);
+  }
+
+  /**
+   * Seal every credential-bearing value in a config, if this deployment asked
+   * for it.
+   *
+   * ## What counts as a credential
+   *
+   * The same predicate the refusal uses: a top-level string that parses as a
+   * URL carrying a password. **Not** the whole `config` object, and the reason
+   * is not cost — it is that encryption and redaction have to agree about what
+   * a secret is, or one of them is wrong in a way nobody sees. Seal something
+   * `redactConfigSecrets` does not hide and the console renders a ciphertext
+   * blob where a URL belongs; hide something this does not seal and the column
+   * still holds the password the docblock says it does not. One predicate, two
+   * consumers, and they cannot drift because there is only one of it.
+   *
+   * Sealing the whole object was the first idea and it fails on its own terms.
+   * `config` also holds the address, the query, the bucket, the path — and
+   * `connectorsUsingConnection`, the console list, and every "which connectors
+   * reach this database" question read those. It would also blind the refusal:
+   * `hasUrlPassword` needs a string to inspect, so with the whole config sealed
+   * there would be nothing left to check and the check would have to be
+   * deleted — a security feature removed as a side effect of a security
+   * feature.
+   *
+   * The cost of choosing is that the rule can be wrong: a token in
+   * `config.headers.authorization` is not sealed. That boundary is already
+   * documented, in the same words, by the redaction this borrows its predicate
+   * from — top-level strings only, and headers belong in `secretEnvVar`.
+   *
+   * ## Order matters
+   *
+   * This runs BEFORE `assertNoNewPlaintextCredential`, which is the whole
+   * composition of the two flags. A sealed value is an object, so the refusal
+   * looks at it, sees no string, and has nothing to refuse. Reverse the two and
+   * `encryptCredentials: true` with the default `allowInlineCredentials: false`
+   * would refuse every credential before it could be sealed — a configuration
+   * that reads as "encrypt them" and means "there is nothing to encrypt".
+   */
+  private async sealCredentials(
+    config: Record<string, unknown>,
+    kind: string,
+    id: string | undefined,
+  ): Promise<Record<string, unknown>> {
+    if (!this.options?.encryptCredentials) return config;
+    const vault = this.vaults[0];
+    const sealed: Record<string, unknown> = { ...config };
+    for (const [field, value] of Object.entries(config)) {
+      // Strings only, which is also what makes an already-sealed value safe
+      // here without a guard of its own. A `SealedSecret` is an object, so it
+      // fails this test and passes through untouched — which is the behaviour
+      // wanted when a promotion copies one across or a host writes through this
+      // store directly, because resealing would mean opening it first (a vault
+      // read the save did not need) and nesting one inside another produces a
+      // value nothing can read.
+      //
+      // An `isSealedSecret` check was written here first and deleted: it could
+      // not change any outcome, and a guard that cannot fire reads as proof
+      // something is being handled when the line below is what handles it. The
+      // behaviour is pinned by a test rather than by the dead branch.
+      if (typeof value !== 'string' || !hasUrlPassword(value)) continue;
+      sealed[field] = await sealOne(vault, value, { kind, id, field });
+    }
+    return sealed;
+  }
+
+  /**
+   * Put the plaintext back, for every value that came out of the column sealed.
+   *
+   * **Unconditional — not gated on `encryptCredentials`.** That flag decides
+   * whether new writes are sealed; a host that turns it off must keep reading
+   * the rows it already sealed, or the switch is a data-loss button.
+   *
+   * ## Why the store opens, rather than the caller that needs the plaintext
+   *
+   * `config-secrets.ts` argues that *redaction* belongs at the HTTP boundary
+   * and not here, because the store's readers are not all screens — the runner
+   * and `applyPromotion` need the real value. That argument is about hiding,
+   * and it points the other way for sealing: hiding has an audience, and
+   * sealing has none. `CatalogConnection.config` means the same thing before
+   * and after this feature — the address and options as authored — and nothing
+   * outside this file has to learn that a vault exists.
+   *
+   * The alternative, handing sealed values out and making each caller open
+   * them, fails concretely in two places and neither is theoretical:
+   *
+   *  - `fetchSql` reads `String(connector.config.url ?? '')`. Given a
+   *    `SealedSecret` that is `"[object Object]"`, and the connector dials a
+   *    garbage address and reports a connection error. The failure names the
+   *    source, not the seal.
+   *  - The console round trip breaks in the worst available way.
+   *    `restoreRedactedSecrets` decides "unchanged" by comparing the incoming
+   *    value against `redact(stored)`. If `stored` were sealed, `redact` sees a
+   *    non-string, skips it, the comparison fails — and the literal string
+   *    `REDACTED` is saved over the credential. The read path serving ciphertext
+   *    to a console that then writes it back as the value is exactly the shape
+   *    of accident this borrowed its predicate to avoid.
+   *
+   * Because the store opens, the read path still holds a real password, so the
+   * redaction still has something to redact and is left untouched. The two
+   * defend different attackers: redaction defends against `catalog:read` over
+   * HTTP, sealing defends against `SELECT` on the database. Dropping either
+   * because the other exists gives that attacker the password back.
+   *
+   * ## The cost, stated
+   *
+   * A vault round trip per sealed value per read, including list reads that
+   * redact away what they just opened. The fast path below means a deployment
+   * that never turned sealing on, and any config with no credential in it,
+   * pays nothing at all. If the rest ever bites, the fix is a short-TTL cache
+   * inside the provider — where the host's own KMS client already has one —
+   * and not a store that opens on some reads and not others, which would hand
+   * back two different configs for the same row depending on which method
+   * asked.
+   */
+  private async openCredentials(
+    config: Record<string, unknown>,
+    kind: string,
+    id: string,
+  ): Promise<Record<string, unknown>> {
+    // Checked before anything is allocated or awaited. Every config that holds
+    // no sealed value — which is all of them, for a host that never turned this
+    // on — leaves here having touched no vault and copied no object.
+    if (!Object.values(config).some(isSealedSecret)) return config;
+    const opened: Record<string, unknown> = { ...config };
+    for (const [field, value] of Object.entries(config)) {
+      if (!isSealedSecret(value)) continue;
+      opened[field] = await this.openSealed(value, { kind, id, field });
+    }
+    return opened;
+  }
+
+  /**
+   * One sealed value, through the vault that sealed it.
+   *
+   * Dispatched by `sealed.vault` and never by "the one that is bound", because
+   * handing a ciphertext to the wrong provider gets either an unhelpful decrypt
+   * error attributed to the wrong system or, with a symmetric cipher and a
+   * shared key, a plausible-looking wrong answer. The refusal names the vault
+   * the row wants, which is the only thing an operator can act on.
+   */
+  private async openSealed(sealed: SealedSecret, context: SecretContext): Promise<string> {
+    const vault = this.vaults.find((candidate) => candidate.name === sealed.vault);
+    if (!vault) {
+      throw new SecretOpenFailedError(
+        `${context.kind}.config.${context.field} on ${context.id} was sealed by the "${sealed.vault}" vault, and the vaults bound here are ${this.vaults
+          .map((candidate) => `"${candidate.name}"`)
+          .join(
+            ', ',
+          )}. Bind that provider alongside the current one — CATALOG_SECRET_VAULT takes an array so both can be readable during a rotation.`,
+        // Waiting cannot help: the binding is what is wrong, and it will be
+        // just as wrong on the third attempt fifteen minutes from now.
+        { retryable: false },
+      );
+    }
+    try {
+      return await vault.open(sealed, context);
+    } catch (error) {
+      throw new SecretOpenFailedError(
+        `${context.kind}.config.${context.field} on ${context.id} could not be opened by the "${sealed.vault}" vault: ${describeCause(error)}`,
+        // Retryable unless the vault said the problem is permanent. A vault
+        // that timed out is the same failure as a source that timed out, which
+        // is what the connector step's three attempts over fifteen minutes are
+        // for. See SecretOpenFailedError, which explains why this must not
+        // reach that step as a BadRequestException.
+        { retryable: !isPermanent(error), cause: error },
+      );
+    }
+  }
+
+  /**
+   * One connector or connection, with its config opened.
+   *
+   * Generic over the two rather than written twice, because the thing that must
+   * not diverge is *which reads open* — a read that forgot to would hand a
+   * `SealedSecret` to a caller expecting a string, and the two shapes only
+   * differ once somebody stringifies one.
+   */
+  private async withOpenConfig<T extends { id: string; config: Record<string, unknown> }>(
+    entity: T,
+    kind: string,
+  ): Promise<T> {
+    const config = await this.openCredentials(entity.config, kind, entity.id);
+    // Identity-compared rather than always copied: `openCredentials` returns the
+    // same object when there was nothing sealed, and allocating a new entity per
+    // row on every list read of every deployment that never turned this on is a
+    // cost for nobody.
+    return config === entity.config ? entity : { ...entity, config };
+  }
+
+  /**
+   * Sequentially, not with `Promise.all`.
+   *
+   * A list read of a hundred connectors would otherwise open a hundred
+   * ciphertexts at once, and the receiving end of that is a KMS account-level
+   * request rate that answers a burst with a throttling error — turning a page
+   * load into a failure that looks like the vault is broken. Slower and
+   * finishes is the right trade for a path that is already a database round
+   * trip, and the fast path above means the loop is free whenever nothing on
+   * the page is sealed.
+   */
+  private async withOpenConfigs<T extends { id: string; config: Record<string, unknown> }>(
+    entities: T[],
+    kind: string,
+  ): Promise<T[]> {
+    const opened: T[] = [];
+    for (const entity of entities) opened.push(await this.withOpenConfig(entity, kind));
+    return opened;
+  }
+
+  /**
+   * Seal the credential in every source node of a graph.
+   *
+   * Per node rather than over the graph as a whole, because a `SecretContext`
+   * describes one field of one row and a graph is one row holding several
+   * configs. The context is `{ kind: 'workflow', id: workflowId, field }`: two
+   * source nodes that both use `url` therefore seal under the same context,
+   * which is correct — they are the same field of the same row, and a provider
+   * scoping by it is scoping to the graph, which is the thing a key should be
+   * bound to.
+   */
+  private async sealSourceNodes(
+    nodes: WorkflowNode[],
+    id: string | undefined,
+  ): Promise<WorkflowNode[]> {
+    // Returns the same array when nothing is sealed, so a deployment that never
+    // turned this on writes the array it was handed rather than a copy of it.
+    if (!this.options?.encryptCredentials) return nodes;
+    const sealed: WorkflowNode[] = [];
+    for (const node of nodes) {
+      if (node.kind !== 'source') {
+        sealed.push(node);
+        continue;
+      }
+      sealed.push({ ...node, config: await this.sealCredentials(node.config, 'workflow', id) });
+    }
+    return sealed;
+  }
+
+  /** One graph, with every source node's config opened. */
+  private async withOpenGraph(workflow: CatalogWorkflow): Promise<CatalogWorkflow> {
+    let opened = false;
+    const nodes: WorkflowNode[] = [];
+    for (const node of workflow.nodes) {
+      if (node.kind !== 'source') {
+        nodes.push(node);
+        continue;
+      }
+      const config = await this.openCredentials(node.config, 'workflow', workflow.id);
+      if (config === node.config) {
+        nodes.push(node);
+        continue;
+      }
+      opened = true;
+      nodes.push({ ...node, config });
+    }
+    return opened ? { ...workflow, nodes } : workflow;
+  }
+
+  /** Sequentially, for the reason {@link withOpenConfigs} gives. */
+  private async withOpenGraphs(workflows: CatalogWorkflow[]): Promise<CatalogWorkflow[]> {
+    const opened: CatalogWorkflow[] = [];
+    for (const workflow of workflows) opened.push(await this.withOpenGraph(workflow));
+    return opened;
+  }
+
+  /** The refusal, applied to a graph. Off when `allowInlineCredentials` is on. */
+  private assertNoNewPlaintextGraphCredential(
+    nodes: WorkflowNode[],
+    stored: unknown[] | undefined,
+    subject: string,
+  ): void {
+    if (this.options?.allowInlineCredentials) return;
+    assertNoNewPlaintextGraphCredential(nodes, stored, subject);
+  }
 
   /**
    * The refusal, unless this deployment said otherwise.
@@ -69,6 +372,13 @@ export class MySqlPipelineStore
    * Note what stays on either way: reads are redacted, so the password never
    * travels in an HTTP response. This flag decides only whether it may rest in
    * the catalog's own table.
+   *
+   * `encryptCredentials` also turns it off, and by a different route worth
+   * being precise about: it does not skip the check, it removes the thing the
+   * check looks for. Every caller below seals first and passes the SEALED
+   * config here, so a credential arrives as an object and `hasUrlPassword`
+   * never sees a string to object to. That ordering is what stops the two flags
+   * from having a fourth, meaningless state — see `CatalogStoreModuleOptions`.
    */
   private assertNoNewPlaintextCredential(
     incoming: Record<string, unknown> | undefined,
@@ -82,13 +392,13 @@ export class MySqlPipelineStore
   async listConnectors(): Promise<CatalogConnector[]> {
     const em = this.em.fork();
     const rows = await em.find(ConnectorRow, {}, { orderBy: { name: 'asc' } });
-    return rows.map(toConnector);
+    return this.withOpenConfigs(rows.map(toConnector), 'connector');
   }
 
   async getConnector(id: string): Promise<CatalogConnector | undefined> {
     const em = this.em.fork();
     const row = await em.findOne(ConnectorRow, { id });
-    return row ? toConnector(row) : undefined;
+    return row ? this.withOpenConfig(toConnector(row), 'connector') : undefined;
   }
 
   async saveConnector(
@@ -126,12 +436,20 @@ export class MySqlPipelineStore
 
     const existing = input.id ? await em.findOne(ConnectorRow, { id: input.id }) : null;
 
-    this.assertNoNewPlaintextCredential(input.config, existing?.config, `"${input.name}"`);
+    // Sealed first, then checked. See `assertNoNewPlaintextCredential` above:
+    // with `encryptCredentials` on, the credential is an object by the time the
+    // refusal looks, which is how the two flags compose instead of colliding.
+    // Minted before sealing, for the reason `saveConnection` gives.
+    const id = input.id ?? randomUUID();
+    const plain = { ...(input.config ?? {}) };
+    const config = await this.sealCredentials(plain, 'connector', id);
+
+    this.assertNoNewPlaintextCredential(config, existing?.config, `"${input.name}"`);
 
     const row =
       existing ??
       em.create(ConnectorRow, {
-        id: input.id ?? randomUUID(),
+        id,
         name: input.name,
         kind: input.kind,
         targetType: input.targetType,
@@ -146,7 +464,7 @@ export class MySqlPipelineStore
     row.description = input.description;
     row.kind = input.kind;
     row.targetType = input.targetType;
-    row.config = { ...(input.config ?? {}) };
+    row.config = config;
     row.secretEnvVar = input.secretEnvVar;
     row.transformId = input.transformId;
     // Validated at length above — both-transform-and-workflow refused, a
@@ -165,7 +483,12 @@ export class MySqlPipelineStore
 
     em.persist(row);
     await em.flush();
-    return toConnector(row);
+    // The plaintext the caller just handed over, not the sealed column and not a
+    // re-open of it. Returning `row.config` would answer a save with ciphertext
+    // — which the controller would then redact into nothing and the console
+    // would render as a blob — and re-opening it would be a vault round trip to
+    // recover a value that is already in this scope.
+    return { ...toConnector(row), config: plain };
   }
 
   /**
@@ -188,13 +511,13 @@ export class MySqlPipelineStore
   async listConnections(): Promise<CatalogConnection[]> {
     const em = this.em.fork();
     const rows = await em.find(ConnectionRow, {}, { orderBy: { name: 'asc' } });
-    return rows.map(toConnection);
+    return this.withOpenConfigs(rows.map(toConnection), 'connection');
   }
 
   async getConnection(id: string): Promise<CatalogConnection | undefined> {
     const em = this.em.fork();
     const row = await em.findOne(ConnectionRow, { id });
-    return row ? toConnection(row) : undefined;
+    return row ? this.withOpenConfig(toConnection(row), 'connection') : undefined;
   }
 
   async saveConnection(
@@ -206,12 +529,23 @@ export class MySqlPipelineStore
     const em = this.em.fork();
     const existing = input.id ? await em.findOne(ConnectionRow, { id: input.id }) : null;
 
-    this.assertNoNewPlaintextCredential(input.config, existing?.config, `"${input.name}"`);
+    // Sealed first, then checked — the ordering `saveConnector` explains, and
+    // the one that lets `encryptCredentials` and `allowInlineCredentials` mean
+    // three things between them rather than four.
+    // Minted BEFORE sealing, not inside `em.create` below, so the seal context
+    // can name the row. See `sealCredentials` — a context whose `id` is absent
+    // on create and present on update seals and opens under two different
+    // contexts, which is why both shipped providers had to leave `id` out.
+    const id = input.id ?? randomUUID();
+    const plain = { ...(input.config ?? {}) };
+    const config = await this.sealCredentials(plain, 'connection', id);
+
+    this.assertNoNewPlaintextCredential(config, existing?.config, `"${input.name}"`);
 
     const row =
       existing ??
       em.create(ConnectionRow, {
-        id: input.id ?? randomUUID(),
+        id,
         name: input.name,
         kind: input.kind,
         config: {},
@@ -223,18 +557,21 @@ export class MySqlPipelineStore
     row.name = input.name;
     row.description = input.description;
     row.kind = input.kind;
-    row.config = { ...(input.config ?? {}) };
+    row.config = config;
     row.secretEnvVar = input.secretEnvVar;
 
     em.persist(row);
     await em.flush();
-    return toConnection(row);
+    // The plaintext the caller supplied, for the reason `saveConnector` gives:
+    // answering a save with the ciphertext it just wrote would be a value the
+    // console cannot render and the round trip cannot compare against.
+    return { ...toConnection(row), config: plain };
   }
 
   async connectorsUsingConnection(id: string): Promise<CatalogConnector[]> {
     const em = this.em.fork();
     const rows = await em.find(ConnectorRow, { connectionId: id }, { orderBy: { name: 'asc' } });
-    return rows.map(toConnector);
+    return this.withOpenConfigs(rows.map(toConnector), 'connector');
   }
 
   /**
@@ -348,13 +685,13 @@ export class MySqlPipelineStore
   async listWorkflows(): Promise<CatalogWorkflow[]> {
     const em = this.em.fork();
     const rows = await em.find(WorkflowRow, {}, { orderBy: { name: 'asc' } });
-    return rows.map(toWorkflow);
+    return this.withOpenGraphs(rows.map(toWorkflow));
   }
 
   async getWorkflow(id: string): Promise<CatalogWorkflow | undefined> {
     const em = this.em.fork();
     const row = await em.findOne(WorkflowRow, { id });
-    return row ? toWorkflow(row) : undefined;
+    return row ? this.withOpenGraph(toWorkflow(row)) : undefined;
   }
 
   /**
@@ -371,6 +708,34 @@ export class MySqlPipelineStore
    * `saveTransform` applies to code. Renaming a workflow or dragging a node is
    * not a new version, and inflating the number would make it useless for the
    * question it exists to answer.
+   *
+   * ## Credentials in a source node
+   *
+   * `WorkflowSourceNode` says it "[carries] the same vocabulary a connector
+   * does — a kind, an optional named connection, a config, the *name* of an env
+   * var holding the credential", and closes with "credentials stay out of the
+   * catalog here exactly as they do everywhere else". That was the fourth
+   * docblock in this codebase to promise it and the second to be wrong: this
+   * method wrote `nodes` verbatim and asked nothing, so
+   * `postgres://svc:pass@warehouse/db` in a source node's `config.url` went
+   * straight into `catalog_workflow` — and `workflow-runner.service.ts` spreads
+   * `node.config` into a synthesised connector, so `fetchSql` reads it from
+   * exactly where it reads a connector's.
+   *
+   * The same rule now applies, node by node: seal if this deployment encrypts,
+   * refuse if it does not, and grandfather what is already stored. The
+   * *predicate* is untouched — top-level strings of a config object — which is
+   * the point. A source node's `config` is not a nested config; it is another
+   * config, and a graph holds several. Widening what counts as a secret would
+   * have put the write side out of step with the redaction on the read side,
+   * which documents that same boundary deliberately.
+   *
+   * **The hash is taken from the plaintext graph, before any sealing.** A
+   * fingerprint is a statement about what the graph *does*, and sealing does
+   * not change that. Hashing the sealed form would bump the version on every
+   * save under any vault whose ciphertext is not deterministic — which is all
+   * of them worth using — and a version that increments when nothing changed is
+   * exactly the uselessness the paragraph above is guarding against.
    */
   async saveWorkflow(
     input: Pick<CatalogWorkflow, 'name' | 'nodes' | 'edges'> & {
@@ -402,13 +767,22 @@ export class MySqlPipelineStore
       );
     }
 
+    // Taken from the plaintext graph, deliberately, and before anything below
+    // seals: see the note on this method. A hash of the ciphertext would make
+    // every save a new version.
     const graphHash = workflowGraphHash({ nodes, edges });
     const existing = input.id ? await em.findOne(WorkflowRow, { id: input.id }) : null;
+
+    // Sealed first, then checked — the ordering `saveConnector` explains, here
+    // applied per source node.
+    const id = input.id ?? randomUUID();
+    const sealedNodes = await this.sealSourceNodes(nodes, id);
+    this.assertNoNewPlaintextGraphCredential(sealedNodes, existing?.nodes, `"${input.name}"`);
 
     const row =
       existing ??
       em.create(WorkflowRow, {
-        id: input.id ?? randomUUID(),
+        id,
         name: input.name,
         nodes: [],
         edges: [],
@@ -423,7 +797,7 @@ export class MySqlPipelineStore
     const graphChanged = existing !== null && existing.graphHash !== graphHash;
     row.name = input.name;
     row.description = input.description;
-    row.nodes = nodes;
+    row.nodes = sealedNodes;
     row.edges = edges;
     row.graphHash = graphHash;
     // Written from the sink, never from the input: a caller must not be able to
@@ -446,13 +820,16 @@ export class MySqlPipelineStore
       });
     }
 
-    return toWorkflow(row);
+    // The plaintext graph the caller drew, for the reason `saveConnector` gives:
+    // a canvas that posted a graph and got ciphertext back would render a source
+    // node it cannot edit, and would post the ciphertext again on the next save.
+    return { ...toWorkflow(row), nodes };
   }
 
   async connectorsUsingWorkflow(id: string): Promise<CatalogConnector[]> {
     const em = this.em.fork();
     const rows = await em.find(ConnectorRow, { workflowId: id }, { orderBy: { name: 'asc' } });
-    return rows.map(toConnector);
+    return this.withOpenConfigs(rows.map(toConnector), 'connector');
   }
 
   /**
@@ -670,6 +1047,11 @@ function assertNoNewPlaintextCredential(
   incoming: Record<string, unknown> | undefined,
   stored: Record<string, unknown> | undefined,
   subject: string,
+  // Where the offending key lives, for the message only. A connector's config is
+  // reached as `config.url`; a graph's is `nodes["s1"].config.url`, and an
+  // operator given the first when they are editing the second has to guess which
+  // of six boxes on a canvas is the one.
+  path = 'config',
 ): void {
   const offending: string[] = [];
   for (const [key, value] of Object.entries(incoming ?? {})) {
@@ -679,8 +1061,154 @@ function assertNoNewPlaintextCredential(
   }
   if (offending.length === 0) return;
   throw new BadRequestException(
-    `${subject} carries a password inside config.${offending.join(', config.')}. A connection URL is the credential, and this column is read by anyone holding catalog:read — put the URL in an environment variable and name it in "Credential env var" instead, which is where every fetcher already looks first.`,
+    `${subject} carries a password inside ${path}.${offending.join(`, ${path}.`)}. A connection URL is the credential, and this column is read by anyone holding catalog:read — put the URL in an environment variable and name it in "Credential env var" instead, which is where every fetcher already looks first.`,
   );
+}
+
+/**
+ * The same refusal, for every source node of a graph.
+ *
+ * Reuses `assertNoNewPlaintextCredential` node by node rather than growing a
+ * second, graph-shaped rule, and that is the decision worth defending. A source
+ * node's `config` is not a *nested* config — it is another config object of the
+ * same kind, one level down in a row that happens to hold several. The
+ * predicate stays "top-level strings of a config object", so the write side
+ * still means exactly what `redactConfigSecrets` means on the read side. Had
+ * this instead walked arbitrarily deep, the two would now disagree about the
+ * same value: the store would refuse a header a redaction happily serves.
+ *
+ * ## Grandfathering, per node
+ *
+ * `stored` is compared **per node id**, never as a whole object. A graph is one
+ * JSON column, so a whole-column comparison would break on any unrelated edit —
+ * moving a box, renaming the graph — and refuse a rename over a credential
+ * nobody touched, which is the failure mode the connector-level grandfathering
+ * was written to avoid in the first place. Node ids are unique (validation
+ * refuses `duplicate-node-id`) and stable, so they are the identity to compare
+ * under.
+ *
+ * The stored nodes are walked permissively, without `isWorkflowNode`. A node
+ * this build cannot narrow still holds bytes that are already in the column,
+ * and the comparison is byte equality — so the worst a permissive walk can do
+ * is grandfather a value that genuinely is already stored, which is precisely
+ * what grandfathering means. Throwing here instead would make a graph written
+ * by a newer release unsaveable by an older one over a credential neither of
+ * them changed.
+ */
+function assertNoNewPlaintextGraphCredential(
+  nodes: WorkflowNode[],
+  stored: unknown[] | undefined,
+  subject: string,
+): void {
+  const storedConfigs = storedNodeConfigs(stored);
+  for (const node of nodes) {
+    if (node.kind !== 'source') continue;
+    assertNoNewPlaintextCredential(
+      node.config,
+      storedConfigs.get(node.id),
+      subject,
+      `nodes["${node.id}"].config`,
+    );
+  }
+}
+
+/** Each stored node's config, by node id, trusting nothing about the shape. */
+function storedNodeConfigs(nodes: unknown[] | undefined): Map<string, Record<string, unknown>> {
+  const configs = new Map<string, Record<string, unknown>>();
+  for (const node of nodes ?? []) {
+    if (typeof node !== 'object' || node === null) continue;
+    const id = Reflect.get(node, 'id');
+    const config = Reflect.get(node, 'config');
+    if (typeof id !== 'string') continue;
+    if (typeof config !== 'object' || config === null || Array.isArray(config)) continue;
+    const record: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(config)) record[key] = value;
+    configs.set(id, record);
+  }
+  return configs;
+}
+
+/**
+ * The vaults a binding names, in the order the store should use them.
+ *
+ * An absent binding and an empty array are the same thing — nobody bound a
+ * vault — and both get the refusing default, so the message a host meets names
+ * the token to bind rather than reporting that no vault answers to the name a
+ * row carries. The second sentence is true and helps nobody.
+ */
+function toVaultList(
+  vault: CatalogSecretVault | CatalogSecretVault[] | undefined,
+): CatalogSecretVault[] {
+  const vaults = vault === undefined ? [] : Array.isArray(vault) ? vault : [vault];
+  return vaults.length > 0 ? vaults : [new RefusingSecretVault()];
+}
+
+/**
+ * Seal one value, and refuse to carry on if it could not be sealed.
+ *
+ * The failure a reader should look for here is the one that is NOT written: no
+ * catch that logs and stores the plaintext. A deployment that turned
+ * `encryptCredentials` on and then wrote three passwords in the clear during a
+ * vault outage would have no way afterwards to find out which three.
+ *
+ * A `SecretVaultNotConfiguredError` passes through unwrapped, because its
+ * message already names the token to bind and wrapping it would bury that
+ * behind a sentence about a vault that does not exist.
+ */
+async function sealOne(
+  vault: CatalogSecretVault,
+  plaintext: string,
+  context: SecretContext,
+): Promise<SealedSecret> {
+  try {
+    return await vault.seal(plaintext, context);
+  } catch (error) {
+    if (error instanceof SecretVaultNotConfiguredError) throw error;
+    throw new SecretSealFailedError(
+      `${context.kind}.config.${context.field} could not be sealed by the "${vault.name}" vault, so nothing was saved: ${describeCause(error)}. The credential was not written in plaintext instead.`,
+      { cause: error },
+    );
+  }
+}
+
+/**
+ * Whether waiting could not possibly help.
+ *
+ * Two sources, and the second is the one that matters in production.
+ *
+ * The first is this package's own {@link SecretVaultNotConfiguredError}:
+ * nothing is bound, or nothing bound answers to the name the row carries. Both
+ * are bindings rather than weather.
+ *
+ * The second is **the vault's own verdict**, read off the cause. Only the vault
+ * can tell an `AccessDeniedException` from a `ThrottlingException`, or a Vault
+ * 403 from a 412 — a key policy that will still be wrong in fifteen minutes
+ * from a rate limit that will not. Both shipped providers classify exactly that
+ * and put a `retryable` boolean on their own error type; without this line that
+ * knowledge stopped at the provider boundary and every permanent failure burned
+ * three attempts over fifteen minutes before reporting a key policy nobody was
+ * going to change by waiting.
+ *
+ * Only an explicit `false` counts. An absent `retryable` means the vault did
+ * not say, and "did not say" has to read as retryable — which is both the safe
+ * direction to be wrong in (a retried permanent failure costs three attempts
+ * and then reports itself; a fatal-by-default transient one turns a five-second
+ * blip into a load that will not be retried) and *precisely* the rule the
+ * durable engine applies one layer up: `existing.error?.retryable !== false`.
+ * The two now agree by construction rather than by coincidence.
+ *
+ * Read with `Reflect.get` rather than by class, deliberately: a provider is a
+ * separate package with its own error types, and this must not require it to
+ * import anything from here to be understood.
+ */
+function isPermanent(error: unknown): boolean {
+  if (error instanceof SecretVaultNotConfiguredError) return true;
+  if (typeof error !== 'object' || error === null) return false;
+  return Reflect.get(error, 'retryable') === false;
+}
+
+function describeCause(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 /** Whether a string parses as a URL that carries a password. */

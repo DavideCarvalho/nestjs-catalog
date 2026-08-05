@@ -1,3 +1,5 @@
+import type { Provider } from '@nestjs/common';
+
 /**
  * Kept in its own file, not beside the module that consumes it.
  *
@@ -49,6 +51,86 @@ export interface CatalogStoreModuleOptions {
    * is the question the refusal exists to make somebody answer.
    */
   allowInlineCredentials?: boolean;
+  /**
+   * Seal credential-bearing config values through a vault before they are
+   * written, so `catalog_connection.config` holds ciphertext rather than a
+   * password. Default false.
+   *
+   * The redaction above stops a password travelling in an HTTP response. It
+   * does nothing for a database dump, a read replica, a backup, or anybody
+   * holding `SELECT` on the instance — and for those, this column is a list of
+   * every password the catalog knows. This is the flag for that reader.
+   *
+   * Requires `CATALOG_SECRET_VAULT` to be bound to a {@link
+   * CatalogSecretVault}. Bound to nothing, the default vault refuses every seal
+   * with a message naming the token, so a save fails rather than a save
+   * succeeding in plaintext.
+   *
+   * ## How it composes with `allowInlineCredentials`
+   *
+   * Three meanings, four combinations, and no fourth meaning — because sealing
+   * happens **before** the refusal is asked, so a sealed value is not a
+   * plaintext credential by the time anything looks:
+   *
+   * | `allowInlineCredentials` | `encryptCredentials` | What a credential in `config` does |
+   * | --- | --- | --- |
+   * | `false` *(default)* | `false` *(default)* | **Refused.** Unchanged: the save is turned away naming `secretEnvVar`. |
+   * | `false` | `true` | **Sealed.** The refusal never fires — it inspects the config after sealing, and finds a ciphertext object rather than a password-bearing string. |
+   * | `true` | `true` | **Sealed.** Identical to the row above. `allowInlineCredentials` is not contradicted here, it is simply already satisfied. |
+   * | `true` | `false` | **Plaintext.** The deliberate dev-environment trade `allowInlineCredentials` documents. |
+   *
+   * The combination worth naming is the second: `false, true` is the one a
+   * production deployment wants, and reading the two flags separately makes it
+   * look like a contradiction — "refuse inline credentials" and "encrypt inline
+   * credentials". It is not. `allowInlineCredentials` asks whether a *password*
+   * may rest in this column, and with sealing on, none does.
+   *
+   * ## Turning it back off does not strand anything
+   *
+   * The flag gates writes only. Reads open a sealed value whatever it says, so
+   * a host that turns encryption off keeps every existing row readable and
+   * simply stops sealing new ones. The opposite — a flag that also gated
+   * decryption — would make this switch a data-loss button.
+   *
+   * ## Rows already holding plaintext
+   *
+   * Sealed on their next save, and not before. There is no read-through-reseal:
+   * a read that writes is a read that can fail a connector run for a
+   * bookkeeping reason, and `getConnector` is on the runner's hot path and the
+   * durable step's preflight. There is no one-shot migration in this release
+   * either; the column takes both forms indefinitely, and what this change
+   * guarantees is that a migration written later needs no schema change and can
+   * tell the two apart with `isSealedSecret`.
+   */
+  encryptCredentials?: boolean;
+  /**
+   * The vault `encryptCredentials` seals through, as a provider for
+   * `CATALOG_SECRET_VAULT`.
+   *
+   * It has to arrive this way rather than from the host's own module: the store
+   * is constructed inside `CatalogMikroOrmStoreModule`'s injector, which cannot
+   * see providers the host declared elsewhere, so a token bound outside would
+   * resolve to `undefined` and the refusing default would fire on a host that
+   * had bound a real vault. This is the same shape
+   * `CatalogPipelineModule.forRoot({ expectations })` uses, for the same
+   * reason.
+   *
+   * ```ts
+   * CatalogMikroOrmStoreModule.forRoot({
+   *   encryptCredentials: true,
+   *   secretVault: { provide: CATALOG_SECRET_VAULT, useValue: new KmsSecretVault(...) },
+   * })
+   * ```
+   *
+   * `useValue` may be a single {@link CatalogSecretVault} or an array of them.
+   * An array is what makes a key rotation possible without an outage — the
+   * first seals, and any of them may open, matched on the `vault` name each row
+   * carries. The token's own docblock spells the transition out.
+   *
+   * Omitting it while `encryptCredentials` is on is not a silent fallback: the
+   * first save that has a credential to seal fails, naming this token.
+   */
+  secretVault?: Provider;
   /**
    * The MikroORM context name this store reads and writes — the same string
    * passed to `MikroOrmModule.forRoot({ contextName })`. Omit for the default

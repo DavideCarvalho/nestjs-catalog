@@ -36,6 +36,11 @@ export class CatalogMikroOrmStoreModule {
         // be the default in this process.
         ...catalogConnectionProviders(options.contextName),
         { provide: CATALOG_STORE_OPTIONS, useValue: options },
+        // Before the store that injects it. Only when the host supplied one:
+        // absent, `MySqlPipelineStore` falls back to the vault that refuses to
+        // seal, which is what a deployment asking for encryption and naming no
+        // vault should meet.
+        ...(options.secretVault ? [options.secretVault] : []),
         StoredCatalogRegistry,
         MySqlWarehouseStore,
         MySqlWorkspaceStore,

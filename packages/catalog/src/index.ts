@@ -27,6 +27,14 @@ export {
   isQueryStore,
 } from './catalog.query';
 export { CATALOG_OPTIONS, type CatalogModuleOptions } from './catalog.options';
+// Everything, deliberately, and here more than anywhere: this is a seam two
+// separate provider packages are being written against. A barrel that shipped
+// `CATALOG_SECRET_VAULT` and `CatalogSecretVault` but not `SealedSecret` or
+// `SecretContext` — the return type and the argument of the two methods a
+// provider implements — would be the exact gap `index.barrel.spec.ts` was
+// written after, reproduced on the one surface where a third party compiles
+// against it.
+export * from './catalog.secrets';
 export {
   type CatalogOverlayStore,
   FileCatalogOverlayStore,

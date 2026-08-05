@@ -34,6 +34,21 @@ export class ConnectorRow {
    * not already stored here, and the pipeline's read routes redact one out of
    * anything they serve. Rows written before either existed are still sitting
    * in this column — the redaction is what covers them.
+   *
+   * ## A value here may be a `SealedSecret` rather than a string
+   *
+   * With `encryptCredentials` on, the store seals credential-bearing values
+   * through the host's vault before writing, so what sits here is `{ vault,
+   * keyId, ciphertext }` and a database dump gives up nothing. **Both forms are
+   * valid in this column, indefinitely.** No migration turns one into the
+   * other: a plaintext row is sealed on its next save and not before, because a
+   * read that reseals is a read that can fail a connector run for a bookkeeping
+   * reason, and this row is read on the runner's hot path.
+   *
+   * Which is why the type stays `Record<string, unknown>` and why nothing
+   * downstream needs to know. `MySqlPipelineStore` opens on the way out — every
+   * read, whatever the flag currently says — so a caller sees the address it
+   * always saw, and `isSealedSecret` is what tells the two forms apart.
    */
   @Property({ type: 'json' })
   config: Record<string, unknown> = {};
@@ -295,6 +310,13 @@ export class WorkflowRow {
    * store narrows each element with `isWorkflowNode` and throws on anything it
    * does not recognise — dropping an unrecognised node instead would leave a
    * graph that still validates and quietly runs nine steps of ten.
+   *
+   * A **source** node's `config` is a credential-bearing config exactly like
+   * {@link ConnectorRow.config} — `workflow-runner.service.ts` spreads it into a
+   * synthesised connector, so `fetchSql` reads `config.url` from here too — and
+   * it is refused, sealed and opened under the same rule and the same
+   * predicate. `graphHash` is computed from the graph BEFORE sealing, so a
+   * ciphertext that differs on every seal never registers as a new version.
    */
   @Property({ type: 'json' })
   nodes: unknown[] = [];
@@ -408,6 +430,13 @@ export class ConnectionRow {
    * `GET pipeline/connections` redacts one on the way out. Before both,
    * `postgres://user:pass@host/db` sat in this column and was handed to every
    * caller holding `catalog:read`.
+   *
+   * Both of those protect a reader coming through the API and neither protects
+   * a dump, a replica or a backup. With `encryptCredentials` on, a value here
+   * may be a `SealedSecret` — `{ vault, keyId, ciphertext }` — instead of a
+   * string; see {@link ConnectorRow.config}, which states the whole arrangement
+   * and why the column holds both forms for as long as a deployment takes to
+   * move over.
    */
   @Property({ type: 'json' })
   config: Record<string, unknown> = {};
