@@ -257,6 +257,13 @@ export class StoredCatalogRegistry extends CatalogRegistry implements OnModuleIn
    * there is nothing underneath to fall back to, and a reset would mean
    * discarding whatever a curator wrote with no way to recover it. Re-publish
    * from the owning application instead.
+   *
+   * **And so this emits no `overlay.reset`.** The library registry emits one
+   * because it destroys the curated values, and that event is the only record
+   * of what they were; here nothing is destroyed, so an event would be a row in
+   * the audit table saying a reset happened when the caller got an exception and
+   * every stored label is still exactly where it was. The refusal is the honest
+   * answer, and it reaches the caller rather than the trail.
    */
   async resetOverlay(): Promise<void> {
     throw new Error(

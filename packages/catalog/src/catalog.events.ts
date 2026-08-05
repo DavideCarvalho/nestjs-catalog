@@ -23,6 +23,7 @@ export const CATALOG_EVENTS = [
   'snapshot.committed',
   'snapshot.dropped',
   'type.curated',
+  'overlay.reset',
   'connector.run.started',
   'connector.run.finished',
   'transform.changed',
@@ -66,6 +67,11 @@ export const CATALOG_EVENT_PHASE: Record<CatalogEvent, number> = {
   // be complete is exactly the mechanism that will fail the build the day a new
   // event is added and nobody thinks about where it belongs.
   'type.curated': 2,
+  // The other curation event, ranked with the one it undoes. It carries no
+  // snapshot id either — a reset is not part of any load — so like the rank
+  // above this is never consulted, and it is written out because the `Record`
+  // has to be complete.
+  'overlay.reset': 2,
   // Sharing carries no snapshot id either, for the same reason curation does
   // not: it is a standalone act on a saved query or a board, not a step of any
   // load. So these ranks are never consulted, and they are written out for the
@@ -134,6 +140,77 @@ export interface CatalogEventPayloads {
     typeName: string;
     property?: string;
     changed: string[];
+  };
+  /**
+   * The whole overlay was discarded — every curated label, description, unit,
+   * order, hidden flag and classification in the catalog, in one request.
+   *
+   * An event of its own rather than a `type.curated` with the name left off.
+   * That payload leads with `typeName`, and a recorder lifts it into an indexed
+   * column; a reset has no single type, so it would land as a curation edit
+   * belonging to no type, indistinguishable from a malformed one. It is also a
+   * different act: `type.curated` records a decision about one column, this
+   * records the destruction of every such decision. Without it the trail could
+   * say who renamed one column and not who reverted every name at once — and
+   * both are `catalog:curate`, so the same curator can do either.
+   *
+   * **The classifications are why this is not merely tidy.** A classification is
+   * what `visibleToPrincipal` filters search results on, so a reset silently
+   * re-admits every classified property's *name* to searches by principals who
+   * could not see it an instant earlier. That is a change in who can see what,
+   * made by a route the controller documents as presentation-only.
+   *
+   * WHAT IT CARRIES, AND WHAT IT DELIBERATELY DOES NOT
+   * --------------------------------------------------
+   * The overlay is discarded rather than versioned, so nothing can be looked up
+   * afterwards: what is not in this payload is nowhere. That argues for carrying
+   * all of it, and all of it is the wrong answer — an audit row holding a
+   * verbatim copy of the overlay is a backup, and a backup nobody designed: no
+   * restore path, no retention policy of its own, and a JSON column that grows
+   * with the catalog. It would be read as one, too. The first person who needed
+   * it would find it, and the second would rely on it.
+   *
+   * So: a summary, drawn where the reader's question stops being "what did I
+   * lose" and starts being "give it back".
+   *
+   * - {@link typeNames}, because "somebody reset the catalog" is nearly useless
+   *   six months later and "was the work on `Dispute` in it" is what is actually
+   *   asked. Bounded by how many types anyone had curated.
+   * - {@link properties}, the scale of it as one number. The property *names* are
+   *   where a summary would turn into the dump.
+   * - {@link classifications} in full, values included, despite that line. They
+   *   are the one part of the overlay whose loss changes what the catalog shows
+   *   to whom, they are a small subset of it, and re-typing them is the only
+   *   recovery anybody can perform.
+   *
+   * **No `principalId`, and the absence is a limit rather than a decision that
+   * the actor does not matter.** `resetOverlay()` takes no principal, the route
+   * that calls it resolves none, and `RoutingCatalogRegistry` forwards the call
+   * by hand — so a field here would be `undefined` on every row, and an audit
+   * table lifts `principalId` into a column where empty reads as "nobody did
+   * this" rather than "this was not captured". `type.curated` has the same gap.
+   * Closing it means threading a principal through the controller, the service
+   * and every registry, which is a change to those, not a field on this payload.
+   *
+   * Emitted even when the overlay was empty, with zeroes. A trail that recorded
+   * only destructive resets cannot tell "nobody pressed it" from "somebody
+   * pressed it and nothing was there", and the second is worth seeing.
+   */
+  'overlay.reset': {
+    /** Every type that carried curation, so the trail names what was lost. */
+    typeNames: string[];
+    /** How many per-property entries went with them, across every type. */
+    properties: number;
+    /**
+     * Every classification that stopped applying, with its value — because that
+     * is what somebody restoring one needs, and after the reset there is nowhere
+     * left to read it.
+     */
+    classifications: Array<{
+      typeName: string;
+      property: string;
+      classification: string;
+    }>;
   };
   /** A connector began pulling. */
   'connector.run.started': {

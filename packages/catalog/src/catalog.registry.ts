@@ -8,7 +8,7 @@ import {
   readPropertyOptions,
   readTypeOptions,
 } from './catalog.decorators';
-import { emitCatalog } from './catalog.events';
+import { type CatalogEventPayloads, emitCatalog } from './catalog.events';
 import { CATALOG_OPTIONS, type CatalogModuleOptions } from './catalog.options';
 import type { CatalogOverlayStore } from './catalog.overlay-store';
 import { CATALOG_OVERLAY_STORE } from './catalog.overlay-store.token';
@@ -235,9 +235,22 @@ export class MikroOrmCatalogRegistry extends CatalogRegistry implements OnModule
     return this.getType(type.name);
   }
 
+  /**
+   * Drop every tier-0 edit, and leave a record that it happened.
+   *
+   * The summary is taken before the overlay is cleared because it is the only
+   * record there will ever be: nothing versions an overlay, so the discarded
+   * values are gone the instant the store is written. See `overlay.reset` in
+   * `catalog.events.ts` for why the payload is a summary and not a copy.
+   *
+   * Emitted after the write, like the two patches above, so the trail says what
+   * happened rather than what was about to.
+   */
   async resetOverlay(): Promise<void> {
+    const discarded = summariseOverlay(this.overlay);
     this.overlay = { types: {} };
     await this.persist();
+    emitCatalog('overlay.reset', discarded);
   }
 
   private async persist(): Promise<void> {
@@ -392,6 +405,42 @@ export class MikroOrmCatalogRegistry extends CatalogRegistry implements OnModule
       relations,
     };
   }
+}
+
+/**
+ * What a reset is about to destroy, in the shape the trail keeps it.
+ *
+ * Here rather than in `catalog.events.ts` because it reads a `CatalogOverlay`,
+ * and this is the only registry that has one — the payload type is the contract,
+ * this is one producer of it. Pure and taking the overlay as an argument so the
+ * order is forced: a caller has to hold the old overlay to call it, and cannot
+ * accidentally summarise the empty one it just installed.
+ *
+ * A type entry counts whatever it holds, including an entry that ended up empty.
+ * `buildType` treats a present entry as enrichment on the same terms, and the
+ * honest reading of one is "somebody patched this type" — which is exactly what
+ * the reset undid.
+ */
+function summariseOverlay(overlay: CatalogOverlay): CatalogEventPayloads['overlay.reset'] {
+  const typeNames = Object.keys(overlay.types);
+  const classifications: CatalogEventPayloads['overlay.reset']['classifications'] = [];
+  let properties = 0;
+
+  for (const typeName of typeNames) {
+    const patched = overlay.types[typeName]?.properties ?? {};
+    for (const [property, patch] of Object.entries(patched)) {
+      properties += 1;
+      const { classification } = patch;
+      // Only a classification that was actually set. An entry that merely
+      // renamed the column carries the key as `undefined`, and listing it would
+      // report a classification lost that nobody had applied.
+      if (classification !== undefined) {
+        classifications.push({ typeName, property, classification });
+      }
+    }
+  }
+
+  return { typeNames, properties, classifications };
 }
 
 /**

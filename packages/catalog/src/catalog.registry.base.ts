@@ -135,5 +135,25 @@ export abstract class CatalogRegistry {
     patch: NonNullable<CatalogOverlay['types'][string]['properties']>[string],
   ): Promise<CatalogObjectTypeDef | undefined>;
 
+  /**
+   * Discard every tier-0 edit at once.
+   *
+   * **An implementation that really discards must emit `overlay.reset`**, and
+   * the reason is an asymmetry this class would otherwise have: the two patches
+   * above are audited one field at a time, so a trail could say who renamed one
+   * column and not who reverted every name in the catalog — while both need only
+   * `catalog:curate`. The summary has to be built before the write; nothing
+   * versions an overlay, so afterwards there is nothing left to read.
+   *
+   * **Refusing is an implementation too, and refusing emits nothing.** A
+   * registry whose curated values have no derived layer underneath them has
+   * nothing to fall back to, so a reset there is destruction rather than a
+   * revert, and the throw is the whole answer — no act, no record of one.
+   * `StoredCatalogRegistry` is that case.
+   *
+   * Which of those a deployment runs is why the event is worth more than the
+   * call it accompanies: a registry that quietly resets without emitting looks
+   * exactly like one that never ran a reset at all.
+   */
   abstract resetOverlay(): Promise<void>;
 }
