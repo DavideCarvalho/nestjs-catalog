@@ -6,10 +6,13 @@ import {
   type CatalogConnector,
   type CatalogPipelineStore,
   type CatalogPrincipal,
+  type CatalogWorkflow,
   RequireHuman,
   RequireScopes,
   SubprocessTransformRunner,
   TRANSFORM_LANGUAGES,
+  type WorkflowNode,
+  hasScope,
   isConnectorKind,
   isTransformLanguage,
 } from '@dudousxd/nestjs-catalog';
@@ -18,6 +21,7 @@ import {
   Body,
   Controller,
   Delete,
+  ForbiddenException,
   Get,
   Inject,
   Logger,
@@ -29,7 +33,12 @@ import {
   type Type,
   UseGuards,
 } from '@nestjs/common';
-import { redactConnection, redactConnector, restoreRedactedSecrets } from './config-secrets';
+import {
+  redactConfigSecrets,
+  redactConnection,
+  redactConnector,
+  restoreRedactedSecrets,
+} from './config-secrets';
 import { ConnectionChecker } from './connection-checker.service';
 import { ConnectorRunnerService } from './connector-runner.service';
 import { discoverConnectorSchema } from './schema-discovery';
@@ -214,13 +223,20 @@ export function createPipelineController(
       // name and posted the object back would store the placeholder as the real
       // credential — the classic way a redaction corrupts what it protects.
       const stored = body.id ? await this.pipeline.getConnection(body.id) : undefined;
-      return this.pipeline.saveConnection(
-        {
-          ...body,
-          kind: body.kind,
-          config: restoreRedactedSecrets(body.config ?? {}, stored?.config),
-        },
-        principal.id,
+      // Redacted on the way out, exactly as the `GET` is, and not because this
+      // caller could not have sent the credential. They could — but a caller who
+      // posts back the placeholder they were shown gets the *restored* row, so
+      // an unredacted response is the redaction on the read undone in a single
+      // request by anyone holding `catalog:write`.
+      return redactConnection(
+        await this.pipeline.saveConnection(
+          {
+            ...body,
+            kind: body.kind,
+            config: restoreRedactedSecrets(body.config ?? {}, stored?.config),
+          },
+          principal.id,
+        ),
       );
     }
 
@@ -284,13 +300,17 @@ export function createPipelineController(
         `saving connector "${body.name}"`,
       );
       const stored = body.id ? await this.pipeline.getConnector(body.id) : undefined;
-      return this.pipeline.saveConnector(
-        {
-          ...body,
-          kind: body.kind,
-          config: restoreRedactedSecrets(body.config ?? {}, stored?.config),
-        },
-        principal.id,
+      // Redacted on the way out — see `saveConnection` for why a save response
+      // is a read.
+      return redactConnector(
+        await this.pipeline.saveConnector(
+          {
+            ...body,
+            kind: body.kind,
+            config: restoreRedactedSecrets(body.config ?? {}, stored?.config),
+          },
+          principal.id,
+        ),
       );
     }
 
@@ -477,23 +497,109 @@ export function createPipelineController(
      *
      * The difference between a transform someone can iterate on and one they can
      * only test in production.
+     *
+     * ## What this route actually is
+     *
+     * It takes code and executes it in this pod. `SubprocessTransformRunner`
+     * gives it a timeout and an environment of `{PATH, NODE_ENV}` and its own
+     * docblock is careful to say that this is not a security boundary — the
+     * child reads `/proc/<ppid>/environ` and gets back every variable the
+     * allowlist withheld, and it reads the filesystem as whatever user the
+     * service runs as. So the question this route asks is not "is the sandbox
+     * tight enough" but "who may run code here", and it is answered here.
+     *
+     * ## Why the answer is not a bigger scope
+     *
+     * It reached the runner on `catalog:write` alone, with **no**
+     * `requirePrincipal` — the only route on this controller without one — and
+     * no check that `body.language` was a language. Raising it to
+     * `catalog:admin` was the obvious repair and is the wrong one, because the
+     * same runner is already three requests away from any `catalog:write`
+     * holder with a grant: save a transform (no per-type check, deliberately —
+     * see `saveTransform`), save a graph whose sink commits a type they may
+     * write, press Run, and `WorkflowRunnerService` calls `transforms.run` with
+     * that code. `ConnectorRunnerService` is the same story one route over. A
+     * gate here that the graph path does not have would stop the person
+     * iterating in the editor and not the person willing to press Save first.
+     *
+     * So the target is not a higher bar than the graph path. It is **the same
+     * bar**, which is what makes the scope on this route honest:
+     *
+     * - a principal, so this is not the one anonymous door into the runner;
+     * - at least one write grant, because that is exactly what the graph path
+     *   costs (`assertMayWriteTypes` over the sinks) and `catalog.principal.ts`
+     *   is entitled to keep claiming that `writeTypes` bounds what a
+     *   `catalog:write` holder can cause. A principal granted no type can cause
+     *   no load on any other route on this surface, and this was the one place
+     *   it could still cause code to run;
+     * - a person, via {@link RequireHuman}. A nightly publisher has no reason to
+     *   open a try pane, and a machine key is the credential that leaks — the
+     *   `StaticKeyPrincipalResolver` docblock says so itself, "long-lived,
+     *   revoked only by redeploying". Holding one should not buy code execution
+     *   in a single POST that stores nothing.
+     *
+     * The residual is deliberate and is written down where a host reads it
+     * rather than only here: **anyone who may write any type can run code in
+     * this process.** That is the trust model `SubprocessTransformRunner`
+     * describes, and the supported way to change it is to bind a different
+     * `TransformRunner`. See the pipeline README.
+     *
+     * ## Why the checks are in the handler and not only in the decorators
+     *
+     * `@RequireScopes` and `@RequireHuman` are declarations for a guard the host
+     * wrote — that split is the whole of `catalog.route-auth.ts`. Scopes are
+     * safe to leave there because every host guard already reads them. `REQUIRES_HUMAN`
+     * had, until this route, never been on a single route in this repository, so
+     * a host guard has had nothing to implement it against and most will not
+     * have. Shipping the decorator as the only control would be shipping a
+     * sentence that is true of the metadata and false of the deployment. The
+     * grant has the same problem for a different reason: no guard can evaluate
+     * it, because "holds at least one write grant" is not a scope. Both are
+     * therefore checked where the principal is in hand, exactly as
+     * `assertMayCommit` is.
      */
     @Post('transforms/try')
     @RequireScopes('catalog:write')
+    @RequireHuman()
     async tryTransform(
+      @Req() request: { principal?: CatalogPrincipal },
       @Body()
       body: {
-        language: 'javascript' | 'python';
+        // `string`, not the two literals it used to name. That annotation was
+        // the type system asserting something only a check can: the value comes
+        // off the wire, `typescript` is a supported language it silently
+        // excluded, and anything at all could arrive. Narrowed below, the way
+        // `saveTransform` and `saveConnector` narrow theirs.
+        language: string;
         code: string;
         records?: unknown[];
       },
     ) {
-      try {
-        return await this.transforms.run(
-          { language: body.language, code: body.code },
-          body.records ?? [],
-          { timeoutMs: 10_000 },
+      const principal = requirePrincipal(request);
+      this.assertMayRunCode(principal);
+      // Validated exactly as `saveTransform` validates it. Without this an
+      // unknown language fell through to the runner's `language === 'python'`
+      // test and ran as JavaScript, so a typo produced a parse error about
+      // somebody else's syntax.
+      if (!isTransformLanguage(body.language)) {
+        throw new BadRequestException(
+          `"${body.language}" is not a transform language. Accepted: ${TRANSFORM_LANGUAGES.join(', ')}.`,
         );
+      }
+      const language = body.language;
+
+      // Said out loud, for the same reason `connections/check` says what it did:
+      // this route stores nothing — no transform row, no run row, nothing to
+      // read back afterwards — so the log line is the only record that code ran
+      // in this process, and on whose say-so.
+      this.logger.log(
+        `${principal.id} ran an unsaved ${language} transform against ${body.records?.length ?? 0} sample record(s).`,
+      );
+
+      try {
+        return await this.transforms.run({ language, code: body.code }, body.records ?? [], {
+          timeoutMs: 10_000,
+        });
       } catch (error) {
         // A failing transform is the author's mistake, not the server's. Letting
         // it become a 500 hides the one thing they need — the timeout, the
@@ -502,15 +608,41 @@ export function createPipelineController(
       }
     }
 
+    /**
+     * The graphs, with every source node's credential taken out.
+     *
+     * Served verbatim before, and the word was load-bearing in the right way and
+     * wrong in one. Right: the view that used to sit here flattened a source
+     * down to a connector id, renamed `name` to `label`, and turned a missing
+     * position into the origin — three lies the screen then repeated back, one
+     * of which would have erased a source's configuration on the next save.
+     * Every field still arrives as stored.
+     *
+     * Wrong about the credential. A {@link WorkflowSourceNode} "carries the same
+     * vocabulary a connector does — a kind, an optional named connection, a
+     * config", says so in its own docblock, and means it: `config.url` on an
+     * inline SQL source is `postgres://user:pass@host/db`, the same string
+     * `config-secrets.ts` was written because `GET connections` and
+     * `GET connectors` were serving. Those two got `redactConnection` and
+     * `redactConnector` and this one did not, so the softest scope in the system
+     * kept reading the strongest secret in it — through the one route nobody had
+     * thought of as a connector route.
+     *
+     * The nesting is worth being exact about, because `config-secrets.ts` states
+     * a boundary that sounds like it excludes this: "top-level string values
+     * only", and a node sits inside a workflow. It does not exclude it. What that
+     * boundary refuses is *descending into* a config —
+     * `config.headers.authorization` stays untouched. A source's `config` is a
+     * config, whole, and its `url` is a top-level string of it. Handing each node's
+     * own config to the same helper is the covered case, not the excluded one; a
+     * secret nested inside one is as untouched here as it is on a connector, and
+     * for the same stated reason.
+     */
     @Get('workflows')
     @RequireScopes('catalog:read')
     async workflowList() {
       const store = this.workflows.requireStore();
-      // Served verbatim. The view that used to sit here flattened a source down
-      // to a connector id, renamed `name` to `label`, and turned a missing
-      // position into the origin — three lies the screen then repeated back, one
-      // of which would have erased a source's configuration on the next save.
-      return store.listWorkflows();
+      return (await store.listWorkflows()).map(redactWorkflow);
     }
     @Post('workflows')
     @RequireScopes('catalog:write')
@@ -533,6 +665,15 @@ export function createPipelineController(
       // grants to consult, so if a graph committing somebody else's type can be
       // written down at all, nothing downstream will ever object to it again.
       assertMayWriteTypes(principal, committedTypes(graph.nodes), `saving workflow "${name}"`);
+      // The other half of redacting the read, and useless without it. A console
+      // reads a graph, drags one box, and posts the whole thing back — so what
+      // it sends for a source's URL is the placeholder it was shown, and storing
+      // that verbatim replaces a working credential with the word REDACTED. It
+      // is the exact failure `restoreRedactedSecrets` was written for on
+      // connectors, arriving one level down: matched per node id, because a node
+      // id is unique within a workflow and is the only thing that survives a
+      // rename, a move, or a re-order of the array.
+      const stored = body.id ? await store.getWorkflow(body.id) : undefined;
       const saved = await store.saveWorkflow(
         {
           id: body.id,
@@ -541,12 +682,17 @@ export function createPipelineController(
             typeof body.description === 'string' && body.description.length > 0
               ? body.description
               : undefined,
-          nodes: graph.nodes,
+          nodes: restoreWorkflowSecrets(graph.nodes, stored),
           edges: graph.edges,
         },
         principal.id,
       );
-      return saved;
+      // Redacted on the way back for the same reason the list is. Returning the
+      // stored row means returning what `restoreWorkflowSecrets` just put back,
+      // so an unredacted response here would hand the credential to any caller
+      // willing to POST the graph they had just been shown — one request, and
+      // the redaction on the read is undone.
+      return redactWorkflow(saved);
     }
     @Delete('workflows/:id')
     @RequireScopes('catalog:write')
@@ -603,6 +749,41 @@ export function createPipelineController(
      * that explains what a connector pointing at a missing graph does to a
      * schedule, and answering 404 first would replace it with a worse one.
      */
+    /**
+     * May this principal cause code to run in this process, right now?
+     *
+     * Two questions, and they refuse for different reasons, so they answer
+     * separately rather than behind one message. Somebody fixing a 403 needs to
+     * know whether to ask for a grant or to stop using a service account.
+     *
+     * **A write grant on something.** Not on a named type, because a transform
+     * names none — `saveTransform` argues that at length and is right about
+     * storing one. Executing one is where the argument runs out: there is no
+     * later sink to check, because there is no later. What is left to ask is the
+     * question the graph path asks in aggregate — may this principal cause any
+     * load at all — and an empty or absent `writeTypes` answers no. That is
+     * `mayWrite`'s own reading of absence ("an unlisted type is a denied
+     * write"), applied with no type to look up.
+     *
+     * **A person.** See {@link RequireHuman}, and the note on this route.
+     *
+     * `ForbiddenException` rather than the plain `Error` `requirePrincipal`
+     * throws: reaching here means a real caller was refused, which is a 403 and
+     * something they can act on, not a deployment fault.
+     */
+    private assertMayRunCode(principal: CatalogPrincipal): void {
+      if (!hasScope(principal, 'catalog:write') || (principal.writeTypes?.length ?? 0) === 0) {
+        throw new ForbiddenException(
+          `${principal.id} is granted no object type to write, so running a transform is refused. Trying a transform executes it in this process; the bar is the one the graph path already charges — see the pipeline README.`,
+        );
+      }
+      if (!principal.actor) {
+        throw new ForbiddenException(
+          `${principal.id} is an application, and trying a transform runs code in this process against no stored record of who asked. Take this route as a signed-in person, or save the transform and run it through a graph, which leaves one.`,
+        );
+      }
+    }
+
     private async assertMayCommit(
       principal: CatalogPrincipal,
       targetType: string,
@@ -624,4 +805,61 @@ export function createPipelineController(
   }
 
   return PipelineController;
+}
+
+/**
+ * One graph, as a screen may see it.
+ *
+ * The sibling of `redactConnector`/`redactConnection`, and deliberately not
+ * living beside them in `config-secrets.ts`: those take a catalog row and this
+ * takes a graph, which is a pipeline shape that `config-secrets.ts` has no
+ * reason to import. What it borrows is the part that is genuinely shared —
+ * `redactConfigSecrets` over a single config object — so there is still exactly
+ * one answer to "what counts as a secret in a config", and a rule added there
+ * reaches source nodes without anybody remembering to come here.
+ *
+ * Only source nodes carry a `config`; the union makes that a narrowing rather
+ * than a hopeful property check, which is why a transform or sink node is
+ * returned as-is rather than spread.
+ */
+function redactWorkflow(workflow: CatalogWorkflow): CatalogWorkflow {
+  return {
+    ...workflow,
+    nodes: workflow.nodes.map((node) =>
+      node.kind === 'source' ? { ...node, config: redactConfigSecrets(node.config) } : node,
+    ),
+  };
+}
+
+/**
+ * Put back every source credential the caller was only ever shown a redaction
+ * of, node by node.
+ *
+ * Matched on node id and nothing else. Position in the array is not identity — a
+ * canvas re-orders freely — and neither is the name, which is documented as
+ * cosmetic. The id is the durable step name and is unique within the workflow,
+ * so it is the only thing here that a save may not quietly change.
+ *
+ * A node the stored graph does not have is a **new** node, and passes through
+ * untouched: there is no placeholder it could be standing for, so whatever
+ * arrived is what was meant, and the store's own refusal is what decides whether
+ * a fresh plaintext password may be written. That is exactly the `stored`-absent
+ * branch of {@link restoreRedactedSecrets}, one level up.
+ *
+ * A node whose id matches something that is no longer a source — the id reused
+ * for a sink, say — also passes through: there is no config on the other side to
+ * have shown anybody.
+ */
+function restoreWorkflowSecrets(
+  nodes: WorkflowNode[],
+  stored: CatalogWorkflow | undefined,
+): WorkflowNode[] {
+  if (!stored) return nodes;
+  const previous = new Map(stored.nodes.map((node) => [node.id, node]));
+  return nodes.map((node) => {
+    if (node.kind !== 'source') return node;
+    const was = previous.get(node.id);
+    if (was?.kind !== 'source') return node;
+    return { ...node, config: restoreRedactedSecrets(node.config, was.config) };
+  });
 }

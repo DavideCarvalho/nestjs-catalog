@@ -54,7 +54,56 @@ a type error and the rows land successfully.
 a timer callback, so neither carries an ambient scope. A host routing one store across environments
 enters one; a single-connection host configures nothing.
 
+## Running a transform is running code
+
+Transforms are JavaScript, TypeScript or Python, and they run in a child process of **this** pod.
+`SubprocessTransformRunner` gives that child a timeout, a working directory of its own and an
+environment of `{PATH, NODE_ENV}`. None of that is a sandbox, and the gap is worth being exact about
+rather than leaving to be discovered: the child runs as the same uid as the service, so it reads the
+whole of the parent's environment back out of `/proc/<ppid>/environ`, reads any absolute path the
+service can — a mounted service-account token included — and opens sockets.
+
+**So the control is authorisation, not isolation.** `POST pipeline/transforms/try` executes code
+immediately, and asks for all three of:
+
+| | why |
+|---|---|
+| `catalog:write` | it is code that decides what gets stored |
+| at least one `writeTypes` grant | the bar the graph path already charges — see below |
+| a signed-in person (`RequireHuman`) | it stores no row, so the log line naming a person is the only record that code ran |
+
+The last one is a **declaration your guard has to enforce** for machine callers to be turned away at
+the door, via the `REQUIRES_HUMAN` metadata key from `@dudousxd/nestjs-catalog`. The route does not
+rely on that: it checks `principal.actor` itself. Reading the key in your guard is still worth doing,
+because it is the mechanism that will govern the next such route.
+
+### What this deliberately does not stop
+
+**A principal that may write any type can run arbitrary code in this process.** Not only through the
+try route — through the ordinary one: save a transform, save a graph whose sink commits a type it may
+write, press Run, and `WorkflowRunnerService` executes that code in the same runner.
+`ConnectorRunnerService` is the same story. Gating the try route harder than the graph path would
+inconvenience the person iterating in an editor and nobody else, so it is gated the same and no
+tighter.
+
+That is the trust model the class docblock describes: transforms are written by people who already
+have database access. If your deployment does not look like that — analysts you would not give a
+shell, a multi-tenant console — the supported change is to bind your own `TransformRunner` (a
+container, gVisor, a WASM runtime) rather than to tighten a scope. It is an interface precisely so
+that swap is a provider change.
+
 ## Notes
+
+**Credentials are redacted at the HTTP boundary, including inside a graph.** `GET connections`,
+`GET connectors` and `GET workflows` replace the password in any top-level config URL with
+`REDACTED` — a workflow's source nodes carry the same `config.url` a connector does, so a graph is a
+place credentials live. The store is not redacted, deliberately: the runner needs a URL that
+connects, and environment promotion copies connectors by reading and re-writing them. Posting a
+redacted value straight back is understood as "unchanged" and restores what is stored, so a console
+that reads a graph and saves it does not overwrite the password with the placeholder. The stated
+limit is that only *top-level* strings are covered — a secret inside `config.headers` is not, and
+belongs in `secretEnvVar`.
+
 
 **Nothing here decides *when* a load runs.** The scheduler starts runs and a human can press the
 button; the runners only execute. Two systems believing they decide when a load happens is the

@@ -1,6 +1,7 @@
-import { spawn } from 'node:child_process';
+import { type ChildProcess, spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { join, resolve as resolvePath } from 'node:path';
 import { Injectable, Logger } from '@nestjs/common';
 import type {
   CatalogTransform,
@@ -11,6 +12,47 @@ import type {
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_OUTPUT_BYTES = 32 * 1024 * 1024;
+
+/**
+ * How much of the child's stderr is held, and why it is a different number from
+ * {@link MAX_OUTPUT_BYTES} with a different consequence.
+ *
+ * It had no bound at all, which is the one shape a capture must never have when
+ * the thing filling it is user code: `stderr += chunk` ran for the whole timeout
+ * window, so a transform whose only line is a loop writing to fd 2 grew the
+ * **parent's** heap — not the child's — at whatever rate the pipe would carry,
+ * and took the pod out with it. The timeout is no answer to that: thirty seconds
+ * of an unthrottled writer is gigabytes, and the process that dies is the one
+ * serving every other request.
+ *
+ * Bounded rather than killed, which is the opposite of what stdout overflow
+ * does, and the asymmetry is the point. Stdout *is* the result channel — past
+ * {@link MAX_OUTPUT_BYTES} there is no readable JSON line at the end of it and
+ * the run has already failed, so killing costs nothing. Stderr is only ever the
+ * diagnostic: a transform that writes a great deal to it and then returns a
+ * perfectly good array of rows is a working transform, and killing it would turn
+ * a noisy dependency's warnings into a failed load.
+ *
+ * The **head** is kept, because the head is what is read. Both places that
+ * consume this take `stderr.slice(0, 500)` — the first line of a traceback, the
+ * import error, the thing that says what went wrong — so dropping the tail
+ * discards exactly the part nobody was going to see. 64 KiB is far more than any
+ * of those and small enough that the ceiling is not itself a memory decision.
+ */
+const MAX_CAPTURED_STDERR_BYTES = 64 * 1024;
+
+/**
+ * Whether the child is put in its own process group, so that stopping it stops
+ * what it started.
+ *
+ * POSIX only, because the mechanism is POSIX: `detached` there makes the child a
+ * process-group leader and `process.kill(-pid)` signals the whole group, which
+ * is the only way to reach a grandchild. On Windows `detached` means something
+ * else entirely (a new console) and a negative pid is not a group, so the
+ * platform gets the single-process kill it always had rather than a call that
+ * would throw on every timeout.
+ */
+const KILL_PROCESS_GROUP = process.platform !== 'win32';
 
 /**
  * How much of what a transform logged is carried back, on both axes.
@@ -85,11 +127,28 @@ export interface TransformRunnerOptions {
 /**
  * Runs a transform in a child process, with a clock on it.
  *
- * **This is not a security boundary.** It stops accidents — an infinite loop, a
- * runaway allocation, a stray read of `process.env.DATABASE_PASSWORD` — because
- * the child gets a timeout and an empty environment. It does not stop code
- * written to escape it: a child process can still open sockets and read the
- * filesystem as whatever user the service runs as.
+ * **This is not a security boundary, and the trimmed environment is not one
+ * either.** It stops accidents — an infinite loop, a runaway allocation, a stray
+ * read of `process.env.DATABASE_PASSWORD` — because the child gets a timeout and
+ * an environment of `{PATH, NODE_ENV}`. It does not stop code written to escape
+ * it, and it is worth being exact about how thin the allowlist is rather than
+ * leaving a reader to assume it holds:
+ *
+ * - the child inherits nothing of the parent's environment **through `env`**,
+ *   and reads all of it anyway from `/proc/<ppid>/environ`, which is readable
+ *   because parent and child run as the same uid;
+ * - it runs in a working directory of this runner's choosing but on the host's
+ *   filesystem, so a service account token under
+ *   `/var/run/secrets/kubernetes.io/serviceaccount/` is an absolute path away;
+ * - it can open sockets, as whatever user the service runs as.
+ *
+ * So the allowlist is a guard rail against the accident, and the reachability of
+ * everything it names is a property of the process boundary, not a leak to be
+ * patched. **Running a transform is running code in this pod.** Who is allowed
+ * to is therefore an authorisation question and not a sandboxing one, and it is
+ * answered at the HTTP surface — see the "Running a transform is running code"
+ * section of `@dudousxd/nestjs-catalog-pipeline`'s README, which is where a host
+ * can actually read it, and `pipeline.controller.ts` for the checks themselves.
  *
  * That is a deliberate trade for the case this is built for, where transforms
  * are written by the same people who already have database access. A catalog
@@ -230,7 +289,21 @@ export class SubprocessTransformRunner implements TransformRunner {
       const child = spawn(command, args, {
         // An empty environment, not the parent's. A transform has no business
         // reading the database password, and inheriting env is how it would.
+        // Read the class docblock before treating this as containment: the same
+        // values are a `/proc/<ppid>/environ` read away, and this is a guard
+        // rail against the accidental read rather than a boundary.
         env: { PATH: process.env.PATH ?? '', NODE_ENV: 'production' },
+        // Not the parent's, which is a running service's directory and holds
+        // the `.env` the allowlist above exists to withhold — a transform whose
+        // first line is `readFileSync(".env")` was reading the host application's
+        // configuration by relative path. A temporary directory keeps the file
+        // writes a transform may legitimately want working while making the one
+        // path it can name without knowing anything about the deployment
+        // uninteresting. Absolute paths are unaffected, and cannot be.
+        cwd: tmpdir(),
+        // Its own process group, so the timeout below can reach a grandchild.
+        // See {@link KILL_PROCESS_GROUP}.
+        detached: KILL_PROCESS_GROUP,
         stdio: ['pipe', 'pipe', 'pipe'],
       });
 
@@ -241,16 +314,21 @@ export class SubprocessTransformRunner implements TransformRunner {
       const timer = setTimeout(() => {
         if (settled) return;
         settled = true;
-        child.kill('SIGKILL');
+        stop(child);
         reject(new Error(`The transform ran for longer than ${timeoutMs}ms and was stopped.`));
       }, timeoutMs);
 
       child.stdout.on('data', (chunk: Buffer) => {
         stdout += chunk.toString();
-        if (stdout.length > MAX_OUTPUT_BYTES) child.kill('SIGKILL');
+        if (stdout.length > MAX_OUTPUT_BYTES) stop(child);
       });
       child.stderr.on('data', (chunk: Buffer) => {
-        stderr += chunk.toString();
+        // Appended only while there is room, rather than appended and trimmed:
+        // trimming after the fact still materialises the whole chunk into the
+        // parent's heap, which is the thing being bounded. See
+        // {@link MAX_CAPTURED_STDERR_BYTES} for why this bounds rather than kills.
+        if (stderr.length >= MAX_CAPTURED_STDERR_BYTES) return;
+        stderr += chunk.toString().slice(0, MAX_CAPTURED_STDERR_BYTES - stderr.length);
       });
 
       child.on('error', (error) => {
@@ -282,7 +360,12 @@ export class SubprocessTransformRunner implements TransformRunner {
 
     const venv = this.options.pythonVenv ?? process.env.CATALOG_PYTHON_VENV;
     if (venv) {
-      const candidate = join(venv, 'bin', 'python');
+      // Absolute, and it has to be: a child now runs in a temporary directory
+      // rather than the parent's, so a relative `CATALOG_PYTHON_VENV` — which
+      // `existsSync` here resolves against the *parent's* cwd — would pass this
+      // check and then fail to spawn. Resolved once, at the point the two cwds
+      // are still the same.
+      const candidate = resolvePath(join(venv, 'bin', 'python'));
       if (existsSync(candidate)) {
         this.pythonPath = candidate;
         this.logger.log(`Python transforms run in the venv at ${venv}`);
@@ -307,6 +390,41 @@ export class SubprocessTransformRunner implements TransformRunner {
     this.pythonPath = null;
     return null;
   }
+}
+
+/**
+ * Stop the transform, and everything the transform started.
+ *
+ * `child.kill()` signals one pid. A transform that double-forks — two lines of
+ * `child_process.spawn` with `detached` and an `unref` — leaves a grandchild
+ * that the direct child's death says nothing about, so the timeout expired, the
+ * caller was told the run had been stopped, and the work carried on
+ * indefinitely. That is not a hypothetical: it is the standard way a timeout on
+ * a process is escaped, and a bound that a caller can opt out of is not a bound.
+ *
+ * So the child leads its own process group and the negative pid signals the
+ * group, which is every descendant that has not deliberately left it. Leaving
+ * one is possible (`setsid` again) and there is no answer to that short of a
+ * cgroup or a container — the same place the class docblock's honesty about the
+ * boundary ends up, for the same reason.
+ *
+ * Falls through to the single-process kill whenever the group kill cannot be the
+ * one that happens: on Windows, where a negative pid is not a group, and on an
+ * `ESRCH` where the group is already gone and the direct kill is a harmless
+ * no-op. A throw here would replace a timeout error — which says something true
+ * and useful — with an unhandled one that says nothing.
+ */
+function stop(child: ChildProcess): void {
+  const pid = child.pid;
+  if (KILL_PROCESS_GROUP && pid !== undefined) {
+    try {
+      process.kill(-pid, 'SIGKILL');
+      return;
+    } catch {
+      // Already gone, or never grouped. The direct kill below covers both.
+    }
+  }
+  child.kill('SIGKILL');
 }
 
 /**
