@@ -303,6 +303,25 @@ export class WorkflowRow {
   @Property({ type: 'json' })
   edges: unknown[] = [];
 
+  /**
+   * `draft` or `ready`. Narrowed on read against `isWorkflowStatus`, never cast.
+   *
+   * **Defaulted to `ready`, and that is the migration decision rather than a
+   * tidy default.** Every workflow already in a database got there through a
+   * `saveWorkflow` that refused anything `validateWorkflow` objected to, so each
+   * one is a graph that was valid at the moment it was written — which is
+   * exactly what `ready` asserts. Defaulting the column to `draft` would be
+   * cheaper to reason about and would silently stop every scheduled connector on
+   * the deployment the moment the migration ran, because a connector may only
+   * run a ready graph. A default that turns an upgrade into an outage is the
+   * wrong default even when it is the conservative-looking one.
+   *
+   * New rows are written with an explicit status by the store, so this default
+   * governs the backfill and nothing else.
+   */
+  @Property({ length: 16, default: 'ready' })
+  status = 'ready';
+
   @Property()
   version = 1;
 

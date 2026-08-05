@@ -252,11 +252,12 @@ describe('CatalogPipelineModule.forRoot (integration)', () => {
     const pipeline = routes.filter((route) => route.includes('/api/catalog-service/pipeline'));
     const publish = routes.filter((route) => route.includes('/api/catalog-service/publish'));
 
-    // 22 + 4. Pinned as a total rather than route-by-route so that a route which
+    // 24 + 4. Pinned as a total rather than route-by-route so that a route which
     // moves prefix — the failure mode this whole file is about — cannot be
     // mistaken for a route that was merely renamed. The last two added were
-    // `POST connectors/:id/discover` and `POST connections/check`.
-    expect(pipeline).toHaveLength(22);
+    // `POST workflows/:id/publish` and `POST workflows/:id/unpublish`, the pair
+    // that took validation off the save and made it the gate on publishing.
+    expect(pipeline).toHaveLength(24);
     expect(publish).toHaveLength(4);
 
     // The five workflow routes named explicitly, because they are the ones that

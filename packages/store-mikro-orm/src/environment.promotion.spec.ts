@@ -46,6 +46,7 @@ class StubWorkspace {
 class StubPipelineStore implements CatalogPipelineStore {
   readonly savedTransforms: string[] = [];
   readonly savedWorkflows: string[] = [];
+  readonly publishedWorkflows: string[] = [];
   readonly savedConnectors: string[] = [];
 
   /** Thrown by `saveTransform`/`saveConnector` when set, to stop an apply mid-way. */
@@ -82,10 +83,39 @@ class StubPipelineStore implements CatalogPipelineStore {
       name: input.name,
       targetType: 'Mvr',
       graphHash: 'hash',
+      // A save drafts, exactly as the real store does. `promoteWorkflows`
+      // publishes immediately afterwards, which is what these tests then get to
+      // assert rather than assume.
+      status: 'draft',
       version: 1,
       nodes: input.nodes,
       edges: input.edges,
       createdBy,
+      createdAt: NOW.toISOString(),
+      updatedAt: NOW.toISOString(),
+    });
+  }
+
+  /**
+   * Recorded rather than ignored, because "it arrived ready" is the assertion.
+   *
+   * A promotion that saved a graph and left it drafted would put a workflow in
+   * the target that the very next phase cannot attach a connector to — the store
+   * refuses a connector pointing at a draft — so the publish is load-bearing and
+   * a spy on it is what stops that regressing silently.
+   */
+  publishWorkflow(id: string): Promise<CatalogWorkflow> {
+    this.publishedWorkflows.push(id);
+    return Promise.resolve({
+      id,
+      name: id,
+      targetType: 'Mvr',
+      graphHash: 'hash',
+      status: 'ready',
+      version: 1,
+      nodes: [],
+      edges: [],
+      createdBy: 'promoter',
       createdAt: NOW.toISOString(),
       updatedAt: NOW.toISOString(),
     });

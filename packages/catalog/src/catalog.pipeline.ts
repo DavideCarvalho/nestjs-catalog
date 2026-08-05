@@ -514,13 +514,64 @@ export interface WorkflowGraph {
  * an audit. The limitation is real and worth stating plainly — an edited graph
  * cannot be reconstructed from an old run, only identified as different.
  */
+/**
+ * Whether this graph is still being drawn, or is something somebody declared
+ * finished.
+ *
+ * The distinction exists because validation used to be the gate on *saving*, and
+ * that made an unfinished graph unstorable: `saveWorkflow` refused anything
+ * `validateWorkflow` had an issue with, so a canvas with one node on it could
+ * not be written down at all and closing the tab lost it. Worse, it made the
+ * canvas lie about ordinary work — clicking "+ Sink" produces a node that is
+ * unreachable from any source and names no type, both true and both useless one
+ * second after the click, because a just-added node is unwired by construction.
+ *
+ * So the gate moved rather than loosened. Validation is now the gate on
+ * publishing, and the same `validateWorkflow` still decides — a draft is not a
+ * graph that skipped the rules, it is a graph nobody has claimed is finished
+ * yet. Everything that consumes a workflow asks for `ready`: a connector may
+ * only point at one, and a promotion may only carry one. What crosses an
+ * environment should be something a person declared done.
+ */
+export const WORKFLOW_STATUSES = [
+  /**
+   * Being drawn. Saves without validating, and cannot run, be scheduled, or be
+   * promoted. An incomplete node here is the normal state rather than an alarm.
+   */
+  'draft',
+  /**
+   * Declared finished, and validated at the moment it was declared. This is the
+   * only status a connector may point at and the only one a promotion carries.
+   */
+  'ready',
+] as const;
+
+export type WorkflowStatus = (typeof WORKFLOW_STATUSES)[number];
+
+/** Same reason as {@link isConnectorKind}: one list, no second copy to drift. */
+export function isWorkflowStatus(value: unknown): value is WorkflowStatus {
+  return WORKFLOW_STATUSES.some((status) => status === value);
+}
+
 export interface CatalogWorkflow {
   id: string;
   name: string;
   description?: string;
   nodes: WorkflowNode[];
   edges: WorkflowEdge[];
-  /** Bumped whenever the graph's behaviour changes. Never on a rename or a move. */
+  /** See {@link WORKFLOW_STATUSES}. A graph is `draft` until somebody publishes it. */
+  status: WorkflowStatus;
+  /**
+   * Bumped whenever the graph's behaviour changes. Never on a rename or a move.
+   *
+   * Bumped on a **draft** edit too, which looks like exactly the inflation this
+   * rule exists to prevent and is not. The counter's job is to make
+   * {@link ConnectorRun.workflowVersion} answer "which shape ran": freezing it
+   * while a graph is drafted would let a run recorded at v4 and a later run also
+   * at v4 mean two different graphs, which is the one thing that field must
+   * never do. Drafting therefore inflates a number nobody reads — cheap — rather
+   * than making a number somebody does read ambiguous.
+   */
   version: number;
   /** Fingerprint of the graph at this version. See {@link workflowGraphHash}. */
   graphHash: string;
@@ -1221,7 +1272,24 @@ export interface CatalogWorkflowStore {
   listWorkflows(): Promise<CatalogWorkflow[]>;
   getWorkflow(id: string): Promise<CatalogWorkflow | undefined>;
   /**
-   * Validates before it writes, and refuses naming the node.
+   * Writes. Validates only what it must.
+   *
+   * A **draft** is written without validating, which is the whole of the change
+   * and the reason {@link WORKFLOW_STATUSES} exists: a graph you have not
+   * finished has to be storable, or closing the tab loses it. A **ready**
+   * workflow is still validated on every save, because it is the one that runs.
+   *
+   * `status` is not an input. A save cannot promote a draft to ready — that is
+   * {@link publishWorkflow}, which exists so there is one place that validates
+   * and one place that can explain why it refused. A save of an already-ready
+   * workflow keeps it ready, and **refuses an edit that would make it invalid**
+   * rather than quietly demoting it to draft. Demotion was the other option and
+   * it is the one that loses a running pipeline silently: a connector may only
+   * point at a ready graph, so a save that dropped the status would disable a
+   * scheduled load with nothing said to anybody. Refusing puts the error in
+   * front of the person who is editing, at the moment they edit. To park a
+   * broken idea on a live graph, {@link unpublishWorkflow} it first and be told
+   * which connectors that stops.
    *
    * `version`, `graphHash` and `targetType` are not inputs: the first two are
    * derived from the graph and the third from the sink, and accepting them from
@@ -1234,6 +1302,34 @@ export interface CatalogWorkflowStore {
     },
     createdBy: string,
   ): Promise<CatalogWorkflow>;
+  /**
+   * Declare a graph finished: validate it, and make it `ready`.
+   *
+   * A transition rather than a field on save, and the argument is that this is
+   * the only shape with somewhere to put the refusal. "Ready" is a claim that
+   * has to be checked, and a check that fails owes an explanation naming the
+   * nodes — `validateWorkflow` produces exactly that, and a boolean field on a
+   * save request has nowhere to return it that is not an error on an operation
+   * the caller thought was about something else. It also makes the audit
+   * question answerable: publishing is an act with an actor, and a field set in
+   * passing during an autosave is not.
+   *
+   * Idempotent on an already-ready graph, because the honest answer to "publish
+   * this thing that is published" is the graph, not an error.
+   */
+  publishWorkflow(id: string, publishedBy: string): Promise<CatalogWorkflow>;
+  /**
+   * Take a graph back to `draft`.
+   *
+   * **Refuses while any connector still runs it**, exactly as
+   * {@link deleteWorkflow} does and for the same reason: a connector may only
+   * point at a ready graph, so unpublishing one out from under a schedule breaks
+   * a load that was working, and the operator needs to know *which* connectors
+   * to point elsewhere first. Refusing here rather than cascading is deliberate —
+   * disabling somebody's connectors as a side effect of an edit to something
+   * else is precisely the silent action this status exists to prevent.
+   */
+  unpublishWorkflow(id: string, unpublishedBy: string): Promise<CatalogWorkflow>;
   /** Refuses while any connector still runs it. */
   deleteWorkflow(id: string): Promise<boolean>;
   /** Which connectors run it. Named, so a refusal can say. */
@@ -1293,7 +1389,13 @@ export function supportsWorkflows(
   return (
     typeof store.listWorkflows === 'function' &&
     typeof store.getWorkflow === 'function' &&
-    typeof store.saveWorkflow === 'function'
+    typeof store.saveWorkflow === 'function' &&
+    // Asked for by name like the rest, rather than assumed to come with
+    // `saveWorkflow`. Promotion publishes what it saves, so a store that has the
+    // save and not the transition would narrow cleanly here and then fail one
+    // call later, in the middle of an apply that has already written types and
+    // transforms into the target.
+    typeof store.publishWorkflow === 'function'
   );
 }
 

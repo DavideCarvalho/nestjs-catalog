@@ -91,18 +91,29 @@ export async function readPromotable(
         // was being skipped.
       }),
     ),
-    workflows: workflows.map((workflow) => ({
-      id: workflow.id,
-      name: workflow.name,
-      description: workflow.description,
-      targetType: workflow.targetType,
-      // The hash, not the version — a version counts edits inside one database
-      // and means nothing in the other.
-      graphHash: workflow.graphHash,
-      version: workflow.version,
-      nodes: workflow.nodes,
-      edges: workflow.edges,
-    })),
+    // **Drafts are not in the promotable set at all**, which is a stronger
+    // statement than "a draft promotion is refused" and is the one worth making.
+    // A draft is a graph nobody has declared finished; it may have no sink, and
+    // therefore no target type, so there is not even a well-formed thing to
+    // describe to a reviewer. Filtering here rather than blocking later also
+    // cannot hide a surprise: a connector may only point at a `ready` workflow,
+    // so no connector in this set can reference one of the graphs left out, and
+    // `connectorBlockers` has nothing it could newly complain about. What
+    // crosses an environment is what somebody declared ready.
+    workflows: workflows
+      .filter((workflow) => workflow.status === 'ready')
+      .map((workflow) => ({
+        id: workflow.id,
+        name: workflow.name,
+        description: workflow.description,
+        targetType: workflow.targetType,
+        // The hash, not the version — a version counts edits inside one database
+        // and means nothing in the other.
+        graphHash: workflow.graphHash,
+        version: workflow.version,
+        nodes: workflow.nodes,
+        edges: workflow.edges,
+      })),
     connections: connections.map((connection) => ({
       id: connection.id,
       name: connection.name,
@@ -504,6 +515,14 @@ async function promoteWorkflows({
       },
       promotedBy,
     );
+    // Saved, then published, because a save creates a draft and a draft is not
+    // something the next phase can attach a connector to — `saveConnector`
+    // refuses one. Two calls rather than a `status` argument on the save, so the
+    // graph goes through exactly the validation every other publish does: it was
+    // ready in the source, but "ready over there" is a claim about a database
+    // whose transforms are not these, and `publishWorkflow` re-checks it against
+    // the transforms that actually arrived in phase 2.
+    await target.pipeline.publishWorkflow(workflow.id, promotedBy);
     outcome.workflows.push(workflow.id);
     outcome.applied += 1;
   }
