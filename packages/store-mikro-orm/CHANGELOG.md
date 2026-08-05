@@ -1,5 +1,257 @@
 # @dudousxd/nestjs-catalog-store-mikro-orm
 
+## 0.7.0
+
+### Minor Changes
+
+- 4d28056: A workflow can be saved unfinished, and publishing is what validates it
+
+  Validation used to be the gate on _saving_. `MySqlPipelineStore.saveWorkflow` ran
+  `validateWorkflow` and refused anything with an issue — `"<name>" cannot run as
+drawn.` — so a graph you had not finished could not be written down at all, and
+  closing the tab lost it. A saved workflow was, by definition, one that runs.
+
+  That also made the canvas lie about ordinary work. Clicking **+ Sink** produced a
+  node that "is not reachable from any source" and "does not say which object type
+  it writes": both true, both useless one second after the click, because a
+  just-added node is unwired by construction.
+
+  So the gate moved rather than loosened. `CatalogWorkflow` gains
+  `status: 'draft' | 'ready'`. A draft saves without validating; only a `ready`
+  graph runs, is schedulable, or is promoted. The same `validateWorkflow` still
+  decides — a draft is not a graph that skipped the rules, it is a graph nobody has
+  claimed is finished yet.
+
+  ## What a host does on upgrade
+
+  **The schema gains one column, and its default is the decision.**
+  `catalog_workflow.status` is `varchar(16) NOT NULL DEFAULT 'ready'`, applied by
+  `ensureCatalogSchema` like every other change in this package — there is nothing
+  to run by hand. It backfills every existing row to `ready`, deliberately: each
+  one got there through a save that refused anything invalid, so each is a graph
+  that was valid when it was written, which is exactly what `ready` asserts.
+  Defaulting to `draft` would have been the conservative-looking choice and would
+  have silently stopped every scheduled connector on the deployment the moment the
+  migration ran, because a connector may only run a ready graph. A default that
+  turns an upgrade into an outage is the wrong default.
+
+  **New graphs now arrive as drafts.** Anything automating `POST workflows` and
+  expecting the result to be immediately runnable must now call
+  `POST workflows/:id/publish`. This is the one behavioural break: a script that
+  created a workflow and attached a connector to it in the same breath will now be
+  refused at the connector save until it publishes.
+
+  **Two new routes**, both `catalog:write`: `POST workflows/:id/publish` and
+  `POST workflows/:id/unpublish`. Publishing is a transition rather than a field on
+  save because "ready" is a claim that has to be checked, and a check that fails
+  owes an explanation naming the nodes — a boolean on a save request has nowhere to
+  put that which is not an error on an operation the author thought was about
+  something else.
+
+  **Two new store methods.** `CatalogWorkflowStore` gains `publishWorkflow` and
+  `unpublishWorkflow`, and `supportsWorkflows` now asks for `publishWorkflow` by
+  name. A custom store implementing the interface must add both; one that has the
+  save and not the transition would narrow cleanly and then fail one call into a
+  promotion that had already written types and transforms into the target.
+
+  ## The three refusals worth knowing about
+
+  **A connector may only point at a `ready` workflow, refused at save.** The check
+  could equally have lived in the runner, and that is the version worth arguing
+  against: it would move the error from the person wiring the connector — who is
+  looking at the screen and can fix it in one edit — to a scheduled window at 3am.
+
+  **A published workflow edited into an invalid state is refused, not demoted.**
+  Silently dropping it back to `draft` was the alternative, and it is the one that
+  loses a running pipeline without saying so: connectors may only run ready graphs,
+  so the demotion would disable a scheduled load with nothing reported. Unpublish
+  it explicitly to park a broken idea on a live graph.
+
+  **Unpublishing is refused while any connector still runs the graph**, naming
+  them, exactly as `deleteWorkflow` already did. Cascading — disabling those
+  connectors here — was rejected on principle: turning off somebody's loads as a
+  side effect of an edit to something else is the silent action this status exists
+  to prevent.
+
+  ## Promotion
+
+  Drafts are not in the promotable set at all, which is stronger than refusing a
+  draft promotion and is the statement worth making: a draft may have no sink, so
+  there is not even a well-formed thing to describe to a reviewer. Nothing can be
+  hidden by the omission, because no connector can reference one. `promoteWorkflows`
+  now saves _and publishes_, since a save drafts and the connector phase that
+  follows cannot attach to a draft — and the publish re-validates the graph against
+  the transforms that actually arrived in the target rather than trusting that it
+  was ready in the source.
+
+- f2f5d7c: Credentials can be encrypted before they rest in the catalog's own tables
+
+  The redaction stopped a connection password travelling in an HTTP response. The
+  refusal stopped a new one being written. Neither does anything for the reader
+  this is about: a database dump, a read replica, a nightly backup, or anybody
+  holding `SELECT` on the instance. For them `catalog_connection.config` was a
+  list of every password the catalog knew — and `allowInlineCredentials` enlarges
+  that population on purpose, which is why this is worth building now.
+
+  **`CatalogSecretVault`, a seam and not a cipher.** There is no encryption in
+  this library and there must not be: shipping AES with a key from an environment
+  variable moves the problem from one column to one variable, and leaves this
+  package answering for key rotation and per-environment separation that the
+  host's KMS or Vault already answers for. Bind `CATALOG_SECRET_VAULT` — to one
+  vault, or to an array of them, which is what lets a key rotation happen without
+  an outage: the first seals, and any of them may open, matched on the `vault`
+  name every row carries.
+
+  **The default refuses.** Unbound, `RefusingSecretVault` throws on `seal` naming
+  the token. A default that quietly stored plaintext would make
+  `encryptCredentials: true` a no-op with a reassuring name — saves would succeed
+  and the column would be exactly as it was.
+
+  **`encryptCredentials`, and how it composes with `allowInlineCredentials`.**
+  Four combinations, three meanings, and no fourth: sealing runs _before_ the
+  refusal is asked, so a sealed credential is an object by the time anything looks
+  for a password-bearing string. `false/false` refuses (unchanged, and the
+  default). `false/true` and `true/true` seal. `true/false` is the deliberate
+  dev-environment plaintext trade the flag already documented. The combination
+  worth naming is `allowInlineCredentials: false, encryptCredentials: true` — it
+  reads like a contradiction and is the one a production deployment wants.
+
+  **The store opens on every read**, whatever the flag currently says, so turning
+  encryption off keeps existing rows readable rather than being a data-loss
+  button. It also means nothing downstream learns that a vault exists: `fetchSql`
+  still gets a URL, and — the sharper reason — `restoreRedactedSecrets` still
+  gets a string to compare against. Had reads handed out ciphertext, the console
+  round trip would have written the literal `REDACTED` over the credential, which
+  is the classic way a fix of this shape corrupts what it protects. **The
+  redaction is unchanged and stays**: it defends against `catalog:read` over HTTP,
+  sealing defends against `SELECT` on the database, and dropping either because
+  the other exists gives that attacker the password back.
+
+  **What is sealed** is what the refusal already recognises — a top-level string
+  that parses as a URL carrying a password — and not the whole `config` object.
+  One predicate, two consumers: seal something the redaction does not hide and a
+  console renders a ciphertext blob; hide something this does not seal and the
+  column still holds the password. Sealing everything would also blind the
+  refusal, which needs a string to inspect.
+
+  **Rows already holding plaintext** are sealed on their next save and not before.
+  No read-through-reseal — a read that writes can fail a connector run for a
+  bookkeeping reason, and these rows are read on the runner's hot path — and no
+  one-shot migration in this release. The column takes both forms indefinitely,
+  `isSealedSecret` tells them apart, and a migration written later needs no schema
+  change.
+
+  **A vault that is down fails a save, and fails a read _retryably_.** A save that
+  cannot seal writes nothing; there is deliberately no catch that logs and stores
+  the plaintext, because a deployment that did that during an outage would have no
+  way afterwards to find out which credentials went in clear. A read that cannot
+  open throws `SecretOpenFailedError`, which is pointedly **not** a
+  `BadRequestException` — `ConnectorRunSteps` catches that class and converts it
+  to a non-retryable `connector_unavailable`, so a five-second vault blip would
+  have become a load that never ran and an operator hunting for a connector nobody
+  deleted. It is fatal only when waiting provably cannot help: nothing bound,
+  nothing bound under the row's vault name, or the vault's own error saying so.
+
+  **`saveWorkflow` refuses and seals a source node's credential too.**
+  `WorkflowSourceNode` promised "credentials stay out of the catalog here exactly
+  as they do everywhere else" and nothing enforced it: the graph was written
+  verbatim, and the workflow runner spreads `node.config` into a synthesised
+  connector, so `fetchSql` read `config.url` from there exactly as it does from a
+  connector's. Same predicate, applied per node; grandfathering compares per node
+  id, so renaming a graph does not refuse over a credential nobody touched. The
+  graph fingerprint is taken before sealing, so a non-deterministic ciphertext
+  never registers as a new version.
+
+- 0995daa: The connection form asks for a connection string, and can test it before saving
+
+  Three changes to one screen's worth of friction.
+
+  **One field, not two.** The SQL address block offered an inline URL and the name
+  of an environment variable holding one, side by side, with a paragraph
+  explaining when each applied — and only one of them worked for a database with a
+  password, which is every database anybody connects to. It asks for the
+  connection string now.
+
+  **`allowInlineCredentials` on the store, default false.** A connection URL is
+  the credential, and `config` is served under `catalog:read`, so a password
+  inside one is refused. That refusal is what makes the "never the credential"
+  promise true rather than aspirational, and it stays the default. A deployment
+  that would rather type a connection string than provision an environment
+  variable can turn it off — and what does NOT change is the redaction: the
+  password never travels in a response either way. The flag decides only whether
+  it may rest in the catalog's own table.
+
+  **`POST pipeline/connections/check`** reaches a connection that has not been
+  saved. The field most likely to be wrong is the address, and finding out used to
+  mean saving a row, testing it from its card, and deleting it.
+
+  It asks `catalog:write`, not the `catalog:read` its by-id sibling asks for, and
+  the difference is the whole point: checking a saved connection reaches an
+  address somebody already chose and wrote down; checking a posted one reaches an
+  address supplied in the request. Under `catalog:read` that is a port scanner for
+  anybody who may look at the catalog. Under `catalog:write` it grants no reach
+  that did not exist — the same caller could save, check and delete — but that
+  route leaves records and this one leaves none, so it logs what it did. The
+  address, never the credential.
+
+### Patch Changes
+
+- 060ec38: Two things this package spent in its host's process, and no longer does
+
+  Both are the same kind of bug: work that is invisible from inside the catalog because it lands
+  somewhere else — the host's heap, or a connection the host will borrow back.
+
+  ## Dating a type read every snapshot ever committed
+
+  `StoredCatalogRegistry.reload()` resolved each type's `lastCommittedAt` with
+  `em.find(SnapshotRow, { committed: true }, { orderBy: { committedAt: 'desc' } })` — the entire
+  committed history of every type, hydrated into managed entities, so that one row per type could be
+  kept and the rest thrown away.
+
+  Measured against MySQL 8.0 at 200 types and 50,000 committed snapshots: `reload()` took **450–500 ms**
+  and the hydrated rows added **161 MB** to the heap. Both are spent in the process this package is
+  mounted inside. `reload()` runs at boot, after every publish, after every commit and after every
+  curation edit, so a nightly connector fleet pays it several times a night — and neither number is
+  stable, because a snapshot row is written per load per type and **nothing in this repository ever
+  deletes one**. The cost grows with how long the deployment has been running, forever.
+
+  It is now a grouped query that asks the database which rows are the serving ones, followed by a
+  primary-key `IN` over that handful. Same answer, and the same `reload()` at the same 200 types and
+  50,000 snapshots now takes **119–133 ms** while hydrating 200 rows instead of 50,000.
+
+  What it costs elsewhere, stated plainly: the grouped query still **scans** the table. The only
+  declared index is `(type_name, created_at)`, which covers neither the `committed` filter nor the
+  `committed_at` ordering. The scan is now the database server's work rather than the host's, which is
+  the trade being made on purpose — but it does not vanish, and it still grows with history. An index
+  on `(committed, type_name, committed_at)` takes the grouped query from ~85 ms to ~14 ms at 50k rows.
+  It is deliberately **not** added here, for two reasons that are decisions rather than defects: the
+  DDL runs at boot on every pod, behind the host's readiness probe, against a table that may be very
+  large; and `fingerprintOf` hashes only column names, types and nullability, so an added `@Index`
+  would not move the schema fingerprint and would never be applied to an already-booted database
+  anyway. Retention for `catalog_snapshot` is the other half of that conversation, and there is
+  currently none.
+
+  ## The query console left a statement timeout on a pooled connection
+
+  `runReadOnlyQuery` bounded the caller's statement with `SET SESSION MAX_EXECUTION_TIME`. That is
+  session scope, and a session here is a pooled connection: the value stayed set on that connection
+  after the request finished, for whoever borrowed it next. With no `contextName` configured,
+  `catalogConnectionProviders` binds this package to the **host's** `EntityManager` — so the connection
+  being altered is one of the host's, and the host's next statement on it silently inherited a
+  fifteen-second timeout it never asked for and had no way to see. Confirmed against MySQL 8.0: after
+  one query, a different `em.fork()` read the value back.
+
+  It is now a per-statement optimizer hint on the wrapper this function already builds. Both forms
+  interrupt a runaway cross join at 1.00 s; the hint leaves `@@SESSION.MAX_EXECUTION_TIME` at 0, and
+  removes a round trip, since it rides on the statement instead of preceding it. The hint attaches to
+  the outer `SELECT` written here, never to the caller's text, so a statement beginning with `WITH` is
+  untouched.
+
+  The `START TRANSACTION READ ONLY` that makes the screen safe to expose is unchanged, and was checked
+  rather than assumed while this was in hand: an `INSERT` issued between it and the `ROLLBACK` comes
+  back as `Cannot execute statement in a READ ONLY transaction`, sequentially and with eight such
+  sequences in flight at once, with the connection id stable across all four statements.
+
 ## 0.6.0
 
 ### Minor Changes

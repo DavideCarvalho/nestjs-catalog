@@ -1,5 +1,281 @@
 # @dudousxd/nestjs-catalog-pipeline
 
+## 1.0.0
+
+### Major Changes
+
+- db38811: A caller chose which environment variable the server read, and a failed URL was readable at `catalog:read`
+
+  Two holes on the same path, both of which turned an ordinary `catalog:write` grant into a read of
+  something it was never given.
+
+  ## 1. `secretEnvVar` was an arbitrary read of the pod's environment — **breaking**
+
+  `resolveSecretEnv` did `process.env[name]`, and `name` is chosen by whoever writes the connector —
+  on `POST pipeline/connectors`, on `POST pipeline/connections`, and on a workflow source node. There
+  was no allow-list anywhere. So a principal holding `catalog:write` on one narrow object type could
+  point a connector at the host application's own database and read it back out of the catalog:
+
+  ```
+  POST pipeline/connectors  {"kind":"sql","targetType":"Mvr","secretEnvVar":"DATABASE_URL",
+                             "config":{"query":"SELECT * FROM users"}}
+  POST pipeline/connectors/<id>/discover   → the columns, writing nothing
+  POST pipeline/connectors/<id>/run        → the rows, into a type they may write
+  GET  catalog/objects/Mvr                 → read them back at catalog:read
+  ```
+
+  Every guard on that path passed, and each of them passed honestly. The per-type write grant passed
+  because the sink really was a type the principal held. `assertNoNewPlaintextCredential` passed
+  because `config` carried no URL at all — the credential was fetched by name, which is the thing the
+  design was proud of. The read-only transaction in `fetchSql` prevents writes and was never about
+  reads. The three "credentials are never stored" docblocks were all true and all beside the point:
+  the catalog stores the _name_, and the name is chosen by the caller.
+
+  The error also distinguished "set" from "not set" **by name**, so any route reaching it was an
+  oracle for the pod's environment, one variable per request — including `discover`, which writes
+  nothing and leaves nothing behind.
+
+  ### What a host has to do
+
+  **Bind an allow-list, or every authenticating connector stops running.** This is fail-closed on
+  purpose, the same stance `CATALOG_LOAD_EXPECTATIONS` and `RefusingSecretVault` already take.
+
+  ```ts
+  CatalogPipelineModule.forRoot({
+    // …em, registry, imports, expectations…
+    secretEnvAllowlist: ["FLEET_DB_URL", "DPAS_API_TOKEN", "VENDOR_*"],
+  });
+  ```
+
+  or, for an operator who owns the manifest rather than the code:
+
+  ```
+  CATALOG_SECRET_ENV_ALLOW="FLEET_DB_URL,DPAS_API_TOKEN,VENDOR_*"
+  ```
+
+  **The list to write is already on your screen.** Every connector and connection shows the variable
+  it reads, under `Credential env var`; the union of those is the whole migration. Both levers are
+  comma- or whitespace-separated; the module option wins when both are set, and the boot line says
+  which is in force, so setting the variable and seeing nothing change has an answer on screen.
+
+  An entry is an exact name, or a prefix ending in a single `*`. A `*` anywhere else is refused **at
+  boot, naming the entry** — `*_URL` reads like a tidy way to admit connection strings and it admits
+  `DATABASE_URL`.
+
+  `['*']` restores the previous behaviour wholesale — every variable in the pod readable by anyone who
+  can write a connector. It exists so an upgrade under time pressure has one honest, greppable line
+  instead of a pin to the previous release, and it warns on **every** boot.
+
+  A host that binds nothing boots and warns, once, naming both levers and what will happen. Connectors
+  that name no credential at all — `inline`, `file`, an S3 connector on a pod role — are unaffected.
+
+  ### What a refused caller is told, and what an operator is told
+
+  One sentence, the same one whether the name was never admitted or was admitted and is not set. The
+  name is repeated back, because the caller supplied it; the _reason_ is what leaked, so the reason
+  goes to the process log under the `CatalogSecretEnv` context instead. This is not less diagnosable —
+  it is diagnosable by the person entitled to diagnose it.
+
+  The cost, stated plainly: `POST pipeline/connections/check` gets less specific. Its whole purpose is
+  catching a mistyped variable name, and it now answers "no credential is available" rather than
+  naming the problem. That is deliberate and unavoidable — the route asks for `catalog:write`, which is
+  exactly the grant the attack above starts from, so it cannot be given a better answer than anybody
+  else. The log line has it.
+
+  ## 2. Source URLs were echoed into run logs and audit payloads — no host action needed
+
+  `fetchHttp` throws `GET ${url} → ${status}` and the file source does the same. The connector runner
+  pushed `Failed: ${message}` into `logs` and emitted `connector.run.finished` with `error: message`;
+  the workflow runner did the same, plus the per-node `error` on `nodeOutcomes`. Both sinks are served
+  under the softest scope in the system: `GET pipeline/runs` returns `logs` and `error` unredacted at
+  `catalog:read`, and `GET catalog/events` returns the payload verbatim. A credential-bearing URL — a
+  password in the userinfo, an `?api_key=`, a signed S3 URL — needed to fail **once** to become
+  readable by everybody who may look at the catalog at all. `redactConnector` guarded the connector
+  list and nothing guarded the runs.
+
+  Redaction now happens at the sink rather than at each thrower, because a URL reaches those fields
+  from any fetcher, any driver and any transform — guarding the throwers means guarding the next one
+  somebody writes. `redactConfigSecrets` was the wrong tool and is untouched: an error message is not
+  a config object and never parses whole as a URL.
+
+  What goes: the URL's password, its **entire** query string, and its fragment. The whole query rather
+  than the parameters that look sensitive, because naming them is a deny-list and this is a fix for a
+  deny-list losing. What stays: scheme, host, path and username — which is what actually says _which_
+  source refused and _as whom_. A URL with nothing to hide is left byte for byte as it was. The
+  unredacted message still goes to the process log, so the operator keeps the full URL.
+
+  **Also fixed:** the connector runner folded transform logs in with `.slice(0, 50)` — a line cap with
+  no character cap, so one line naming every record a transform received wrote megabytes into a run
+  row, growing with the data. It now uses the same both-axes `capLines` the workflow runner has had
+  since that was measured there. `capLines` moved to a new `run-logs.ts` and is still re-exported from
+  `workflow-runner.service.ts`, so nothing importing it has to change.
+
+- 67741ab: Two security fixes on the pipeline surface: who may execute a transform, and what a graph serves.
+
+  **`POST pipeline/transforms/try` is code execution and is now authorised as such.** It was the only
+  route on the controller that never called `requirePrincipal`, and it did not check that
+  `body.language` was a language the way `saveTransform` does. It reached `SubprocessTransformRunner`
+  on `catalog:write` alone — and that runner is honest in its own docblock about not being a security
+  boundary, because the child reads the parent's whole environment back out of `/proc/<ppid>/environ`
+  whatever the `env` allowlist withholds, and reads the filesystem as the service's own user. So the
+  softest thing on that route was the only thing holding the door.
+
+  It now requires a principal, at least one `writeTypes` grant, and a signed-in person
+  (`@RequireHuman()` — this is the decorator's first use anywhere; declare `REQUIRES_HUMAN` in your
+  guard). **Breaking for hosts** whose console calls this route with a machine principal, or with a
+  principal holding `catalog:write` and no per-type write grant: both now get 403.
+
+  The bar is deliberately the same one the graph path already charges rather than a higher one — a
+  principal that may write some type can already run the same code by saving a transform, saving a
+  graph and pressing Run. That residual is the trust model, and it is now written down in the pipeline
+  README under "Running a transform is running code" instead of only in a JSDoc, along with the
+  supported way to change it (bind your own `TransformRunner`).
+
+  **`GET pipeline/workflows` served source-node credentials verbatim.** A `WorkflowSourceNode` carries
+  the same `config` vocabulary a connector does, so a URL with a password in a graph was readable by
+  anyone holding `catalog:read` — the audience `redactConnector`/`redactConnection` were written for,
+  through the one route nobody had counted as a connector route. Source configs are now redacted on the
+  way out, and restored per node id on the way back in, so a console that reads a graph and posts it
+  back does not overwrite the credential with the placeholder. The save responses of `POST workflows`,
+  `POST connectors` and `POST connections` are redacted too: each returns the row it just restored, so
+  an unredacted response undid the read redaction in a single request.
+
+  `SubprocessTransformRunner` also gets three fixes worth having regardless of the above: `stderr` is
+  bounded at 64 KiB (it accumulated without any cap for the whole timeout window, growing the _parent's_
+  heap until the pod died), the timeout kills the child's process group rather than one pid (so a
+  transform that spawned anything no longer outlives it), and the child runs in a temporary directory
+  rather than inheriting the service's, where `readFileSync(".env")` reached the host application's
+  configuration.
+
+### Minor Changes
+
+- 4d28056: A workflow can be saved unfinished, and publishing is what validates it
+
+  Validation used to be the gate on _saving_. `MySqlPipelineStore.saveWorkflow` ran
+  `validateWorkflow` and refused anything with an issue — `"<name>" cannot run as
+drawn.` — so a graph you had not finished could not be written down at all, and
+  closing the tab lost it. A saved workflow was, by definition, one that runs.
+
+  That also made the canvas lie about ordinary work. Clicking **+ Sink** produced a
+  node that "is not reachable from any source" and "does not say which object type
+  it writes": both true, both useless one second after the click, because a
+  just-added node is unwired by construction.
+
+  So the gate moved rather than loosened. `CatalogWorkflow` gains
+  `status: 'draft' | 'ready'`. A draft saves without validating; only a `ready`
+  graph runs, is schedulable, or is promoted. The same `validateWorkflow` still
+  decides — a draft is not a graph that skipped the rules, it is a graph nobody has
+  claimed is finished yet.
+
+  ## What a host does on upgrade
+
+  **The schema gains one column, and its default is the decision.**
+  `catalog_workflow.status` is `varchar(16) NOT NULL DEFAULT 'ready'`, applied by
+  `ensureCatalogSchema` like every other change in this package — there is nothing
+  to run by hand. It backfills every existing row to `ready`, deliberately: each
+  one got there through a save that refused anything invalid, so each is a graph
+  that was valid when it was written, which is exactly what `ready` asserts.
+  Defaulting to `draft` would have been the conservative-looking choice and would
+  have silently stopped every scheduled connector on the deployment the moment the
+  migration ran, because a connector may only run a ready graph. A default that
+  turns an upgrade into an outage is the wrong default.
+
+  **New graphs now arrive as drafts.** Anything automating `POST workflows` and
+  expecting the result to be immediately runnable must now call
+  `POST workflows/:id/publish`. This is the one behavioural break: a script that
+  created a workflow and attached a connector to it in the same breath will now be
+  refused at the connector save until it publishes.
+
+  **Two new routes**, both `catalog:write`: `POST workflows/:id/publish` and
+  `POST workflows/:id/unpublish`. Publishing is a transition rather than a field on
+  save because "ready" is a claim that has to be checked, and a check that fails
+  owes an explanation naming the nodes — a boolean on a save request has nowhere to
+  put that which is not an error on an operation the author thought was about
+  something else.
+
+  **Two new store methods.** `CatalogWorkflowStore` gains `publishWorkflow` and
+  `unpublishWorkflow`, and `supportsWorkflows` now asks for `publishWorkflow` by
+  name. A custom store implementing the interface must add both; one that has the
+  save and not the transition would narrow cleanly and then fail one call into a
+  promotion that had already written types and transforms into the target.
+
+  ## The three refusals worth knowing about
+
+  **A connector may only point at a `ready` workflow, refused at save.** The check
+  could equally have lived in the runner, and that is the version worth arguing
+  against: it would move the error from the person wiring the connector — who is
+  looking at the screen and can fix it in one edit — to a scheduled window at 3am.
+
+  **A published workflow edited into an invalid state is refused, not demoted.**
+  Silently dropping it back to `draft` was the alternative, and it is the one that
+  loses a running pipeline without saying so: connectors may only run ready graphs,
+  so the demotion would disable a scheduled load with nothing reported. Unpublish
+  it explicitly to park a broken idea on a live graph.
+
+  **Unpublishing is refused while any connector still runs the graph**, naming
+  them, exactly as `deleteWorkflow` already did. Cascading — disabling those
+  connectors here — was rejected on principle: turning off somebody's loads as a
+  side effect of an edit to something else is the silent action this status exists
+  to prevent.
+
+  ## Promotion
+
+  Drafts are not in the promotable set at all, which is stronger than refusing a
+  draft promotion and is the statement worth making: a draft may have no sink, so
+  there is not even a well-formed thing to describe to a reviewer. Nothing can be
+  hidden by the omission, because no connector can reference one. `promoteWorkflows`
+  now saves _and publishes_, since a save drafts and the connector phase that
+  follows cannot attach to a draft — and the publish re-validates the graph against
+  the transforms that actually arrived in the target rather than trusting that it
+  was ready in the source.
+
+- 0995daa: The connection form asks for a connection string, and can test it before saving
+
+  Three changes to one screen's worth of friction.
+
+  **One field, not two.** The SQL address block offered an inline URL and the name
+  of an environment variable holding one, side by side, with a paragraph
+  explaining when each applied — and only one of them worked for a database with a
+  password, which is every database anybody connects to. It asks for the
+  connection string now.
+
+  **`allowInlineCredentials` on the store, default false.** A connection URL is
+  the credential, and `config` is served under `catalog:read`, so a password
+  inside one is refused. That refusal is what makes the "never the credential"
+  promise true rather than aspirational, and it stays the default. A deployment
+  that would rather type a connection string than provision an environment
+  variable can turn it off — and what does NOT change is the redaction: the
+  password never travels in a response either way. The flag decides only whether
+  it may rest in the catalog's own table.
+
+  **`POST pipeline/connections/check`** reaches a connection that has not been
+  saved. The field most likely to be wrong is the address, and finding out used to
+  mean saving a row, testing it from its card, and deleting it.
+
+  It asks `catalog:write`, not the `catalog:read` its by-id sibling asks for, and
+  the difference is the whole point: checking a saved connection reaches an
+  address somebody already chose and wrote down; checking a posted one reaches an
+  address supplied in the request. Under `catalog:read` that is a port scanner for
+  anybody who may look at the catalog. Under `catalog:write` it grants no reach
+  that did not exist — the same caller could save, check and delete — but that
+  route leaves records and this one leaves none, so it logs what it did. The
+  address, never the credential.
+
+### Patch Changes
+
+- ba2a8f6: A failed connection check no longer returns the credential
+
+  `POST pipeline/connections/:id/check` asks for `catalog:read`, and a probe that
+  fails throws with the address in its message — `${url} answered 401.` for an
+  HTTP source, the driver's own text for a SQL one. A connection URL is the
+  credential, so the softest scope in the system was reading the strongest secret
+  in it, through an error string rather than through the config the redaction was
+  built to guard.
+
+  The process log still gets the message whole. The response is redacted:
+  password, query string and fragment go, scheme, host, path and username stay —
+  because which host refused, and as whom, is the entire value of a failed check.
+
 ## 0.7.1
 
 ### Patch Changes
