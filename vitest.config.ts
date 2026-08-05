@@ -1,40 +1,16 @@
-import { fileURLToPath } from 'node:url';
 import swc from 'unplugin-swc';
 import { defineConfig } from 'vitest/config';
-
-const pkg = (name: string, entry = 'src/index.ts') =>
-  fileURLToPath(new URL(`./packages/${name}/${entry}`, import.meta.url));
+import { workspaceAliases } from './scripts/workspace-aliases.mjs';
 
 export default defineConfig({
   // Workspace packages resolve to their TS SOURCE, so a cross-package test never runs against a
   // stale `dist/`. Production builds still go through `tsc` per package.
-  resolve: {
-    alias: {
-      // The subpath FIRST: Vite matches string aliases as a prefix, so the bare
-      // entry below would rewrite `@dudousxd/nestjs-catalog/client` to
-      // `.../src/index.ts/client` and fail to resolve. Every screen in the React
-      // package imports that subpath for real, not just for types, so without
-      // this line none of them can be tested at all.
-      '@dudousxd/nestjs-catalog/client': pkg('catalog', 'src/client.ts'),
-      '@dudousxd/nestjs-catalog': pkg('catalog'),
-      '@dudousxd/nestjs-catalog-pipeline': pkg('pipeline'),
-      '@dudousxd/nestjs-catalog-store-mikro-orm': pkg('store-mikro-orm'),
-      '@dudousxd/nestjs-catalog-store-clickhouse': pkg('store-clickhouse'),
-      '@dudousxd/nestjs-catalog-store-fanout': pkg('store-fanout'),
-      '@dudousxd/nestjs-catalog-telescope': pkg('telescope'),
-      '@dudousxd/nestjs-catalog-dashboard': pkg('dashboard', 'src/server/index.ts'),
-      // The React package, which the console imports by name rather than by
-      // path. Missing from this list, it resolved to `packages/react/dist/` —
-      // a directory that is gitignored, built by hand, and was a whole feature
-      // behind the source: a spec asserting the console mounts a screen that
-      // shipped this release passed or failed on whether somebody had run `tsc`
-      // in another package, which is the exact staleness the comment above says
-      // this block exists to prevent. Subpath first, for the prefix-matching
-      // reason spelled out above.
-      '@dudousxd/nestjs-catalog-react/workflow': pkg('react', 'src/workflow/index.ts'),
-      '@dudousxd/nestjs-catalog-react': pkg('react'),
-    },
-  },
+  //
+  // The list itself lives in `tsconfig.spec.base.json`, which the spec typechecks also read, so
+  // `tsc` and `vitest` cannot end up looking at two different programs. That is not hypothetical:
+  // this block was missing `@dudousxd/nestjs-catalog-react` entirely, and the packages/react/dist/
+  // it silently fell back to was a release behind. See scripts/workspace-aliases.mjs.
+  resolve: { alias: workspaceAliases() },
   plugins: [
     // Emits `emitDecoratorMetadata`, which NestJS DI needs and esbuild cannot produce. Without it
     // every module test fails resolving constructor parameters, which reads as a wiring bug.

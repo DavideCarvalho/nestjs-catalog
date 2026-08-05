@@ -17,3 +17,20 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm lint
       - run: pnpm build
+
+      # The third gate, and the reason the other two were not enough.
+      #
+      # `build` compiles each package's `src` through its own tsconfig, and every one of those
+      # configs EXCLUDES the specs on purpose — a spec compiled into `dist/` would be published. So
+      # until this step existed, no job in this repo typechecked a single spec file, and `vitest`
+      # does not either: SWC strips the types and never asks whether they were right. Several specs
+      # had been quietly wrong for an unknown number of releases behind a green suite.
+      #
+      # Runs after `build` rather than replacing it: `pnpm typecheck` covers the configs `build`
+      # cannot (the dashboard's server tsconfig, which vite and tsup never typecheck) plus every
+      # `packages/*/tsconfig.spec.json`. It costs about ten seconds — the spec configs resolve
+      # workspace packages to source, so it needs no build of its own and the eight `tsc` runs go
+      # in parallel. That is cheap enough that gating on it rather than merely reporting is easy:
+      # a red typecheck here is a spec that has drifted from the code it claims to test, and the
+      # whole lesson of this file is what happens when that is allowed to be somebody's later.
+      - run: pnpm typecheck

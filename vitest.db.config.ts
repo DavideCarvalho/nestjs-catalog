@@ -1,9 +1,6 @@
-import { fileURLToPath } from 'node:url';
 import swc from 'unplugin-swc';
 import { defineConfig } from 'vitest/config';
-
-const pkg = (name: string) =>
-  fileURLToPath(new URL(`./packages/${name}/src/index.ts`, import.meta.url));
+import { workspaceAliases } from './scripts/workspace-aliases.mjs';
 
 /**
  * The REAL-engine matrix: only `*.db.spec.ts`, which boot MySQL and ClickHouse through
@@ -16,15 +13,11 @@ const pkg = (name: string) =>
  * Long timeouts because a cold image pull dominates the first run; the cases are fast once up.
  */
 export default defineConfig({
-  resolve: {
-    alias: {
-      '@dudousxd/nestjs-catalog': pkg('catalog'),
-      '@dudousxd/nestjs-catalog-pipeline': pkg('pipeline'),
-      '@dudousxd/nestjs-catalog-store-mikro-orm': pkg('store-mikro-orm'),
-      '@dudousxd/nestjs-catalog-store-clickhouse': pkg('store-clickhouse'),
-      '@dudousxd/nestjs-catalog-store-fanout': pkg('store-fanout'),
-    },
-  },
+  // The same list `vitest.config.ts` and the spec typechecks use. It used to be a hand-kept subset
+  // — five store-ish packages, no react, no dashboard, no `/client` subpath — which is a difference
+  // nobody chose: anything outside the subset resolved to a stale `dist/` in exactly the run where
+  // the point is to be sure what the real engine sees is the real adapter.
+  resolve: { alias: workspaceAliases() },
   plugins: [
     swc.vite({
       jsc: {

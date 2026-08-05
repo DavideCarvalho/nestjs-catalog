@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+
+  "//": "What every packages/*/tsconfig.spec.json layers ON TOP of its own build config. Each spec config extends BOTH, in that order, so strictness can never drift from the build while the handful of settings that must differ between 'tsc emits this into dist' and 'vitest runs this through Vite' are stated once, here. Before this file existed the spec configs were seven hand-copied near-duplicates that nothing ran, and they had rotted apart in three separate ways.",
+
+  "//noEmit": "The specs are typechecked, never emitted — every build config excludes them precisely so they do not land in a published dist. `declaration`/`declarationMap` are both switched off with it, and BOTH are needed: tsconfig.base.json turns declarationMap on, and TS rejects declarationMap without declaration (TS5069) as a config error before it looks at a single source file. packages/dashboard/tsconfig.spec.json set declaration:false alone and therefore reported exactly one error, which masked every real one underneath it.",
+  "//rootDir": "The repo root, because specs reach across it: the store adapters share test/catalog-store-contract.ts, and the fan-out suite imports the MySQL harness out of packages/store-mikro-orm/test/. Relative paths in an extended config resolve against the config that DECLARED them, so `.` here means the repo root for every package that extends this file, not the package directory.",
+
+  "//module": "`preserve` (which implies moduleResolution `bundler`), NOT the `nodenext` the build configs use — because Vite, not Node, is what loads a spec. The two disagree in ways that produce errors with no bug behind them and hide the ones with a bug behind them: under `nodenext` a .ts file in a package without \"type\": \"module\" is CommonJS, so `const x = await runner.available()` at the top level of transform-runner.spec.ts is TS1309 ('cannot use await at the top level') even though vitest runs it happily, and `await import('./access.controller')` could not be resolved at all. Modelling the loader that actually runs the file is not a loosening; it is the config finally describing the thing it checks.",
+
+  "//paths": "THE list of workspace packages, and the reason this file is plain JSON with no comments outside \"//\"-prefixed keys: vitest.config.ts and vitest.db.config.ts JSON.parse it and derive resolve.alias from it, so the typechecker and the test runner cannot disagree about what a package name means. They disagree expensively. A spec that imports @dudousxd/nestjs-catalog-react by name resolved, at runtime, to packages/react/dist/ — gitignored, built by hand, and a whole feature behind source — so whether a spec passed depended on when somebody last ran tsc in another package; and tsc, resolving the same name through node_modules to that same dist/*.d.ts, was checking the built artefact while vitest ran the source. Mapping the names to src here points both at one thing. Adding a package means adding one line here, and both runners pick it up.",
+  "//paths-subpaths": "A subpath entry is a separate key because tsconfig paths match exactly, and Vite matches a string alias on a `/` boundary — so both need the subpath named. The derivation sorts longest-first before handing them to Vite, so ./client can never be swallowed by the bare entry above it.",
+
+  "compilerOptions": {
+    "noEmit": true,
+    "declaration": false,
+    "declarationMap": false,
+    "rootDir": ".",
+    "module": "preserve",
+    "moduleResolution": "bundler",
+    "paths": {
+      "@dudousxd/nestjs-catalog": ["./packages/catalog/src/index.ts"],
+      "@dudousxd/nestjs-catalog/client": ["./packages/catalog/src/client.ts"],
+      "@dudousxd/nestjs-catalog-pipeline": ["./packages/pipeline/src/index.ts"],
+      "@dudousxd/nestjs-catalog-store-mikro-orm": ["./packages/store-mikro-orm/src/index.ts"],
+      "@dudousxd/nestjs-catalog-store-clickhouse": ["./packages/store-clickhouse/src/index.ts"],
+      "@dudousxd/nestjs-catalog-store-fanout": ["./packages/store-fanout/src/index.ts"],
+      "@dudousxd/nestjs-catalog-telescope": ["./packages/telescope/src/index.ts"],
+      "@dudousxd/nestjs-catalog-dashboard": ["./packages/dashboard/src/server/index.ts"],
+      "@dudousxd/nestjs-catalog-react": ["./packages/react/src/index.ts"],
+      "@dudousxd/nestjs-catalog-react/workflow": ["./packages/react/src/workflow/index.ts"]
+    }
+  }
+}

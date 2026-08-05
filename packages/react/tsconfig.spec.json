@@ -1,17 +1,7 @@
 {
-  "//": "Typechecking for the specs, which the build config MUST exclude \u2014 they would otherwise be emitted into dist and published. Extends the build config so the two cannot drift on strictness, then inverts what it excludes.",
-  "extends": "./tsconfig.json",
-  "compilerOptions": {
-    "noEmit": true,
-    "declaration": false,
-    "rootDir": "../..",
-    "jsx": "react-jsx",
-    "lib": [
-      "ES2022",
-      "DOM",
-      "DOM.Iterable"
-    ]
-  },
+  "//": "Typechecking for the specs, which the build config MUST exclude — they would otherwise be emitted into dist and published. Extends BOTH: the build config, so strictness here can never drift from what ships; then ../../tsconfig.spec.base.json, which carries the few settings that must differ because vitest, not Node, loads these files, plus the workspace-package-to-source map both it and vitest read. Later entries in an `extends` array win, so the spec base's overrides sit on top.",
+  "//jsx": "Nothing to re-declare here any more. This package's build config is already a DOM + react-jsx config, so the specs inherit both — unlike the dashboard's, which extends a NodeNext server-only config and has to add them back.",
+  "extends": ["./tsconfig.json", "../../tsconfig.spec.base.json"],
   "include": [
     "src/**/*.spec.ts",
     "src/**/*.spec.tsx",
@@ -19,8 +9,5 @@
     "src/**/*.test.tsx",
     "test/**/*"
   ],
-  "exclude": [
-    "node_modules",
-    "dist"
-  ]
+  "exclude": ["node_modules", "dist"]
 }

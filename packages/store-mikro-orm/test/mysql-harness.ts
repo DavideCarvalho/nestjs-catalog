@@ -6,6 +6,24 @@
 // which reads as a bug in the entity rather than as a missing polyfill.
 import 'reflect-metadata';
 import type { CatalogObjectTypeDef } from '@dudousxd/nestjs-catalog';
+// By package NAME, including for the package this file sits inside — and that is a deliberate
+// choice between three, because it decides what a `*.db.spec.ts` is actually testing.
+//
+// A relative `../src/index` would resolve, always, with no configuration. But the fan-out suite
+// imports this harness across a package boundary, so a relative path would have store-fanout's
+// specs reaching into a sibling's source through a route no consumer of either package can take,
+// and the barrel — the thing every consumer does go through — would stop being exercised.
+//
+// A workspace link (a self-referencing `@dudousxd/nestjs-catalog-store-mikro-orm` dependency) would
+// resolve by name, but through `main`/`types` to `dist/`. That is the build artefact: the suite
+// would test whatever was last compiled while vitest, which aliases these names to source, ran
+// something else. Two programs, one report.
+//
+// So: by name, mapped to source in `tsconfig.spec.base.json`, which vitest derives its aliases from.
+// The name stays the one a consumer writes, the file resolved is the one vitest executes, and there
+// is no link to forget — which is what happened here. There was none, so this import resolved to
+// nothing, the entities below all inferred as `object`, and thirty-odd cascading errors sat in a
+// config that nothing ran.
 import {
   MySqlWarehouseStore,
   ObjectTypeRow,

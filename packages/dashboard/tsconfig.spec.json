@@ -1,16 +1,13 @@
 {
-  "//": "Typechecking for the specs, which every build config MUST exclude \u2014 they would otherwise be emitted into dist and published. Extends the SERVER config, not `tsconfig.json`: that one is solution-style (`files: []` + references) and carries no compilerOptions at all, so extending it silently drops decorators and every Nest spec fails to parse. The client and react specs live in the same package, so their DOM and jsx settings are added on top.",
-  "extends": "./tsconfig.server.json",
+  "//": "Typechecking for the specs, which every build config MUST exclude — they would otherwise be emitted into dist and published. Extends the SERVER config, not `tsconfig.json`: that one is solution-style (`files: []` + references) and carries no compilerOptions at all, so extending it silently drops decorators and every Nest spec fails to parse. Then ../../tsconfig.spec.base.json on top, for the settings that must differ because vitest rather than Node loads these files, and for the workspace-package-to-source map it shares with vitest.",
+  "//jsx": "The client and react specs live in this same package, so DOM and react-jsx are added back on top of a config that is deliberately server-only. packages/react needs no such block: its build config is already a DOM config.",
+  "//strictness": "The two flags this package inherits from tsconfig.base.json and its workspace dependencies do not. This is the only package whose configs extend the repo base, so it is the only one where the spec map (which points package names at src/, not dist/) drags another package's SOURCE into a program stricter than the one its owner compiles it with. Under the inherited settings that produced 69 errors in packages/react/src alone — every one of them a TS2375/TS2379 exactOptionalPropertyTypes complaint or a TS2538/TS18048 index check — against code packages/react builds green, will keep building green, and would not accept a fix for. The choice is not 'strict or loose'; it is 'check the real source under the options its owner uses' versus 'check a stale dist/*.d.ts under ours', and the stale dist is the exact failure this whole spec map exists to end. Nothing is lost on the dashboard's own non-spec source, which `tsc -p tsconfig.server.json --noEmit` still checks with both flags on, in the same `pnpm typecheck` run. Delete these two lines the day packages/react adopts tsconfig.base.json.",
+  "extends": ["./tsconfig.server.json", "../../tsconfig.spec.base.json"],
   "compilerOptions": {
-    "noEmit": true,
-    "declaration": false,
-    "rootDir": "../..",
     "jsx": "react-jsx",
-    "lib": [
-      "ES2022",
-      "DOM",
-      "DOM.Iterable"
-    ]
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "exactOptionalPropertyTypes": false,
+    "noUncheckedIndexedAccess": false
   },
   "include": [
     "src/**/*.spec.ts",
@@ -19,8 +16,5 @@
     "src/**/*.test.tsx",
     "test/**/*"
   ],
-  "exclude": [
-    "node_modules",
-    "dist"
-  ]
+  "exclude": ["node_modules", "dist"]
 }

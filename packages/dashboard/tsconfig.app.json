@@ -1,30 +1,22 @@
 {
+  "//": "The browser half of the console — the code `vite build` bundles into the served assets. It is referenced from the solution-style tsconfig.json, so an editor uses it, and that is currently the only thing that does: `build` is `vite build && tsup && tsc -p tsconfig.react.json`, and vite transpiles through esbuild, which typechecks nothing. So src/client/** is shipped browser code that no command in this repo has ever typechecked.",
+
+  "//not-in-the-gate": "Deliberately NOT run by `pnpm typecheck`, and this note exists so that stays a decision rather than an oversight. It does not pass, and it never has. On a clean tree it reports five errors, every one of them TS2375/TS2379 under `exactOptionalPropertyTypes` — three in App.tsx passing `T | undefined` into a React prop typed `T`, two in transport.ts doing the same into its own fetch wrapper. They are NOT stale-artefact errors: they survive a fresh `pnpm build`. The cause is that this config extends ../../tsconfig.base.json while the code beneath it has only ever been compiled by esbuild, and while packages/react — whose props three of them cross — does not set that flag in its own build config, so those prop types were written without it.",
+
+  "//how-it-gets-fixed": "Fix the five, then add this config to scripts/typecheck-specs.mjs, or give the package a second `typecheck` entry. Fix rather than delete: this is the only config covering src/client/**, so deleting it leaves the console's whole browser bundle typechecked by nothing, which is worse than a config that is honestly red. What must NOT happen is switching `exactOptionalPropertyTypes` off here to make it green — two of the five are the dashboard's own code violating the dashboard's own base config, and that is a real defect rather than a cross-package strictness mismatch. (The spec config next door does turn it off, for the narrower reason spelled out there: it pulls packages/react SOURCE into its program, and cannot hold another package's code to options its owner never applied.)",
+
+  "//include": "`src/app/**` was in this list and matches nothing — there is no src/app, and no sign there ever was. Dropped, because a glob over a directory that does not exist reads like coverage.",
+
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "module": "ESNext",
     "moduleResolution": "Bundler",
     "jsx": "react-jsx",
-    "lib": [
-      "ES2022",
-      "DOM",
-      "DOM.Iterable"
-    ],
-    "types": [
-      "react",
-      "react-dom"
-    ],
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["react", "react-dom"],
     "noEmit": true,
     "allowImportingTsExtensions": true
   },
-  "include": [
-    "src/app/**/*",
-    "src/client/**/*"
-  ],
-  "exclude": [
-    "**/*.spec.ts",
-    "**/*.spec.tsx",
-    "**/*.test.ts",
-    "**/*.test.tsx",
-    "test"
-  ]
+  "include": ["src/client/**/*"],
+  "exclude": ["**/*.spec.ts", "**/*.spec.tsx", "**/*.test.ts", "**/*.test.tsx", "test"]
 }
