@@ -221,7 +221,7 @@ export function createPipelineController(
     async run(
       @Req() request: { principal?: CatalogPrincipal },
       @Param('id') id: string,
-      @Body() body?: { snapshotId?: string },
+      @Body() body?: { snapshotId?: string; expectShrink?: string },
     ) {
       const principal = requirePrincipal(request);
       // Checked at the run and not only at the save, because a connector
@@ -246,6 +246,18 @@ export function createPipelineController(
         id,
         principal.id,
         body?.snapshotId ?? `manual-${randomUUID().slice(0, 8)}`,
+        // The acknowledgement that this load is allowed to collapse, and it
+        // reaches the runner only from HERE. The scheduled path deliberately
+        // has no field for it: a cron run is unattended, and an acknowledgement
+        // given once and honoured every night is the bound switched off wearing
+        // a reason. So the operator's route is exactly this one — let the
+        // scheduled load be refused, then re-run it by hand saying why.
+        //
+        // Forwarded rather than defaulted. `undefined` means nobody said
+        // anything; an empty string means somebody sent the field with nothing
+        // behind it, which the runner refuses, and flattening the two here
+        // would turn that refusal into silence.
+        ...(body && 'expectShrink' in body ? [{ expectShrink: body.expectShrink }] : []),
       );
     }
 
