@@ -78,7 +78,7 @@ export function createPipelineController(
       private readonly registry: CatalogPipelineRegistry,
     ) {}
 
-    /** Which transform languages this deployment can actually execute. */
+    /** What this deployment can actually execute, and whether a run survives a crash. */
     @Get('capabilities')
     @RequireScopes('catalog:read')
     async capabilities() {
@@ -86,7 +86,26 @@ export function createPipelineController(
         this.transforms.available(),
         this.transforms.pythonPackages(),
       ]);
-      return { languages, pythonPackages: packages };
+      return {
+        languages,
+        pythonPackages: packages,
+        // Served, finally. The console has always asked — `WorkflowCanvas`
+        // reads `capabilities.durable` and prints whether a failed run resumes
+        // where it stopped — and this route has never answered, so the screen
+        // fell through to its "unknown" branch in every deployment there has
+        // ever been.
+        //
+        // That silence also swallowed the whole `CATALOG_PIPELINE_DURABILITY_DETAIL`
+        // seam: it is the supported way a host states the two things the
+        // launcher deliberately cannot detect from here — whether this pod
+        // registers the workflow handlers, and which environment its worker
+        // serves — and every word of it was dropped on arrival.
+        //
+        // Synchronous, unlike the two above: it reports what resolved in this
+        // process rather than probing anything, which is the property its own
+        // docblock argues for at length. Nothing here waits on it.
+        durable: this.launcher.durability(),
+      };
     }
 
     /**
