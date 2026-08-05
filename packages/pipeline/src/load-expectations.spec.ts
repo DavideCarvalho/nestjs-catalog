@@ -33,6 +33,7 @@ const TYPE: CatalogObjectTypeDef = {
   primaryKey: ['id'],
   enriched: false,
   properties: [],
+  relations: [],
 };
 
 const HOUR = 3_600_000;
@@ -535,7 +536,7 @@ describe('PublishService: a load that collapsed', () => {
     // question; that the bound is not being applied is this method's, and it
     // said nothing.
     const warn = vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
-    const store = collapsing(12, { listSnapshots: () => Promise.resolve([]) });
+    const store = collapsing(12, { listSnapshots: vi.fn(() => Promise.resolve([])) });
 
     await publisher(store).commitAsSystem('ingest', 'Mvr', 'today');
 

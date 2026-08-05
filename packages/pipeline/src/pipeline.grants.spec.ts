@@ -254,7 +254,9 @@ const SUBWO: CatalogObjectTypeDef = {
   tableName: 'catalog_subwo',
   group: 'Ungrouped',
   primaryKey: ['id'],
+  enriched: false,
   properties: [],
+  relations: [],
 };
 
 class FakeWriteStore implements CatalogWriteStore {
@@ -275,7 +277,16 @@ class FakeWriteStore implements CatalogWriteStore {
   }
   commit(def: CatalogObjectTypeDef, snapshotId: string): Promise<SnapshotRef> {
     this.committed.push(def.name);
-    return Promise.resolve({ type: def.name, snapshotId, rowCount: 0, committedAt: 'now' });
+    // The real `SnapshotRef`, not an approximation of it. The old literal named
+    // fields the type does not have and omitted the two it requires, which the
+    // spec typecheck now catches — it compiled before only because nothing ever
+    // checked these files.
+    return Promise.resolve({
+      id: snapshotId,
+      createdAt: '2026-01-01T00:00:00.000Z',
+      rowCount: 0,
+      principalId: 'ingest',
+    });
   }
   dropSnapshot(): Promise<void> {
     return Promise.resolve();
@@ -525,6 +536,7 @@ describe('connector and connection configuration is not served in the clear', ()
         id: 'c1',
         name: 'Nightly',
         kind: 'sql',
+        enabled: true,
         targetType: 'Subwo',
         config: { url: URL_WITH_PASSWORD },
       },
@@ -545,6 +557,7 @@ describe('connector and connection configuration is not served in the clear', ()
         id: 'c1',
         name: 'Nightly',
         kind: 'sql',
+        enabled: true,
         targetType: 'Subwo',
         connectionId: 'conn-1',
         config: { url: URL_WITH_PASSWORD },
@@ -602,6 +615,7 @@ describe('connector and connection configuration is not served in the clear', ()
         id: 'c1',
         name: 'Nightly',
         kind: 'sql',
+        enabled: true,
         targetType: 'Subwo',
         config: { url: URL_WITH_PASSWORD, query: 'SELECT 1' },
       },

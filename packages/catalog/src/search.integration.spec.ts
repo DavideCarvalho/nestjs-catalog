@@ -291,7 +291,10 @@ describe('GET /catalog/search (integration)', () => {
   }
 
   async function search(
-    server: unknown,
+    // Typed from supertest itself rather than `unknown`: `getHttpServer()`
+    // returns `any`, and widening it here meant the call below could not be
+    // checked at all — which the spec typecheck now says out loud.
+    server: Parameters<typeof request>[0],
     key: string | undefined,
     query: Record<string, string>,
   ): Promise<CatalogSearchResult> {

@@ -172,15 +172,17 @@ describe('durability, with an engine in the injector', () => {
    * nothing is being asked.
    */
   it('does not interrogate the engine to answer', () => {
-    const hostile = new Proxy(
-      {},
-      {
-        get(_target, property) {
-          if (property === 'constructor') return FakeEngine;
-          throw new Error(`durability() asked the engine for "${String(property)}".`);
-        },
+    // `Object.create(null)` rather than `{}`: it is typed `any`, so the Proxy is
+    // too and satisfies the `WorkflowEngine` parameter without an assertion —
+    // the same trick the store specs use, and the reason is the same. A real
+    // `WorkflowEngine` has 130 members and this fixture must have NONE that can
+    // be read without throwing, which is the whole assertion.
+    const hostile = new Proxy(Object.create(null), {
+      get(_target, property) {
+        if (property === 'constructor') return FakeEngine;
+        throw new Error(`durability() asked the engine for "${String(property)}".`);
       },
-    );
+    });
     const answer = new WorkflowLauncher(runnerStub().service, hostile).durability();
     expect(answer.available).toBe(true);
     expect(answer.engine).toBe('FakeEngine');

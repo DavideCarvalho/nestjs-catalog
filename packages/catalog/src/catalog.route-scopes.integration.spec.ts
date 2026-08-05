@@ -161,6 +161,8 @@ const PROPERTY: CatalogPropertyDef = {
   columnName: 'id',
   nullable: false,
   primary: true,
+  hidden: false,
+  order: 0,
   enriched: false,
 };
 
@@ -169,6 +171,7 @@ const TYPE: CatalogObjectTypeDef = {
   displayName: 'Vehicle',
   pluralDisplayName: 'Vehicles',
   tableName: 'vehicle',
+  group: 'default',
   primaryKey: ['id'],
   enriched: false,
   properties: [PROPERTY],
@@ -425,7 +428,10 @@ describe('Every catalog route declares what it needs (integration)', () => {
     return app.getHttpServer();
   }
 
-  function send(server: unknown, route: Route, key: string) {
+  // Typed from supertest itself rather than `unknown`: `getHttpServer()` returns
+  // `any`, and widening it to `unknown` here meant the call below could not be
+  // checked at all — which the spec typecheck now says out loud.
+  function send(server: Parameters<typeof request>[0], route: Route, key: string) {
     const call = request(server)[route.method](route.path).set('x-catalog-key', key);
     return route.body ? call.send(route.body) : call;
   }

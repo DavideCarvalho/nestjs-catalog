@@ -36,7 +36,9 @@ const TYPE: CatalogObjectTypeDef = {
   group: 'Fleet',
   tableName: 'catalog_mvr',
   primaryKey: ['id'],
+  enriched: false,
   properties: [],
+  relations: [],
 };
 
 const DECLARED: CatalogLoadExpectations = {

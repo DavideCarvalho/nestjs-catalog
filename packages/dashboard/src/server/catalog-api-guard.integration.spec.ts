@@ -62,7 +62,7 @@ afterEach(async () => {
   app = undefined;
 });
 
-type Auth = Parameters<typeof CatalogDashboardModule.forRoot>[0]['auth'];
+type Auth = NonNullable<Parameters<typeof CatalogDashboardModule.forRoot>[0]>['auth'];
 
 async function bootWith(
   controller: typeof DecoratedApiController | typeof UndecoratedApiController,

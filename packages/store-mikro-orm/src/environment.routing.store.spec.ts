@@ -25,13 +25,29 @@ import { RoutingCatalogStore, runInEnvironment } from './environment.routing';
 
 const TYPE: CatalogObjectTypeDef = {
   name: 'Mvr',
+  displayName: 'MVR',
+  pluralDisplayName: 'MVRs',
+  tableName: 'mvr',
+  group: 'fleet',
+  primaryKey: ['id'],
+  enriched: false,
   properties: [],
   relations: [],
 };
 
 /** The pointer a warehouse keeps, and the newest-first list that is not it. */
-const SERVING: SnapshotRef = { id: 'snap-serving', createdAt: new Date('2026-01-01') };
-const NEWEST: SnapshotRef = { id: 'snap-rolled-back', createdAt: new Date('2026-02-01') };
+const SERVING: SnapshotRef = {
+  id: 'snap-serving',
+  createdAt: '2026-01-01T00:00:00.000Z',
+  rowCount: 4200,
+  principalId: 'flip-nestjs',
+};
+const NEWEST: SnapshotRef = {
+  id: 'snap-rolled-back',
+  createdAt: '2026-02-01T00:00:00.000Z',
+  rowCount: 4300,
+  principalId: 'flip-nestjs',
+};
 
 /**
  * A store that answers both questions differently on purpose.

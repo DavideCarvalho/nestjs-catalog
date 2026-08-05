@@ -137,7 +137,11 @@ describe('MikroOrmCatalogDirectory', () => {
     // METHOD being absent to answer 501, so an implementation that grew an
     // empty `listPeople` would turn "people live in your IdP" into "nobody can
     // sign in", which is the misreading the 501 exists to prevent.
-    expect(new MikroOrmCatalogDirectory(db.em).listPeople).toBeUndefined();
-    expect(new MikroOrmCatalogDirectory(db.em).upsertPerson).toBeUndefined();
+    // `Reflect.get`, not a property access: the whole point is that these are
+    // NOT on the class, so naming them directly is a type error — the assertion
+    // and the thing it asserts cannot both be written the same way.
+    const directory = new MikroOrmCatalogDirectory(db.em);
+    expect(Reflect.get(directory, 'listPeople')).toBeUndefined();
+    expect(Reflect.get(directory, 'upsertPerson')).toBeUndefined();
   });
 });

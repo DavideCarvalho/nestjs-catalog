@@ -361,7 +361,7 @@ describe('the discovered columns', () => {
 
 describe('confirming', () => {
   it('sends exactly what was selected, with the type a person chose', async () => {
-    const createType = vi.fn(() => Promise.resolve({}));
+    const createType = vi.fn((_draft: DiscoveredTypeDraft) => Promise.resolve({}));
     await discoverIn(bridgeFor(discovery(), createType));
 
     fireEvent.click(screen.getByLabelText('Include seen_at'));
@@ -379,7 +379,7 @@ describe('confirming', () => {
   });
 
   it('leaves out a column somebody unchecked', async () => {
-    const createType = vi.fn(() => Promise.resolve({}));
+    const createType = vi.fn((_draft: DiscoveredTypeDraft) => Promise.resolve({}));
     await discoverIn(bridgeFor(discovery(), createType));
 
     fireEvent.click(screen.getByLabelText('Include plate'));
@@ -388,9 +388,14 @@ describe('confirming', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Create Mvr' }));
 
     await waitFor(() => expect(createType).toHaveBeenCalled());
-    expect(createType.mock.calls[0][0].properties.map((p: { name: string }) => p.name)).toEqual([
-      'seen_at',
-    ]);
+    // Read through the draft rather than off `mock.calls[0][0]`: the spy is
+    // declared with no argument types, so its calls are an empty tuple and
+    // indexing one is an error the spec typecheck now reports. Asserting the
+    // length first also means a spy that was never called fails HERE, naming
+    // that, instead of throwing on a property of undefined three lines down.
+    const [draft] = createType.mock.lastCall ?? [];
+    expect(draft).toBeDefined();
+    expect(draft?.properties.map((property) => property.name)).toEqual(['seen_at']);
   });
 
   it('says the type now exists, so nobody presses it twice', async () => {

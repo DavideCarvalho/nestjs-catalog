@@ -26,7 +26,9 @@ afterEach(async () => {
   app = undefined;
 });
 
-async function boot(auth?: Parameters<typeof CatalogDashboardModule.forRoot>[0]['auth']) {
+async function boot(
+  auth?: NonNullable<Parameters<typeof CatalogDashboardModule.forRoot>[0]>['auth'],
+) {
   const moduleRef = await Test.createTestingModule({
     imports: [CatalogDashboardModule.forRoot({ path: '/catalog', ...(auth ? { auth } : {}) })],
   }).compile();

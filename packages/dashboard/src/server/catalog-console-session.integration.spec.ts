@@ -50,7 +50,7 @@ class HostApiController {
   }
 }
 
-function boot(auth: Parameters<typeof CatalogDashboardModule.forRoot>[0]['auth']) {
+function boot(auth: NonNullable<Parameters<typeof CatalogDashboardModule.forRoot>[0]>['auth']) {
   @Module({
     imports: [CatalogDashboardModule.forRoot({ path: '/catalog', ...(auth ? { auth } : {}) })],
     controllers: [HostApiController],

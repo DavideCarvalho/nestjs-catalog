@@ -1,7 +1,11 @@
-import { FatalError, runStepHandler } from '@dudousxd/nestjs-durable-core';
+import { FatalError, type RemoteTask, runStepHandler } from '@dudousxd/nestjs-durable-core';
 import { BadRequestException, NotFoundException } from '@nestjs/common';
 import { describe, expect, it, vi } from 'vitest';
-import { CONNECTOR_RUN_STEP, ConnectorRunSteps } from './connector-run.steps';
+import {
+  CONNECTOR_RUN_STEP,
+  type ConnectorRunStepInput,
+  ConnectorRunSteps,
+} from './connector-run.steps';
 import { passthroughScope } from './seams';
 
 /** See the note in `pipeline.module.integration.spec.ts`: the package cannot load here. */
@@ -22,12 +26,24 @@ function steps(run: () => Promise<never>): ConnectorRunSteps {
   return new ConnectorRunSteps(Object.assign(Object.create(null), runner), passthroughScope);
 }
 
-const task = {
+/** The step's own input, typed. `task.input` is `unknown` on the wire type. */
+const INPUT: ConnectorRunStepInput = {
+  connectorId: 'c1',
+  principalId: 'p1',
+  snapshotId: 'snap-1',
+};
+
+const task: RemoteTask = {
   runId: 'run-1',
   seq: 1,
   stepId: 'run-1:1',
   name: CONNECTOR_RUN_STEP,
-  input: { connectorId: 'c1', principalId: 'p1', snapshotId: 'snap-1' },
+  // Typed as the real `RemoteTask` rather than inferred from the literal. The
+  // literal was missing `group` and `attempt`, which nothing noticed because
+  // these files were never typechecked.
+  group: 'connector-run',
+  attempt: 1,
+  input: INPUT,
 };
 
 /**
@@ -50,8 +66,23 @@ function wouldRetry(error: { retryable?: boolean } | undefined): boolean {
  * would pass on the unfixed code, because `FatalError` is honoured only in the
  * engine's local retry loop and every `ctx.step` here is dispatched.
  */
+function isConnectorRunInput(value: unknown): value is ConnectorRunStepInput {
+  return (
+    Boolean(value) &&
+    typeof value === 'object' &&
+    typeof Reflect.get(Object(value), 'connectorId') === 'string'
+  );
+}
+
 async function dispatch(subject: ConnectorRunSteps) {
-  const result = await runStepHandler(task, (input, log) => subject.runConnector(input, log));
+  const result = await runStepHandler(task, (input, log) => {
+    // `RemoteTask.input` is `unknown` by design — a worker deserialises whatever
+    // came off the wire, and the step is the thing that knows its own shape. So
+    // the narrowing belongs here rather than being asserted away: this is the
+    // same boundary the real worker crosses.
+    if (!isConnectorRunInput(input)) throw new Error('The task carried the wrong input.');
+    return subject.runConnector(input, log);
+  });
   if (result.status !== 'failed') throw new Error(`Expected a failed step, got ${result.status}.`);
   return result.error;
 }
@@ -88,9 +119,7 @@ describe('ConnectorRunSteps: a connector that is gone or switched off', () => {
   // right whichever way the engine chose to run it.
   it('is still a FatalError, so the in-process path stops too', async () => {
     await expect(
-      steps(() => Promise.reject(new NotFoundException('No connector c1'))).runConnector(
-        task.input,
-      ),
+      steps(() => Promise.reject(new NotFoundException('No connector c1'))).runConnector(INPUT),
     ).rejects.toBeInstanceOf(FatalError);
   });
 
