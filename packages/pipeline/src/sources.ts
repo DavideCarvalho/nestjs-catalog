@@ -1,5 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import type { CatalogConnection, CatalogConnector } from '@dudousxd/nestjs-catalog';
+import { Logger } from '@nestjs/common';
+import { admitsSecretEnv, credentialUnavailable, secretEnvAllowlist } from './secret-env-allowlist';
 
 /**
  * Pulling raw records out of a source.
@@ -11,6 +13,14 @@ import type { CatalogConnection, CatalogConnector } from '@dudousxd/nestjs-catal
  * Credentials are never stored on the connector. Each fetcher reads one named
  * environment variable, so what the catalog database holds is the *name* of a
  * secret — a leak gives away the shape of an integration, not the keys to it.
+ *
+ * That last sentence is true and used to be the end of the argument, which was
+ * the mistake: the name is stored, but it is *chosen by the caller*, and a name
+ * the caller chooses is a read of the pod's environment with a connector wrapped
+ * around it. Which names may be chosen is now
+ * {@link secretEnvAllowlist}'s answer — see `secret-env-allowlist.ts`, which
+ * spells out the whole path from `POST pipeline/connectors` to somebody reading
+ * `DATABASE_URL` back out of a catalog type.
  */
 export interface FetchContext {
   connector: CatalogConnector;
@@ -53,16 +63,51 @@ export function resolveSecret(connector: CatalogConnector): string | undefined {
   return resolveSecretEnv(connector.secretEnvVar);
 }
 
-/** Read a credential by the name of its variable, or say why it could not. */
+/**
+ * Named for the question rather than for this file, because the reader of the
+ * line is looking for the allow-list they have to configure and cannot grep for
+ * `sources.ts` in their own deployment manifest.
+ */
+const secretLogger = new Logger('CatalogSecretEnv');
+
+/**
+ * Read a credential by the name of its variable — if this deployment admits
+ * that name.
+ *
+ * Two things happen here that used to happen nowhere.
+ *
+ * **The allow-list is consulted before `process.env` is touched at all.** Not as
+ * tidiness: it is what makes the refusal say nothing. A name that is not
+ * admitted is refused by a function that never looked the variable up, so there
+ * is no fact about the environment for the message to leak even by accident, and
+ * no later edit can reintroduce one without moving this line.
+ *
+ * **The caller is told one sentence and the log is told which.** The message
+ * this replaced named the variable and said it was "not set in this
+ * environment", which turned every route that reaches here into an oracle for
+ * the pod's environment, one variable at a time — and it did so on
+ * `POST connectors/:id/discover`, which writes nothing and therefore leaves
+ * nothing behind. {@link credentialUnavailable} is deliberately the same
+ * sentence for both refusals; the warning below is the part that says which, to
+ * the only audience entitled to know.
+ *
+ * Empty is still not-set, unchanged: a variable exported as `""` cannot
+ * authenticate to anything, and the fetcher would otherwise go on to
+ * authenticate as nobody and fail against the source instead.
+ */
 export function resolveSecretEnv(name?: string): string | undefined {
   if (!name) return undefined;
-  const value = process.env[name];
-  if (!value) {
-    throw new Error(
-      `${name} is not set in this environment, so the connector cannot authenticate.`,
-    );
-  }
-  return value;
+
+  const admitted = admitsSecretEnv(name, secretEnvAllowlist());
+  const value = admitted ? process.env[name] : undefined;
+  if (value) return value;
+
+  secretLogger.warn(
+    admitted
+      ? `A connector asked for the credential in "${name}", which the allow-list admits and which is not set in this environment. The caller was told only that no credential is available.`
+      : `A connector asked for the credential in "${name}", which this deployment's credential allow-list does not admit, so the variable was not read. If that name is a source this catalog is meant to authenticate to, add it to CatalogPipelineModule.forRoot({ secretEnvAllowlist }) or to CATALOG_SECRET_ENV_ALLOW. If it is not, somebody with catalog:write has just tried to read an environment variable through a connector, and the connector will say who.`,
+  );
+  throw new Error(credentialUnavailable(name));
 }
 
 /**

@@ -9,6 +9,7 @@ import {
 import { BadRequestException, Inject, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { EXPECT_SHRINK_LABEL } from './load-expectations';
 import { PublishService } from './publish.service';
+import { capLines, redactLines, redactSecrets } from './run-logs';
 import {
   type FetchResult,
   SOURCES,
@@ -18,6 +19,18 @@ import {
 } from './sources';
 
 const BATCH_SIZE = 500;
+
+/**
+ * How many lines of a transform's own logging survive into the run record.
+ *
+ * The number is unchanged — it was `.slice(0, 50)` inline — but it was only ever
+ * half a bound. A line cap with no character cap lets one line naming every
+ * record a transform received write megabytes into a run row, and it grows with
+ * the data, which is exactly the property a persisted record must not have.
+ * `capLines` bounds both, the way the workflow runner has since it was measured
+ * there; this path was simply missed.
+ */
+const TRANSFORM_LOG_LINES = 50;
 
 /**
  * What a caller may say about ONE run, beyond which connector it is.
@@ -165,7 +178,7 @@ export class ConnectorRunnerService {
         rows = result.rows;
         logs.push(
           `Transform "${transform.name}" v${transform.version} produced ${rows.length} rows in ${result.elapsedMs}ms.`,
-          ...result.logs.slice(0, 50),
+          ...capLines(result.logs, TRANSFORM_LOG_LINES),
         );
       }
 
@@ -265,18 +278,34 @@ export class ConnectorRunnerService {
         transformVersion,
       });
 
+      // Redacted on the way *out*, not on the way in, and on the success path
+      // as well as the failure one. A run that succeeded can still have logged a
+      // URL — a transform printing the endpoint it read, a carry-forward line
+      // quoting a source — and `GET pipeline/runs` serves these to anybody
+      // holding `catalog:read`, which is the softest scope in the system. The
+      // lines are left intact in `logs` until here so that everything above
+      // reads exactly as it did; the boundary is the store.
       const finished = await this.pipeline.finishRun(run.id, {
         status: 'succeeded',
         fetched,
         written,
-        logs,
+        logs: redactLines(logs),
         transformVersion,
       });
       this.logger.log(`${connector.name}: ${fetched} fetched, ${written} written as ${snapshotId}`);
       return finished ?? run;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      logs.push(`Failed: ${message}`);
+      // The one the two readable sinks get. `fetchHttp` throws `GET ${url} →
+      // ${status}` and the file source does the same, so a credential-bearing
+      // URL that fails once used to be readable by every holder of
+      // `catalog:read` — from `logs` and `error` on `GET pipeline/runs`, and
+      // from the event payload on `GET catalog/events`. Redacted here, at the
+      // sink, rather than at each thrower: a URL can reach this line from any
+      // fetcher, any driver and any transform, and guarding the throwers means
+      // guarding the next one somebody writes too.
+      const readable = redactSecrets(message);
+      logs.push(`Failed: ${readable}`);
 
       emitCatalog('connector.run.finished', {
         connectorId,
@@ -287,7 +316,7 @@ export class ConnectorRunnerService {
         status: 'failed',
         fetched,
         written,
-        error: message,
+        error: readable,
         transformVersion,
       });
 
@@ -297,10 +326,16 @@ export class ConnectorRunnerService {
         status: 'failed',
         fetched,
         written,
-        logs,
-        error: message,
+        logs: redactLines(logs),
+        error: readable,
         transformVersion,
       });
+      // The unredacted one, deliberately, and only here. A process log is read
+      // by whoever operates the deployment; `logs` and `error` are read by
+      // anybody with the softest scope in the system. That split is the same one
+      // `resolveSecretEnv` makes, and it is what keeps this a redaction rather
+      // than a deletion — the URL that failed is still recoverable by the person
+      // who is supposed to be debugging it.
       this.logger.warn(`${connector.name} failed: ${message}`);
       return finished ?? run;
     }

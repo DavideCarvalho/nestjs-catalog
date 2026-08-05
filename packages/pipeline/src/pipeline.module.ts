@@ -29,6 +29,13 @@ import {
   CATALOG_PIPELINE_SCOPE,
   passthroughScope,
 } from './seams';
+import {
+  SECRET_ENV_ALLOW_VAR,
+  describeSecretEnvAllowlist,
+  installSecretEnvAllowlist,
+  secretEnvAllowlist,
+  secretEnvAllowlistSource,
+} from './secret-env-allowlist';
 import { WorkflowLauncher } from './workflow-launcher.service';
 import { WorkflowRunSteps } from './workflow-run.steps';
 import { CatalogWorkflowRunWorkflow } from './workflow-run.workflow';
@@ -144,6 +151,60 @@ export interface CatalogPipelineModuleOptions {
    */
   expectations?: Provider;
   /**
+   * Which environment variables a connector, a connection or a workflow source
+   * node may name as the place its credential lives.
+   *
+   * **A host that runs any authenticating connector has to bind this**, and a
+   * deployment upgrading onto this release has to bind it before the upgrade
+   * lands or its connectors stop running. The refusal ships on: a
+   * `secretEnvVar` naming anything not on this list is refused, and the caller
+   * is told only that no credential is available.
+   *
+   * That is deliberate and it is the fix. `secretEnvVar` is chosen by whoever
+   * writes the connector, and `resolveSecretEnv` did `process.env[name]` with
+   * nothing in between — so a principal holding `catalog:write` on one narrow
+   * object type could point a connector at `DATABASE_URL`, run it, and read the
+   * host application's own database back out of a catalog type at
+   * `catalog:read`. Every guard on that path passed honestly; there was simply
+   * nothing that asked whether the *name* was one this deployment meant to
+   * offer. `secret-env-allowlist.ts` sets out the whole route.
+   *
+   * ```ts
+   * CatalogPipelineModule.forRoot({
+   *   // …em, registry, imports, expectations…
+   *   secretEnvAllowlist: ['FLEET_DB_URL', 'DPAS_API_TOKEN', 'VENDOR_*'],
+   * })
+   * ```
+   *
+   * Three things worth knowing before writing that array:
+   *
+   * - **An entry is an exact name or a prefix ending in one `*`.** A `*`
+   *   anywhere else is refused at boot rather than interpreted — `*_URL` reads
+   *   like a tidy way to admit connection strings and it admits `DATABASE_URL`.
+   * - **The list to write is already on your screen.** Every connector and
+   *   connection shows the variable it reads, as `Credential env var`; the
+   *   union of those is the migration.
+   * - **`['*']` is the escape hatch and is not a policy.** It restores the
+   *   previous behaviour — every variable in the pod readable by anyone who can
+   *   write a connector — and warns at every boot. It exists so an upgrade under
+   *   time pressure has one honest, greppable line rather than a pin to the
+   *   previous release.
+   *
+   * Omitting this falls through to `CATALOG_SECRET_ENV_ALLOW` in the
+   * environment, comma- or whitespace-separated, which is the same policy for
+   * the operator who owns the manifest rather than the code. When both are set
+   * **this option wins**, and the boot line says which is in force — so setting
+   * the variable and seeing nothing change has an answer on screen. Binding
+   * neither is a boot that succeeds and warns, naming both levers.
+   *
+   * Not a `Provider`, unlike `expectations`, and the asymmetry is forced rather
+   * than chosen: the fetchers reach the credential through a free function
+   * called from four places, one of which is a controller this module does not
+   * construct, and a policy that had to be injected would be a policy one of
+   * them could be written without. See {@link installSecretEnvAllowlist}.
+   */
+  secretEnvAllowlist?: readonly string[];
+  /**
    * Whether THIS process runs the scheduler loop. Default true. A host that
    * splits API and worker roles should pass false on the roles that do not poll
    * — not for safety (a duplicate start is a no-op, the run id is derived from
@@ -175,6 +236,17 @@ export interface CatalogPipelineModuleOptions {
 @Module({})
 export class CatalogPipelineModule {
   static forRoot(options: CatalogPipelineModuleOptions): DynamicModule {
+    // Here rather than in a provider, and it is the one side effect in this
+    // method. The policy has to be in force before anything can resolve a
+    // credential, and the earliest thing that can resolve one is the scheduler
+    // — which starts on a timer from `onApplicationBootstrap`, the same hook a
+    // provider installing this would run in, with no ordering between them. A
+    // module built is strictly before a module booted, so this cannot lose that
+    // race. A malformed pattern throws from here, which is a boot that fails
+    // naming the pattern rather than a boot that succeeds and refuses every
+    // load for a reason that reads like the allow-list working.
+    if (options.secretEnvAllowlist) installSecretEnvAllowlist(options.secretEnvAllowlist);
+
     const providers: Provider[] = [
       options.em,
       options.registry,
@@ -199,6 +271,7 @@ export class CatalogPipelineModule {
       ConnectionChecker,
       ConnectorScheduler,
       LoadExpectationsAnnouncer,
+      SecretEnvAllowlistAnnouncer,
       ConnectorRunSteps,
       ConnectorRunWorkflow,
       WorkflowRunSteps,
@@ -337,5 +410,44 @@ class LoadExpectationsAnnouncer implements OnApplicationBootstrap {
     else this.logger.log(message);
   }
 }
+
+/**
+ * Says once, at boot, which credentials this deployment will let a connector
+ * read.
+ *
+ * The refusal it is announcing is correct and arrives far too late to be the
+ * first anybody hears of it: an operator whose upgrade turned every
+ * authenticating connector off would otherwise learn that from a run at three in
+ * the morning being told — correctly, and by design — that it may not say why.
+ * One line at boot, naming both levers, is what makes the fail-closed default
+ * survivable.
+ *
+ * A provider rather than a branch inside `forRoot`, for the same reason
+ * {@link LoadExpectationsAnnouncer} is: `forRoot` knows only whether IT was
+ * handed a list, and the operator who set `CATALOG_SECRET_ENV_ALLOW` in the
+ * manifest would be warned at exactly the moment they had done the right thing.
+ * Reading the effective policy is the only question whose answer covers both
+ * routes in.
+ */
+@Injectable()
+class SecretEnvAllowlistAnnouncer implements OnApplicationBootstrap {
+  // Named for the thing being announced rather than for this class, and the same
+  // name `resolveSecretEnv` logs its refusals under — so an operator told to
+  // read the log for the reason a credential was unavailable has one context to
+  // filter on and finds the boot line sitting in it.
+  private readonly logger = new Logger('CatalogSecretEnv');
+
+  onApplicationBootstrap(): void {
+    const { level, message } = describeSecretEnvAllowlist(
+      secretEnvAllowlist(),
+      secretEnvAllowlistSource(),
+    );
+    if (level === 'warn') this.logger.warn(message);
+    else this.logger.log(message);
+  }
+}
+
+/** Re-exported so a deployment can name the variable it has to set. */
+export { SECRET_ENV_ALLOW_VAR };
 
 export type { Type };

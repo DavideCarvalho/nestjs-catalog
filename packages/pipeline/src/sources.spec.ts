@@ -3,7 +3,8 @@ import {
   type CatalogConnection,
   type CatalogConnector,
 } from '@dudousxd/nestjs-catalog';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { installSecretEnvAllowlist } from './secret-env-allowlist';
 import {
   type FetchContext,
   SOURCES,
@@ -65,7 +66,18 @@ describe('toFetchResult', () => {
 describe('resolveSecretEnv', () => {
   const touched: string[] = [];
 
+  // Every case here names a variable this deployment admits. The allow-list
+  // itself — which names get through, and what a caller is told about the ones
+  // that do not — is `secret-env-allowlist.spec.ts` and
+  // `sources.secret-env.spec.ts`; these are the resolution mechanics on top of
+  // it, and installing the list is what stops them testing the refusal by
+  // accident.
+  beforeEach(() => {
+    installSecretEnvAllowlist(['CATALOG_TEST_*']);
+  });
+
   afterEach(() => {
+    installSecretEnvAllowlist(undefined);
     for (const name of touched.splice(0)) delete process.env[name];
   });
 
@@ -88,9 +100,14 @@ describe('resolveSecretEnv', () => {
   // this cannot paper over. Returning undefined would send the fetcher on to
   // authenticate as nobody, and the failure would arrive later as a 403 against
   // the source rather than a misconfiguration here.
-  it('fails loudly, naming the variable, when it is not set', () => {
+  //
+  // What it may no longer do is say WHICH — an admitted-but-unset variable and a
+  // name that was never admitted are one sentence now, because the two being
+  // different made this an oracle for the pod's environment. The name is still
+  // repeated back; the caller supplied it.
+  it('fails, naming the variable, when it is not set', () => {
     expect(() => resolveSecretEnv('CATALOG_TEST_MISSING')).toThrow(/CATALOG_TEST_MISSING/);
-    expect(() => resolveSecretEnv('CATALOG_TEST_MISSING')).toThrow(/cannot authenticate/);
+    expect(() => resolveSecretEnv('CATALOG_TEST_MISSING')).toThrow(/No credential is available/);
   });
 
   it('treats a variable set to the empty string as not set', () => {

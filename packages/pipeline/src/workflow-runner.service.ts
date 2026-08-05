@@ -24,6 +24,7 @@ import {
 } from '@dudousxd/nestjs-catalog';
 import { BadRequestException, Inject, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { PublishService } from './publish.service';
+import { redactLines, redactSecrets, safeLogLines } from './run-logs';
 import {
   type FetchResult,
   SOURCES,
@@ -31,6 +32,18 @@ import {
   resolveSecret,
   toFetchResult,
 } from './sources';
+
+/**
+ * Re-exported from where it now lives.
+ *
+ * `capLines` moved into `run-logs.ts` when the connector runner turned out to
+ * need it too — it had a line cap and no character cap, which is half a bound —
+ * and it sits there beside the redaction it has to be composed with in a
+ * particular order. The name stays reachable from this module because it is part
+ * of this package's published surface and because a host importing it should not
+ * have to care that the file underneath it changed.
+ */
+export { capLines } from './run-logs';
 
 /**
  * The same size the single-transform connector runner uses, and deliberately
@@ -52,9 +65,12 @@ const BATCH_SIZE = 500;
  * step boundary must not have. Logs are the one non-counter allowed across a
  * boundary because they are what an operator reads when a node misbehaves, and
  * the price of keeping them is that both dimensions are bounded.
+ *
+ * The character bound itself lives in `run-logs.ts` now, as `capLines`' default,
+ * because the connector runner needs the same number and two files each holding
+ * an opinion about how long a log line may be is how they stop agreeing.
  */
 const LOG_LINES_PER_NODE = 20;
-const LOG_LINE_CHARS = 400;
 /** And the run as a whole, which is what the finish step carries. */
 const LOG_LINES_PER_RUN = 200;
 
@@ -415,11 +431,16 @@ export class WorkflowRunnerService {
       transformVersion: output.transformVersion,
       elapsedMs: output.elapsedMs,
     };
-    // Bounded here rather than only at the store, because these lines travel
-    // into the finish step's *input* checkpoint on the durable path. A cap
-    // applied only on the way into the database would leave the durable store
-    // holding what the database refused.
-    progress.logs = capLines([...progress.logs, ...output.logs], LOG_LINES_PER_RUN);
+    // Bounded and redacted here rather than only at the store, because these
+    // lines travel into the finish step's *input* checkpoint on the durable
+    // path. A cap applied only on the way into the database would leave the
+    // durable store holding what the database refused, and the same is true of
+    // the redaction: `durable_step_checkpoints` is a second copy of every log
+    // line a node produced, and it is not covered by anything at the HTTP
+    // boundary. The node paths already redact what they return, so this is the
+    // second of two passes and does nothing on a well-behaved one — which is
+    // exactly why `redactSecrets` had to be idempotent.
+    progress.logs = safeLogLines([...progress.logs, ...output.logs], LOG_LINES_PER_RUN);
     // What a *source* read is what "fetched" has always meant on a run, and a
     // graph with two sources fetched the sum of both.
     if (node.kind === 'source') progress.fetched += output.rows;
@@ -471,6 +492,18 @@ export class WorkflowRunnerService {
       }
     }
 
+    // The last boundary before both readable sinks, and the only one that sees
+    // all three carriers at once. `GET pipeline/runs` serves `logs`, `error` and
+    // `nodeOutcomes` at `catalog:read`; `GET catalog/events` serves the payload
+    // below at the same scope. A source URL reaches every one of them by a
+    // different route — `runInline` wraps the node's message into `error`, a
+    // node's own logging arrives through `record`, and `recordFailure` puts the
+    // raw message on the outcome — so redacting at any one of those three would
+    // have left the other two.
+    const readable = redactLines(logs);
+    const error = input.error === undefined ? undefined : redactSecrets(input.error);
+    const nodeOutcomes = redactOutcomes(input.nodeOutcomes);
+
     emitCatalog('connector.run.finished', {
       connectorId: input.connectorId,
       connectorName: input.workflowName,
@@ -480,16 +513,16 @@ export class WorkflowRunnerService {
       status: input.status,
       fetched: input.fetched,
       written: input.written,
-      error: input.error,
+      error,
     });
 
     const finished = await store.finishRun(input.runRowId, {
       status: input.status,
       fetched: input.fetched,
       written: input.written,
-      logs,
-      error: input.error,
-      nodeOutcomes: input.nodeOutcomes,
+      logs: readable,
+      error,
+      nodeOutcomes,
     });
 
     if (input.status === 'succeeded') {
@@ -497,6 +530,10 @@ export class WorkflowRunnerService {
         `${input.workflowName}: ${input.fetched} fetched, ${input.written} written as ${input.snapshotId}`,
       );
     } else {
+      // The unredacted one, and only here. A process log is read by whoever
+      // operates the deployment; the three fields above are read by anybody
+      // holding the softest scope in the system. That split is what keeps this a
+      // redaction rather than a deletion.
       this.logger.warn(`${input.workflowName} failed: ${input.error}`);
     }
 
@@ -678,7 +715,7 @@ export class WorkflowRunnerService {
       output,
       rows: rows.length,
       elapsedMs: Date.now() - startedAt,
-      logs: capLines(logs, LOG_LINES_PER_NODE),
+      logs: safeLogLines(logs, LOG_LINES_PER_NODE),
     };
   }
 
@@ -714,7 +751,7 @@ export class WorkflowRunnerService {
       transformVersion: transform.version,
       rows: result.rows.length,
       elapsedMs: Date.now() - startedAt,
-      logs: capLines(logs, LOG_LINES_PER_NODE),
+      logs: safeLogLines(logs, LOG_LINES_PER_NODE),
     };
   }
 
@@ -812,7 +849,7 @@ export class WorkflowRunnerService {
       // like a full reload.
       rows: written,
       elapsedMs: Date.now() - startedAt,
-      logs: capLines(logs, LOG_LINES_PER_NODE),
+      logs: safeLogLines(logs, LOG_LINES_PER_NODE),
     };
   }
 
@@ -1056,24 +1093,27 @@ function nodeState(
 }
 
 /**
- * Trim logging to something a checkpoint can hold, on both axes.
+ * Every node outcome with its `error` redacted, and every other field untouched.
  *
- * A truncated line says so, because a line that was silently cut looks like a
- * transform that stopped mid-sentence — which is a bug report about the wrong
- * thing.
+ * Rebuilt rather than mutated, because `input.nodeOutcomes` on the durable path
+ * is the object the finish step was handed as its checkpointed input — editing
+ * it in place would edit what a replay reads back, so a second attempt would
+ * redact an already-redacted string and, more to the point, the step's recorded
+ * input would stop matching what the engine actually delivered.
+ *
+ * The counters and the status are left alone deliberately: they are the part of
+ * a failed node an operator reads first, and there is no credential in a row
+ * count.
  */
-export function capLines(
-  lines: string[],
-  maxLines: number,
-  maxChars: number = LOG_LINE_CHARS,
-): string[] {
-  return lines
-    .slice(0, maxLines)
-    .map((line) =>
-      line.length > maxChars
-        ? `${line.slice(0, maxChars)}… (${line.length - maxChars} more characters)`
-        : line,
-    );
+function redactOutcomes(
+  outcomes: Record<string, WorkflowNodeOutcome>,
+): Record<string, WorkflowNodeOutcome> {
+  const redacted: Record<string, WorkflowNodeOutcome> = {};
+  for (const [nodeId, outcome] of Object.entries(outcomes)) {
+    redacted[nodeId] =
+      outcome.error === undefined ? outcome : { ...outcome, error: redactSecrets(outcome.error) };
+  }
+  return redacted;
 }
 
 function positiveInt(raw: string | undefined, fallback: number): number {
