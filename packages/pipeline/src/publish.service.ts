@@ -416,6 +416,11 @@ export class PublishService {
     const currentSnapshot = this.store.currentSnapshot?.bind(this.store);
     if (!listSnapshots || !currentSnapshot) {
       this.warnOnce(
+        // Shares `def.name` with the pending-snapshot warning below, and that
+        // is safe rather than sloppy: this branch fires only when the store is
+        // MISSING one of the two members, and that one is reached only when it
+        // has both. One instance holds one store, so the two can never both
+        // fire for the same type and neither can silence the other.
         def.name,
         `The configured store cannot say ${!currentSnapshot ? 'which snapshot it is serving' : 'what it has written'}, so the row-count expectation on ${def.name} cannot be enforced and a load that collapses will commit unnoticed.`,
       );
@@ -428,11 +433,30 @@ export class PublishService {
     if (!previous) return;
 
     const pending = (await listSnapshots(def)).find((snapshot) => snapshot.id === snapshotId);
-    // The store does not report the snapshot about to be committed — an
-    // adapter that lists only committed ones, or a window too short to reach
-    // it. Left to `commit`, which knows whether the snapshot exists and says so
-    // far better than a guess from here would.
-    if (!pending) return;
+    if (!pending) {
+      // The store does not report the snapshot about to be committed — an
+      // adapter that lists only committed ones, or a window too short to reach
+      // it. WHETHER IT EXISTS is still `commit`'s question, and it answers it
+      // better than a guess from here would.
+      //
+      // But the bound standing down is this method's business, and it used to
+      // happen in silence — so the other branch of this same method warned that
+      // it could not enforce the expectation, and this one said nothing at all
+      // while doing exactly the same thing. A host reading `maxShrink` in its
+      // configuration had no way to learn it was decorative on this adapter.
+      //
+      // Warned rather than refused, matching the branch above and for the
+      // reason its docblock gives at length: refusing here would break every
+      // store that reports less than the bundled one, including adapters
+      // outside this repository. Turning either branch into a refusal is one
+      // decision about both, not a change smuggled into the one nobody
+      // documented.
+      this.warnOnce(
+        def.name,
+        `The configured store did not list snapshot ${snapshotId} of ${def.name} among the snapshots it reports, so there is no row count to measure and the row-count bound is standing down for this commit. An adapter that lists only committed snapshots, or whose window is shorter than a load, hits this every time.`,
+      );
+      return;
+    }
 
     const refusal = refuseRowCountDrift({
       typeName: def.name,

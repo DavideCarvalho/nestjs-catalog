@@ -1,4 +1,5 @@
 import type { CatalogObjectTypeDef, CatalogPrincipal, SnapshotRef } from '@dudousxd/nestjs-catalog';
+import { Logger } from '@nestjs/common';
 import { describe, expect, it, vi } from 'vitest';
 import { ConnectorRunSteps } from './connector-run.steps';
 import {
@@ -513,11 +514,34 @@ describe('PublishService: a load that collapsed', () => {
   // that reconstructing one from the snapshot list names the wrong row exactly
   // when somebody has rolled a load back.
   it('commits and warns when the store cannot say what it is serving', async () => {
+    // The "and warns" half used to be a claim in the title with nothing behind
+    // it — the body asserted only that the commit happened, which is also what
+    // a silent stand-down looks like. The warning IS the feature here: a host
+    // that configured a bound has no other way to learn it is decorative on
+    // this adapter.
+    const warn = vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
     const store = collapsing(12, { currentSnapshot: undefined });
 
     await publisher(store).commitAsSystem('ingest', 'Mvr', 'today');
 
     expect(store.commit).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls.flat().join(' ')).toMatch(/cannot be enforced/);
+    warn.mockRestore();
+  });
+
+  it('commits and warns when the store does not list the snapshot being committed', async () => {
+    // The other branch of the same method, which stood down in total silence
+    // while its sibling warned. Whether the snapshot exists is still `commit`'s
+    // question; that the bound is not being applied is this method's, and it
+    // said nothing.
+    const warn = vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    const store = collapsing(12, { listSnapshots: () => Promise.resolve([]) });
+
+    await publisher(store).commitAsSystem('ingest', 'Mvr', 'today');
+
+    expect(store.commit).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls.flat().join(' ')).toMatch(/standing down/);
+    warn.mockRestore();
   });
 });
 
