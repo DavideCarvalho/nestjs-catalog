@@ -12,8 +12,11 @@ import type {
   ConnectionCheck,
   ConnectorKind,
   ConnectorRun,
+  DeleteReconciliation,
+  RowCountBound,
   SealedSecret,
   SecretContext,
+  StoredLoadExpectation,
   TransformLanguage,
   WorkflowEdge,
   WorkflowExecutionMode,
@@ -52,6 +55,7 @@ import {
   ConnectionRow,
   ConnectorRow,
   ConnectorRunRow,
+  LoadExpectationRow,
   TransformRow,
   WorkflowRow,
   WorkflowStageRow,
@@ -1220,6 +1224,203 @@ export class MySqlPipelineStore
     });
     return rows.map(toRun);
   }
+
+  // Load expectations, as an operator set them.
+  //
+  // Rows, and only rows. The precedence these take part in — a host's `byType`
+  // entry over one of these over the host's `default`, field by field — is
+  // resolved in the pipeline package beside the functions that enforce it, and
+  // deliberately not here: a store that resolved would be a second place the
+  // answer is decided, and the first symptom of the two disagreeing is a load
+  // that is refused in one environment and committed in another.
+  //
+  // Unbounded, unlike the runs and the revisions above, and that is safe for a
+  // reason rather than by omission: there is one row per object type at most,
+  // because the type name IS the key. A catalog with a thousand types has a
+  // thousand rows.
+
+  async listLoadExpectations(): Promise<StoredLoadExpectation[]> {
+    const em = this.em.fork();
+    const rows = await em.find(LoadExpectationRow, {}, { orderBy: { typeName: 'asc' } });
+    return rows.map(toLoadExpectation);
+  }
+
+  async getLoadExpectation(typeName: string): Promise<StoredLoadExpectation | undefined> {
+    const em = this.em.fork();
+    const row = await em.findOne(LoadExpectationRow, { typeName });
+    return row ? toLoadExpectation(row) : undefined;
+  }
+
+  /**
+   * Upsert one type's expectation, stamped with who set it and when.
+   *
+   * ## What is written is what can be read back
+   *
+   * Both JSON columns are normalised on the way in through the *same* functions
+   * that narrow them on the way out, and a `deletes` that does not survive that
+   * round trip is refused rather than stored. So the column cannot come to hold
+   * a value this store would later read as "nothing was declared" — which is the
+   * one failure mode that would be invisible from every side: the save returned
+   * 200, the console renders the row, and the load is refused anyway with a
+   * message telling the operator to declare the thing they declared.
+   *
+   * That refusal is *structural* — "this cannot be read back" — and is not the
+   * operator-facing validation. The 400s that name a field, on an empty
+   * `because`, a `periodic-full-reload` with no positive interval, a strategy
+   * outside the three, or a `maxShrink` outside `(0, 1]`, live on the pipeline
+   * controller where the person typing them is. Two vocabularies would be one
+   * too many, so this one refuses only what it genuinely cannot persist.
+   *
+   * `setAt` is taken from this process's clock and never from the caller, for
+   * the reason `startRun` takes its own timestamp: a stored instant a client can
+   * choose is not an audit record. `setBy` and `setByActor` are arguments rather
+   * than fields on `expectation` for the same reason — a caller cannot claim
+   * them by putting them in a body.
+   */
+  async saveLoadExpectation(
+    typeName: string,
+    expectation: Pick<StoredLoadExpectation, 'deletes' | 'rowCount'>,
+    setBy: string,
+    setByActor?: string,
+  ): Promise<StoredLoadExpectation> {
+    const deletes = expectation.deletes
+      ? toDeleteReconciliation({ ...expectation.deletes })
+      : undefined;
+    if (expectation.deletes && !deletes) {
+      throw new BadRequestException(
+        `The delete reconciliation given for ${typeName} cannot be stored: it needs a "strategy" of "accepted", "soft-deleted-at-source" or "periodic-full-reload", a "because" string, and — for "periodic-full-reload" — a numeric "withinMs". Writing it as it stands would leave a row this store reads back as declaring nothing, so the load would be refused while the console showed a policy.`,
+      );
+    }
+
+    const em = this.em.fork();
+    const now = new Date();
+    const row =
+      (await em.findOne(LoadExpectationRow, { typeName })) ??
+      em.create(LoadExpectationRow, { typeName, setBy, setAt: now });
+
+    row.deletes = deletes;
+    row.rowCount = expectation.rowCount ? toRowCountBound({ ...expectation.rowCount }) : undefined;
+    // Overwritten on every save, including one that changes neither policy
+    // field. The attribution is a statement about the decision that is now
+    // standing, and the person who re-affirmed it is the one accountable for it.
+    row.setBy = setBy;
+    row.setByActor = setByActor;
+    row.setAt = now;
+
+    em.persist(row);
+    await em.flush();
+    return toLoadExpectation(row);
+  }
+
+  /**
+   * Drop the stored row. The host's `CATALOG_LOAD_EXPECTATIONS` is untouched, so
+   * a type this deployment declared in code keeps that declaration and simply
+   * stops having an operator layer under it.
+   *
+   * `false` means there was no row, which is a fact and not a failure — a
+   * caller clearing a type nobody had set has got what it asked for.
+   */
+  async clearLoadExpectation(typeName: string): Promise<boolean> {
+    const em = this.em.fork();
+    return (await em.nativeDelete(LoadExpectationRow, { typeName })) > 0;
+  }
+}
+
+/**
+ * A stored row as the interface describes it.
+ *
+ * Both policy columns go through the narrowing below rather than being handed
+ * over as the union they are declared to be. MikroORM returns whatever the
+ * column holds, so typing them as `DeleteReconciliation` on the entity would
+ * make every read an unchecked assertion about JSON written by some earlier
+ * version of this package — the same rule `WorkflowRow.nodes` follows, and for
+ * the same reason.
+ */
+function toLoadExpectation(row: LoadExpectationRow): StoredLoadExpectation {
+  return {
+    typeName: row.typeName,
+    deletes: toDeleteReconciliation(row.deletes),
+    rowCount: toRowCountBound(row.rowCount),
+    setBy: row.setBy,
+    setByActor: row.setByActor,
+    setAt: row.setAt.toISOString(),
+  };
+}
+
+/**
+ * The stored JSON as a `DeleteReconciliation`, or nothing.
+ *
+ * **Unreadable reads as absent, and absent is the strict answer**, which is why
+ * this may drop a value rather than throwing the way `isWorkflowNode` does. The
+ * two are opposite cases: a dropped workflow node leaves a graph that still
+ * validates and silently runs nine steps of ten, whereas a dropped delete
+ * strategy means `refuseUndeclaredDeletes` sees nothing declared and stops the
+ * incremental load. The failure of this column is a refused load with a message
+ * that says exactly what to declare — loud, safe, and recoverable by saving the
+ * expectation again.
+ *
+ * The literals are written out in each branch rather than passing the narrowed
+ * variable through, so the object returned is typed by this function and not by
+ * what the column happened to contain.
+ */
+function toDeleteReconciliation(
+  value: Record<string, unknown> | undefined,
+): DeleteReconciliation | undefined {
+  if (!value) return undefined;
+  const { strategy, because, column, withinMs } = value;
+  if (typeof because !== 'string') return undefined;
+
+  if (strategy === 'accepted') return { strategy: 'accepted', because };
+
+  if (strategy === 'soft-deleted-at-source') {
+    // The column is genuinely optional — a source that flips a status the
+    // transform reads does not name one — so an absent or unreadable value here
+    // is not a reason to lose the declaration.
+    return typeof column === 'string'
+      ? { strategy: 'soft-deleted-at-source', because, column }
+      : { strategy: 'soft-deleted-at-source', because };
+  }
+
+  if (strategy === 'periodic-full-reload') {
+    // `withinMs` is not optional on this branch: the strategy IS the interval,
+    // and one without a number is a declaration that polices nothing.
+    // `Number.isFinite` rather than `typeof === 'number'` alone, because a
+    // column holding `null` parsed as `NaN` would otherwise become an interval
+    // no comparison is ever true of.
+    if (!Number.isFinite(withinMs) || typeof withinMs !== 'number') return undefined;
+    return { strategy: 'periodic-full-reload', because, withinMs };
+  }
+
+  return undefined;
+}
+
+/**
+ * The stored JSON as a partial bound.
+ *
+ * Field by field, keeping only what is a finite number, because the merge that
+ * consumes this is itself field by field: a stored `maxShrink` must not carry an
+ * opinion about `maxGrowth` with it, and a key that is simply absent is how that
+ * is said.
+ *
+ * Nothing readable answers `undefined` rather than `{}`. The two mean the same
+ * to the merge — neither contributes a field — and the shorter one keeps the
+ * console from rendering a bound that is not there.
+ */
+function toRowCountBound(
+  value: Record<string, unknown> | undefined,
+): Partial<RowCountBound> | undefined {
+  if (!value) return undefined;
+  const bound: Partial<RowCountBound> = {};
+  if (typeof value.maxShrink === 'number' && Number.isFinite(value.maxShrink)) {
+    bound.maxShrink = value.maxShrink;
+  }
+  if (typeof value.maxGrowth === 'number' && Number.isFinite(value.maxGrowth)) {
+    bound.maxGrowth = value.maxGrowth;
+  }
+  if (typeof value.minRows === 'number' && Number.isFinite(value.minRows)) {
+    bound.minRows = value.minRows;
+  }
+  return Object.keys(bound).length > 0 ? bound : undefined;
 }
 
 /**

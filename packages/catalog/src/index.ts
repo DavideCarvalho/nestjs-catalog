@@ -49,6 +49,8 @@ export {
   type CatalogConnector,
   type ConnectionCheck,
   CONNECTOR_KINDS,
+  type CatalogLoadExpectations,
+  type CatalogLoadExpectationStore,
   type CatalogPipelineStore,
   type CatalogStageStore,
   type CatalogTransform,
@@ -57,9 +59,14 @@ export {
   type CatalogWorkflowStore,
   type ConnectorKind,
   type ConnectorRun,
+  type DeleteReconciliation,
   isConnectorKind,
   isPipelineStore,
   isTransformLanguage,
+  type LoadExpectation,
+  type RowCountBound,
+  type StoredLoadExpectation,
+  supportsLoadExpectations,
   supportsTransformRevisions,
   isWorkflowEdge,
   isWorkflowExecutionMode,
@@ -196,6 +203,7 @@ export {
 export * from './catalog.access';
 export {
   assertNoColumnCollisions,
+  assertSafeIdentifier,
   CATALOG_RESERVED_COLUMNS,
   CATALOG_SNAPSHOT_MODES,
   CATALOG_STORE,
@@ -214,9 +222,11 @@ export {
   findColumnCollisions,
   isCatalogStoreCapabilities,
   isReservedColumn,
+  isSafeIdentifier,
   isWriteStore,
   type SnapshotRef,
   supportsCarryForward,
+  UnsafeIdentifierError,
 } from './catalog.store';
 export { MikroOrmReadStore } from './stores/mikro-orm-read.store';
 export type {

@@ -99,6 +99,21 @@ function fakeTransport(answers: Record<string, unknown>) {
   return { transport, calls, lastCallTo };
 }
 
+/**
+ * The calls to the catalog library's own endpoints, and only those.
+ *
+ * The assertions below are about what the CATALOG screens ask the CATALOG
+ * controller for — that a filter is applied client-side, that a reset does not
+ * cost a second snapshot fetch. The Model screen's type panel also reads the
+ * per-type load expectation from the HOST's pipeline endpoints, which is a
+ * different question with its own spec (`load-expectation.spec.tsx`), and an
+ * unfiltered call list here would fail every time that section changed what it
+ * asks for.
+ */
+function catalogCalls(calls: Call[]) {
+  return calls.filter((call) => call.path.startsWith('/catalog'));
+}
+
 function withCatalog(transport: CatalogTransport, children: ReactNode) {
   const queryClient = new QueryClient({
     // No retries: a refusal should reach the screen once, not four times over 30 seconds.
@@ -183,7 +198,7 @@ describe('CatalogManager', () => {
     // The seam: one GET, to the path the catalog controller actually serves. Getting here at all
     // is the regression test for the two-react-query bug — a screen whose `useQuery` cannot see
     // the provider throws during render rather than fetching.
-    expect(calls).toEqual([{ method: 'GET', path: '/catalog', params: undefined }]);
+    expect(catalogCalls(calls)).toEqual([{ method: 'GET', path: '/catalog', params: undefined }]);
     // The names come from the answer, not from the code name: the whole point of the overlay is
     // that `Mvr` is displayed as "Vehicle".
     expect(list.getByText('Vehicle')).toBeDefined();
@@ -235,7 +250,7 @@ describe('CatalogManager', () => {
     const list = await typeList();
     expect(list.queryByText('Vehicle')).toBeNull();
     expect(list.getByText('Work order')).toBeDefined();
-    expect(calls).toHaveLength(1);
+    expect(catalogCalls(calls)).toHaveLength(1);
   });
 
   it('renders an empty catalog as empty, not as a failure', async () => {
@@ -279,7 +294,7 @@ describe('CatalogManager', () => {
     fireEvent.click(screen.getByText('Reset edits'));
 
     await waitFor(() =>
-      expect(calls.map((call) => `${call.method} ${call.path}`)).toEqual([
+      expect(catalogCalls(calls).map((call) => `${call.method} ${call.path}`)).toEqual([
         'GET /catalog',
         'POST /catalog/reset',
       ]),

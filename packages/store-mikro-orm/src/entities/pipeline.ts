@@ -499,3 +499,138 @@ export class ConnectionRow {
   @Property({ length: 1024, nullable: true })
   lastCheckError?: string;
 }
+
+/**
+ * What an operator declared about how one object type is allowed to load.
+ *
+ * The layer between a host's `CATALOG_LOAD_EXPECTATIONS.byType` entry and its
+ * `default` — see `StoredLoadExpectation` in the catalog package for why the
+ * policy grew a stored layer at all, and `CatalogLoadExpectations` for why the
+ * grain is the type and nothing finer.
+ *
+ * ## Its own table, and not two columns on `ObjectTypeRow`
+ *
+ * The obvious cheaper shape is a pair of columns on `catalog_object_type`, and
+ * it is wrong for two separate reasons.
+ *
+ * The first is ownership. Those rows are *published* — they arrive over the wire
+ * from the application that owns the model, and `StoredCatalogRegistry` writes
+ * them from that payload. An operator's decision written into a row a publisher
+ * rewrites is a decision with a publisher-shaped hole in it.
+ *
+ * The second is that a type name is not required to have a row there yet. A
+ * deployment can perfectly well want `Employee` locked down before the first
+ * publish of `Employee` lands, and a policy that can only be set for types that
+ * already exist is a policy that cannot be set in advance — which is the moment
+ * it is most worth setting.
+ *
+ * ## New table, so the initialiser trap does not apply — and why that is said
+ *
+ * MikroORM's field initialisers run when *this process* constructs a row. They
+ * do not run for rows a column predates: add a non-nullable property with a
+ * TypeScript default to an existing entity and every row already in the table
+ * still reads NULL, because `schema.update` adds the column and nothing
+ * backfills it. Nothing here is exposed to that — this is a whole new table, so
+ * every row in it is written by the store that owns it, after the columns
+ * existed. It is written down because the next person adding a field to this
+ * class is exposed to it, and by then the table will predate them.
+ *
+ * ## No `@Index`, deliberately
+ *
+ * Every access is by primary key (`getLoadExpectation`, `saveLoadExpectation`,
+ * `clearLoadExpectation`) or a full read of a table bounded by the number of
+ * object types (`listLoadExpectations`). There is nothing an index would serve.
+ * That is worth stating rather than leaving as an absence, because an index
+ * added here later would NOT reach a database that has already booted:
+ * `fingerprintOf` in `schema.ts` hashes column names, types and nullability and
+ * nothing else, so an index-only change leaves the marker unchanged and
+ * `schema.update` is never called.
+ */
+@Entity({ tableName: 'catalog_load_expectation' })
+export class LoadExpectationRow {
+  /**
+   * The object type name, and the primary key.
+   *
+   * One row per type by construction rather than by a unique index over a
+   * surrogate id: two rows saying different things about how `Employee`
+   * reconciles deletes is the state this table must not be able to reach, and a
+   * key is the only version of that rule that cannot be forgotten by a caller.
+   */
+  @PrimaryKey({ length: 128 })
+  typeName!: string;
+
+  /**
+   * The whole `DeleteReconciliation`, as JSON, or NULL when the operator said
+   * nothing about deletes.
+   *
+   * JSON rather than `strategy` / `because` / `column` / `withinMs` columns, and
+   * the deciding reason is numeric rather than aesthetic. `withinMs` is a
+   * millisecond interval, and MikroORM infers `int` for a `number` property: a
+   * 30-day reload interval is 2,592,000,000, past the 2,147,483,647 a signed INT
+   * holds, so the column would either reject the row or silently store 24.8 days
+   * and refuse loads earlier than the operator declared. {@link rowCount} has the
+   * same problem from the other end — `maxShrink` is `0.5` and an INT stores
+   * `0`, which is a bound that refuses a load for losing a single row. Both are
+   * fixable with explicit column types; both are the kind of fix that is one
+   * review away from being dropped, and JSON round-trips a JavaScript number
+   * exactly with no column type to get wrong.
+   *
+   * Typed as `Record<string, unknown>` and never as `DeleteReconciliation`,
+   * exactly as {@link WorkflowRow.nodes} is: MikroORM hands back whatever the
+   * column holds, and declaring the union here would make every read a silent,
+   * unchecked assertion about a value written by some earlier version of this
+   * package. `MySqlPipelineStore` narrows it on the way out.
+   */
+  @Property({ type: 'json', nullable: true })
+  deletes?: Record<string, unknown>;
+
+  /**
+   * The `Partial<RowCountBound>` the operator set, as JSON, or NULL.
+   *
+   * Partial on purpose and all the way down: an operator raising `maxShrink`
+   * says nothing about `maxGrowth`, and the precedence merge resolves field by
+   * field, so a stored `{ maxShrink: 0.8 }` must not imply anything about the
+   * other two. A row of columns would have had to represent "not set" as NULL
+   * per field and then be careful never to read a NULL as a zero — which is the
+   * same distinction this column gets for free by simply not carrying the key.
+   */
+  @Property({ type: 'json', nullable: true })
+  rowCount?: Record<string, unknown>;
+
+  /**
+   * The principal that set it.
+   *
+   * Never nullable, and never defaulted. An expectation whose author is unknown
+   * is the state this whole layer exists to prevent — the argument for making
+   * `because` mandatory is the same argument, one field along — so a row that
+   * cannot say who wrote it should be impossible to write rather than rendered
+   * as "unattributed".
+   */
+  @Property({ length: 128 })
+  setBy!: string;
+
+  /**
+   * The person behind the principal, when there was one.
+   *
+   * Nullable because a principal is not always a person, and this column says
+   * which. It is the audit's real subject: `setBy` may be a console's own
+   * client id shared by everybody who logs into it, and the trail's question is
+   * which human decided that `Employee` may accumulate rows deleted upstream.
+   */
+  @Property({ length: 128, nullable: true })
+  setByActor?: string;
+
+  /**
+   * Millisecond precision, matching {@link ConnectorRunRow.startedAt} and the
+   * audit trail's `occurredAt`.
+   *
+   * Assigned explicitly by the store on every save rather than through
+   * `onCreate`/`onUpdate`. `onCreate` would freeze it at the first save, so an
+   * expectation edited a year later would still claim the original date;
+   * `onUpdate` would move it on any flush that touched the row for any reason,
+   * including one that changed nothing about the decision. This column answers
+   * "when was this decided", so only deciding may move it.
+   */
+  @Property({ length: 3 })
+  setAt!: Date;
+}

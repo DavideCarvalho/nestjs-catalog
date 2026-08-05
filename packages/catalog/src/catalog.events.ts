@@ -171,10 +171,17 @@ export interface CatalogEventPayloads {
     snapshotId: string;
   };
   /**
-   * Someone changed a label, description, unit or visibility.
+   * Someone changed a label, description, unit or visibility — or stated how a
+   * type reconciles deletes.
    *
-   * Presentation-only, and emitted anyway: "who renamed this column and when"
-   * is a governance question, and the answer is otherwise nowhere.
+   * Presentation was the whole of it once, and emitted anyway: "who renamed this
+   * column and when" is a governance question whose answer is otherwise nowhere.
+   * Per-type load expectations then arrived on the same event, and a delete
+   * strategy is not presentation — it decides whether an incremental load of the
+   * type may commit at all. `changed` tells the two apart (`expectation.deletes`
+   * and `expectation.cleared` against the field names a rename carries), which is
+   * why widening this event was better than minting a second one nobody's
+   * recorder would have been reading.
    */
   'type.curated': {
     typeName: string;

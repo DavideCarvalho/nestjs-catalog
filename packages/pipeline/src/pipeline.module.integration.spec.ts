@@ -252,14 +252,15 @@ describe('CatalogPipelineModule.forRoot (integration)', () => {
     const pipeline = routes.filter((route) => route.includes('/api/catalog-service/pipeline'));
     const publish = routes.filter((route) => route.includes('/api/catalog-service/publish'));
 
-    // 25 + 4. Pinned as a total rather than route-by-route so that a route which
+    // 29 + 4. Pinned as a total rather than route-by-route so that a route which
     // moves prefix — the failure mode this whole file is about — cannot be
-    // mistaken for a route that was merely renamed. The last one added was
-    // `GET transforms/:id/revisions`, which is what makes the version number a
-    // run records name code that can still be read; the two before it were
-    // `POST workflows/:id/publish` and `POST workflows/:id/unpublish`, the pair
-    // that took validation off the save and made it the gate on publishing.
-    expect(pipeline).toHaveLength(25);
+    // mistaken for a route that was merely renamed. The last four added were the
+    // per-type load expectations — `GET expectations`, and `GET`/`PUT`/`DELETE
+    // expectations/:type` — which are what let an operator declare a delete
+    // strategy without a deploy; before them `GET transforms/:id/revisions`,
+    // which is what makes the version number a run records name code that can
+    // still be read.
+    expect(pipeline).toHaveLength(29);
     expect(publish).toHaveLength(4);
 
     // The five workflow routes named explicitly, because they are the ones that

@@ -2,22 +2,35 @@
  * The paths behind the pipeline and access screens — and, for now, the embed
  * components, which are the documented exception at the top of the file.
  *
- * These deliberately do **not** live in `@dudousxd/nestjs-catalog/client` beside
- * `catalogRoutes`, and the difference is worth being precise about, because it
- * is the difference between a route builder that is a promise and one that is a
- * guess.
+ * Most of these deliberately do **not** live in
+ * `@dudousxd/nestjs-catalog/client` beside `catalogRoutes`, and the difference
+ * is worth being precise about, because it is the difference between a route
+ * builder that is a promise and one that is a default.
  *
- * `catalogRoutes` describes paths the catalog library's own controller serves.
- * Install the library, register the module, and `/catalog/objects/...` exists —
- * the builder is the library documenting itself, and it cannot be wrong.
+ * `catalogRoutes` is a frozen object of builders that take no base path: the
+ * paths the catalog library's own controller serves, at the segment it serves
+ * them under. Install the library, register the module, and
+ * `/catalog/objects/...` exists — the builder is the library documenting itself.
  *
- * Connectors, transforms and access are the other shape. The library defines
- * their *model* — `CatalogPipelineStore`, `CatalogConnection`, `CatalogPrincipal`
- * — but ships no controller for any of them, because how a deployment exposes
- * the code that reshapes its data, and who may create an account, are decisions
- * that belong to the deployment. Putting `pipelineRoutes` next to `catalogRoutes`
- * would tell a reader that installing the library makes `/pipeline/connectors`
- * answer, and it does not: they would get a 404 with nothing to point at.
+ * Connectors, transforms and access are the other shape, and what makes them so
+ * is not that nothing serves them. It is that WHERE they are served is the
+ * host's decision, which a frozen builder cannot express:
+ *
+ * - Connectors, transforms, workflows and runs are served by
+ *   `createPipelineController`, which ships in
+ *   `@dudousxd/nestjs-catalog-pipeline` — a *separate* package, mounted under
+ *   whatever `path` its `forRoot` was given, and mounted nowhere at all if it
+ *   was given none. Installing `@dudousxd/nestjs-catalog` does not make
+ *   `/pipeline/connectors` answer, so putting `pipelineRoutes` beside
+ *   `catalogRoutes` would tell a reader it does, and they would get a 404 with
+ *   nothing to point at.
+ * - Access is the one that used to be described here as having no controller
+ *   either, and it does have one: `createAccessController` is in the catalog
+ *   library and `CatalogModule.forRoot` mounts it unless the host passes
+ *   `controller: false`. What it does not have is a fixed path — it mounts
+ *   under `accessPath`, a sibling of the catalog's own mount point — so it is
+ *   still a default rather than a promise, for the second reason rather than
+ *   the first.
  *
  * So the builders live here, in the package that ships the screens that need
  * them, and are stated as a *default* the host can move. The defaults are
@@ -25,11 +38,26 @@
  * `/api/pipeline` — because the transport is what knows the API prefix, and a
  * screen that hardcoded one app's mount point would be unusable in the next app.
  *
+ * The two load-expectation paths are the case that says what the rule above
+ * really is. They are served by that same pipeline controller in that same
+ * separate package, yet their builder — `pipelineExpectationRoutes` — is in
+ * `@dudousxd/nestjs-catalog/client`, and `pipelineRoutes` below borrows it
+ * instead of writing the strings again. That is not an exception, because the
+ * test was never which package a builder lives in: it is whether the builder
+ * takes a base path. `pipelineExpectationRoutes` does, so it promises nothing
+ * about where the routes are mounted no matter where it sits. It sits there
+ * because the wire types it goes with — `LoadExpectationInput`,
+ * `ResolvedLoadExpectation` — are declared in that entry point and the pipeline
+ * controller reads them from there too, and a path split from the shapes it
+ * returns is how the two halves of one contract come to be moved separately.
+ *
  * What this package therefore asks of a host is an HTTP surface with these
  * shapes, wherever it wants to mount it. That contract is the response types on
  * `CatalogClient` plus these paths, and a host that would rather satisfy it from
  * somewhere else entirely can pass its own base path, or replace the client.
  */
+
+import { pipelineExpectationRoutes } from '@dudousxd/nestjs-catalog/client';
 
 /**
  * The embed API, which is the exception to everything above.
@@ -155,10 +183,35 @@ export interface PipelineRoutes {
   workflows(): string;
   workflow(id: string): string;
   runWorkflow(id: string): string;
+  /**
+   * Every per-type load expectation an operator has stored.
+   *
+   * Keyed by object type and nothing else. A connector, a workflow sink and an
+   * application POSTing to the publish API all end at the same publish methods
+   * and all have the same delete problem, so a per-connector route would have
+   * given one dataset two answers to one question.
+   */
+  loadExpectations(): string;
+  /**
+   * One type's expectation. GET resolves it and says where each field came
+   * from; PUT stores one; DELETE drops the stored row and leaves the host's.
+   *
+   * The GET answers a merge rather than the stored row, because the stored row
+   * alone cannot tell a screen whether it is the one in force — a host that
+   * declared the same type in code wins, and a screen that showed the stored
+   * value would offer an edit that is refused.
+   */
+  loadExpectation(typeName: string): string;
 }
 
 export function pipelineRoutes(basePath: string = DEFAULT_PIPELINE_BASE_PATH): PipelineRoutes {
   const base = normalise(basePath);
+  // The two expectation paths are BORROWED rather than written out again — two
+  // copies of a path is how a route ends up moved on one side and 404ing on the
+  // other. The header's load-expectation paragraph is why the copy that wins
+  // lives in `@dudousxd/nestjs-catalog/client` while everything else here is
+  // built in place.
+  const expectations = pipelineExpectationRoutes(base);
   return {
     capabilities: () => `${base}/capabilities`,
     connections: () => `${base}/connections`,
@@ -177,6 +230,8 @@ export function pipelineRoutes(basePath: string = DEFAULT_PIPELINE_BASE_PATH): P
     workflows: () => `${base}/workflows`,
     workflow: (id) => `${base}/workflows/${encodeURIComponent(id)}`,
     runWorkflow: (id) => `${base}/workflows/${encodeURIComponent(id)}/run`,
+    loadExpectations: () => expectations.expectations(),
+    loadExpectation: (typeName) => expectations.expectation(typeName),
   };
 }
 

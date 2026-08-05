@@ -1,11 +1,13 @@
 /**
  * The paths behind the pipeline and access screens.
  *
- * Unlike `catalogRoutes`, these describe endpoints this library does NOT serve — the host mounts
- * them wherever it likes and tells the provider where. That makes the builder the single place a
- * mistake can be made, and the mistake is always silent: a wrong path is a 404 at runtime, with no
- * compile error and nothing on screen but an empty list.
+ * Unlike `catalogRoutes`, these describe endpoints mounted wherever the host decided — by a
+ * separate package for the pipeline ones, by `accessPath` for the access ones, as `routes.ts`
+ * argues at length. Either way this package is guessing until it is told, which makes the builder
+ * the single place a mistake can be made, and the mistake is always silent: a wrong path is a 404
+ * at runtime, with no compile error and nothing on screen but an empty list.
  */
+import { pipelineExpectationRoutes } from '@dudousxd/nestjs-catalog/client';
 import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_ACCESS_BASE_PATH,
@@ -63,6 +65,8 @@ describe('pipelineRoutes', () => {
       workflows: routes.workflows(),
       workflow: routes.workflow('w1'),
       runWorkflow: routes.runWorkflow('w1'),
+      loadExpectations: routes.loadExpectations(),
+      loadExpectation: routes.loadExpectation('Mvr'),
     }).toEqual({
       capabilities: '/api/pipeline/capabilities',
       connections: '/api/pipeline/connections',
@@ -80,7 +84,25 @@ describe('pipelineRoutes', () => {
       workflows: '/api/pipeline/workflows',
       workflow: '/api/pipeline/workflows/w1',
       runWorkflow: '/api/pipeline/workflows/w1/run',
+      loadExpectations: '/api/pipeline/expectations',
+      loadExpectation: '/api/pipeline/expectations/Mvr',
     });
+  });
+
+  it('hands back exactly what the catalog client builds for the expectation paths', () => {
+    // These two are the only paths here NOT written out in `routes.ts` — it borrows
+    // `pipelineExpectationRoutes` from `@dudousxd/nestjs-catalog/client`, which is also what the
+    // pipeline controller's own spec checks its `@Get`/`@Put`/`@Delete` decorators against. The
+    // literals above say what the strings are; this says they are the SAME strings, so a route
+    // moved in the catalog package moves here rather than leaving the console asking for a path
+    // that stopped existing.
+    const base = '/api/pipeline';
+    const client = pipelineExpectationRoutes(base);
+    const routes = pipelineRoutes(base);
+
+    expect(routes.loadExpectations()).toBe(client.expectations());
+    expect(routes.loadExpectation('Mvr')).toBe(client.expectation('Mvr'));
+    expect(routes.loadExpectation('a/b')).toBe(client.expectation('a/b'));
   });
 
   it('strips a trailing slash rather than doubling it', () => {

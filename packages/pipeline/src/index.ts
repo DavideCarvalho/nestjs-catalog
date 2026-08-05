@@ -29,6 +29,13 @@ export {
   type CatalogPipelineModuleOptions,
 } from './pipeline.module';
 export { createPipelineController } from './pipeline.controller';
+export {
+  describeStoredUnpublishableNames,
+  identifierRefusal,
+  isUnpublishableName,
+  refuseUnpublishablePropertyNames,
+  type NamedProperty,
+} from './property-names';
 export { createPublishController } from './publish.controller';
 export { PublishService, type PublishedType } from './publish.service';
 export { WorkflowLauncher, type WorkflowDurability } from './workflow-launcher.service';

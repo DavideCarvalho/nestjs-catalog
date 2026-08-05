@@ -1,6 +1,14 @@
 export { CatalogManager, type CatalogManagerProps } from './CatalogManager';
 export { CoverageLedger } from './CoverageLedger';
 export { EditableField } from './EditableField';
+// Mounted on the Model screen already. Exported because a host that builds its
+// own type panel out of this package's parts should not have to rebuild the one
+// section that can say an incremental load of a type is currently refused.
+export {
+  DELETE_STRATEGIES,
+  LoadExpectationSection,
+  type LoadExpectationSectionProps,
+} from './LoadExpectationSection';
 export { cn } from './cn';
 export { ObjectExplorer, type ObjectExplorerProps } from './ObjectExplorer';
 export { DashboardBoard } from './DashboardBoard';
@@ -213,6 +221,16 @@ export {
   type ConnectionInput,
   type ConnectorInput,
   catalogQueryKeys,
+  // The load-expectation shapes. Mirrored from the pipeline package for the
+  // reason `PipelineCapabilities` is — see their docblocks in context.tsx —
+  // and exported so a host writing its own panel can name what the four
+  // `expectations` routes answer with.
+  type DeleteReconciliation,
+  type LoadExpectation,
+  type LoadExpectationInput,
+  type ResolvedLoadExpectation,
+  type RowCountBound,
+  type StoredLoadExpectation,
   type PersonInput,
   type PersonUpsertResult,
   type PipelineCapabilities,

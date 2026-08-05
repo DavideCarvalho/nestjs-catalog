@@ -7,6 +7,7 @@ import {
   ConnectionRow,
   ConnectorRow,
   ConnectorRunRow,
+  LoadExpectationRow,
   TransformRow,
   WorkflowRow,
   WorkflowStageRow,
@@ -40,6 +41,11 @@ const OWNED = [
   // cascade away code a recorded run still names — so discovery can reach this
   // one from nothing either.
   RevisionRow,
+  // Once more: an expectation is keyed by an object type *name*, and the type it
+  // names may not have been published yet — that is the point of it, a policy
+  // settable before the first load — so there is no relation for discovery to
+  // walk and this list is the only thing that creates the table.
+  LoadExpectationRow,
 ];
 
 /**

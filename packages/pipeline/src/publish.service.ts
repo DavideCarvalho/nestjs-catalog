@@ -1,7 +1,9 @@
 import {
+  CATALOG_PIPELINE_STORE,
   CATALOG_STORE,
   type CarryForwardResult,
   type CatalogObjectTypeDef,
+  type CatalogPipelineStore,
   type CatalogPrincipal,
   type CatalogPropertyDef,
   type CatalogWriteStore,
@@ -28,13 +30,18 @@ import {
 import {
   CATALOG_LOAD_EXPECTATIONS,
   type CatalogLoadExpectations,
+  type LoadExpectation,
   LoadExpectationError,
-  expectationFor,
   refuseRowCountDrift,
   refuseStaleReconciliation,
   refuseUndeclaredDeletes,
-  rowCountBoundFor,
+  resolveLoadExpectation,
+  rowCountBoundOf,
 } from './load-expectations';
+import {
+  describeStoredUnpublishableNames,
+  refuseUnpublishablePropertyNames,
+} from './property-names';
 import {
   CATALOG_PIPELINE_EM,
   CATALOG_PIPELINE_REGISTRY,
@@ -96,7 +103,7 @@ export interface PublishedType {
 @Injectable()
 export class PublishService {
   private readonly logger = new Logger(PublishService.name);
-  /** Types already warned about a store that cannot answer. See `warnOnce`. */
+  /** Keys already warned about, not necessarily type names. See `warnOnce`. */
   private readonly warned = new Set<string>();
 
   constructor(
@@ -118,6 +125,19 @@ export class PublishService {
     @Optional()
     @Inject(CATALOG_LOAD_EXPECTATIONS)
     private readonly expectations?: CatalogLoadExpectations,
+    // The middle layer of the policy, and the only reason this service knows the
+    // pipeline store exists. An operator sets a per-type expectation through
+    // `PUT pipeline/expectations/:type`; it is stored here, and this is where it
+    // has to be read back, because both enforcement sites are in this class and
+    // a policy read anywhere else would be a second answer.
+    //
+    // `@Optional()`, and not defensively: a worker-only host binds the write
+    // store and no pipeline store at all, and the specs in this package
+    // construct this service by hand. Absent means no stored layer, which is
+    // exactly the behaviour of every deployment before this existed.
+    @Optional()
+    @Inject(CATALOG_PIPELINE_STORE)
+    private readonly pipeline?: CatalogPipelineStore,
   ) {}
 
   /**
@@ -127,6 +147,12 @@ export class PublishService {
    * redeploys constantly and would otherwise reset every label a human wrote
    * on the next boot — the whole point of curating in the console is that it
    * survives the next deploy of the app that published the type.
+   *
+   * **A property whose `name` cannot be a SQL identifier is refused here**,
+   * before anything is written, because the alternative is where that refusal
+   * used to land: at the first commit, with the source read in full and every
+   * row of it already stored. See `property-names.ts` — including why a name
+   * this type already holds is warned about rather than refused.
    */
   async upsertType(
     principal: CatalogPrincipal,
@@ -150,6 +176,18 @@ export class PublishService {
       );
     }
 
+    // The properties this type already holds, read before anything is created
+    // so that the name check below can tell a property being ADDED from one that
+    // is merely being re-sent. Also the map the merge loop uses further down —
+    // one reading of "what is already here", because two would be two answers.
+    const known = new Map(
+      (existing?.properties.getItems() ?? []).map((p): [string, PropertyRow] => [p.name, p]),
+    );
+
+    // Before the row is created, before the flush and before `ensureType`, which
+    // is the whole point.
+    this.assertPropertyNamesArePublishable(published, known);
+
     const row =
       existing ??
       em.create(ObjectTypeRow, {
@@ -169,8 +207,6 @@ export class PublishService {
     row.description ??= published.description;
     row.icon ??= published.icon;
     row.titleProperty ??= published.titleProperty;
-
-    const known = new Map((existing ? row.properties.getItems() : []).map((p) => [p.name, p]));
 
     published.properties.forEach((property, index) => {
       const target =
@@ -240,6 +276,36 @@ export class PublishService {
       `${principal.id} published ${def.name} (${def.properties.length} properties, ${def.relations.length} relations)`,
     );
     return def;
+  }
+
+  /**
+   * Refuse a publish that would add a property whose name cannot be SQL, and
+   * say out loud the ones it deliberately lets through.
+   *
+   * Called from `upsertType` with the type's stored properties in hand and
+   * before anything is written — that ordering is the entire point and is what
+   * `publish.property-names.spec.ts` asserts on, because the refusal itself was
+   * always going to happen, just far too late. `property-names.ts` holds both
+   * decisions and the reasoning for each; nothing is decided here.
+   *
+   * The warning is keyed under a prefix of its own so that it cannot silence —
+   * or be silenced by — the store-capability warnings in
+   * `assertRowCountIsPlausible`, which key on the bare type name and whose
+   * docblock reasons about the two of them alone.
+   */
+  private assertPropertyNamesArePublishable(
+    published: PublishedType,
+    known: ReadonlyMap<string, PropertyRow>,
+  ): void {
+    const refusal = refuseUnpublishablePropertyNames(
+      published.name,
+      published.properties,
+      new Set(known.keys()),
+    );
+    if (refusal) throw new BadRequestException(refusal);
+
+    const stored = describeStoredUnpublishableNames(published.name, known.keys());
+    if (stored) this.warnOnce(`unpublishable-names:${published.name}`, stored);
   }
 
   async appendRows(
@@ -349,7 +415,7 @@ export class PublishService {
       );
     }
 
-    const expectation = expectationFor(this.expectations, typeName);
+    const expectation = await this.expectationFor(typeName);
     const undeclared = refuseUndeclaredDeletes(typeName, expectation);
     if (undeclared) throw new LoadExpectationError(typeName, 'deletes', undeclared);
 
@@ -464,9 +530,25 @@ export class PublishService {
       previous,
       pending: pending.rowCount,
       pendingLabels: pending.labels,
-      bound: rowCountBoundFor(this.expectations, def.name),
+      bound: rowCountBoundOf(await this.expectationFor(def.name)),
     });
     if (refusal) throw new LoadExpectationError(def.name, 'row-count', refusal);
+  }
+
+  /**
+   * The policy in force for a type, across all three layers.
+   *
+   * Both enforcement sites in this class go through it, which is the property
+   * that matters: the deletes gate and the row-count bound reading the policy
+   * from two different places is how a type ends up declared for one check and
+   * undeclared for the other.
+   *
+   * Async only because the stored layer is a row somewhere. The rules it feeds
+   * stay pure and synchronous — see `load-expectations.ts` — so what is awaited
+   * here is the sourcing and nothing else.
+   */
+  private async expectationFor(typeName: string): Promise<LoadExpectation> {
+    return (await resolveLoadExpectation(this.expectations, this.pipeline, typeName)).resolved;
   }
 
   /** Snapshots of a type, or none when the store does not keep a list. */
@@ -475,11 +557,18 @@ export class PublishService {
   }
 
   /**
-   * One line per type per process, not one per load.
+   * One line per key per process, not one per load.
    *
    * A capability gap does not change between two loads of the same type, and a
    * warning repeated on every run of an hourly connector is a warning that gets
-   * filtered out — which would lose the one reader it was written for.
+   * filtered out — which would lose the one reader it was written for. The same
+   * holds for a property name stored years ago, which is why `upsertType` is
+   * here too.
+   *
+   * The key is a type name in the two capability warnings and a prefixed one in
+   * `upsertType`, deliberately: two unrelated things said about one type must
+   * not be able to swallow each other, and a bare name for both would mean
+   * whichever spoke first won.
    */
   private warnOnce(key: string, message: string): void {
     if (this.warned.has(key)) return;

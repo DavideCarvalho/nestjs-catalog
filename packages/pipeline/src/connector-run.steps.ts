@@ -16,8 +16,8 @@ import { ConnectorRunnerService } from './connector-runner.service';
 import {
   CATALOG_LOAD_EXPECTATIONS,
   type CatalogLoadExpectations,
-  expectationFor,
   refuseUndeclaredDeletes,
+  resolveLoadExpectation,
 } from './load-expectations';
 import { CATALOG_PIPELINE_SCOPE, type CatalogPipelineScope } from './seams';
 
@@ -181,10 +181,17 @@ export class ConnectorRunSteps {
     if (!this.pipeline) return undefined;
     const connector = await this.pipeline.getConnector(connectorId);
     if (!connector || connector.mode !== 'incremental') return undefined;
-    return refuseUndeclaredDeletes(
+    // Through the resolver, not the host object alone. An operator who declared
+    // a strategy through the API and then watched the nightly run refuse anyway
+    // would have every reason to think the feature does not work — and would be
+    // right about this path, which answers before the merge ever gets asked.
+    // Same store the row was written to, one method call further on.
+    const expectation = await resolveLoadExpectation(
+      this.expectations,
+      this.pipeline,
       connector.targetType,
-      expectationFor(this.expectations, connector.targetType),
     );
+    return refuseUndeclaredDeletes(connector.targetType, expectation.resolved);
   }
 }
 

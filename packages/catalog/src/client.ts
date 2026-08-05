@@ -10,6 +10,16 @@
  * types are.
  */
 
+// Type-only, and re-exported again further down: `export … from` creates no
+// local binding, and the load-expectation declarations at the foot of this file
+// need to refer to these shapes by name.
+import type {
+  DeleteReconciliation,
+  LoadExpectation,
+  RowCountBound,
+  StoredLoadExpectation,
+} from './catalog.pipeline';
+
 // The query types live beside the store interface they belong to, not in
 // catalog.types — but a browser consumer should not have to know that.
 export type {
@@ -233,3 +243,152 @@ export type {
   CatalogTraceSpan,
   TraceQuery,
 } from './catalog.workspace';
+
+/*
+ * What a load has to be true of before it becomes the data everybody reads —
+ * the browser's half of it.
+ *
+ * The shapes themselves live in `catalog.pipeline.ts` beside `CatalogConnector`,
+ * and are re-exported here for the same reason the connector shapes above are:
+ * a screen that had to restate them would be the second copy of a contract two
+ * packages serve. What is DECLARED here rather than re-exported is the pair the
+ * pipeline's HTTP surface invented and nothing else has a claim on — the
+ * provenance answer and the request body — plus the strategy list, which a
+ * `<select>` has to be built from rather than from a copy that drifts.
+ *
+ * The enforcement functions are deliberately not here and are not coming: they
+ * are in `@dudousxd/nestjs-catalog-pipeline`, they decide whether a load
+ * commits, and a browser running its own copy of them would be a second answer
+ * to a question with one.
+ */
+export type {
+  CatalogLoadExpectations,
+  DeleteReconciliation,
+  LoadExpectation,
+  RowCountBound,
+  StoredLoadExpectation,
+} from './catalog.pipeline';
+
+/**
+ * The three answers to "how do deletions at the source reach this type", as a
+ * value.
+ *
+ * A list rather than only the union, because the editor on the Model screen has
+ * to offer them and a hand-written array in a component is the copy that drifts
+ * — the same argument {@link CONNECTOR_KINDS} makes one screen over. The server
+ * validates against this too: a `strategy` off the wire is `string` until
+ * something checks it, and the check and the dropdown reading one list is what
+ * stops the two from disagreeing about what is acceptable.
+ *
+ * **There are three and there is deliberately no fourth.** Tombstones off a
+ * change feed is the correct answer and needs machinery nothing here has; a
+ * strategy name that nothing implements is a dropdown with a lie in it. See
+ * `DeleteReconciliation` for the whole argument.
+ */
+export const DELETE_RECONCILIATION_STRATEGIES = [
+  'accepted',
+  'soft-deleted-at-source',
+  'periodic-full-reload',
+] as const;
+
+export type DeleteReconciliationStrategy = (typeof DELETE_RECONCILIATION_STRATEGIES)[number];
+
+/** Whether a value off the wire names one of the three. */
+export function isDeleteReconciliationStrategy(
+  value: unknown,
+): value is DeleteReconciliationStrategy {
+  return (
+    typeof value === 'string' &&
+    (DELETE_RECONCILIATION_STRATEGIES as readonly string[]).includes(value)
+  );
+}
+
+/**
+ * What an operator sends to set a type's expectation.
+ *
+ * Both fields optional and both meaning "leave this alone" when absent, which is
+ * why they are not simply `LoadExpectation`: a request that omits `rowCount`
+ * has said nothing about row counts, and reading that as "clear it" would let a
+ * form that only renders the delete strategy silently drop a bound somebody set.
+ * Clearing the whole stored row is `DELETE`, which is a decision with a verb on
+ * it.
+ */
+export interface LoadExpectationInput {
+  deletes?: DeleteReconciliation;
+  rowCount?: Partial<RowCountBound>;
+}
+
+/**
+ * The resolved expectation for one type, and which layer won each field.
+ *
+ * The provenance is the whole reason this is not just a `LoadExpectation`. The
+ * policy is sourced from three layers — `host.byType[type]`, then the stored row
+ * an operator set, then `host.default` — and a screen that showed only the
+ * answer would let somebody edit a field this deployment has pinned in code and
+ * watch the edit vanish on the next read, with nothing anywhere saying why.
+ * {@link hostLocked} is what lets it say "this deployment fixed it" instead.
+ */
+export interface ResolvedLoadExpectation {
+  typeName: string;
+  /** The three layers merged, field by field. What the load is actually judged against. */
+  resolved: LoadExpectation;
+  /**
+   * Which layer supplied the delete strategy.
+   *
+   * `'default'` means the host's house-wide `default` did. `'none'` means
+   * nothing did, anywhere — which is not a gap to be filled in silently: it is
+   * the state that refuses every incremental load of this type, and the one the
+   * screen most needs to name.
+   */
+  deletesFrom: 'host' | 'stored' | 'default' | 'none';
+  /**
+   * Which layer supplied the row-count bound — the strongest one that set any
+   * field of it, since the three are merged key by key rather than replaced
+   * whole.
+   *
+   * There is no `'none'`, and that is a statement rather than an omission: a
+   * bound always applies. Where no layer says anything the built-in
+   * `DEFAULT_ROW_COUNT_BOUND` does, and that is what `'default'` covers as well
+   * as the host's own `default`.
+   */
+  rowCountFrom: 'host' | 'stored' | 'default';
+  /** The operator's row, present whether or not it won anything. */
+  stored?: StoredLoadExpectation;
+  /**
+   * Which fields this deployment declared in code, per field.
+   *
+   * True means a stored value for that field would never apply, so the editor
+   * shows it disabled and says so. Only `host.byType[type]` locks: `host.default`
+   * is the weakest layer and an operator's row beats it, so a house-wide default
+   * is not a lock and must not be drawn as one.
+   */
+  hostLocked: { deletes: boolean; rowCount: boolean };
+}
+
+/**
+ * Where the per-type expectations sit, relative to wherever the pipeline
+ * controller was mounted.
+ *
+ * A function of the base path rather than a frozen object like
+ * {@link catalogRoutes}, and the difference is the one `routes.ts` in the React
+ * package draws: the catalog controller's paths cannot move, and these move with
+ * whatever `path` the host passed to `CatalogPipelineModule.forRoot` — the
+ * routes below are `<path>/pipeline/expectations`, and `/pipeline` is only the
+ * default.
+ *
+ * Two builders for four routes: `PUT` and `DELETE` address the same path a `GET`
+ * of one type does, and a builder per verb would be three names for one string.
+ */
+export function pipelineExpectationRoutes(basePath = '/pipeline') {
+  const base = basePath.endsWith('/') ? basePath.slice(0, -1) : basePath;
+  return {
+    /** Every stored row, plus the types the host has locked. `GET`, `catalog:read`. */
+    expectations: () => `${base}/expectations`,
+    /**
+     * One type: `GET` for the resolved expectation and its provenance, `PUT` to
+     * set the stored row, `DELETE` to drop it. The writes need `catalog:curate`
+     * and a signed-in person.
+     */
+    expectation: (typeName: string) => `${base}/expectations/${encodeURIComponent(typeName)}`,
+  } as const;
+}

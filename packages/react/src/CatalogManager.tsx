@@ -19,6 +19,7 @@ import {
 import { useMemo, useState } from 'react';
 import { CoverageLedger } from './CoverageLedger';
 import { EditableField } from './EditableField';
+import { LoadExpectationSection } from './LoadExpectationSection';
 import { cn } from './cn';
 import { catalogQueryKeys, useCatalogClient } from './context';
 import { type Freshness, freshnessOf, isWorthFlagging } from './freshness';
@@ -454,6 +455,15 @@ function TypeDetail({
           <PropertyTable properties={type.properties} onPatchProperty={onPatchProperty} />
         </div>
       </section>
+
+      {/*
+        Between the properties and the links, and on this screen rather than in
+        the pipeline console, because it is a statement the catalog makes ABOUT
+        a type — the same kind of thing as its description and its units — and
+        because the state it exists to reveal (no strategy declared, so
+        incremental loads are refused) is invisible everywhere else.
+      */}
+      <LoadExpectationSection typeName={type.name} displayName={type.displayName} />
 
       <LinkSection
         type={type}

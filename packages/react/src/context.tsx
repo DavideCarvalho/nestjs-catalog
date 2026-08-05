@@ -14,10 +14,16 @@ import type {
   ConnectorRun,
   Dashboard,
   DashboardCard,
+  DeleteReconciliation,
+  LoadExpectation,
+  LoadExpectationInput,
   ObjectQueryParams,
   PropertyPatch,
+  ResolvedLoadExpectation,
+  RowCountBound,
   SaveQueryInput,
   SavedQuery,
+  StoredLoadExpectation,
   TraceQuery,
   TransformLanguage,
   TransformResult,
@@ -121,6 +127,36 @@ export interface PipelineCapabilities {
    */
   durable?: WorkflowDurability;
 }
+
+/**
+ * What a load has to be true of before it becomes the data everybody reads.
+ *
+ * RE-EXPORTED rather than mirrored, and the distinction is the same one
+ * {@link CatalogRevision} above turns on: {@link PipelineCapabilities} is
+ * mirrored because naming it would mean importing
+ * `@dudousxd/nestjs-catalog-pipeline`, a package built for a Node process with
+ * database drivers behind optional imports. These shapes have no such problem —
+ * they are plain declarations on `@dudousxd/nestjs-catalog/client`, the entry
+ * point that exists precisely so a browser can name the catalog's own
+ * contracts, and a second copy here is what would drift.
+ *
+ * Named from this module at all, rather than left for a host to import from the
+ * other package, for the reason the whole of this file is: everything else this
+ * client returns is reachable from here, and typing a variable should not
+ * require knowing which of the two packages declares which shape.
+ *
+ * The enforcement functions are deliberately NOT reachable from a browser.
+ * They decide whether a load commits, they live in the pipeline package, and a
+ * console running its own copy would be a second answer to a question with one.
+ */
+export type {
+  DeleteReconciliation,
+  LoadExpectation,
+  LoadExpectationInput,
+  ResolvedLoadExpectation,
+  RowCountBound,
+  StoredLoadExpectation,
+};
 
 /**
  * What a caller may set on a connection.
@@ -454,6 +490,32 @@ export interface CatalogClient {
   publishType(name: string, schema: unknown): Promise<unknown>;
   listRuns(connectorId?: string): Promise<ConnectorRun[]>;
 
+  /**
+   * What one type promises about deletes and row counts, resolved.
+   *
+   * Per type and never per connector: the three ways rows arrive — a
+   * connector, a workflow sink, an application POSTing to the publish API —
+   * end at the same two publish methods, so a per-connector answer would cover
+   * one of the three and leave one dataset with two answers to one question.
+   */
+  loadExpectation(typeName: string): Promise<ResolvedLoadExpectation>;
+  /**
+   * Store one, or replace what is stored.
+   *
+   * The answer is typed `unknown` and callers are expected to refetch. That is
+   * not laziness: what a screen has to show is the RESOLVED expectation, which
+   * is a merge of this write with whatever the host declared in code, and the
+   * merge is the server's to perform. A screen that wrote this response into
+   * its cache would be claiming the stored row is the one in force, which is
+   * exactly what {@link ResolvedLoadExpectation.hostLocked} exists to deny.
+   *
+   * Refuses by name when the transport cannot `PUT`, rather than resolving
+   * having done nothing — see {@link CatalogTransport.put}.
+   */
+  setLoadExpectation(typeName: string, input: LoadExpectationInput): Promise<unknown>;
+  /** Drop the stored row. Anything the host declared in code survives it. */
+  clearLoadExpectation(typeName: string): Promise<unknown>;
+
   listTransforms(): Promise<CatalogTransform[]>;
   saveTransform(input: TransformInput): Promise<CatalogTransform>;
   deleteTransform(id: string): Promise<{ deleted: boolean }>;
@@ -638,6 +700,21 @@ export function CatalogProvider({
       listRuns: (connectorId) =>
         transport.get(pipeline.runs(), connectorId ? { connector: connectorId } : undefined),
 
+      loadExpectation: (typeName) =>
+        transport.get<ResolvedLoadExpectation>(pipeline.loadExpectation(typeName)),
+      setLoadExpectation: (typeName, input) => {
+        if (!transport.put) {
+          throw new Error(
+            'This transport cannot PUT, so it cannot store a load expectation. Implement `put` ' +
+              'on the transport you passed to CatalogProvider — storing one is an idempotent ' +
+              'upsert of the whole per-type row, which is why the route is a PUT and not a POST.',
+          );
+        }
+        return transport.put<unknown>(pipeline.loadExpectation(typeName), input);
+      },
+      clearLoadExpectation: (typeName) =>
+        transport.delete<unknown>(pipeline.loadExpectation(typeName)),
+
       listTransforms: () => transport.get(pipeline.transforms()),
       saveTransform: (input) => transport.post<CatalogTransform>(pipeline.transforms(), input),
       deleteTransform: (id) => transport.delete<{ deleted: boolean }>(pipeline.transform(id)),
@@ -713,6 +790,17 @@ export const catalogQueryKeys = {
     ['nestjs-catalog', 'pipeline', 'transforms', id, 'revisions'] as const,
   runs: (connectorId?: string) =>
     ['nestjs-catalog', 'pipeline', 'runs', connectorId ?? 'all'] as const,
+  /**
+   * One type's resolved load expectation.
+   *
+   * Under the `pipeline` prefix rather than beside `snapshot`, even though the
+   * screen that reads it is the Model screen: the endpoint is served by the
+   * host's pipeline controller, not by the catalog library, so a host
+   * invalidating "everything the pipeline knows" has to reach this too. Keyed
+   * per type because that is the grain of the answer.
+   */
+  loadExpectation: (typeName: string) =>
+    ['nestjs-catalog', 'pipeline', 'expectations', typeName] as const,
   workflows: ['nestjs-catalog', 'pipeline', 'workflows'] as const,
 
   /**
