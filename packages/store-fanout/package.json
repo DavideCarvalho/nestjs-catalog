@@ -1,6 +1,6 @@
 {
   "name": "@dudousxd/nestjs-catalog-store-fanout",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Fan-out store for @dudousxd/nestjs-catalog: one primary that decides, N followers kept in step, with a durable failure journal, snapshot replay and a comparison tool for migrating between engines without a big-bang cutover.",
   "license": "MIT",
   "author": "Davide Carvalho",
