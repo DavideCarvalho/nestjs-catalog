@@ -50,9 +50,20 @@ function asChartKind(value: string): (typeof CHART_KINDS)[number] {
 
 export function SavedQueryPanel({
   currentSql,
+  openId,
   onLoad,
 }: {
   currentSql: string;
+  /**
+   * Which of these is in the editor right now, if any.
+   *
+   * The visible answer to "what is this address naming". A console that opens a
+   * saved query from a link and then shows a list where every row looks
+   * identical has told you the SQL came from somewhere without telling you
+   * where, and the next thing that happens is somebody saving a second copy of
+   * a query they already had open.
+   */
+  openId?: string | null;
   onLoad: (query: SavedQuery) => void;
 }) {
   const client = useCatalogClient();
@@ -262,7 +273,13 @@ export function SavedQueryPanel({
                   <button
                     type="button"
                     onClick={() => onLoad(query)}
-                    className="min-w-0 flex-1 truncate rounded-md px-2 py-1 text-left text-[11px] hover:bg-zinc-50 dark:hover:bg-zinc-800"
+                    aria-current={query.id === openId ? 'true' : undefined}
+                    className={cn(
+                      'min-w-0 flex-1 truncate rounded-md px-2 py-1 text-left text-[11px]',
+                      query.id === openId
+                        ? 'bg-sky-100 dark:bg-sky-950'
+                        : 'hover:bg-zinc-50 dark:hover:bg-zinc-800',
+                    )}
                   >
                     {query.name}
                     {query.cacheTtlSeconds > 0 && (

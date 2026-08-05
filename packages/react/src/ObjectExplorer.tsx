@@ -49,7 +49,7 @@ export interface ObjectExplorerProps {
 }
 
 /**
- * The type asked for in the URL, wherever the host keeps it.
+ * A parameter asked for in the URL, wherever the host keeps it.
  *
  * Both the real query string and the hash's own query, because a console like
  * this is very often hash-routed and `#objects?type=Mvr` leaves
@@ -59,15 +59,25 @@ export interface ObjectExplorerProps {
  *
  * A convenience, not the contract: hosts that route properly should pass the
  * `type` prop and never depend on this.
+ *
+ * **Why the other deep-linkable screens import it from here.** This was
+ * `typeFromLocation`, private to this file, and it is the only argued precedent
+ * in the package for how a screen finds a parameter: prop first, this second,
+ * and the prop is what a real host is expected to pass. `QueryConsole` and
+ * `DashboardBoard` learned the same trick for `?savedQuery=` and `?dashboard=`,
+ * and a second copy of these eight lines would have been a second place for the
+ * hash-versus-search rule above to be got wrong. Its home is a screen only
+ * because a shared module for it does not exist yet; nothing here knows what an
+ * object type is, and it should move the day a third concern needs it.
  */
-function typeFromLocation(): string | null {
+export function paramFromLocation(name: string): string | null {
   if (typeof window === 'undefined') return null;
-  const fromSearch = new URLSearchParams(window.location.search).get('type');
+  const fromSearch = new URLSearchParams(window.location.search).get(name);
   if (fromSearch) return fromSearch;
   const hash = window.location.hash;
   const mark = hash.indexOf('?');
   if (mark === -1) return null;
-  return new URLSearchParams(hash.slice(mark + 1)).get('type');
+  return new URLSearchParams(hash.slice(mark + 1)).get(name);
 }
 
 export function ObjectExplorer({
@@ -104,7 +114,7 @@ export function ObjectExplorer({
 
   useEffect(() => {
     if (typeName || !snapshot?.types.length) return;
-    const requested = typeProp ?? typeFromLocation();
+    const requested = typeProp ?? paramFromLocation('type');
     const match = snapshot.types.find((t) => t.name === requested);
     setTypeName(match?.name ?? snapshot.types[0].name);
   }, [snapshot, typeName, typeProp]);

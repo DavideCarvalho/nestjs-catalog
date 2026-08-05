@@ -1,8 +1,13 @@
-import type { CatalogQueryRelation, CatalogQueryResult } from '@dudousxd/nestjs-catalog/client';
+import type {
+  CatalogQueryRelation,
+  CatalogQueryResult,
+  SavedQuery,
+} from '@dudousxd/nestjs-catalog/client';
 import { useMutation, useQuery } from '@tanstack/react-query';
-import { AlertTriangle, History, Layers, Play, Sparkles, TableIcon } from 'lucide-react';
-import { type KeyboardEvent, useMemo, useRef, useState } from 'react';
-import { SavedQueryPanel } from './SavedQueryPanel';
+import { AlertTriangle, History, Layers, Link2Off, Play, Sparkles, TableIcon } from 'lucide-react';
+import { type KeyboardEvent, useEffect, useMemo, useRef, useState } from 'react';
+import { paramFromLocation } from './ObjectExplorer';
+import { SavedQueryPanel, savedQueryKeys } from './SavedQueryPanel';
 import { cn } from './cn';
 import { useCatalogClient } from './context';
 import { CodeEditor } from './ui/code-editor';
@@ -35,6 +40,43 @@ export interface QueryConsoleProps {
    */
   onGenerate?: (prompt: string, schema: CatalogQueryRelation[]) => Promise<string>;
   maxRows?: number;
+  /**
+   * Which saved query to open in the editor. Omit to fall back to
+   * `?savedQuery=` then to the starter SQL.
+   *
+   * The same shape, and the same reasoning, as `ObjectExplorer`'s `type`: the
+   * host is the one that knows where its own router keeps parameters, so it
+   * passes what it parsed, and {@link paramFromLocation} is the convenience for
+   * a host that does not. A search result naming a saved query has been landing
+   * on this screen and stopping since the box shipped, because there was no
+   * prop for the id to arrive through.
+   *
+   * `| undefined` is spelled out rather than left to `?`, because a host
+   * compiling under `exactOptionalPropertyTypes` — which the console in this
+   * repo does — cannot pass `params.get('savedQuery') ?? undefined` to a bare
+   * `?: string` without a spread that exists only to satisfy the compiler. "No
+   * saved query named" is a value this prop genuinely takes.
+   */
+  savedQueryId?: string | undefined;
+  /**
+   * Called with whatever is now open, so the host can put it in the address.
+   *
+   * **Why the write is a callback and the read is not.** Reading a URL is an
+   * observation and cannot surprise anybody, which is why the fallback reader
+   * above is unconditional. Writing one is an act with effects outside this
+   * component's box: whether a selection becomes a history entry you can press
+   * Back through or replaces the current one, and whether the address may be
+   * touched at all, are decisions belonging to the application that owns the
+   * address bar — a console mounted at `/analytics/boards` inside somebody's
+   * app should not find a library appending parameters to its URL. So this
+   * screen reports, and a host that wants copyable links wires it up. Omit it
+   * and nothing writes, which is exactly what every existing host gets.
+   *
+   * `undefined` means nothing is open — the starter SQL, or a query that was
+   * just deleted — and the host should drop the parameter rather than leave it
+   * naming something gone.
+   */
+  onSavedQueryChange?: (id: string | undefined) => void;
 }
 
 /**
@@ -98,18 +140,103 @@ function AskAssistantPanel({
   );
 }
 
-export function QueryConsole({ onGenerate, maxRows = 500 }: QueryConsoleProps) {
+export function QueryConsole({
+  onGenerate,
+  maxRows = 500,
+  savedQueryId,
+  onSavedQueryChange,
+}: QueryConsoleProps) {
   const client = useCatalogClient();
   const [sql, setSql] = useState(STARTER);
   const [prompt, setPrompt] = useState('');
   const [askOpen, setAskOpen] = useState(false);
   const editorRef = useRef<HTMLTextAreaElement>(null);
 
+  /**
+   * The id somebody asked for, and the id actually in the editor.
+   *
+   * Two pieces of state rather than one, because the gap between them is the
+   * whole point: an id that was asked for and never opened is a link naming a
+   * query that is not here, and it has to be sayable. Collapsing them would
+   * leave "asked for something gone" indistinguishable from "asked for
+   * nothing", which is the state that renders as the starter SQL and looks
+   * exactly like a click that never landed.
+   */
+  const [requestedId, setRequestedId] = useState<string | null>(null);
+  const [openedId, setOpenedId] = useState<string | null>(null);
+
+  // The prop wins whenever it changes, not only on the first render — a host
+  // navigating from one saved query to another sets it, and guarding on "no
+  // query open yet" would show the previous one under an address naming the
+  // new one. `ObjectExplorer` learned this the same way.
+  //
+  // The one and only place either source is read. Seeding the state with
+  // `savedQueryId ?? null` as well would read the prop twice, which is not just
+  // redundant: it makes the first render right even when this effect is wrong,
+  // so a build that stopped following the prop would still open the right query
+  // on arrival and only misbehave on the second navigation — the harder half of
+  // the bug, hidden behind the easier one.
+  useEffect(() => {
+    const requested = savedQueryId ?? paramFromLocation('savedQuery');
+    if (requested) setRequestedId(requested);
+  }, [savedQueryId]);
+
   const { data: relations = [] } = useQuery({
     queryKey: ['catalog', 'query', 'relations'],
     queryFn: () => client.queryRelations(),
     staleTime: 60_000,
   });
+
+  /**
+   * The saved list, read here as well as in the panel below.
+   *
+   * Same key, so this is a cache hit rather than a second request, and the
+   * screen that has to resolve an id into SQL is the one that owns the SQL. The
+   * alternative — fetching the single query by id — would be a second endpoint
+   * answering something already on screen, and it could not tell "deleted"
+   * apart from "the server refused" without reading the failure.
+   */
+  const { data: saved, isSuccess: savedLoaded } = useQuery({
+    queryKey: savedQueryKeys.all,
+    queryFn: () => client.listSavedQueries(),
+  });
+
+  function open(query: SavedQuery) {
+    setSql(query.sql);
+    setOpenedId(query.id);
+    // Also the requested id, so the "not here" notice clears itself when you
+    // pick something that is here — without needing the host to have wired the
+    // callback up. A screen whose banner can only be dismissed by a host is a
+    // banner that never goes away on the hosts that need it most.
+    setRequestedId(query.id);
+    onSavedQueryChange?.(query.id);
+  }
+
+  useEffect(() => {
+    if (!requestedId || !saved) return;
+    // Already in the editor. Without this, every background refetch of the
+    // saved list would hand back a new array, re-run this effect and overwrite
+    // whatever has been typed since — the query screen's version of losing
+    // your work to a poll.
+    if (openedId === requestedId) return;
+    const match = saved.find((query) => query.id === requestedId);
+    if (!match) return;
+    setSql(match.sql);
+    setOpenedId(match.id);
+  }, [requestedId, saved, openedId]);
+
+  /**
+   * A link that named a saved query this catalog does not have.
+   *
+   * Only once the list has actually arrived: while it is in flight the id is
+   * merely unresolved, and reporting that as missing would flash "not here" on
+   * every correct link. Nothing is opened in its place and the address is left
+   * exactly as it was — falling back to some other query is what turns a stale
+   * link into a working link showing the wrong thing, and quietly rewriting the
+   * URL would delete the only evidence of which link is broken.
+   */
+  const missingId =
+    requestedId && savedLoaded && !saved.some((q) => q.id === requestedId) ? requestedId : null;
 
   const run = useMutation({
     mutationFn: () => client.runQuery({ sql, maxRows }),
@@ -195,7 +322,7 @@ export function QueryConsole({ onGenerate, maxRows = 500 }: QueryConsoleProps) {
               </div>
             ))}
           </div>
-          <SavedQueryPanel currentSql={sql} onLoad={(query) => setSql(query.sql)} />
+          <SavedQueryPanel currentSql={sql} openId={openedId} onLoad={open} />
         </aside>
 
         <div className="flex min-w-0 flex-1 flex-col">
@@ -235,6 +362,8 @@ export function QueryConsole({ onGenerate, maxRows = 500 }: QueryConsoleProps) {
             )}
           </div>
 
+          {missingId && <MissingSavedQuery id={missingId} />}
+
           {askOpen && onGenerate && (
             <AskAssistantPanel
               prompt={prompt}
@@ -267,6 +396,38 @@ export function QueryConsole({ onGenerate, maxRows = 500 }: QueryConsoleProps) {
         </div>
       </div>
     </TooltipProvider>
+  );
+}
+
+/**
+ * What a link naming a query that is not here gets to say.
+ *
+ * Above the editor rather than inside the results pane, because it is a
+ * statement about how you arrived and not about anything that ran — the results
+ * pane still says "Results appear here", which is true.
+ *
+ * The id is quoted verbatim. It is the only part of a broken link worth
+ * anything: whoever sent it can be told which one, and a person looking at two
+ * environments can see at a glance that the id belongs to the other. A message
+ * that said only "that query is gone" would be asking them to go and read the
+ * address bar for it.
+ */
+function MissingSavedQuery({ id }: { id: string }) {
+  return (
+    <div
+      className={cn(
+        'flex shrink-0 items-start gap-2 border-b bg-amber-50/70 px-4 py-2',
+        'text-xs text-amber-800 dark:bg-amber-950/25 dark:text-amber-300',
+        RULE,
+      )}
+    >
+      <Link2Off size={13} className="mt-0.5 shrink-0" />
+      <span className="leading-relaxed">
+        This link named a saved query that is not in this catalog:{' '}
+        <span className="font-mono">{id}</span>. It may have been deleted, or it may belong to a
+        different environment. Nothing was opened in its place — the editor is untouched.
+      </span>
+    </div>
   );
 }
 

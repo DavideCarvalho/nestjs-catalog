@@ -29,7 +29,7 @@ import {
   TerminalSquare,
   Workflow,
 } from 'lucide-react';
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { IDENTITY_QUERY_KEY, KeyGate } from './KeyGate';
 import { TabStrip } from './TabStrip';
 
@@ -217,6 +217,35 @@ export function App() {
    * where it started, which is the only shape in which a shortcut-opened search
    * is worth using mid-task.
    */
+  /**
+   * Put what a screen just opened into the address, without a history entry.
+   *
+   * `history.replaceState` rather than assigning `location.hash`, and the
+   * difference is the whole design. Assigning pushes an entry per selection, so
+   * a session spent clicking through eleven dashboards leaves eleven presses of
+   * Back between you and the screen you were on before — a back button that
+   * replays a browsing session nobody thinks of as navigation. Replacing keeps
+   * the address always naming what is on screen, which is the one thing a
+   * copyable link needs, and costs nothing to leave.
+   *
+   * `params` is set here as well because `replaceState` fires no `hashchange`,
+   * so the listener above will not see this. That is the point rather than a
+   * workaround: it also means this cannot loop, since the screen's effect keys
+   * on the parameter's VALUE and is handed back the one it just reported.
+   *
+   * One parameter per route, replacing the whole set rather than merging into
+   * it: no two routes share a parameter, and carrying `?type=Mvr` from the
+   * objects screen into a dashboard link would put a name in the address that
+   * nothing on that screen reads.
+   */
+  const nameInAddress = useCallback((target: Route, key: string, value: string | undefined) => {
+    const next = new URLSearchParams();
+    if (value) next.set(key, value);
+    const query = next.toString();
+    window.history.replaceState(null, '', query ? `#${target}?${query}` : `#${target}`);
+    setParams(next);
+  }, []);
+
   const cameFrom = useRef<Tab>(isTab(route) ? route : 'model');
   useEffect(() => {
     if (isTab(route)) cameFrom.current = route;
@@ -342,10 +371,22 @@ export function App() {
               />
             </TabsPanel>
             <TabsPanel value="query" className="h-full">
-              <QueryPane />
+              {/* Both halves of the same agreement as `type` above: the host
+                  parses its own hash and hands the id over, and takes back
+                  whatever the screen opened so the address keeps naming it.
+                  The parameter names here MUST match the ones `SearchScreen`
+                  generates below — that is the contract the search links have
+                  been half of since the box shipped. */}
+              <QueryPane
+                savedQueryId={params.get('savedQuery') ?? undefined}
+                onSavedQueryChange={(id) => nameInAddress('query', 'savedQuery', id)}
+              />
             </TabsPanel>
             <TabsPanel value="dashboards" className="h-full">
-              <DashboardBoard />
+              <DashboardBoard
+                dashboardId={params.get('dashboard') ?? undefined}
+                onDashboardChange={(id) => nameInAddress('dashboards', 'dashboard', id)}
+              />
             </TabsPanel>
             <TabsPanel value="connectors" className="h-full overflow-hidden">
               <PipelineConsole />
@@ -431,18 +472,22 @@ function SearchLauncher({ active }: { active: boolean }) {
  * crosses the catalog and then dead-ends on two of its four groups is a worse
  * answer than the nine tabs it replaces.
  *
- * **What the two id hrefs do and do not promise.** `#objects?type=X` is honest
- * end to end: `ObjectExplorer` is handed `params.get('type')` below and opens on
- * that type, and the string is the same one `CatalogManager` generates, which is
- * the whole reason `explorerHref` has the shape it does. `#query?savedQuery=…`
- * and `#dashboards?dashboard=…` land on the right SCREEN and no further —
- * `QueryConsole` takes no saved-query id and `DashboardBoard` takes no props at
- * all, so today both open on their own default and the id rides along unread.
- * That is deliberately not nothing: the row navigates, the parameter is already
- * in the address for the day either screen learns to read it, and the id is the
- * only part of the link that would have to change if they never do. It is also
- * the reason those hrefs are worth reviewing again the moment either screen
- * grows a prop.
+ * **What the three id hrefs promise, and who keeps the promise.** All of them
+ * are now honest end to end, and each is honest only because a parameter name
+ * is written twice: once here and once in the `params.get(...)` handed to the
+ * screen above. `#objects?type=X` is the original — the same string
+ * `CatalogManager` generates, which is the whole reason `explorerHref` has the
+ * shape it does. `#query?savedQuery=…` and `#dashboards?dashboard=…` used to
+ * land on the right SCREEN and no further, because `QueryConsole` took no
+ * saved-query id and `DashboardBoard` took no props at all; both now read the
+ * id they are given and open what it names, or say plainly that it names
+ * nothing here.
+ *
+ * The two spellings agreeing is the entire feature, and nothing in either file
+ * enforces it — rename `savedQuery` on one side and the link goes back to
+ * landing and stopping, silently, exactly as it did before. That is what
+ * `App.deep-links.spec.tsx` holds: it does not read the hrefs, it clicks them
+ * and asserts the named thing is on screen.
  *
  * Encoded rather than interpolated raw. A type name is an identifier and an id
  * is generated, so `encodeURIComponent` is the identity function for every value
@@ -477,7 +522,13 @@ function SearchScreen() {
  * has one. Passing `onGenerate` unconditionally would put a button on screen
  * that fails on click, which teaches people to distrust the whole page.
  */
-function QueryPane() {
+function QueryPane({
+  savedQueryId,
+  onSavedQueryChange,
+}: {
+  savedQueryId: string | undefined;
+  onSavedQueryChange: (id: string | undefined) => void;
+}) {
   const { data } = useQuery({
     queryKey: ['query-ai', 'capabilities'],
     queryFn: () => api.aiCapabilities(),
@@ -486,6 +537,8 @@ function QueryPane() {
 
   return (
     <QueryConsole
+      savedQueryId={savedQueryId}
+      onSavedQueryChange={onSavedQueryChange}
       onGenerate={
         data?.available ? async (prompt) => (await api.generateSql(prompt)).sql : undefined
       }

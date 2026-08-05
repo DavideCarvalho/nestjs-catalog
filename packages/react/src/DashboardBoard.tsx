@@ -22,8 +22,17 @@ import type {
   SavedQuery,
 } from '@dudousxd/nestjs-catalog/client';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Download, GripVertical, LayoutGrid, Plus, RefreshCw, Trash2 } from 'lucide-react';
-import { useState } from 'react';
+import {
+  Download,
+  GripVertical,
+  LayoutGrid,
+  Link2Off,
+  Plus,
+  RefreshCw,
+  Trash2,
+} from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { paramFromLocation } from './ObjectExplorer';
 import { ChartBody } from './charts/body';
 import { CHART_GRID, chartSpan } from './charts/grid';
 import { registeredChartLibraries, visualizationFor } from './charts/registry';
@@ -52,14 +61,75 @@ const dashboardKeys = {
  * alternative, a dashboard-wide refresh policy, would override a decision the
  * query's author already made with more information than the dashboard has.
  */
-export function DashboardBoard() {
+export interface DashboardBoardProps {
+  /**
+   * Which board to open. Omit to fall back to `?dashboard=` then to the first.
+   *
+   * The same shape, and the same reasoning, as `ObjectExplorer`'s `type`: the
+   * host is the one that knows where its own router keeps parameters, so it
+   * passes what it parsed, and {@link paramFromLocation} is the convenience for
+   * a host that does not. This screen took no props at all until now, which is
+   * why `#dashboards?dashboard=…` from the search box landed here and then
+   * showed whichever board the component picked for itself.
+   *
+   * `| undefined` is spelled out rather than left to `?`, because a host
+   * compiling under `exactOptionalPropertyTypes` — which the console in this
+   * repo does — cannot pass `params.get('dashboard') ?? undefined` to a bare
+   * `?: string` without a spread that exists only to satisfy the compiler. "No
+   * board named" is a value this prop genuinely takes.
+   */
+  dashboardId?: string | undefined;
+  /**
+   * Called with whatever board is now open, so the host can put it in the
+   * address. `undefined` when nothing is — the board was just deleted, say.
+   *
+   * **Why the write is a callback and the read is not.** Reading a URL is an
+   * observation. Writing one is an act with effects outside this component's
+   * box: whether a selection becomes a history entry you can press Back through
+   * is the host's decision, and eleven boards clicked through in a session is
+   * eleven presses of Back if it is made carelessly. A console mounted inside
+   * somebody else's page should not find a library it embedded rewriting the
+   * address. So this screen reports and the host writes; omit it and nothing
+   * writes, which is what every existing host gets.
+   *
+   * Fired on SELECTION only, never on the implicit first board. The default
+   * board is not something anybody chose, and naming it in the address would
+   * hand out links that promise a specific board and deliver "whatever is
+   * first" — the failure this whole prop pair exists to remove.
+   */
+  onDashboardChange?: (id: string | undefined) => void;
+}
+
+export function DashboardBoard({ dashboardId, onDashboardChange }: DashboardBoardProps = {}) {
   const client = useCatalogClient();
   const queryClient = useQueryClient();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [name, setName] = useState('');
 
-  const { data: dashboards = [] } = useQuery({
+  // The prop wins whenever it changes, not only on the first render — a host
+  // navigating from one board to another sets it, and guarding on "nothing open
+  // yet" would show the previous board under an address naming the new one.
+  // Deliberately NOT guarded on the id existing: ignoring an id we cannot find
+  // is how a dead link ends up looking like a live one.
+  //
+  // The one and only place either source is read. Seeding the state with
+  // `dashboardId ?? null` as well would read the prop twice, which is not just
+  // redundant: it makes the first render right even when this effect is wrong,
+  // so a build that stopped following the prop would still open the right board
+  // on arrival and only misbehave on the second navigation — the harder half of
+  // the bug, hidden behind the easier one.
+  useEffect(() => {
+    const requested = dashboardId ?? paramFromLocation('dashboard');
+    if (requested) setSelectedId(requested);
+  }, [dashboardId]);
+
+  function select(id: string) {
+    setSelectedId(id);
+    onDashboardChange?.(id);
+  }
+
+  const { data: dashboards = [], isSuccess: dashboardsLoaded } = useQuery({
     queryKey: dashboardKeys.all,
     queryFn: () => client.listDashboards(),
   });
@@ -75,7 +145,9 @@ export function DashboardBoard() {
     onSuccess: (dashboard) => {
       setCreating(false);
       setName('');
-      setSelectedId(dashboard.id);
+      // A board you just made is as chosen as one you clicked, so the address
+      // names it and the link is sendable the moment it exists.
+      select(dashboard.id);
       invalidate();
     },
   });
@@ -106,11 +178,35 @@ export function DashboardBoard() {
     mutationFn: (id: string) => client.deleteDashboard(id),
     onSuccess: () => {
       setSelectedId(null);
+      // The parameter goes with it. Left in place it would name a board that
+      // this very session deleted, and the next reload would greet its author
+      // with a "that board is gone" notice about their own deliberate act.
+      onDashboardChange?.(undefined);
       invalidate();
     },
   });
 
-  const selected = dashboards.find((d) => d.id === selectedId) ?? dashboards[0] ?? null;
+  /**
+   * Which board is open, and — separately — whether a link asked for one that
+   * is not here.
+   *
+   * The old line was `find(...) ?? dashboards[0] ?? null`, which answered two
+   * different questions with one fallback. "Nobody named a board" and "the
+   * board somebody named is gone" both landed on the first board in the list:
+   * correct for the first, and for the second the behaviour that makes a stale
+   * link look like a working link showing the wrong thing. A person who clicked
+   * a search result for a specific board would read somebody else's numbers
+   * under the title of somebody else's board, with nothing on screen to suggest
+   * they were not the ones asked for.
+   *
+   * So the fallback now applies only when nothing was asked for. `missingId` is
+   * the other case, and it waits for `dashboardsLoaded`: until the list has
+   * arrived the id is merely unresolved, and reporting that as gone would flash
+   * the notice on every correct link.
+   */
+  const found = dashboards.find((d) => d.id === selectedId) ?? null;
+  const missingId = selectedId !== null && dashboardsLoaded && !found ? selectedId : null;
+  const selected = selectedId === null ? (dashboards[0] ?? null) : found;
 
   // Pointer with a small activation distance so a click on a card's buttons is
   // not swallowed as the start of a drag; keyboard so the layout is reachable
@@ -245,7 +341,7 @@ export function DashboardBoard() {
               <button
                 key={dashboard.id}
                 type="button"
-                onClick={() => setSelectedId(dashboard.id)}
+                onClick={() => select(dashboard.id)}
                 className={cn(
                   'flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-sm',
                   selected?.id === dashboard.id
@@ -287,14 +383,7 @@ export function DashboardBoard() {
 
         <main className="@container min-w-0 flex-1 overflow-y-auto">
           {!selected ? (
-            <div className="flex h-full items-center justify-center px-6">
-              <div className="max-w-sm text-center">
-                <h2 className="text-lg font-medium">No dashboard open</h2>
-                <p className={cn('mt-1 text-sm', MUTED)}>
-                  Save a query first, then make a dashboard and add it as a card.
-                </p>
-              </div>
-            </div>
+            <NothingOpen missingId={missingId} />
           ) : (
             <div className="mx-auto max-w-6xl px-8 py-6">
               <div className="flex items-start justify-between gap-4">
@@ -386,6 +475,50 @@ export function DashboardBoard() {
         </main>
       </div>
     </TooltipProvider>
+  );
+}
+
+/**
+ * The two reasons this pane can be empty, which must not be told as one.
+ *
+ * "There is no board open" is a state a new deployment starts in, and the right
+ * thing to say is how to make one. "The board you asked for is not here" is a
+ * failure that happened to somebody following a link, and the right thing to
+ * say is which board and that nothing was substituted for it — because the
+ * alternative reading, the one this notice exists to prevent, is that the click
+ * never registered.
+ *
+ * The id is quoted verbatim: it is the only actionable part of a dead link.
+ * Whoever sent it can be told exactly which one, and somebody looking at two
+ * environments can see at a glance that the id belongs to the other one. The
+ * address is deliberately left naming it — rewriting the URL to something valid
+ * would erase the evidence while the reader is still looking at it.
+ */
+function NothingOpen({ missingId }: { missingId: string | null }) {
+  if (missingId) {
+    return (
+      <div className="flex h-full items-center justify-center px-6">
+        <div className="max-w-md text-center">
+          <Link2Off size={20} className={cn('mx-auto', MUTED)} />
+          <h2 className="mt-2 text-lg font-medium">That dashboard is not here</h2>
+          <p className={cn('mt-1 text-sm', MUTED)}>
+            This link named <span className="font-mono text-[12px]">{missingId}</span>, which is not
+            in this catalog — it may have been deleted, or it may belong to a different environment.
+            No other board was opened in its place. Pick one from the left.
+          </p>
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div className="flex h-full items-center justify-center px-6">
+      <div className="max-w-sm text-center">
+        <h2 className="text-lg font-medium">No dashboard open</h2>
+        <p className={cn('mt-1 text-sm', MUTED)}>
+          Save a query first, then make a dashboard and add it as a card.
+        </p>
+      </div>
+    </div>
   );
 }
 
