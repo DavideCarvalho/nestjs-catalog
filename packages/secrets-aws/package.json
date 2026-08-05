@@ -1,0 +1,53 @@
+{
+  "name": "@dudousxd/nestjs-catalog-secrets-aws",
+  "version": "0.0.0",
+  "description": "AWS KMS secret vault for @dudousxd/nestjs-catalog: envelope encryption with a per-secret data key, the secret's kind and field bound as KMS encryption context, and the resolved key ARN recorded on every row.",
+  "license": "MIT",
+  "author": "Davide Carvalho",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/DavideCarvalho/nestjs-catalog.git",
+    "directory": "packages/secrets-aws"
+  },
+  "keywords": [
+    "nestjs",
+    "catalog",
+    "kms",
+    "aws",
+    "secrets",
+    "encryption",
+    "envelope-encryption",
+    "govcloud"
+  ],
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "//sideEffects": "Safe to be false: nothing here runs at import time. Every export is a class, a pure function or a declaration, and the only I/O is a KMS call inside seal/open. Lets a host that imports the vault type without wiring the module drop the rest.",
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsc -p tsconfig.json --watch",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "//peerDependencies": "@aws-sdk/client-kms is a PEER, not a dependency, matching @dudousxd/nestjs-catalog-store-clickhouse's handling of @clickhouse/client. A host with no AWS in it must not acquire an AWS SDK by depending on the catalog; and a host that does run on AWS almost certainly already pins a version of the SDK, which a bundled copy would sit beside rather than share — two credential-provider chains and two HTTP agents in one process.",
+  "peerDependencies": {
+    "@aws-sdk/client-kms": ">=3",
+    "@dudousxd/nestjs-catalog": ">=0.1",
+    "@nestjs/common": ">=10"
+  },
+  "devDependencies": {
+    "@aws-sdk/client-kms": "3.1090.0",
+    "@dudousxd/nestjs-catalog": "workspace:*",
+    "@nestjs/common": "11.1.19",
+    "@types/node": "25.6.0",
+    "typescript": "5.9.3"
+  }
+}

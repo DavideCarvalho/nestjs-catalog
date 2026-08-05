@@ -25,7 +25,9 @@
       "@dudousxd/nestjs-catalog-store-mikro-orm": ["./packages/store-mikro-orm/src/index.ts"],
       "@dudousxd/nestjs-catalog-store-clickhouse": ["./packages/store-clickhouse/src/index.ts"],
       "@dudousxd/nestjs-catalog-store-fanout": ["./packages/store-fanout/src/index.ts"],
+      "@dudousxd/nestjs-catalog-secrets-aws": ["./packages/secrets-aws/src/index.ts"],
       "@dudousxd/nestjs-catalog-telescope": ["./packages/telescope/src/index.ts"],
+      "@dudousxd/nestjs-catalog-secrets-vault": ["./packages/secrets-vault/src/index.ts"],
       "@dudousxd/nestjs-catalog-dashboard": ["./packages/dashboard/src/server/index.ts"],
       "@dudousxd/nestjs-catalog-react": ["./packages/react/src/index.ts"],
       "@dudousxd/nestjs-catalog-react/workflow": ["./packages/react/src/workflow/index.ts"]
