@@ -1,13 +1,16 @@
 import { CATALOG_REVISION_LIMIT } from '@dudousxd/nestjs-catalog/client';
+import { parseDiffFromFile } from '@pierre/diffs';
+import { MultiFileDiff } from '@pierre/diffs/react';
 import { useQuery } from '@tanstack/react-query';
 import { GitCompare, History } from 'lucide-react';
 import { type ReactNode, useMemo, useState } from 'react';
 import { cn } from '../cn';
 import { type CatalogRevision, catalogQueryKeys, useCatalogClient } from '../context';
 import { Button } from '../ui/button';
+import { codeOptions } from '../ui/code-editor';
+import { useCodeThemeType } from '../ui/code-theme';
 import { SelectField } from '../ui/select';
 import { Sheet } from '../ui/sheet';
-import { type DiffLine, type DiffSection, diffLines, foldUnchanged } from './line-diff';
 
 /**
  * Why a load came out different from the last one.
@@ -49,29 +52,6 @@ const MUTED = 'text-zinc-400 dark:text-zinc-500';
 const RULE = 'border-zinc-200 dark:border-zinc-800';
 const PANEL = 'bg-white dark:bg-zinc-900';
 
-/**
- * How many diff rows are painted before the rest go behind a control.
- *
- * The same number `QueryConsole` caps a result set at, and for the same reason:
- * past a few hundred rows a browser is painting a wall nobody reads, and the
- * screen appears frozen — which is its own kind of dishonesty about what is
- * happening. The remaining rows are one click away and the control says how many
- * there are.
- *
- * WHY THIS IS NOT `capLines`, and it is worth being precise. `capLines` in the
- * pipeline package bounds both axes — lines AND characters within a line — of
- * text on its way into a durable checkpoint and a run row, because an unbounded
- * string there makes the size of a write a property of somebody's source data.
- * Neither half of that argument reaches here. The bodies have already been
- * fetched whole, so nothing is saved by rendering fewer, and — this is the part
- * that matters — a character cap would be actively WRONG: two lines that differ
- * only past the cap would be truncated into equality and the diff would report
- * them as unchanged. A diff view must never compare anything but the whole line.
- * So long lines wrap, exactly as they do in the code editor, and the only cap is
- * on rows.
- */
-const DIFF_MAX_ROWS = 500;
-
 /** Which of the two editable things in this catalog is being compared. */
 export type RevisionSubjectKind = 'transform' | 'saved-query';
 
@@ -93,12 +73,31 @@ export interface RevisionSubject {
  * literally true on a deployment that has only just turned revisions on.
  */
 interface Side {
-  version: number;
+  /**
+   * How this side got here, and what it is allowed to claim about itself.
+   *
+   * `recorded` is a revision the catalog kept. `current` is the live row, which
+   * can be a version ahead of everything recorded. `buffer` is what is in the
+   * editor RIGHT NOW and has never been saved — see {@link Side.version}.
+   */
+  origin: 'recorded' | 'current' | 'buffer';
+  /**
+   * Null on the buffer, and that is the honest answer rather than a gap.
+   *
+   * `SavedQuery` carries no version counter, so unsaved SQL has no number that
+   * anything else in the system would agree with. Inventing one to make the
+   * three origins look alike would put a version on text that exists in one
+   * browser tab. A recorded revision and the live row both have one.
+   */
+  version: number | null;
   body: string;
   authoredBy: string | null;
   authoredAt: string | null;
-  /** True for the live row, which is not (yet) in the recorded history. */
-  live: boolean;
+}
+
+/** What a side is picked by. Versions are numbers and the buffer is not. */
+function keyOf(side: Side): string {
+  return side.origin === 'buffer' ? 'buffer' : String(side.version);
 }
 
 export interface RevisionHistoryProps {
@@ -114,6 +113,21 @@ export interface RevisionHistoryProps {
    */
   current?: { version: number; body: string } | undefined;
   /**
+   * What is in the editor right now, unsaved.
+   *
+   * Given one, this screen answers "what have I changed since the last save" —
+   * which nothing could answer before, because the sheet only ever compared
+   * RECORDED revisions against each other. It sits at the top of both pickers
+   * and is the default right-hand side, since the question somebody opens
+   * history with while mid-edit is almost always that one.
+   *
+   * Folded in only when there is at least one recorded revision to compare it
+   * against. On a subject with no history the empty states below are the true
+   * answer, and a diff of an unsaved buffer against nothing would replace them
+   * with a screen claiming every line was added.
+   */
+  buffer?: { body: string } | undefined;
+  /**
    * The version a connector run recorded, pinned on the left.
    *
    * The whole reason the runs list is an entry point. Given one, this opens on
@@ -123,7 +137,7 @@ export interface RevisionHistoryProps {
   ranVersion?: number | undefined;
 }
 
-export function RevisionHistory({ subject, current, ranVersion }: RevisionHistoryProps) {
+export function RevisionHistory({ subject, current, buffer, ranVersion }: RevisionHistoryProps) {
   const client = useCatalogClient();
 
   const revisions = useQuery({
@@ -137,22 +151,32 @@ export function RevisionHistory({ subject, current, ranVersion }: RevisionHistor
         : client.listSavedQueryRevisions(subject.id),
   });
 
-  const sides = useMemo(() => sidesFrom(revisions.data ?? [], current), [revisions.data, current]);
+  const sides = useMemo(
+    () => sidesFrom(revisions.data ?? [], current, buffer),
+    [revisions.data, current, buffer],
+  );
 
   /**
-   * Which two are on screen, as VERSION NUMBERS rather than indices.
+   * Which two are on screen, as SIDE KEYS rather than indices.
    *
    * `null` means "whatever the default is", so a background refetch that adds a
    * newer revision moves the right-hand side onto it — which is what somebody
    * who has not touched the selects expects. Storing an index instead would
    * silently repoint both sides at different versions when the list grew, and an
    * index is not a thing anybody chose.
+   *
+   * A key rather than a version number because the buffer has no version, and a
+   * `number | null` state could not tell "the unsaved buffer" apart from "no
+   * choice made yet".
    */
-  const [leftVersion, setLeftVersion] = useState<number | null>(null);
-  const [rightVersion, setRightVersion] = useState<number | null>(null);
+  const [leftKey, setLeftKey] = useState<string | null>(null);
+  const [rightKey, setRightKey] = useState<string | null>(null);
 
-  const right = pick(sides, rightVersion) ?? sides[0];
-  const left = pick(sides, leftVersion) ?? pick(sides, ranVersion ?? null) ?? sides[1];
+  const right = pick(sides, rightKey) ?? sides[0];
+  const left =
+    pick(sides, leftKey) ??
+    pick(sides, ranVersion === undefined ? null : String(ranVersion)) ??
+    sides[1];
 
   if (revisions.isPending) {
     return <Notice>Reading the history…</Notice>;
@@ -195,21 +219,28 @@ export function RevisionHistory({ subject, current, ranVersion }: RevisionHistor
           label="Compare"
           ariaLabel="Compare version"
           sides={sides}
-          value={left.version}
-          onChange={setLeftVersion}
+          value={keyOf(left)}
+          onChange={setLeftKey}
         />
         <span className={cn('pb-1.5 font-mono text-[11px]', MUTED)}>→</span>
         <SidePicker
           label="Against"
           ariaLabel="Against version"
           sides={sides}
-          value={right.version}
-          onChange={setRightVersion}
+          value={keyOf(right)}
+          onChange={setRightKey}
         />
       </div>
 
       <Authorship left={left} right={right} />
-      <DiffBody before={left.body} after={right.body} />
+      <DiffBody
+        before={left.body}
+        after={right.body}
+        // A saved query is always SQL. A transform is one of three languages and
+        // the sheet is not told which, so it gets none rather than a guess.
+        {...(subject.kind === 'saved-query' ? { language: 'sql' } : {})}
+        name={subject.name}
+      />
     </div>
   );
 }
@@ -242,33 +273,45 @@ function savedQueryRevisionKey(id: string) {
 function sidesFrom(
   revisions: CatalogRevision[],
   current: { version: number; body: string } | undefined,
+  buffer: { body: string } | undefined,
 ): Side[] {
   const sides: Side[] = revisions
     .map((revision) => ({
+      origin: 'recorded' as const,
       version: revision.version,
       body: revision.body,
       authoredBy: revision.authoredBy,
       authoredAt: revision.authoredAt,
-      live: false,
     }))
     .sort((a, b) => b.version - a.version);
 
   if (current && !sides.some((side) => side.version === current.version)) {
     sides.unshift({
+      origin: 'current',
       version: current.version,
       body: current.body,
       authoredBy: null,
       authoredAt: null,
-      live: true,
+    });
+  }
+
+  // Only with something to compare against — see `RevisionHistoryProps.buffer`.
+  if (buffer && sides.length > 0) {
+    sides.unshift({
+      origin: 'buffer',
+      version: null,
+      body: buffer.body,
+      authoredBy: null,
+      authoredAt: null,
     });
   }
 
   return sides;
 }
 
-function pick(sides: Side[], version: number | null): Side | undefined {
-  if (version === null) return undefined;
-  return sides.find((side) => side.version === version);
+function pick(sides: Side[], key: string | null): Side | undefined {
+  if (key === null) return undefined;
+  return sides.find((side) => keyOf(side) === key);
 }
 
 function SidePicker({
@@ -281,25 +324,23 @@ function SidePicker({
   label: string;
   ariaLabel: string;
   sides: Side[];
-  value: number;
-  onChange: (version: number) => void;
+  value: string;
+  onChange: (key: string) => void;
 }) {
   return (
     <SelectField
       label={label}
       ariaLabel={ariaLabel}
-      value={String(value)}
-      // The select speaks strings and versions are numbers, so the parse happens
-      // here rather than anywhere a type assertion could hide it. A value that
-      // did not come from the options below cannot arrive, and if one somehow
-      // did, `Number` would produce NaN, `pick` would find nothing, and the
-      // default comparison would stand — rather than a blank panel.
-      onValueChange={(next) => onChange(Number(next))}
+      value={value}
+      // No parse. The select speaks strings and so does a side key, which is
+      // half the reason the key exists: the version was `Number`-ed back out of
+      // this callback, and the buffer has no number to produce.
+      onValueChange={onChange}
       className="min-w-[10rem]"
       options={sides.map((side) => ({
-        value: String(side.version),
-        label: `v${side.version}`,
-        hint: side.live ? 'current, not yet recorded' : (side.authoredBy ?? undefined),
+        value: keyOf(side),
+        label: labelOf(side),
+        hint: hintOf(side),
       }))}
     />
   );
@@ -309,13 +350,25 @@ function SidePicker({
 function Authorship({ left, right }: { left: Side; right: Side }) {
   return (
     <p className={cn('font-mono text-[10px] leading-relaxed', MUTED)}>
-      v{left.version} {describeAuthor(left)} → v{right.version} {describeAuthor(right)}
+      {labelOf(left)} {describeAuthor(left)} → {labelOf(right)} {describeAuthor(right)}
     </p>
   );
 }
 
+/** What a side is called. The buffer is named by what it is, having no number. */
+function labelOf(side: Side): string {
+  return side.origin === 'buffer' ? 'Unsaved edits' : `v${side.version}`;
+}
+
+function hintOf(side: Side): string | undefined {
+  if (side.origin === 'buffer') return 'in the editor, not saved';
+  if (side.origin === 'current') return 'current, not yet recorded';
+  return side.authoredBy ?? undefined;
+}
+
 function describeAuthor(side: Side): string {
-  if (side.live) return '(current)';
+  if (side.origin === 'buffer') return '(this browser tab)';
+  if (side.origin === 'current') return '(current)';
   const who = side.authoredBy ?? 'unknown';
   // The locale's own format. A console rendering an ISO string at somebody is
   // making them do arithmetic about their own timezone.
@@ -328,150 +381,100 @@ function describeAuthor(side: Side): string {
  *
  * Split out from the fetching above so it can be rendered — and tested — from
  * two plain strings, which is what the thing actually being asserted is.
+ *
+ * WHY THIS IS NO LONGER HAND-ROLLED
+ * ---------------------------------
+ * It used to be `line-diff.ts` — forty lines of LCS, a fold, and a row
+ * renderer — whose docblock argued that the two strings a catalog diffs are a
+ * transform's code and somebody's SQL against military logistics data, and that
+ * there was no version of this screen worth a supply-chain question mark on
+ * that content, so there was no dependency at all. That argument is dead, and it
+ * was not this file that killed it: `@pierre/diffs` is now the EDITOR, so it
+ * already sees every one of those strings on every keystroke. Keeping a second,
+ * weaker differ beside it to avoid a dependency that is already there would buy
+ * nothing and cost a divergence — two components disagreeing about what changed,
+ * which is the one thing a diff must not do. `line-diff.ts` and its spec are
+ * gone; the argument went with them rather than being left standing next to a
+ * package that refutes it.
+ *
+ * What is lost with it: the `coarse` fallback past `DIFF_MAX_CELLS` and the
+ * explicit row cap. Both were bounds on a hand-rolled algorithm. The renderer
+ * here is virtualised — it draws the rows in view and no more — so the wall of
+ * paint the cap existed to prevent is not reachable the same way.
+ *
+ * What is gained: word-level highlighting inside a changed line, which the old
+ * one explicitly could not do and which is most of the value when the answer to
+ * "why did Tuesday's load differ" is one renamed column.
  */
-/**
- * One row of the rendered comparison: a line, or a collapsed run standing in for
- * several. Named rather than inferred so the fold's index — which is what the
- * expand control writes back — cannot be lost in a union the compiler widens.
- */
-type DiffRowItem =
-  | { kind: 'line'; line: DiffLine }
-  | { kind: 'fold'; index: number; count: number };
+export function DiffBody({
+  before,
+  after,
+  /**
+   * What to highlight it as.
+   *
+   * Optional and defaulting to nothing, because this component is reached from
+   * both subjects: a transform's code could be any of three languages and the
+   * sheet does not carry which, while a saved query is always SQL. Left unset,
+   * the name below carries no extension and the diff renders unhighlighted —
+   * which is honest, and better than colouring Python as SQL.
+   */
+  language,
+  name = 'version',
+}: {
+  before: string;
+  after: string;
+  language?: string | undefined;
+  name?: string;
+}) {
+  const themeType = useCodeThemeType();
 
-export function DiffBody({ before, after }: { before: string; after: string }) {
-  const diff = useMemo(() => diffLines(before, after), [before, after]);
-  const sections = useMemo(() => foldUnchanged(diff.lines), [diff.lines]);
-  const [expanded, setExpanded] = useState<Set<number>>(() => new Set());
-  const [showAllRows, setShowAllRows] = useState(false);
-
-  const rows = useMemo(
-    () =>
-      sections.flatMap<DiffRowItem>((section, index) =>
-        section.kind === 'shown' || expanded.has(index)
-          ? section.lines.map((line) => ({ kind: 'line', line }))
-          : [{ kind: 'fold', index, count: section.lines.length }],
-      ),
-    [sections, expanded],
-  );
-
-  const visible = showAllRows ? rows : rows.slice(0, DIFF_MAX_ROWS);
-  const withheld = rows.length - visible.length;
+  /**
+   * The counts in the header, from the same parse the renderer performs.
+   *
+   * Recomputed here rather than read off the rendered DOM, and that is the
+   * cheap half: `parseDiffFromFile` is memoised on the two bodies, and the
+   * hunks carry their own `+`/`-` line counts. `identical` is "no hunks", which
+   * is the only thing that means byte-for-byte equal — see this file's header
+   * for the three other nothings that must not borrow that sentence.
+   */
+  const summary = useMemo(() => {
+    const parsed = parseDiffFromFile(
+      { name, contents: before, ...(language ? { lang: language } : {}) },
+      { name, contents: after, ...(language ? { lang: language } : {}) },
+    );
+    let added = 0;
+    let removed = 0;
+    for (const hunk of parsed.hunks) {
+      added += hunk.additionLines;
+      removed += hunk.deletionLines;
+    }
+    return { added, removed, identical: parsed.hunks.length === 0 };
+  }, [before, after, language, name]);
 
   return (
     <div className={cn('overflow-hidden rounded-lg border', RULE, PANEL)}>
       <div className={cn('flex items-center gap-3 border-b px-3 py-1.5', RULE)}>
         <GitCompare size={11} className={MUTED} />
-        {diff.identical ? (
-          // The ONLY state that gets to say nothing changed, and it earns it:
-          // the two bodies are byte-for-byte the same. See this file's header
-          // for the three other nothings that must not borrow this sentence.
+        {summary.identical ? (
           <span className="font-mono text-[10px] text-zinc-500 dark:text-zinc-400">
             These two versions are identical.
           </span>
         ) : (
           <span className="font-mono text-[10px]">
-            <span className="text-emerald-600">+{diff.added}</span>{' '}
-            <span className="text-red-600">−{diff.removed}</span>
+            <span className="text-emerald-600">+{summary.added}</span>{' '}
+            <span className="text-red-600">−{summary.removed}</span>
           </span>
         )}
       </div>
 
-      {diff.alignment === 'coarse' && (
-        <p className="border-b border-amber-200 bg-amber-50/70 px-3 py-1.5 text-[11px] text-amber-800 dark:border-amber-900 dark:bg-amber-950/25 dark:text-amber-300">
-          These two versions are too far apart to line up line by line, so the whole changed region
-          is shown as removed and re-added. Nothing below is wrong; it is blunter than usual.
-        </p>
-      )}
-
-      <div className="overflow-x-auto">
-        {visible.map((row) =>
-          row.kind === 'fold' ? (
-            <FoldRow
-              key={`fold-${row.index}`}
-              count={row.count}
-              onExpand={() => setExpanded((current) => new Set(current).add(row.index))}
-            />
-          ) : (
-            <DiffRow key={rowKey(row.line)} line={row.line} />
-          ),
-        )}
-      </div>
-
-      {withheld > 0 && (
-        <div className={cn('border-t px-3 py-2', RULE)}>
-          <Button variant="outline" size="sm" onClick={() => setShowAllRows(true)}>
-            Show the remaining {withheld} lines
-          </Button>
-        </div>
-      )}
-    </div>
-  );
-}
-
-/**
- * A stable key for a diff row, out of the numbering it already carries.
- *
- * Not the array index, which is what this looked like first. A row's pair of
- * line numbers is unique across the whole comparison and does not move when a
- * fold above it opens: two removed lines have different `before`, two added
- * lines have different `after`, and an unchanged line has both. An index key
- * would renumber every row below an expanded fold, so React would reconcile
- * hundreds of rows that did not change.
- */
-function rowKey(line: DiffLine): string {
-  return `${line.before ?? '-'}:${line.after ?? '-'}`;
-}
-
-/**
- * One line.
- *
- * The `+`/`−`/space gutter is not decoration and it is not a duplicate of the
- * colour: it is the only marker that survives a colourblind reader, a printout,
- * a high-contrast theme and a screen reader, all of which the background tint
- * does not. Diffs have been read this way for forty years, so it is also the
- * marker nobody has to learn.
- *
- * `whitespace-pre-wrap break-words` matches the code editor exactly, which is
- * what lets a four-hundred-character line be READ rather than truncated. See
- * `DIFF_MAX_ROWS` for why truncating a line here would make the comparison lie.
- */
-function DiffRow({ line }: { line: DiffLine }) {
-  return (
-    <div
-      className={cn(
-        'flex items-start gap-2 px-2 font-mono text-[11px] leading-[1.5]',
-        line.op === 'added' && 'bg-emerald-50 dark:bg-emerald-950/30',
-        line.op === 'removed' && 'bg-red-50 dark:bg-red-950/30',
-      )}
-    >
-      <span className={cn('w-8 shrink-0 select-none text-right', MUTED)}>{line.before ?? ''}</span>
-      <span className={cn('w-8 shrink-0 select-none text-right', MUTED)}>{line.after ?? ''}</span>
-      <span
-        className={cn(
-          'w-3 shrink-0 select-none',
-          line.op === 'added' && 'text-emerald-600',
-          line.op === 'removed' && 'text-red-600',
-        )}
-      >
-        {line.op === 'added' ? '+' : line.op === 'removed' ? '−' : ' '}
-      </span>
-      <span className="min-w-0 whitespace-pre-wrap break-words">{line.text}</span>
-    </div>
-  );
-}
-
-/** A collapsed run of unchanged lines, and the way to see it anyway. */
-function FoldRow({ count, onExpand }: { count: number; onExpand: () => void }) {
-  return (
-    <div className={cn('border-y bg-zinc-50/60 px-2 py-0.5 dark:bg-zinc-800/30', RULE)}>
-      <Button
-        variant="ghost"
-        size="sm"
-        onClick={onExpand}
-        className="font-mono text-[10px] font-normal"
-      >
-        ⋯ {count} unchanged {count === 1 ? 'line' : 'lines'}
-      </Button>
+      <MultiFileDiff
+        oldFile={{ name, contents: before, ...(language ? { lang: language } : {}) }}
+        newFile={{ name, contents: after, ...(language ? { lang: language } : {}) }}
+        // `unified`, not `split`: this sheet is already the width it is, and a
+        // side-by-side diff of code at half of it wraps every line back into the
+        // shape the editor was rewritten to escape.
+        options={{ ...codeOptions(themeType), diffStyle: 'unified' }}
+      />
     </div>
   );
 }
@@ -540,7 +543,7 @@ function OnlyOneVersion({ subject, only }: { subject: RevisionSubject; only: Sid
       <History size={16} className="mx-auto mb-2" aria-hidden />
       <p>
         One version of <span className="font-medium">{subject.name}</span> is recorded
-        {only ? <span className="font-mono"> (v{only.version})</span> : null}, so there is nothing
+        {only ? <span className="font-mono"> ({labelOf(only)})</span> : null}, so there is nothing
         before it to compare against.
       </p>
       <p className="mx-auto mt-2 max-w-md text-[11px] leading-relaxed">
@@ -608,5 +611,3 @@ export function RevisionHistoryButton({
     </Button>
   );
 }
-
-export type { DiffLine, DiffSection };

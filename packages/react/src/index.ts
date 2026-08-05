@@ -108,10 +108,12 @@ export { TransformEditor, type TransformEditorProps } from './TransformEditor';
 // comparison somewhere else: beside its own deploy log, in an approval flow, or
 // on a page this package does not ship.
 //
-// `diffLines` and `foldUnchanged` are pure and come with it deliberately. They
-// are the whole of the algorithm, they take no dependency and reach no network,
-// and a host that wants to render a comparison its own way should not have to
-// choose between this package's markup and writing an LCS.
+// `diffLines` and `foldUnchanged` used to be exported alongside it, on the
+// argument that a host wanting to render its own comparison should not have to
+// choose between this package's markup and writing an LCS. They are gone: the
+// diff is `@pierre/diffs` now, which is a peer dependency a host already has
+// installed, and re-exporting a weaker second differ from here would be handing
+// out an answer that can disagree with the one this screen shows.
 export {
   DiffBody,
   RevisionHistory,
@@ -122,17 +124,6 @@ export {
   type RevisionSubject,
   type RevisionSubjectKind,
 } from './diff/RevisionDiff';
-export {
-  DIFF_CONTEXT_LINES,
-  DIFF_MAX_CELLS,
-  DIFF_MIN_FOLD,
-  type DiffLine,
-  type DiffOp,
-  type DiffSection,
-  diffLines,
-  foldUnchanged,
-  type LineDiff,
-} from './diff/line-diff';
 export { AccessConsole, type AccessConsoleProps } from './AccessConsole';
 
 // The authored graph: sources wired through transforms into sinks.
@@ -267,7 +258,16 @@ export { FieldGroup, TextAreaField, TextField } from './ui/field';
 export { Select, SelectField, type SelectOption } from './ui/select';
 export { Switch } from './ui/switch';
 export { Sheet } from './ui/sheet';
-export { CodeEditor, type CodeEditorProps } from './ui/code-editor';
+// `codeEditorRoot` and `codeEditorText` come with it because the editor renders
+// into a shadow root: without them a host cannot assert on its own screen, and
+// every consumer would rediscover the tag name by reading our source.
+export {
+  CodeEditor,
+  type CodeEditorHandle,
+  type CodeEditorProps,
+  codeEditorRoot,
+  codeEditorText,
+} from './ui/code-editor';
 export {
   RichTextField,
   RichTextView,

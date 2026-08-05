@@ -6,7 +6,7 @@ import type {
 import { isTransformLanguage } from '@dudousxd/nestjs-catalog/client';
 import { useMutation } from '@tanstack/react-query';
 import { ArrowLeft, Play } from 'lucide-react';
-import { type KeyboardEvent, type RefObject, useRef, useState } from 'react';
+import { type KeyboardEvent, useState } from 'react';
 import { cn } from './cn';
 import { useCatalogClient } from './context';
 import { RevisionHistoryButton, RevisionHistorySheet } from './diff/RevisionDiff';
@@ -193,7 +193,6 @@ export function TransformEditor({
   );
   const [sample, setSample] = useState(SAMPLE);
   const [historyOpen, setHistoryOpen] = useState(false);
-  const editorRef = useRef<HTMLTextAreaElement>(null);
 
   const tryIt = useMutation({
     mutationFn: () => {
@@ -223,7 +222,11 @@ export function TransformEditor({
     onSuccess: onSaved,
   });
 
-  function onKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+  // `preventDefault` is what claims the key. The editor's default keymap binds
+  // ⌘↵ to "insert a blank line", and `CodeEditor` only withholds a keystroke
+  // from it when the host has said it wants it — so without this, trying the
+  // transform would also leave a blank line in the code being tried.
+  function onKeyDown(event: KeyboardEvent<HTMLDivElement>) {
     if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
       event.preventDefault();
       tryIt.mutate();
@@ -293,7 +296,6 @@ export function TransformEditor({
             onKeyDown={onKeyDown}
             language={language === 'python' ? 'python' : 'tsx'}
             label="Transform code"
-            textareaRef={editorRef}
             className="h-72"
           />
         </div>
@@ -305,7 +307,7 @@ export function TransformEditor({
                 Sample records
               </span>
             </div>
-            {/* Highlighted like the code above it. This was the one pane
+            {/* The same editor as the code above it. This was the one pane
                 that stayed a bare textarea, so the sample you are debugging
                 against rendered as flat grey while the transform beside it was
                 coloured — and a missing brace in a sample is exactly the thing
