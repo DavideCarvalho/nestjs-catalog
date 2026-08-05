@@ -23,6 +23,16 @@ export default defineConfig({
       '@dudousxd/nestjs-catalog-store-fanout': pkg('store-fanout'),
       '@dudousxd/nestjs-catalog-telescope': pkg('telescope'),
       '@dudousxd/nestjs-catalog-dashboard': pkg('dashboard', 'src/server/index.ts'),
+      // The React package, which the console imports by name rather than by
+      // path. Missing from this list, it resolved to `packages/react/dist/` —
+      // a directory that is gitignored, built by hand, and was a whole feature
+      // behind the source: a spec asserting the console mounts a screen that
+      // shipped this release passed or failed on whether somebody had run `tsc`
+      // in another package, which is the exact staleness the comment above says
+      // this block exists to prevent. Subpath first, for the prefix-matching
+      // reason spelled out above.
+      '@dudousxd/nestjs-catalog-react/workflow': pkg('react', 'src/workflow/index.ts'),
+      '@dudousxd/nestjs-catalog-react': pkg('react'),
     },
   },
   plugins: [

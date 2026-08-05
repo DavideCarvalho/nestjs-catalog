@@ -5,10 +5,16 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 /**
  * The console's tab strip, when there are more tabs than room.
  *
- * Nine tabs plus the brand and two controls need ~1150px, and below that the
- * strip used to push the whole DOCUMENT sideways. Scrolling the strip fixes
+ * Nine tabs plus the brand and the pinned controls need ~1150px, and below that
+ * the strip used to push the whole DOCUMENT sideways. Scrolling the strip fixes
  * that but creates a second problem: tabs that exist and cannot be seen, with
  * nothing saying so. The arrows are the "nothing saying so" part.
+ *
+ * The budget is why search is a 28px icon in the pinned group and not a tenth
+ * tab: everything added to this row is subtracted from the width at which the
+ * strip starts scrolling, and `value` is a `string` rather than the console's
+ * `Tab` union precisely so a route with no tab — `#search` — can be the current
+ * one without this component having to know what it is.
  *
  * Each arrow appears only when there is something in ITS direction. A pair of
  * chevrons that are always present, one of them always dead, teaches people to

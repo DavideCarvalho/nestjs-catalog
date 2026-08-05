@@ -65,7 +65,31 @@ export {
   connectionOptionsFor,
   describeConnection,
 } from './ConnectionPanel';
-export { PipelineConsole, type PipelineConsoleProps } from './PipelineConsole';
+// The schema-discovery seam, whole.
+//
+// `PipelineConsoleProps['schemaDiscovery']` is a bridge the HOST implements —
+// this package cannot ask a connector for its columns, only render the answer —
+// and every one of these was reachable from that prop's type and from nowhere
+// else. So the only way to write the bridge with its signature spelled out was
+// to name it through an indexed access on a component's props, or to deep-import
+// a file inside `dist/`. Both are the caller paying for a list that fell behind.
+//
+// `initialChoices` and `proposalFrom` come with them because they are the rules
+// that decide whether a schema somebody ticked is one the publish route will
+// accept — pure and deliberately outside the panel, per their own docblocks, and
+// worth nothing there if the only way to run them is to render it.
+export {
+  type ColumnChoice,
+  type ConnectorSchemaDiscovery,
+  type DiscoveredColumn,
+  type DiscoveredTypeDraft,
+  initialChoices,
+  PipelineConsole,
+  type PipelineConsoleProps,
+  proposalFrom,
+  type SchemaDiscoveryBridge,
+  type SchemaDrift,
+} from './PipelineConsole';
 export { TransformEditor, type TransformEditorProps } from './TransformEditor';
 export { AccessConsole, type AccessConsoleProps } from './AccessConsole';
 
@@ -93,6 +117,7 @@ export { AccessConsole, type AccessConsoleProps } from './AccessConsole';
 export {
   type CatalogWorkflow,
   describeDurability,
+  type DurabilityCopy,
   isWorkflowNodeKind,
   newLocalId,
   nodeName,
@@ -122,15 +147,24 @@ export {
   edgeId,
   hasBlockingProblem,
   problemsByNode,
+  type ValidateOptions,
   validateWorkflow,
+  type WorkflowDraft,
   type WorkflowProblem,
   type WorkflowProblemCode,
+  type WorkflowProblemLevel,
   wouldCycle,
 } from './workflow/validate';
 
 export {
   type CatalogClient,
   type CatalogIdentity,
+  // What `CatalogClient.listPeople` answers with. The interface was exported and
+  // the shape of its one paged reply was not, so a host writing a user table
+  // could name the client and not the page — and the honest workaround, typing
+  // the state as `CatalogPersonSummary[]`, is the exact mistake that method's
+  // docblock warns about: it drops `total` and under-reports who has access.
+  type CatalogPeoplePage,
   type CatalogPersonRole,
   type CatalogPersonSummary,
   type CatalogPrincipalSummary,
@@ -155,9 +189,16 @@ export {
   accessRoutes,
   DEFAULT_ACCESS_BASE_PATH,
   DEFAULT_PIPELINE_BASE_PATH,
+  // The third default, which had been left out while its two siblings were
+  // exported — so `CatalogProviderProps.publishBasePath` was documented as
+  // defaulting to a constant a host could not name, and the way to override it
+  // relative to the default was to retype the string and hope.
+  DEFAULT_PUBLISH_BASE_PATH,
   // The embed paths, which the catalog controller does serve — exported so a
   // host writing its own embed consumer need not restate them. See routes.ts.
   embedRoutes,
+  // The one argument `AccessRoutes.people` and `CatalogClient.listPeople` take.
+  type PeopleQuery,
   type PipelineRoutes,
   pipelineRoutes,
 } from './routes';
