@@ -1393,13 +1393,12 @@ function ConnectorForm({
       />
 
       <div className="grid gap-3 sm:grid-cols-2">
-        {!viaConnection && (
-          <CredentialField
-            kind={kind}
-            value={draft.secretEnvVar}
-            onChange={(secretEnvVar) => setDraft({ ...draft, secretEnvVar })}
-          />
-        )}
+        {/* `CredentialField` used to sit here. The credential goes in the
+            connection string now — one field for one decision — and where that
+            string may REST is the store's call (`allowInlineCredentials`, and
+            the secret vault behind it), not a question to ask on a form.
+            `secretEnvVar` is still on the model and `CredentialField` is still
+            exported, for a deployment that wants the name-only path. */}
         <SelectField
           label="Transform"
           ariaLabel="Transform"
