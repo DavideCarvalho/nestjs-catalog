@@ -141,6 +141,17 @@ function harness(over: Record<string, unknown> = {}) {
       if (run) Object.assign(run, outcome);
       return Promise.resolve(run);
     },
+    // Newest first, as a real store answers. The runner asks on the way in and
+    // guards the call, so a fake without it would leave that path untested here
+    // while looking exactly like a fake with it.
+    listRuns: (connectorId?: string, limit?: number) =>
+      Promise.resolve(
+        runs
+          .filter((run) => connectorId === undefined || run.connectorId === connectorId)
+          .slice()
+          .reverse()
+          .slice(0, limit ?? 50),
+      ),
   };
 
   const publish = {

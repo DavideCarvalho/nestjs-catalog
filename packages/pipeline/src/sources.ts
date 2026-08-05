@@ -52,11 +52,150 @@ export interface FetchResult {
   state?: Record<string, unknown>;
 }
 
-export type SourceFetcher = (context: FetchContext) => Promise<unknown[] | FetchResult>;
+/**
+ * The same fetch, from a source that can hand rows over as they arrive.
+ *
+ * The third shape rather than a widening of {@link FetchResult}, because the two
+ * differ in more than the container. An array is complete the moment it is
+ * returned, so its `state` is a value. A stream is not complete until it has been
+ * drained, so a watermark computed from it is *not yet known* when the fetcher
+ * returns — which is why `state` here is a function the consumer calls **after**
+ * exhausting `records`, and why calling it earlier would hand back a watermark
+ * that stops short of the rows already written.
+ *
+ * Returning this instead of an array is what makes a read bounded: the fetcher
+ * yields, the runner writes a batch, and the source is not asked for more until
+ * that write has finished. Nothing in the pipeline holds the whole result. A
+ * fetcher that cannot do that returns an array and loses nothing it had — see
+ * {@link SourceFetcher}.
+ */
+export interface StreamedFetchResult {
+  records: AsyncIterable<unknown>;
+  /**
+   * Where the read got to, asked **only after `records` is exhausted**.
+   *
+   * May throw, and {@link fetchSql}'s does: a bounded read whose rows never
+   * carried the watermark column has nothing to advance to, and saying so is
+   * the whole point of the check. By then some batches have been written —
+   * they are left in an uncommitted snapshot, which is what the runner's
+   * failure path does with every other error.
+   */
+  state?: () => Record<string, unknown> | undefined;
+}
 
-/** Normalise the two shapes a fetcher may return. */
+/**
+ * Pulling raw records out of one source.
+ *
+ * Three return shapes, and the first two are the original ones untouched: a bare
+ * array, or {@link FetchResult} when there is state to remember. Every fetcher
+ * here except the SQL one still returns an array, because an HTTP response, a
+ * parsed CSV and a listed S3 prefix are each already whole in memory by the time
+ * there is anything to hand over — streaming them would be a shape with no
+ * saving behind it.
+ *
+ * {@link StreamedFetchResult} is for the sources that genuinely can be read a
+ * row at a time. Adding it as a third shape rather than converting everything is
+ * deliberate: a widening that made every fetcher async-iterable would have
+ * rewritten four working sources to buy nothing, and each rewrite is a chance to
+ * change what one of them returns.
+ */
+export type SourceFetcher = (
+  context: FetchContext,
+) => Promise<unknown[] | FetchResult | StreamedFetchResult>;
+
+/** Normalise the two array shapes a fetcher may return. */
 export function toFetchResult(value: unknown[] | FetchResult): FetchResult {
   return Array.isArray(value) ? { records: value } : value;
+}
+
+/**
+ * Whether a fetcher handed back a stream rather than a finished array.
+ *
+ * On `records`, because that is the only field the two shapes share and it is
+ * the one that actually differs. A predicate rather than a `kind` discriminant
+ * so that a fetcher writes `{ records, state }` in both cases and nothing has to
+ * be kept in step by hand.
+ */
+function isStreamedFetch(value: FetchResult | StreamedFetchResult): value is StreamedFetchResult {
+  return !Array.isArray(value.records);
+}
+
+/**
+ * Every fetch shape seen as the one a consumer can iterate.
+ *
+ * The array shapes are wrapped rather than copied — {@link fromArray} yields out
+ * of the caller's own array — so a source that was already complete pays a
+ * generator and not a second copy of its data.
+ *
+ * `streamed` is reported rather than left to be inferred from the connector
+ * kind, because the connector runner has one thing to say that depends on it: a
+ * connector with a transform buffers its read, and "this read could have been
+ * bounded and was not" belongs on the run rather than being something an
+ * operator deduces from the fact that the connector has a transform attached.
+ * On the array shapes it is false, which is the truth — those sources had
+ * nothing to stream.
+ */
+export interface RecordStream {
+  records: AsyncIterable<unknown>;
+  /** Where the read got to. Call only after `records` is exhausted. */
+  state(): Record<string, unknown> | undefined;
+  /** Whether the source was handing rows over incrementally. */
+  streamed: boolean;
+}
+
+export function toRecordStream(value: unknown[] | FetchResult | StreamedFetchResult): RecordStream {
+  if (Array.isArray(value)) {
+    return { records: fromArray(value), state: () => undefined, streamed: false };
+  }
+  if (isStreamedFetch(value)) {
+    const settle = value.state;
+    return { records: value.records, state: () => settle?.(), streamed: true };
+  }
+  const state = value.state;
+  return { records: fromArray(value.records), state: () => state, streamed: false };
+}
+
+/**
+ * A fetch as a finished array, whatever shape it arrived in.
+ *
+ * For the two consumers that cannot work incrementally and are honest about it:
+ * a workflow source node stages its whole output before the next node reads it,
+ * and a schema discovery infers from a sample. Both held the whole thing before
+ * this existed and still do; what this adds is that they keep working when a
+ * fetcher streams.
+ *
+ * `limit` stops pulling rather than slicing afterwards, which is the difference
+ * between a discovery reading twenty rows out of a million-row table and reading
+ * the table. A truncated stream comes back **without state**, deliberately: the
+ * watermark of a read that stopped early would name a row the caller never saw,
+ * and storing it would skip everything after it forever. The array shapes keep
+ * their state, because slicing an array the fetcher already read whole loses
+ * nothing it knew.
+ */
+export async function toBufferedFetchResult(
+  value: unknown[] | FetchResult | StreamedFetchResult,
+  limit?: number,
+): Promise<FetchResult> {
+  if (Array.isArray(value)) {
+    return { records: limit === undefined ? value : value.slice(0, limit) };
+  }
+  if (!isStreamedFetch(value)) {
+    const records = limit === undefined ? value.records : value.records.slice(0, limit);
+    return value.state === undefined ? { records } : { records, state: value.state };
+  }
+
+  const records: unknown[] = [];
+  for await (const record of value.records) {
+    if (limit !== undefined && records.length >= limit) return { records };
+    records.push(record);
+  }
+  const state = value.state?.();
+  return state === undefined ? { records } : { records, state };
+}
+
+/** An array, seen as the stream shape. Yields out of it rather than copying it. */
+async function* fromArray(values: readonly unknown[]): AsyncGenerator<unknown> {
+  for (const value of values) yield value;
 }
 
 export function resolveSecret(connector: CatalogConnector): string | undefined {
@@ -281,6 +420,32 @@ export const fetchS3: SourceFetcher = async ({ connector, secret, state, mode })
  * past where the last one got to. Without it — or in `full` mode — this reads
  * everything, which is the behaviour a source with no ordering column can
  * honestly offer.
+ *
+ * **MySQL is read as a stream and Postgres is not, and the asymmetry is the
+ * driver's rather than a preference.** This used to `await` the whole result set
+ * on both, which meant the driver materialised every row before anything
+ * downstream ran: the write side has been bounded since it was written
+ * (`appendBatches`, 500 rows at a time) and the read side was the half nobody
+ * had bounded. A 981,469-row table never got past it — the step's lease expired
+ * while the rows were still arriving, with nothing recorded anywhere because
+ * nothing had failed.
+ *
+ * mysql2 can hand rows over one at a time: its `Query` and `Execute` commands
+ * both expose `.stream()`, which pauses the socket when the reader stops
+ * pulling, so back-pressure reaches all the way to the wire. That is what
+ * {@link streamMysql} uses, and it is why a MySQL connector now holds a batch
+ * rather than a table.
+ *
+ * **`pg` cannot, and there is nothing here that can make it.** A plain
+ * `client.query` is a single protocol round trip that buffers the whole result
+ * set inside the driver before it resolves; row-at-a-time reading in Postgres
+ * means an explicit portal, which lives in a separate package (`pg-cursor`, or
+ * `pg-query-stream` on top of it) that this deployment does not require and this
+ * repository has no way to exercise. Shipping an untested optional-driver path
+ * under a docblock claiming it streams would be worse than the honest statement:
+ * **a Postgres connector still materialises its result set**, and a large one
+ * should be narrowed with a `watermarkColumn` or a `LIMIT` in the query until
+ * that dependency is taken on deliberately.
  */
 export const fetchSql: SourceFetcher = async ({ connector, secret, state, mode }) => {
   const { url, sql, dialect } = sqlTarget(connector, secret);
@@ -296,16 +461,39 @@ export const fetchSql: SourceFetcher = async ({ connector, secret, state, mode }
       ? { text: sql, params: [] }
       : boundStatement(sql, column, previous, dialect);
 
-  const rows =
-    dialect === 'postgres'
-      ? await queryPostgres(url, statement.text, statement.params)
-      : await queryMysql(url, statement.text, statement.params);
+  if (dialect === 'postgres') {
+    const rows = await queryPostgres(url, statement.text, statement.params);
+    if (!bounded) return rows;
+    const next = maxWatermark(rows, column, previous);
+    return next === undefined ? { records: rows } : { records: rows, state: { watermark: next } };
+  }
 
-  if (!bounded) return rows;
+  const rows = streamMysql(url, statement.text, statement.params);
+  if (!bounded) return { records: rows };
 
-  const next = maxWatermark(rows, column, previous);
-  return next === undefined ? { records: rows } : { records: rows, state: { watermark: next } };
+  // A running maximum rather than a pass over the finished array, which is the
+  // only form a watermark can take when there is no finished array. Same
+  // comparison, same refusal, same stored value — see {@link trackWatermark}.
+  const watermark = trackWatermark(column, previous);
+  return {
+    records: observing(rows, watermark),
+    state: () => {
+      const next = watermark.settle();
+      return next === undefined ? undefined : { watermark: next };
+    },
+  };
 };
+
+/** Every row, unchanged, with the watermark tracker shown each one on the way past. */
+async function* observing(
+  rows: AsyncIterable<unknown>,
+  watermark: WatermarkTracker,
+): AsyncGenerator<unknown> {
+  for await (const row of rows) {
+    watermark.observe(row);
+    yield row;
+  }
+}
 
 /**
  * Where a SQL connector reads from, and in whose dialect.
@@ -581,11 +769,137 @@ interface PostgresClientLike {
   end(): Promise<void>;
 }
 
-/** The same, for `mysql2/promise`. `query`/`execute` resolve to `[rows, fields]`. */
+/**
+ * The same, for `mysql2/promise`. `query`/`execute` resolve to `[rows, fields]`.
+ *
+ * `connection` is the *core* connection the promise wrapper holds — the one
+ * whose `query`/`execute` return the command object rather than a promise, which
+ * is the only place a row stream can be got from. Typed as `unknown` because
+ * reaching through a driver's internals is exactly the claim that should be
+ * checked at run time rather than declared; {@link isRowStreamer} is the check.
+ */
 interface MysqlConnectionLike {
   query(sql: string): Promise<[unknown, unknown]>;
   execute(sql: string, params: unknown[]): Promise<[unknown, unknown]>;
   end(): Promise<void>;
+  connection?: unknown;
+}
+
+/**
+ * The core connection's two statement methods, which return a command rather
+ * than a promise.
+ *
+ * `unknown` returns on purpose: what comes back is a `Query` or an `Execute`,
+ * and the only thing this file wants from either is `.stream()`, which
+ * {@link rowStream} asks for and checks.
+ */
+interface MysqlRowStreamer {
+  query(sql: string): unknown;
+  execute(sql: string, params: unknown[]): unknown;
+}
+
+function isRowStreamer(value: unknown): value is MysqlRowStreamer {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof Reflect.get(value, 'query') === 'function' &&
+    typeof Reflect.get(value, 'execute') === 'function'
+  );
+}
+
+function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof Reflect.get(value, Symbol.asyncIterator) === 'function'
+  );
+}
+
+/** Named for what it warns about, since a log line is where this is read. */
+const sqlLogger = new Logger('CatalogSqlSource');
+
+/**
+ * A mysql2 command's rows, as something `for await` can walk.
+ *
+ * `.stream()` is a `Readable` in object mode, and the back-pressure is the whole
+ * reason this path exists: mysql2 pushes each decoded row into it, and when the
+ * reader stops pulling, the push returns false and the driver pauses the socket.
+ * A consumer that writes a batch before asking for the next row therefore holds
+ * a batch, not a result set — all the way down to the wire.
+ */
+function rowStream(command: unknown): AsyncIterable<unknown> {
+  if (!command || typeof command !== 'object') {
+    throw new Error('The mysql driver did not return a statement to read rows from.');
+  }
+  const stream: unknown = Reflect.get(command, 'stream');
+  if (typeof stream !== 'function') {
+    throw new Error(
+      'This mysql2 has no row stream on its statements, so a SQL read cannot be bounded. Upgrade mysql2, or narrow the connector query.',
+    );
+  }
+  const readable: unknown = Reflect.apply(stream, command, []);
+  if (!isAsyncIterable(readable)) {
+    throw new Error('The mysql row stream is not iterable, so there is nothing to read from it.');
+  }
+  return readable;
+}
+
+/**
+ * A MySQL result set, one row at a time.
+ *
+ * Read-only by construction exactly as the buffered read was, and for the same
+ * reason: the transaction refuses a write whatever the author's query turns out
+ * to parse as. `execute` when there is something to bind and `query` when there
+ * is not, which is the same split {@link queryMysql} makes and for the same
+ * reason — see the comment there, which is about a literal `?` in somebody's SQL
+ * and is not a performance note.
+ *
+ * The ROLLBACK and the close sit in a `finally` on the *generator*, so they run
+ * when the consumer stops early as well as when the rows run out: a `for await`
+ * that breaks calls the generator's `return`, which unwinds this. A consumer
+ * that abandons the iterator without closing it would leak the connection, which
+ * is the one obligation this shape puts on a caller that the buffered one did
+ * not.
+ *
+ * Falls back to the buffered read when the driver is not the one this expects.
+ * Refusing would turn a working connector into a failed load over a shape
+ * mismatch in somebody's `mysql2` alias, and the buffered read is what every
+ * connector did until now — so the fallback is a return to the previous
+ * behaviour rather than a degradation. It is said out loud because a silent one
+ * would leave an operator reading this docblock and believing their load is
+ * bounded when it is not.
+ */
+async function* streamMysql(url: string, sql: string, params: unknown[]): AsyncGenerator<unknown> {
+  const mysql = await importOptional<{
+    createConnection: (url: string) => Promise<MysqlConnectionLike>;
+  }>('mysql2/promise', 'mysql');
+  const connection = await mysql.createConnection(url);
+  try {
+    await connection.query('START TRANSACTION READ ONLY');
+
+    const core = connection.connection;
+    if (!isRowStreamer(core)) {
+      sqlLogger.warn(
+        'This mysql2 does not expose the core connection a row stream comes from, so the whole result set is being read into memory — the behaviour every SQL connector had before streaming existed. A very large table may exhaust the heap or outlive its step lease.',
+      );
+      const [rows] =
+        params.length > 0 ? await connection.execute(sql, params) : await connection.query(sql);
+      if (Array.isArray(rows)) yield* rows;
+      return;
+    }
+
+    // `execute` when there is something to bind, because it prepares the
+    // statement server-side and the value never touches the SQL text at all.
+    // mysql2's `query` would interpolate it client-side by scanning for `?`
+    // without knowing which of them sit inside string literals, so an author
+    // whose query contains a literal question mark would have it take the bind
+    // meant for the watermark. With nothing to bind there is nothing to
+    // prepare, and an unbounded run keeps exactly the path it always had.
+    yield* rowStream(params.length > 0 ? core.execute(sql, params) : core.query(sql));
+  } finally {
+    await connection.query('ROLLBACK').catch(() => undefined);
+    await connection.end().catch(() => undefined);
+  }
 }
 
 async function queryPostgres(url: string, sql: string, params: unknown[]): Promise<unknown[]> {
@@ -604,29 +918,6 @@ async function queryPostgres(url: string, sql: string, params: unknown[]): Promi
   }
 }
 
-async function queryMysql(url: string, sql: string, params: unknown[]): Promise<unknown[]> {
-  const mysql = await importOptional<{
-    createConnection: (url: string) => Promise<MysqlConnectionLike>;
-  }>('mysql2/promise', 'mysql');
-  const connection = await mysql.createConnection(url);
-  try {
-    await connection.query('START TRANSACTION READ ONLY');
-    // `execute` when there is something to bind, because it prepares the
-    // statement server-side and the value never touches the SQL text at all.
-    // mysql2's `query` would interpolate it client-side by scanning for `?`
-    // without knowing which of them sit inside string literals, so an author
-    // whose query contains a literal question mark would have it take the bind
-    // meant for the watermark. With nothing to bind there is nothing to
-    // prepare, and an unbounded run keeps exactly the path it always had.
-    const [rows] =
-      params.length > 0 ? await connection.execute(sql, params) : await connection.query(sql);
-    return Array.isArray(rows) ? rows : [];
-  } finally {
-    await connection.query('ROLLBACK').catch(() => undefined);
-    await connection.end().catch(() => undefined);
-  }
-}
-
 /** What the last run stored, or nothing if it never stored anything. */
 function readWatermark(value: unknown, column: string): string | number | undefined {
   if (value === undefined || value === null) return undefined;
@@ -634,36 +925,63 @@ function readWatermark(value: unknown, column: string): string | number | undefi
 }
 
 /**
- * The largest watermark value in a result set, or nothing if it did not move.
+ * The largest watermark value seen so far, kept while rows go past.
  *
- * Loud rather than silent when the column is missing from every row: a run that
- * cannot advance would read the same rows again on the next run, and again
- * after that, and the only symptom would be a load that keeps writing the same
- * numbers.
+ * A running maximum rather than a pass over a finished array, because a streamed
+ * read has no finished array to pass over — and because the answer must be the
+ * same either way. It *is* the same: {@link maxWatermark} is now this fed from a
+ * loop, so the comparison, the refusal and the "did it move" test have one
+ * implementation and a bounded read cannot drift from a buffered one.
+ *
+ * `settle` is the loud part, and it is loud rather than silent for the reason it
+ * always was: a run that cannot advance would read the same rows again on the
+ * next run, and again after that, and the only symptom would be a load that
+ * keeps writing the same numbers. It is asked once, after the last row —
+ * asking earlier would refuse a stream whose first page happened not to carry
+ * the column.
  */
+interface WatermarkTracker {
+  /** Show it one row. Rows that are not objects still count towards the refusal. */
+  observe(row: unknown): void;
+  /** The new watermark, nothing if it did not move — or a throw if none could. */
+  settle(): string | number | undefined;
+}
+
+function trackWatermark(column: string, previous: string | number | undefined): WatermarkTracker {
+  let best = previous;
+  let seen = false;
+  let rows = 0;
+
+  return {
+    observe(row: unknown): void {
+      rows += 1;
+      if (!row || typeof row !== 'object') return;
+      const value: unknown = Reflect.get(row, column);
+      if (value === undefined || value === null) return;
+      seen = true;
+      const candidate = normaliseWatermark(value, column);
+      if (best === undefined || isAfter(candidate, best)) best = candidate;
+    },
+    settle(): string | number | undefined {
+      if (rows > 0 && !seen) {
+        throw new Error(
+          `The query returned ${rows} rows and none of them carried "${column}", so there is nothing to advance the watermark to and the next run would read them all again. Select the watermark column in the query.`,
+        );
+      }
+      return best === previous ? undefined : best;
+    },
+  };
+}
+
+/** The same answer for a result set that is already whole. */
 function maxWatermark(
   rows: unknown[],
   column: string,
   previous: string | number | undefined,
 ): string | number | undefined {
-  let best = previous;
-  let seen = false;
-
-  for (const row of rows) {
-    if (!row || typeof row !== 'object') continue;
-    const value: unknown = Reflect.get(row, column);
-    if (value === undefined || value === null) continue;
-    seen = true;
-    const candidate = normaliseWatermark(value, column);
-    if (best === undefined || isAfter(candidate, best)) best = candidate;
-  }
-
-  if (rows.length > 0 && !seen) {
-    throw new Error(
-      `The query returned ${rows.length} rows and none of them carried "${column}", so there is nothing to advance the watermark to and the next run would read them all again. Select the watermark column in the query.`,
-    );
-  }
-  return best === previous ? undefined : best;
+  const tracker = trackWatermark(column, previous);
+  for (const row of rows) tracker.observe(row);
+  return tracker.settle();
 }
 
 /**

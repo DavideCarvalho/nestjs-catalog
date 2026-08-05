@@ -30,7 +30,7 @@ import {
   SOURCES,
   applyConnection,
   resolveSecret,
-  toFetchResult,
+  toBufferedFetchResult,
 } from './sources';
 
 /**
@@ -668,7 +668,13 @@ export class WorkflowRunnerService {
       );
     }
 
-    const result: FetchResult = toFetchResult(
+    // Buffered, and it stays buffered. A source node stages its whole output
+    // before any downstream node reads a row of it — `stage` below is one write
+    // of `rows` — so a streamed read would arrive here and be turned back into an
+    // array a few lines later with nothing gained. The single-connector runner is
+    // where streaming pays, because there the next node IS the batch write. If
+    // this ever stages incrementally, this is the line to change.
+    const result: FetchResult = await toBufferedFetchResult(
       await fetcher({
         connector,
         secret: resolveSecret(connector),

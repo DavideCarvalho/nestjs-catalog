@@ -73,12 +73,16 @@ export {
   applyConnection,
   describeSql,
   resolveSecret,
+  toBufferedFetchResult,
   toFetchResult,
+  toRecordStream,
   zeroRowStatement,
   type FetchResult,
+  type RecordStream,
   type SqlDescription,
   type SqlDialect,
   type SqlFieldDescription,
+  type StreamedFetchResult,
 } from './sources';
 export {
   WORKFLOW_FINISH_STEP,
