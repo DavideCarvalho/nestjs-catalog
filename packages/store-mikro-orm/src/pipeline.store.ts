@@ -18,6 +18,7 @@ import type {
   WorkflowExecutionMode,
   WorkflowNode,
   WorkflowNodeOutcome,
+  WorkflowStatus,
 } from '@dudousxd/nestjs-catalog';
 import {
   CATALOG_SECRET_VAULT,
@@ -32,11 +33,19 @@ import {
   isWorkflowEdge,
   isWorkflowExecutionMode,
   isWorkflowNode,
+  isWorkflowStatus,
   validateWorkflow,
   workflowGraphHash,
 } from '@dudousxd/nestjs-catalog';
 import type { EntityManager } from '@mikro-orm/mysql';
-import { BadRequestException, Inject, Injectable, Optional } from '@nestjs/common';
+import {
+  BadRequestException,
+  Inject,
+  Injectable,
+  Logger,
+  NotFoundException,
+  Optional,
+} from '@nestjs/common';
 import { CATALOG_STORE_ENTITY_MANAGER } from './context';
 import {
   ConnectionRow,
@@ -52,6 +61,8 @@ import { CATALOG_STORE_OPTIONS, type CatalogStoreModuleOptions } from './options
 export class MySqlPipelineStore
   implements CatalogPipelineStore, CatalogWorkflowStore, CatalogStageStore
 {
+  private readonly logger = new Logger(MySqlPipelineStore.name);
+
   /**
    * Every vault this store may open with. The first is the one it seals with.
    *
@@ -423,6 +434,19 @@ export class MySqlPipelineStore
           `"${input.name}" points at workflow ${input.workflowId}, which does not exist. A connector pointing at a graph that is not there fails on a schedule rather than at the moment somebody decided.`,
         );
       }
+      // **Refused at save, not at run.** A draft is a graph nobody has declared
+      // finished, and it may have no sink at all, so a connector pointing at one
+      // has nothing to execute. The check could equally live in the runner, and
+      // that is precisely the version worth arguing against: it would move the
+      // error from the person wiring the connector — who is looking at the
+      // screen and can fix it in one edit — to a scheduled window at 3am, where
+      // it becomes a failed run somebody reads the next morning without the
+      // context that produced it.
+      if (workflow.status !== 'ready') {
+        throw new BadRequestException(
+          `"${input.name}" points at workflow "${workflow.name}", which is still a draft. Publish it first: a draft is a graph nobody has declared finished, and scheduling one means finding out at 3am rather than now.`,
+        );
+      }
       // The redundancy between a connector's target type and its workflow's sink
       // is kept honest here. It is what lets "which connectors write this type"
       // keep working unchanged now that the sink, not the connector, is what
@@ -747,31 +771,22 @@ export class MySqlPipelineStore
     const nodes = input.nodes ?? [];
     const edges = input.edges ?? [];
 
-    const issues = validateWorkflow({ nodes, edges });
-    if (issues.length > 0) {
-      throw new BadRequestException(
-        `"${input.name}" cannot run as drawn. ${issues.map((issue) => issue.message).join(' ')}`,
-      );
-    }
-
     const em = this.em.fork();
+    const existing = input.id ? await em.findOne(WorkflowRow, { id: input.id }) : null;
+    // A new graph starts as a draft. An existing one keeps the status it has —
+    // a save is an edit, never a promotion, and never a demotion either.
+    const status = existing ? narrowStatus(existing.status, existing.id) : 'draft';
+
+    assertStaysRunnable(status, { nodes, edges }, input.name);
 
     await assertTransformsExist(em, nodes);
 
-    // Validation guarantees exactly one sink, so this find cannot be ambiguous
-    // and cannot be absent.
-    const sink = nodes.find((node) => node.kind === 'sink');
-    if (!sink || sink.kind !== 'sink') {
-      throw new BadRequestException(
-        `"${input.name}" has no sink node, so nothing would ever be committed.`,
-      );
-    }
+    const targetType = targetTypeOf(status, nodes, input.name);
 
     // Taken from the plaintext graph, deliberately, and before anything below
     // seals: see the note on this method. A hash of the ciphertext would make
     // every save a new version.
     const graphHash = workflowGraphHash({ nodes, edges });
-    const existing = input.id ? await em.findOne(WorkflowRow, { id: input.id }) : null;
 
     // Sealed first, then checked — the ordering `saveConnector` explains, here
     // applied per source node.
@@ -786,9 +801,10 @@ export class MySqlPipelineStore
         name: input.name,
         nodes: [],
         edges: [],
+        status,
         version: 1,
         graphHash,
-        targetType: sink.targetType,
+        targetType,
         createdBy,
         createdAt: new Date(),
         updatedAt: new Date(),
@@ -801,8 +817,10 @@ export class MySqlPipelineStore
     row.edges = edges;
     row.graphHash = graphHash;
     // Written from the sink, never from the input: a caller must not be able to
-    // claim a workflow writes one type while its sink commits another.
-    row.targetType = sink.targetType;
+    // claim a workflow writes one type while its sink commits another. Empty
+    // while a draft has not drawn one yet — `publishWorkflow` is what refuses to
+    // let that state become runnable.
+    row.targetType = targetType;
     if (graphChanged) row.version += 1;
 
     em.persist(row);
@@ -824,6 +842,115 @@ export class MySqlPipelineStore
     // a canvas that posted a graph and got ciphertext back would render a source
     // node it cannot edit, and would post the ciphertext again on the next save.
     return { ...toWorkflow(row), nodes };
+  }
+
+  /**
+   * Validate, then declare it ready.
+   *
+   * This is where the gate that used to sit on `saveWorkflow` now lives, and
+   * putting it on its own transition is what gives the refusal somewhere to go:
+   * the caller asked one question — "is this finished?" — so every issue
+   * `validateWorkflow` found is the answer, rather than an error on a save the
+   * author thought was about something else.
+   *
+   * The sink check is repeated here rather than left to `validateWorkflow`
+   * because `targetType` is a stored, indexed column that a draft is allowed to
+   * carry empty. Publishing is the moment it stops being allowed to, and it is
+   * re-derived from the graph at this instant rather than trusted from the row —
+   * the row's copy was written by a save that may not have had a sink at all.
+   *
+   * Idempotent. Publishing something already published re-validates it and
+   * returns it, because "it was already ready" is not a problem anybody needs
+   * reported and an error would make a double-click a failure.
+   */
+  async publishWorkflow(id: string, publishedBy: string): Promise<CatalogWorkflow> {
+    const em = this.em.fork();
+    const row = await em.findOne(WorkflowRow, { id });
+    if (!row) {
+      throw new NotFoundException(`Workflow ${id} does not exist, so there is nothing to publish.`);
+    }
+
+    const workflow = toWorkflow(row);
+    const issues = validateWorkflow({ nodes: workflow.nodes, edges: workflow.edges });
+    if (issues.length > 0) {
+      throw new BadRequestException(
+        `"${row.name}" cannot run as drawn, so it cannot be published. ${issues
+          .map((issue) => issue.message)
+          .join(' ')}`,
+      );
+    }
+
+    // Validation guarantees exactly one sink, so this cannot be absent here even
+    // though it can be on the draft this was a second ago.
+    const sink = workflow.nodes.find((node) => node.kind === 'sink');
+    if (!sink || sink.kind !== 'sink') {
+      throw new BadRequestException(
+        `"${row.name}" has no sink node, so nothing would ever be committed.`,
+      );
+    }
+
+    await assertTransformsExist(em, workflow.nodes);
+
+    const wasDraft = row.status !== 'ready';
+    row.status = 'ready';
+    row.targetType = sink.targetType;
+    em.persist(row);
+    await em.flush();
+
+    // Only on the transition. Re-publishing an unchanged graph is not a change,
+    // and an event on every idempotent call would put a stream of them in front
+    // of anybody watching for the one that mattered.
+    if (wasDraft) {
+      emitCatalog('workflow.changed', {
+        workflowId: row.id,
+        name: row.name,
+        version: row.version,
+        graphHash: row.graphHash,
+        targetType: row.targetType,
+        nodeCount: workflow.nodes.length,
+        changedBy: publishedBy,
+      });
+    }
+
+    return toWorkflow(row);
+  }
+
+  /**
+   * Back to `draft`, and refused while anything still runs it.
+   *
+   * The same refusal `deleteWorkflow` makes, listing the same names, because the
+   * consequence is the same: a connector may only run a ready graph, so
+   * unpublishing one out from under a schedule is indistinguishable from
+   * deleting it as far as the next window is concerned. Cascading — disabling
+   * those connectors here — was the alternative and is refused on principle:
+   * turning off somebody's loads as a side effect of an edit to something else
+   * is exactly the silent action this status was added to prevent.
+   */
+  async unpublishWorkflow(id: string, unpublishedBy: string): Promise<CatalogWorkflow> {
+    const inUse = await this.connectorsUsingWorkflow(id);
+    if (inUse.length > 0) {
+      throw new BadRequestException(
+        `${inUse.length} connector(s) still run this workflow: ${inUse
+          .map((connector) => connector.name)
+          .join(
+            ', ',
+          )}. Point them elsewhere before unpublishing it, or their next run fails with nothing to execute.`,
+      );
+    }
+
+    const em = this.em.fork();
+    const row = await em.findOne(WorkflowRow, { id });
+    if (!row) {
+      throw new NotFoundException(
+        `Workflow ${id} does not exist, so there is nothing to unpublish.`,
+      );
+    }
+
+    row.status = 'draft';
+    em.persist(row);
+    await em.flush();
+    this.logger.log(`${unpublishedBy} took workflow "${row.name}" (${row.id}) back to draft.`);
+    return toWorkflow(row);
   }
 
   async connectorsUsingWorkflow(id: string): Promise<CatalogConnector[]> {
@@ -1246,6 +1373,28 @@ function narrow<T extends string>(
   );
 }
 
+/**
+ * A workflow's status, with an ABSENT one read as `ready`.
+ *
+ * Absent is not the same as unrecognised, and `narrow` is right to refuse the
+ * second. A value this build does not know means the data is newer than the
+ * code, and answering with a different one would point the reader at the wrong
+ * line. But `undefined` means the opposite — a row hydrated from a database
+ * that predates the column, because MikroORM does not run a field initialiser
+ * for a column the table does not have yet, so the default governs the backfill
+ * and not the window before it runs.
+ *
+ * `ready` for exactly the reason the column's own docblock gives: every row
+ * already there passed validation to get there, and reading them as drafts
+ * would stop every scheduled connector the moment the code deployed and before
+ * the migration caught up. A default that turns an upgrade into an outage is
+ * the wrong default even when it looks like the careful one.
+ */
+function narrowStatus(value: string | undefined, id: string): WorkflowStatus {
+  if (value === undefined) return 'ready';
+  return narrow(value, isWorkflowStatus, 'Workflow status', id);
+}
+
 function toConnector(row: ConnectorRow): CatalogConnector {
   return {
     id: row.id,
@@ -1312,6 +1461,59 @@ function toRun(row: ConnectorRunRow): ConnectorRun {
     startedAt: row.startedAt.toISOString(),
     finishedAt: row.finishedAt?.toISOString(),
   };
+}
+
+/**
+ * The gate that used to stand in front of every save now stands in front of
+ * `ready` only.
+ *
+ * A draft is stored exactly as drawn, unfinished nodes and all: that is what
+ * makes closing the tab safe, and it is why "+ Sink" no longer answers with two
+ * true and useless complaints one second after the click. What is refused is a
+ * *ready* graph edited into something that cannot run — **refused rather than
+ * demoted**, because a connector may only point at a ready graph, so a save that
+ * silently dropped the status would stop a scheduled load with nothing said to
+ * anybody. The person editing is the one who can fix it, and they are looking at
+ * the screen right now.
+ *
+ * A free function rather than a branch inside `saveWorkflow` because that method
+ * was already at the complexity ceiling, and because this is the rule the whole
+ * feature turns on — it deserves somewhere to be read.
+ */
+function assertStaysRunnable(
+  status: WorkflowStatus,
+  graph: { nodes: WorkflowNode[]; edges: WorkflowEdge[] },
+  name: string,
+): void {
+  if (status !== 'ready') return;
+  const issues = validateWorkflow(graph);
+  if (issues.length === 0) return;
+  throw new BadRequestException(
+    `"${name}" is published, so it has to stay runnable, and this edit would leave it unable to run. ${issues
+      .map((issue) => issue.message)
+      .join(' ')} Unpublish it first if you want to park it in this state.`,
+  );
+}
+
+/**
+ * The type the sink commits, or the empty string while nobody has drawn one.
+ *
+ * Only a `ready` graph is guaranteed to have exactly one sink, because only a
+ * ready graph has been validated. A draft may legitimately have none yet — that
+ * is what drafting is — so this carries the empty string until there is a sink
+ * to derive it from, and `publishWorkflow` is what guarantees one exists before
+ * anything can run. Never taken from the caller: a client must not be able to
+ * claim a workflow writes one type while its sink commits another.
+ */
+function targetTypeOf(status: WorkflowStatus, nodes: WorkflowNode[], name: string): string {
+  const sink = nodes.find((node) => node.kind === 'sink');
+  if (sink && sink.kind === 'sink') return sink.targetType;
+  if (status === 'ready') {
+    throw new BadRequestException(
+      `"${name}" has no sink node, so nothing would ever be committed.`,
+    );
+  }
+  return '';
 }
 
 /**
@@ -1412,6 +1614,7 @@ function toWorkflow(row: WorkflowRow): CatalogWorkflow {
     edges: row.edges.map((edge, index) =>
       narrowGraphPart(edge, isWorkflowEdge, 'edge', index, row.id),
     ),
+    status: narrowStatus(row.status, row.id),
     version: row.version,
     graphHash: row.graphHash,
     targetType: row.targetType,

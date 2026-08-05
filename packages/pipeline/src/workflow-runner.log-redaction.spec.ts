@@ -67,6 +67,12 @@ function harness() {
     listWorkflows: () => Promise.resolve([]),
     getWorkflow: () => Promise.resolve(undefined),
     saveWorkflow: () => Promise.resolve(undefined),
+    // `supportsWorkflows` asks for this by name too: a store that can save a
+    // graph but not publish one would narrow cleanly here and fail one call
+    // later, mid-promotion. A stub that omits it is a stub that no longer
+    // counts as a workflow store at all — which is how this spec started
+    // failing when drafts landed, rather than through anything it tests.
+    publishWorkflow: () => Promise.resolve(undefined),
     writeStage: () => Promise.resolve(),
     readStage: () => Promise.resolve([]),
     dropStages: () => Promise.resolve(0),

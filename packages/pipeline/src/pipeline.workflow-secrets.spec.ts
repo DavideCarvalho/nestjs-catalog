@@ -143,6 +143,14 @@ class MemoryPipelineStore implements CatalogPipelineStore {
   getWorkflow(id: string): Promise<CatalogWorkflow | undefined> {
     return Promise.resolve(this.workflows.get(id));
   }
+  /**
+   * Asked for by name by `supportsWorkflows`, so a stub without it stops being
+   * a workflow store — which is how this spec began failing when drafts landed,
+   * rather than through anything it asserts.
+   */
+  publishWorkflow(id: string): Promise<CatalogWorkflow | undefined> {
+    return Promise.resolve(this.workflows.get(id));
+  }
   saveWorkflow(
     input: Pick<CatalogWorkflow, 'name' | 'nodes' | 'edges'> & { id?: string },
     createdBy: string,

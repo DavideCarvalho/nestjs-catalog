@@ -655,6 +655,10 @@ describe('store capability checks', () => {
       listWorkflows: async () => [],
       getWorkflow: async () => undefined,
       saveWorkflow: async () => undefined,
+      // Asked for by name like the rest: promotion publishes what it saves, so a
+      // store with the save and not the transition would narrow cleanly and then
+      // fail one call into an apply that has already written types.
+      publishWorkflow: async () => undefined,
       writeStage: async () => ({ written: 0 }),
       readStage: async () => [],
     });

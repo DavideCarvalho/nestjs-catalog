@@ -694,6 +694,62 @@ export function createPipelineController(
       // the redaction on the read is undone.
       return redactWorkflow(saved);
     }
+    /**
+     * Declare a graph finished.
+     *
+     * Its own route rather than a field on the save above, for the reason the
+     * store's `publishWorkflow` argues: publishing is a claim that has to be
+     * checked, and a check that fails owes an explanation naming the nodes. A
+     * flag on the save has nowhere to put that which is not an error on an
+     * operation the author thought was about something else — and an autosave
+     * that silently published would make "ready" mean nothing at all.
+     *
+     * `catalog:write` and not something narrower. The graph's own sinks are
+     * re-authorised here rather than trusted from save time, which is the same
+     * case `workflows/:id/run` makes and for the same reason: a graph written
+     * last month by a principal that could commit this type, published today by
+     * one that cannot, is a load nobody with the grant ever approved.
+     */
+    @Post('workflows/:id/publish')
+    @RequireScopes('catalog:write')
+    async publishWorkflow(
+      @Req() request: { principal?: CatalogPrincipal },
+      @Param('id') id: string,
+    ) {
+      const principal = requirePrincipal(request);
+      const store = this.workflows.requireStore();
+      const workflow = await store.getWorkflow(id);
+      if (!workflow) {
+        throw new NotFoundException(
+          `Workflow ${id} does not exist, so there is nothing to publish.`,
+        );
+      }
+      assertMayWriteTypes(
+        principal,
+        committedTypes(workflow.nodes),
+        `publishing workflow "${workflow.name}"`,
+      );
+      return store.publishWorkflow(id, principal.id);
+    }
+    /**
+     * Take it back to draft, and be told what that stops.
+     *
+     * No type authorisation here, deliberately, and it is worth saying why the
+     * asymmetry with publish is right rather than an oversight: unpublishing
+     * cannot cause a load. It can only prevent one, and the store already
+     * refuses while any connector still runs the graph — so the destructive
+     * reading of this route is a refusal, not a write.
+     */
+    @Post('workflows/:id/unpublish')
+    @RequireScopes('catalog:write')
+    async unpublishWorkflow(
+      @Req() request: { principal?: CatalogPrincipal },
+      @Param('id') id: string,
+    ) {
+      const principal = requirePrincipal(request);
+      const store = this.workflows.requireStore();
+      return store.unpublishWorkflow(id, principal.id);
+    }
     @Delete('workflows/:id')
     @RequireScopes('catalog:write')
     async deleteWorkflow(@Param('id') id: string) {

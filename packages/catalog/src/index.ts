@@ -64,6 +64,7 @@ export {
   isWorkflowExecutionMode,
   isWorkflowNode,
   isWorkflowNodeKind,
+  isWorkflowStatus,
   supportsWorkflows,
   supportsWorkflowStages,
   TRANSFORM_RUNNER,
@@ -76,6 +77,7 @@ export {
   WORKFLOW_ISSUE_CODES,
   WORKFLOW_NODE_ID_PATTERN,
   WORKFLOW_NODE_KINDS,
+  WORKFLOW_STATUSES,
   type WorkflowEdge,
   type WorkflowExecutionMode,
   type WorkflowGraph,
@@ -90,6 +92,7 @@ export {
   type WorkflowSinkNode,
   type WorkflowSourceNode,
   type WorkflowStageRef,
+  type WorkflowStatus,
   type WorkflowTransformNode,
   type WorkflowValidationIssue,
 } from './catalog.pipeline';

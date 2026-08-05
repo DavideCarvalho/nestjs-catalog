@@ -190,6 +190,10 @@ class MemoryPipelineStore implements CatalogPipelineStore {
     const saved: CatalogWorkflow = {
       ...input,
       id: input.id ?? 'generated',
+      // Drafted, as the real store drafts it. These tests are about write
+      // grants, and every one of them asserts against the save itself, so the
+      // status only has to be the one a save actually produces.
+      status: 'draft',
       version: 1,
       graphHash: 'hash',
       targetType: first && first.kind === 'sink' ? first.targetType : '',
@@ -199,6 +203,20 @@ class MemoryPipelineStore implements CatalogPipelineStore {
     };
     this.workflows.set(saved.id, saved);
     return Promise.resolve(saved);
+  }
+  publishWorkflow(id: string): Promise<CatalogWorkflow> {
+    const stored = this.workflows.get(id);
+    if (!stored) throw new Error(`No workflow ${id} to publish.`);
+    const published: CatalogWorkflow = { ...stored, status: 'ready' };
+    this.workflows.set(id, published);
+    return Promise.resolve(published);
+  }
+  unpublishWorkflow(id: string): Promise<CatalogWorkflow> {
+    const stored = this.workflows.get(id);
+    if (!stored) throw new Error(`No workflow ${id} to unpublish.`);
+    const drafted: CatalogWorkflow = { ...stored, status: 'draft' };
+    this.workflows.set(id, drafted);
+    return Promise.resolve(drafted);
   }
   deleteWorkflow(): Promise<boolean> {
     return Promise.resolve(false);

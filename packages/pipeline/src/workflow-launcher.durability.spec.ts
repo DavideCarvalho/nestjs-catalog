@@ -53,6 +53,7 @@ const workflow: CatalogWorkflow = {
   name: 'Nightly fleet',
   nodes: [],
   edges: [],
+  status: 'ready',
   version: 4,
   graphHash: 'abcdef0123456789',
   targetType: 'Mvr',
