@@ -23,11 +23,14 @@ import { RequireScopes } from './catalog.route-auth';
 import { CatalogService } from './catalog.service';
 import {
   CATALOG_TRACE_STORE,
+  CATALOG_WORKSPACE_STORE,
   type CatalogTraceOutcome,
   type CatalogTraceStore,
+  type CatalogWorkspaceStore,
   type DashboardCard,
   type SaveQueryInput,
   isCatalogTraceOutcome,
+  supportsSavedQueryRevisions,
 } from './catalog.workspace';
 
 /**
@@ -105,6 +108,15 @@ export function createCatalogController(
       @Optional()
       @Inject(CATALOG_TRACE_STORE)
       private readonly traces?: CatalogTraceStore,
+      // By token as well, and for the reason the trace store above is: a
+      // revision list is not on `CatalogService`, so a route that went through
+      // the facade could not be served at all. The cost is the one the facade's
+      // own note names — a host running `controller: false` and writing its own
+      // revisions route injects this token rather than `CatalogService`, exactly
+      // as it already must for traces.
+      @Optional()
+      @Inject(CATALOG_WORKSPACE_STORE)
+      private readonly workspace?: CatalogWorkspaceStore,
     ) {}
 
     private requireTraces(): CatalogTraceStore {
@@ -408,6 +420,33 @@ export function createCatalogController(
       response.setHeader('content-type', 'text/csv; charset=utf-8');
       response.setHeader('content-disposition', `attachment; filename="${filename}"`);
       return toCsv(result);
+    }
+
+    /**
+     * Every SQL this query has ever been, newest first.
+     *
+     * `catalog:read`, the same scope `GET saved-queries/:id` asks for, because
+     * it hands back the same field one version older. Gating history harder than
+     * the current text would be gating the diff rather than the data — the
+     * caller can already read what the statement says today, and the authoring
+     * scope that `POST`/`PATCH` require is about *choosing what SQL runs*, which
+     * reading an old body is not.
+     *
+     * An empty list is a real answer: a query nobody has edited since revisions
+     * shipped may have nothing recorded. A store that keeps none at all says so
+     * rather than answering `[]`, because "we do not keep these" and "nothing
+     * has changed" are different facts and a screen would draw them the same.
+     */
+    @Get('saved-queries/:id/revisions')
+    @RequireScopes('catalog:read')
+    savedQueryRevisions(@Param('id') id: string) {
+      const workspace = this.workspace;
+      if (!workspace || !supportsSavedQueryRevisions(workspace)) {
+        throw new BadRequestException(
+          "This catalog's workspace store keeps no revisions, so a saved query's SQL can be read but not compared with what it used to be.",
+        );
+      }
+      return workspace.listSavedQueryRevisions(id);
     }
 
     @Get('dashboards')

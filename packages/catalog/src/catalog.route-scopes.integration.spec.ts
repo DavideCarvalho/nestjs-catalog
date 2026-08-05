@@ -33,6 +33,7 @@ import {
   type AuditQuery,
   CATALOG_WORKSPACE_STORE,
   type CatalogAuditEvent,
+  type CatalogRevision,
   type CatalogWorkspaceStore,
   type Dashboard,
   type DashboardCard,
@@ -265,6 +266,21 @@ class StubWorkspace implements CatalogWorkspaceStore {
   deleteSavedQuery(): Promise<boolean> {
     return Promise.resolve(true);
   }
+  // Answered rather than left off, even though the member is optional: without
+  // it the revisions route refuses before it reaches the guard's verdict for a
+  // reason that has nothing to do with its declaration.
+  listSavedQueryRevisions(id: string): Promise<CatalogRevision[]> {
+    return Promise.resolve([
+      {
+        id: `saved-query:${id}:1`,
+        subjectId: id,
+        version: 1,
+        body: SAVED_QUERY.sql,
+        authoredBy: SAVED_QUERY.createdBy,
+        authoredAt: SAVED_QUERY.updatedAt,
+      },
+    ]);
+  }
   listDashboards(): Promise<Dashboard[]> {
     return Promise.resolve([DASHBOARD]);
   }
@@ -359,6 +375,11 @@ const ROUTES: Route[] = [
   { method: 'delete', path: '/api/catalog/saved-queries/q-1', scope: 'catalog:curate' },
   { method: 'post', path: '/api/catalog/saved-queries/q-1/run', scope: 'catalog:read' },
   { method: 'get', path: '/api/catalog/saved-queries/q-1/export.csv', scope: 'catalog:read' },
+  // Reading what the statement used to be is the same capability as reading what
+  // it is, one version older — and `GET saved-queries/:id` above is
+  // `catalog:read`. The authoring scope holds back *choosing what SQL runs*,
+  // which reading an old body is not.
+  { method: 'get', path: '/api/catalog/saved-queries/q-1/revisions', scope: 'catalog:read' },
 
   // Dashboards carry no SQL of their own.
   { method: 'get', path: '/api/catalog/dashboards', scope: 'catalog:read' },

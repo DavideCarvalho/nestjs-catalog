@@ -11,7 +11,7 @@ import {
   WorkflowRow,
   WorkflowStageRow,
 } from './entities/pipeline';
-import { AuditEventRow, DashboardRow, SavedQueryRow } from './entities/workspace';
+import { AuditEventRow, DashboardRow, RevisionRow, SavedQueryRow } from './entities/workspace';
 
 /** Where the applied-schema fingerprint is kept. */
 export const MARKER_TABLE = 'catalog_schema_meta';
@@ -35,6 +35,11 @@ const OWNED = [
   // MikroORM's discovery can reach neither of these from anything else.
   WorkflowRow,
   WorkflowStageRow,
+  // And again: a revision holds a subject *id* rather than a relation to a
+  // transform or a saved query — deliberately, so deleting a subject cannot
+  // cascade away code a recorded run still names — so discovery can reach this
+  // one from nothing either.
+  RevisionRow,
 ];
 
 /**

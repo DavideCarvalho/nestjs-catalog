@@ -8,7 +8,7 @@ import {
   WorkflowRow,
   WorkflowStageRow,
 } from './entities/pipeline';
-import { AuditEventRow, DashboardRow, SavedQueryRow } from './entities/workspace';
+import { AuditEventRow, DashboardRow, RevisionRow, SavedQueryRow } from './entities/workspace';
 
 export {
   CatalogAuditRecorder,
@@ -18,6 +18,11 @@ export { PrincipalRow, SnapshotRow } from './entities/governance';
 export {
   AuditEventRow,
   DashboardRow,
+  isRevisionSubject,
+  REVISION_SUBJECTS,
+  RevisionRow,
+  type RevisionSubject,
+  revisionKey,
   SavedQueryRow,
 } from './entities/workspace';
 export { MikroOrmCatalogDirectory } from './directory.service';
@@ -127,6 +132,10 @@ export const catalogStoreEntities = [
   // workflow read dies on missing metadata rather than on a missing table.
   WorkflowRow,
   WorkflowStageRow,
+  // Reachable from nothing for the same reason again: a revision holds a subject
+  // id rather than a relation, so that deleting a transform cannot cascade away
+  // code that a recorded run still names.
+  RevisionRow,
   // Reachable from nothing: a connector holds a connection *id*, deliberately
   // not a foreign key, so MikroORM's discovery cannot walk to this entity from
   // any other. It has to be listed by hand, and being absent here is invisible

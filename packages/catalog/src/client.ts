@@ -15,12 +15,23 @@
 export type {
   AuditQuery,
   CatalogAuditEvent,
+  // The revision shape, exported here as well as from the package root because
+  // the diff screen that consumes it is a browser one. A console that had to
+  // restate it would be the second copy of a contract two packages serve —
+  // which is the drift this entry point exists to prevent, and which the React
+  // package is currently paying by mirroring it.
+  CatalogRevision,
   Dashboard,
   DashboardCard,
   QueryVisualization,
   SaveQueryInput,
   SavedQuery,
 } from './catalog.workspace';
+
+// A value, not a type: a screen saying how far back the history goes should read
+// the number rather than print one of its own. See its docblock for what the cap
+// costs.
+export { CATALOG_REVISION_LIMIT } from './catalog.workspace';
 
 export type {
   CatalogQueryRelation,
@@ -110,6 +121,15 @@ export const catalogRoutes = {
   workspaceCapabilities: () => '/catalog/workspace/capabilities',
   savedQueries: () => '/catalog/saved-queries',
   savedQuery: (id: string) => `/catalog/saved-queries/${encodeURIComponent(id)}`,
+  /**
+   * Every SQL this query has ever been.
+   *
+   * A sub-resource of the saved query rather than a `?version=` on it, because
+   * the question a diff screen asks first is "what were all of them" — it has to
+   * see the list before it knows which two to compare, and one request that
+   * answers that beats a list plus two fetches.
+   */
+  savedQueryRevisions: (id: string) => `/catalog/saved-queries/${encodeURIComponent(id)}/revisions`,
   runSavedQuery: (id: string) => `/catalog/saved-queries/${encodeURIComponent(id)}/run`,
   exportSavedQuery: (id: string) => `/catalog/saved-queries/${encodeURIComponent(id)}/export.csv`,
   dashboards: () => '/catalog/dashboards',

@@ -3,6 +3,7 @@ import type {
   CatalogConnection,
   CatalogConnector,
   CatalogPipelineStore,
+  CatalogRevision,
   CatalogSecretVault,
   CatalogStageStore,
   CatalogTransform,
@@ -56,6 +57,10 @@ import {
   WorkflowStageRow,
 } from './entities/pipeline';
 import { CATALOG_STORE_OPTIONS, type CatalogStoreModuleOptions } from './options';
+// One revision table, so one implementation of what a revision costs. See the
+// block those are declared under: a second copy of the retention rule in this
+// file is how the two subjects end up keeping different amounts of history.
+import { pruneRevisions, readRevisions, recordRevision } from './workspace.store';
 
 @Injectable()
 export class MySqlPipelineStore
@@ -649,11 +654,27 @@ export class MySqlPipelineStore
   }
 
   /**
-   * Saving bumps the version whenever the code changed.
+   * Saving bumps the version whenever the code changed, and archives the code at
+   * that version.
    *
    * Only when it changed: renaming a transform is not a new version, and
    * inflating the number would make it useless for the question it exists to
-   * answer.
+   * answer. That rule is followed here rather than diverged from, and under a
+   * bounded archive it earns its keep twice over — a revision per save would let
+   * twenty renames evict twenty bodies that loads actually ran.
+   *
+   * ## What is archived, and when
+   *
+   * On create, the first code, as version 1. On a code change, **two**: the
+   * version being superseded and the new one. The first of those is the upgrade
+   * path — a transform that predates `catalog_revision` has never had a revision
+   * written, and the last moment its live code is still readable is this one,
+   * before the assignment below overwrites it. `recordRevision` leaves an
+   * already-recorded version alone, so from the second edit onwards that call is
+   * a no-op.
+   *
+   * Both are staged onto this fork and land in the single flush below, so a
+   * version and the text it names are written together or not at all.
    */
   async saveTransform(
     input: Pick<CatalogTransform, 'name' | 'language' | 'code'> & {
@@ -678,6 +699,12 @@ export class MySqlPipelineStore
         updatedAt: new Date(),
       });
 
+    // Read before the assignments below, which is the whole reason it is a copy
+    // rather than a reference: `row` IS `existing`, so one line later there is
+    // nowhere left to read the superseded code from.
+    const superseded = existing
+      ? { version: existing.version, code: existing.code, at: existing.updatedAt }
+      : undefined;
     const codeChanged = existing !== null && existing.code !== input.code;
     row.name = input.name;
     row.description = input.description;
@@ -686,7 +713,41 @@ export class MySqlPipelineStore
     if (codeChanged) row.version += 1;
 
     em.persist(row);
+    if (!existing) {
+      await recordRevision(em, {
+        subject: 'transform',
+        subjectId: row.id,
+        version: row.version,
+        body: row.code,
+        authoredBy: createdBy,
+        authoredAt: row.updatedAt,
+      });
+    } else if (codeChanged && superseded) {
+      // Attributed to the row's `createdBy` and dated to when it was last
+      // written. That is who created the transform rather than who last edited
+      // it — the row keeps no second actor — and it is recorded as the one fact
+      // there is rather than as the current editor, who demonstrably did not
+      // write this code.
+      await recordRevision(em, {
+        subject: 'transform',
+        subjectId: row.id,
+        version: superseded.version,
+        body: superseded.code,
+        authoredBy: row.createdBy,
+        authoredAt: superseded.at,
+      });
+      await recordRevision(em, {
+        subject: 'transform',
+        subjectId: row.id,
+        version: row.version,
+        body: row.code,
+        authoredBy: createdBy,
+        authoredAt: new Date(),
+      });
+    }
     await em.flush();
+    // After the flush, so it counts what was just written. See `pruneRevisions`.
+    if (!existing || codeChanged) await pruneRevisions(em, 'transform', row.id);
 
     if (!existing || codeChanged) {
       emitCatalog('transform.changed', {
@@ -701,9 +762,42 @@ export class MySqlPipelineStore
     return toTransform(row);
   }
 
+  /**
+   * Deletes the transform. **Leaves its revisions.**
+   *
+   * Not a cascade, and not an omission. A connector run in the history still
+   * records the version it executed, and throwing away the only remaining copy
+   * of that code because somebody tidied up the editor would make the run
+   * record's `transformVersion` mean less than it did before revisions existed.
+   * They are bounded per subject either way — see `RevisionRow`, which says the
+   * same thing from the schema's side.
+   */
   async deleteTransform(id: string): Promise<boolean> {
     const em = this.em.fork();
     return (await em.nativeDelete(TransformRow, { id })) > 0;
+  }
+
+  /**
+   * Every version of this transform's code, newest first.
+   *
+   * A transform that predates `catalog_revision` and has not been saved since
+   * answers with one synthesised revision holding its current code — see
+   * `readRevisions` for why that is not written down, and why it is identical to
+   * what the next save will store.
+   */
+  listTransformRevisions(id: string): Promise<CatalogRevision[]> {
+    const em = this.em.fork();
+    return readRevisions(em, 'transform', id, async () => {
+      const row = await em.findOne(TransformRow, { id });
+      return row
+        ? {
+            version: row.version,
+            body: row.code,
+            authoredBy: row.createdBy,
+            authoredAt: row.updatedAt,
+          }
+        : undefined;
+    });
   }
 
   async listWorkflows(): Promise<CatalogWorkflow[]> {

@@ -8,6 +8,13 @@
  * systems each believing they decide when a load runs.
  */
 
+// The revision shape is declared beside the audit trail rather than here,
+// because it is one shape over two subjects — a transform's code and a saved
+// query's SQL — and neither of them owns it. This is a type-only import, and the
+// edge only ever points this way: `catalog.workspace.ts` knows nothing about
+// pipelines.
+import type { CatalogRevision } from './catalog.workspace';
+
 /**
  * Where a connector pulls from.
  *
@@ -159,6 +166,14 @@ export function isTransformLanguage(value: unknown): value is TransformLanguage 
  * Versioned, because a load that produced surprising numbers is investigated
  * afterwards, and "which code ran" is the first question. Bumping the version
  * on every change costs a row and answers it.
+ *
+ * The version used to be the *whole* answer, and it was half of one: it named
+ * code that no longer existed anywhere, because one row per transform is
+ * overwritten in place. Each version's code is now recorded as a
+ * {@link CatalogRevision}, read through
+ * {@link CatalogPipelineStore.listTransformRevisions}, so the number on a run
+ * and the text it names are both retrievable. `version` still counts saves that
+ * changed the code and nothing else — see `saveTransform`.
  */
 export interface CatalogTransform {
   id: string;
@@ -252,7 +267,14 @@ export interface ConnectorRun {
   error?: string;
   startedAt: string;
   finishedAt?: string;
-  /** Which transform version ran, so a surprising load can be traced to code. */
+  /**
+   * Which transform version ran, so a surprising load can be traced to code.
+   *
+   * Traced to the code itself, now, and not only to a number: the version this
+   * names is the version of a {@link CatalogRevision}, so `transforms/:id/revisions`
+   * answers with the body that produced these rows. Until that route existed
+   * this field could only establish *that* the transform had been edited since.
+   */
   transformVersion?: number;
 
   /** Which workflow ran, when the connector delegated to one. */
@@ -260,10 +282,12 @@ export interface ConnectorRun {
   /**
    * Which *version* of it ran.
    *
-   * The same question `transformVersion` answers, asked of the graph. A
-   * workflow keeps only its latest shape — exactly as a transform keeps only
-   * its latest code — so this number is what connects a run to the graph that
-   * produced it, and the only way to know a graph has changed since.
+   * The same question `transformVersion` answers, asked of the graph — and no
+   * longer answered as well, which is worth knowing before relying on it. A
+   * workflow keeps only its latest shape (see {@link CatalogWorkflow} for why it
+   * is excluded from revisions while a transform is not), so this number
+   * connects a run to the graph that produced it and is the only way to know a
+   * graph has changed since. It cannot produce the graph.
    */
   workflowVersion?: number;
   /**
@@ -507,12 +531,34 @@ export interface WorkflowGraph {
  * the code; for a workflow it means the code *and* the wiring, so both the
  * graph version and the per-node transform versions are recorded on the run.
  *
- * Like a transform, only the latest shape is kept. Storing every past graph was
- * the alternative and was rejected for consistency: transforms already answer
- * "which code ran" with a number and no history, and a model where the graph is
- * fully recoverable but the code inside it is not would give false confidence in
- * an audit. The limitation is real and worth stating plainly — an edited graph
- * cannot be reconstructed from an old run, only identified as different.
+ * **Only the latest shape is kept, and unlike a transform it is not
+ * revisioned.** That asymmetry is a decision rather than an oversight, and this
+ * is where somebody looking for the missing feature will look, so it is argued
+ * here.
+ *
+ * A transform's code and a saved query's SQL are text a person typed, and
+ * {@link CatalogRevision} archives text: two bodies, a line differ, done. A
+ * graph is a structure. Its "body" would be JSON nobody wrote, and a text diff
+ * over it is dominated by key order and canvas positions — it would report a
+ * dragged box as a change to what the load does, which is the opposite of what
+ * {@link workflowGraphHash} is careful to exclude. Diffing graphs is a graph
+ * problem and deserves a screen that draws one, not a line differ pointed at
+ * serialised nodes.
+ *
+ * The decisive reason is the counter. {@link version} is bumped on **draft**
+ * edits deliberately — see the note on it — so that a run's `workflowVersion`
+ * can never mean two different graphs. Archiving one body per version would
+ * therefore store every autosave of a canvas somebody is still dragging boxes
+ * around on, and under the per-subject cap that {@link CATALOG_REVISION_LIMIT}
+ * imposes, that noise would evict the versions that actually ran. A counter
+ * designed to be cheap to inflate and an archive designed to be bounded do not
+ * compose; making them compose means keying the archive on behaviour rather than
+ * on saves, which is what `graphHash` already is, and that is a different
+ * feature from this one.
+ *
+ * So the limitation stays, stated plainly: an edited graph cannot be
+ * reconstructed from an old run, only identified as different. A diff screen
+ * answers for the code and the SQL and not for the wiring.
  */
 /**
  * Whether this graph is still being drawn, or is something somebody declared
@@ -1399,6 +1445,18 @@ export function supportsWorkflows(
   );
 }
 
+/**
+ * Whether this store keeps a transform's history.
+ *
+ * The method rather than a flag, exactly as {@link supportsWorkflows} argues: a
+ * flag is a claim and a method is the thing itself.
+ */
+export function supportsTransformRevisions(
+  store: CatalogPipelineStore,
+): store is CatalogPipelineStore & Required<Pick<CatalogPipelineStore, 'listTransformRevisions'>> {
+  return typeof store.listTransformRevisions === 'function';
+}
+
 export function supportsWorkflowStages(
   store: CatalogPipelineStore,
 ): store is CatalogPipelineStore & CatalogStageStore {
@@ -1453,6 +1511,22 @@ export interface CatalogPipelineStore
     createdBy: string,
   ): Promise<CatalogTransform>;
   deleteTransform(id: string): Promise<boolean>;
+  /**
+   * Every version of this transform's code, newest first.
+   *
+   * **Optional**, mixed in for the same reason {@link CatalogWorkflowStore} is:
+   * a store written against the previous shape of this interface still
+   * implements it, and turning that into a compile error would be a breaking
+   * change for an additive feature. {@link supportsTransformRevisions} is how a
+   * caller asks, so a deployment whose store keeps no history gets a sentence
+   * rather than a method that is missing at run time.
+   *
+   * The list is what makes `transformVersion` on a run mean something: the
+   * revision whose {@link CatalogRevision.version} equals it holds the code that
+   * produced those rows. Bounded — see {@link CATALOG_REVISION_LIMIT} for what
+   * that bound costs.
+   */
+  listTransformRevisions?(id: string): Promise<CatalogRevision[]>;
 
   startRun(input: {
     connectorId: string;

@@ -12,6 +12,16 @@ export interface SavedQuery {
   id: string;
   name: string;
   description?: string;
+  /**
+   * The statement, as it is now.
+   *
+   * Overwritten in place by {@link CatalogWorkspaceStore.updateSavedQuery}, and
+   * for a long time that was the end of it — a report that started answering
+   * differently left nothing to compare against, not even a version number. What
+   * it used to say is kept as {@link CatalogRevision}s now, read through
+   * {@link CatalogWorkspaceStore.listSavedQueryRevisions}; this field stays the
+   * one a run of the query executes.
+   */
   sql: string;
   /** Free-form grouping, the way a folder would work without being one. */
   folder?: string;
@@ -74,6 +84,124 @@ export interface SaveQueryInput {
   visualization?: QueryVisualization;
   shared?: boolean;
 }
+
+/**
+ * One recorded revision of something whose text a person edits.
+ *
+ * The same shape for a transform's code and for a saved query's SQL, and that is
+ * the point rather than a saving: the two are edited the same way and go wrong
+ * the same way — somebody changes the text, a load or a report starts coming out
+ * different, and the question afterwards is what the text used to say. `body` is
+ * named for that. `code` would have been a lie on half of its uses.
+ *
+ * ## What this exists to fix
+ *
+ * A {@link ConnectorRun} has always recorded `transformVersion`, so the catalog
+ * already knew *which* version produced a given load. What it did not keep was
+ * the text of that version: one row per transform, overwritten in place, the
+ * counter bumped and the previous code gone. A saved query had not even the
+ * counter. Meanwhile the runs list renders `code v3`, which reads as a reference
+ * to something retrievable — so an operator was told a version number, believed
+ * the source was recoverable, and it was not.
+ *
+ * The number on the run and the {@link version} here are **the same number**.
+ * That is the whole contract: "this load ran v3" becomes something a person can
+ * open.
+ *
+ * ## No `kind` field, deliberately
+ *
+ * A revision is always read through a route that already names its subject —
+ * `transforms/:id/revisions`, `saved-queries/:id/revisions` — so a discriminator
+ * here would be a field whose only possible value the caller had just supplied.
+ * The *store* keys by one, because one table holds both kinds; that is a storage
+ * concern and it stays in the store.
+ *
+ * ## What is NOT revisioned, and why
+ *
+ * A workflow graph, which has the identical "latest only" limitation and is
+ * deliberately left with it. See {@link CatalogWorkflow}, which makes the
+ * argument where somebody looking for the missing feature will find it.
+ */
+export interface CatalogRevision {
+  /**
+   * Stable id of this revision.
+   *
+   * Derived from the subject and the version rather than random — see
+   * `revisionKey` in the MikroORM store — so recording the same version twice
+   * replaces it instead of appending a second copy, and a screen may key a list
+   * on it across refetches.
+   */
+  id: string;
+  /** What it belongs to — a transform id or a saved-query id. */
+  subjectId: string;
+  /** The version this revision IS. Matches `transformVersion` on a run. */
+  version: number;
+  /** The text as it was: the transform's code, or the query's SQL. */
+  body: string;
+  /**
+   * Who saved it.
+   *
+   * Exact for a transform, which is saved through a store method that is given
+   * the actor. **Approximate for a saved query**, whose update path is given
+   * none — `updateSavedQuery` takes an id and a patch, and `CatalogService`
+   * keeps the actor for the audit event it emits — so a saved query's revisions
+   * are attributed to the query's `createdBy`. That is who created it, not
+   * necessarily who last edited it, and it is recorded that way rather than
+   * invented: a name here that was picked to fill the field would be read as
+   * evidence. Threading the editor through `updateSavedQuery` is what would fix
+   * it, and it is a change to that method's contract rather than to this one.
+   */
+  authoredBy: string;
+  authoredAt: string;
+}
+
+/**
+ * How many revisions are kept per subject. Writing a newer one drops the oldest
+ * beyond this.
+ *
+ * ## Why there is a cap at all
+ *
+ * This is append-only text that grows forever, and it is the fourth append-only
+ * table in the bundled store. The other three earn their unboundedness and this
+ * one does not. An audit event and a connector run are each one small row per
+ * *thing that happened*, at a rate an operator can read off their own load
+ * schedule; staged rows are dropped the moment the run that produced them is
+ * finished with. A revision is neither: it grows with how often somebody edits,
+ * which nobody meters, and every row carries a whole code body rather than a
+ * counter. Unpredictable in rate *and* large per row is the combination worth
+ * bounding — and "this grows; here is the query to prune it" would have been a
+ * fourth unbounded table with a paragraph in front of it.
+ *
+ * ## Why a count per subject rather than an age bound
+ *
+ * An age bound keys the wrong thing. A transform edited twice in 2019 and relied
+ * on ever since would lose both revisions, while one edited daily keeps
+ * everything — exactly backwards. What makes a revision unrecoverable is being
+ * superseded, so that is what the bound counts.
+ *
+ * ## What it costs, stated rather than implied
+ *
+ * A run's `transformVersion` can name a revision that has been evicted: a
+ * transform saved more than this many times can no longer produce its earliest
+ * code. That loss is real. It is strictly smaller than the one it replaces —
+ * where every version but the newest was unrecoverable — and it is visible
+ * rather than silent, because a caller holding a version older than the oldest
+ * revision in the list can see that the list does not reach that far.
+ *
+ * At the cap a 4 KB body costs 200 KB per subject, so a thousand heavily-edited
+ * subjects cost roughly 200 MB. That is a ceiling, which is the point of having
+ * one.
+ *
+ * ## Why a constant and not a module option
+ *
+ * The number is part of what this table promises, and a console should be able
+ * to print "the last 50 are kept" without a round trip to ask which deployment
+ * it is talking to. A knob is also a promise to support every value of it,
+ * including the one that switches the feature off and is then reported as a bug.
+ * It becomes an option on the day there is a deployment it is wrong for, rather
+ * than in anticipation of one.
+ */
+export const CATALOG_REVISION_LIMIT = 50;
 
 export interface Dashboard {
   id: string;
@@ -544,6 +672,27 @@ export interface CatalogWorkspaceStore {
    */
   deleteSavedQuery(id: string): Promise<boolean>;
 
+  /**
+   * Every SQL this saved query has ever been, newest first.
+   *
+   * **Optional**, and mixed in here rather than made a member every store must
+   * have, for the reason {@link CatalogWorkflowStore} gives about the same
+   * decision: a store written against the previous shape of this interface —
+   * including the routing proxy in the MikroORM package — implements
+   * `CatalogWorkspaceStore` today, and turning that into a compile error would
+   * be a breaking change for a feature that is purely additive.
+   * {@link supportsSavedQueryRevisions} is how a caller asks, so "this store
+   * keeps no revisions" is a sentence a route can say rather than a method that
+   * is missing at run time.
+   *
+   * An EMPTY list is a real answer and never an error: a query nobody has edited
+   * since this shipped may genuinely have nothing recorded. What the bundled
+   * store does about that — see `readRevisions` — is a store's decision, and a
+   * consumer must read "nothing recorded" as itself rather than as "nothing has
+   * changed".
+   */
+  listSavedQueryRevisions?(id: string): Promise<CatalogRevision[]>;
+
   listDashboards(): Promise<Dashboard[]>;
   getDashboard(id: string): Promise<Dashboard | undefined>;
   saveDashboard(
@@ -568,6 +717,20 @@ export interface CatalogWorkspaceStore {
 
   recordEvent(event: Omit<CatalogAuditEvent, 'id'>): Promise<void>;
   listEvents(query: AuditQuery): Promise<CatalogAuditEvent[]>;
+}
+
+/**
+ * Whether this store keeps a saved query's history.
+ *
+ * Checks the method rather than a flag, the same way {@link isWorkspaceStore}
+ * and `supportsWorkflows` do: a flag is a claim and a method is the thing
+ * itself.
+ */
+export function supportsSavedQueryRevisions(
+  store: CatalogWorkspaceStore,
+): store is CatalogWorkspaceStore &
+  Required<Pick<CatalogWorkspaceStore, 'listSavedQueryRevisions'>> {
+  return typeof store.listSavedQueryRevisions === 'function';
 }
 
 export function isWorkspaceStore(store: unknown): store is CatalogWorkspaceStore {

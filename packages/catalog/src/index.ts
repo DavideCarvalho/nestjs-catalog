@@ -60,6 +60,7 @@ export {
   isConnectorKind,
   isPipelineStore,
   isTransformLanguage,
+  supportsTransformRevisions,
   isWorkflowEdge,
   isWorkflowExecutionMode,
   isWorkflowNode,
@@ -133,10 +134,15 @@ export type {
 } from './search.types';
 export {
   type AuditQuery,
+  CATALOG_REVISION_LIMIT,
   CATALOG_TRACE_OUTCOMES,
   CATALOG_TRACE_STORE,
   CATALOG_WORKSPACE_STORE,
   type CatalogAuditEvent,
+  // The archive of everything whose text a person edits — a transform's code and
+  // a saved query's SQL. Exported here as well as on `/client` because a host
+  // writing its own revisions route has to type the handler.
+  type CatalogRevision,
   type CatalogTrace,
   type CatalogTraceList,
   type CatalogTraceOutcome,
@@ -160,6 +166,7 @@ export {
   type QueryVisualization,
   type SaveQueryInput,
   type SavedQuery,
+  supportsSavedQueryRevisions,
   type TraceQuery,
   traceOutcomeFilter,
 } from './catalog.workspace';

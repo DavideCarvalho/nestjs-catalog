@@ -125,25 +125,27 @@ export class ConnectorRow {
 /**
  * User code that shapes stored data.
  *
- * **Only the latest code is kept.** One row per transform, overwritten in place:
- * `saveTransform` assigns the new code onto the existing row and increments
- * `version` when the code differs. There is no history table and no second row,
- * so the code that ran last week is gone the moment somebody saves over it.
+ * **This row holds the current code.** One row per transform, overwritten in
+ * place: `saveTransform` assigns the new code onto the existing row and
+ * increments `version` when the code differs.
  *
- * `version` is therefore an *identifier*, not an archive. A run records the
- * version it executed, so an investigation into a surprising load can always
- * establish that the transform has been edited since — v3 in the run history
- * against v5 on the row is a definite answer to "is this still the code that
- * produced those numbers". What it cannot do is produce v3. This is the same
- * limitation {@link WorkflowRow} states for graphs, and it is stated here
- * because the console reinforces the opposite reading: a run renders as
- * `code v3`, which looks like a reference to something retrievable.
+ * The versions before it are kept, in `catalog_revision` — see `RevisionRow`.
+ * That is new, and it is what the rest of this docblock used to say could not be
+ * relied upon: `version` was an *identifier* and not an archive, so a run
+ * recorded at v3 against a row at v5 answered "has this been edited since" and
+ * could not produce v3. The console reinforced the opposite reading the whole
+ * time, rendering a run as `code v3` — a version number that looked like a
+ * reference to something retrievable. It is one now:
+ * `GET pipeline/transforms/:id/revisions` returns the body of each version, and
+ * the numbers are the same numbers.
  *
- * Keeping the old rows is a schema change and not a docblock — a second table,
- * a foreign key from the run, and an answer to how long code bodies are retained
- * in a table nobody prunes. Worth doing if the investigation above turns out to
- * need the code itself rather than the fact that it changed; not worth implying
- * before then.
+ * Two limits are worth carrying forward rather than quietly dropping. The
+ * archive is **bounded** per transform (`CATALOG_REVISION_LIMIT`), so a transform
+ * edited more times than that can no longer produce its earliest code — see the
+ * constant for why a cap and what it costs. And a version whose text was
+ * overwritten *before* this table existed is not recoverable by anything: the
+ * store backfills the version that was live at upgrade time, out of this row,
+ * and there is nothing anywhere to backfill the ones before it from.
  */
 @Entity({ tableName: 'catalog_transform' })
 export class TransformRow {
@@ -215,11 +217,16 @@ export class ConnectorRunRow {
   /**
    * Which version of the transform this run executed.
    *
-   * Enough to *identify* the code and never enough to recover it — see
-   * {@link TransformRow}, which holds one row per transform and overwrites it.
-   * A console that renders this as `code v3` is naming a version, not linking to
-   * a copy, and an investigation that gets as far as this number has learned
-   * whether the transform has changed since, which is usually the question.
+   * Enough to *recover* the code, which it was not until `catalog_revision`
+   * existed: this number is a revision's version, so a console rendering `code
+   * v3` can link to the body that produced these rows rather than merely naming
+   * a version of something already overwritten. See {@link TransformRow}.
+   *
+   * The link can still come up empty in two cases, and both are honest ones: the
+   * version predates the revision table, or it has fallen off the far end of the
+   * per-transform cap. A reader that finds no revision for this number has
+   * learned that the transform has changed since, which is what this field
+   * always gave them.
    */
   @Property({ nullable: true })
   transformVersion?: number;
@@ -286,9 +293,16 @@ export class ConnectorRunRow {
  * tables would buy a constraint that catches the least dangerous mistake while
  * making every read of a workflow a join and every save a diff.
  *
- * Versioned like a transform, and with the same limitation stated out loud: only
- * the latest graph is kept. A run records the version and the hash it ran, so an
- * edited graph can always be *identified* as different, but not reconstructed.
+ * Versioned like a transform, and — since `catalog_revision` — no longer with
+ * the same limitation as one. Only the latest graph is kept. A run records the
+ * version and the hash it ran, so an edited graph can always be *identified* as
+ * different, and not reconstructed.
+ *
+ * That asymmetry is deliberate: `CatalogWorkflow` in the catalog package argues
+ * it, and the short version is that {@link version} is bumped on draft edits by
+ * design, so archiving one body per version would fill a bounded table with
+ * autosaves of a canvas somebody is still dragging boxes around on — evicting
+ * the versions that ran.
  */
 @Entity({ tableName: 'catalog_workflow' })
 @Index({ properties: ['targetType'] })

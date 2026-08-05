@@ -15,6 +15,7 @@ import {
   hasScope,
   isConnectorKind,
   isTransformLanguage,
+  supportsTransformRevisions,
 } from '@dudousxd/nestjs-catalog';
 import {
   BadRequestException,
@@ -490,6 +491,40 @@ export function createPipelineController(
     @RequireScopes('catalog:write')
     deleteTransform(@Param('id') id: string) {
       return this.pipeline.deleteTransform(id).then((deleted: boolean) => ({ deleted }));
+    }
+
+    /**
+     * Every version of this transform's code, newest first.
+     *
+     * The route that makes `code v3` in the runs list mean something. A run
+     * records `transformVersion`; a transform row holds only its latest code; so
+     * until this existed the console named a version of something already
+     * overwritten. The version on a run and the version on a revision here are
+     * the same number, which is the whole contract.
+     *
+     * `catalog:read`, the same scope `GET transforms` asks for — that route
+     * already hands back the current `code` in full, so gating an older copy of
+     * the same field harder would be gating the diff rather than the data.
+     * Writing code stays `catalog:write`, as the note on this controller says.
+     *
+     * Declaration order is not load-bearing here: the only literal sibling under
+     * `transforms/` is `transforms/try`, which is a POST and so cannot be
+     * captured by a GET `:id`.
+     *
+     * A store that keeps no revisions is told apart from a transform with no
+     * history, and answers differently. Both come back as an empty list
+     * otherwise, and a screen would draw "we do not keep these" and "this has
+     * never changed" identically.
+     */
+    @Get('transforms/:id/revisions')
+    @RequireScopes('catalog:read')
+    transformRevisions(@Param('id') id: string) {
+      if (!supportsTransformRevisions(this.pipeline)) {
+        throw new BadRequestException(
+          "This catalog's pipeline store keeps no revisions, so a transform's code can be read but not compared with the version a run recorded.",
+        );
+      }
+      return this.pipeline.listTransformRevisions(id);
     }
 
     /**
