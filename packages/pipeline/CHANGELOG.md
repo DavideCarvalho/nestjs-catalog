@@ -1,8 +1,16 @@
 # @dudousxd/nestjs-catalog-pipeline
 
-## 1.0.0
+> **A note on 1.0.0.** A release briefly published `1.0.0` carrying the changes
+> listed under 0.8.0 below. It was withdrawn — `latest` points at 0.7.1 and then
+> at 0.8.0 — because this package is not ready to claim a settled API. The
+> breaking change is real and is described where it always was; inside 0.x, a
+> minor is the level that carries one. `1.0.0` remains on the registry because
+> npm does not allow its removal with the token that published it; nothing
+> should install it.
 
-### Major Changes
+## 0.8.0
+
+### Minor Changes
 
 - db38811: A caller chose which environment variable the server read, and a failed URL was readable at `catalog:read`
 

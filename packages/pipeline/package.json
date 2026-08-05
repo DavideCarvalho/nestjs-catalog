@@ -1,7 +1,7 @@
 {
   "name": "@dudousxd/nestjs-catalog-pipeline",
-  "version": "1.0.0",
-  "description": "The connector pipeline for @dudousxd/nestjs-catalog: fetch, transform, publish — connectors, sources, transforms, workflow graphs, the durable workflows that run them and a cron scheduler.",
+  "version": "0.8.0",
+  "description": "The connector pipeline for @dudousxd/nestjs-catalog: fetch, transform, publish \u2014 connectors, sources, transforms, workflow graphs, the durable workflows that run them and a cron scheduler.",
   "license": "MIT",
   "author": "Davide Carvalho",
   "repository": {
