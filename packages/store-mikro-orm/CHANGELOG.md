@@ -1,5 +1,106 @@
 # @dudousxd/nestjs-catalog-store-mikro-orm
 
+## 0.5.0
+
+### Minor Changes
+
+- f600109: An empty load is a load, and a repair reports what it actually cleared
+
+  **`MySqlWarehouseStore.write` no longer returns early on an empty array.** A
+  load of zero rows now writes no rows and does everything else: it replaces
+  whatever that batch held, it creates the snapshot row with the labels it was
+  given, and it counts. This is a behaviour change a host can notice — a caller
+  that used to get a silent no-op now gets a snapshot.
+
+  The old shape cost more than it saved. No rows meant no snapshot row, so the
+  next step failed with _"no snapshot has been written for this type"_ — true, and
+  the wrong event: nothing failed to be written, a source returned nothing, and
+  that sentence sends somebody looking for a lost batch. Worse, the
+  acknowledgement an operator attaches to a collapse they meant (`_expectShrink`,
+  read by `refuseRowCountDrift` in the pipeline package) rides on the snapshot's
+  labels, so it was inert for exactly the load most likely to need it: the one
+  where the dataset really did go to zero.
+
+  Whether an empty snapshot may _replace_ what is being served is still not this
+  store's decision. That rule already exists one layer up, together with the label
+  that suspends it, and a refusal in the adapter would be the same rule enforced
+  by the component that has no way to hear the answer — a deliberate truncation
+  would become impossible to express. What the store does instead is make the load
+  representable, and warn on a commit that empties a type which had rows, for the
+  benefit of a host running this adapter with no bound configured.
+
+  Two smaller consequences of the same change: an empty batch is refused for a
+  negative batch number like any other batch (that check used to sit below the
+  early return), and an empty batch that lands after a carry-forward marks the
+  merge stale like any other batch — it removes rows, so the merge no longer
+  covers the load.
+
+  **Silence still is not a declaration.** A caller that writes no batch at all
+  leaves no snapshot and `commit` still refuses, because a run whose source was
+  unreachable, a run that died before its first batch, and a snapshot id nobody
+  wrote to are indistinguishable from inside the store — and inventing an empty
+  snapshot would pick the most destructive reading of the three. The refusal now
+  names the possibility the caller's own logs will not: a source that returned
+  nothing, and how to say so on purpose.
+
+  **`FanoutReplayResult.cleared` no longer undercounts.** It was a sum of what two
+  of the repair's steps reported, which could not include the entry the commit at
+  the end of a replay discharges — a follower held back from a load owes a
+  `commit` entry, and committing it on the follower also closes every entry about
+  snapshots it has now moved past. An operator reading "2 outstanding" on the
+  status screen, running the repair, being told it cleared 1 and then finding the
+  ledger empty had two numbers that could not both be right. It is now measured by
+  reading the ledger before and after, so it reconciles with the screen and cannot
+  fall behind a step somebody adds to the repair later. Entries that were _closed_
+  rather than repaired are counted and called out in `notes`.
+
+### Patch Changes
+
+- 01df149: Reverting every curation edit at once is audited too.
+
+  `patchType` and `patchProperty` emit `type.curated`, on the argument that "who renamed this column
+  and when" is a governance question with no other answer. `resetOverlay` discards every curated label,
+  description, unit, order, hidden flag and **classification** in the catalog, needs the same
+  `catalog:curate` scope, and emitted nothing — so the trail could name the person who renamed one
+  column and not the person who reverted every name at once.
+
+  Un-classifying a property this way is not cosmetic either: `visibleToPrincipal` filters search
+  results on `classification`, so a reset silently re-admits every classified property's _name_ to
+  searches by principals who could not see it a moment before.
+
+  **New event: `overlay.reset`.** It could not be a `type.curated` — that payload leads with a
+  `typeName` a recorder lifts into an indexed column, and a reset has no single one — so `CATALOG_EVENTS`
+  gains a name, and every recorder and watcher that iterates that list picks it up with no change.
+
+  What it carries is a **summary, not a copy**. The overlay is discarded rather than versioned, so what
+  is not in the payload is nowhere, which argues for carrying all of it — and all of it would be a
+  backup nobody designed, with no restore path and no retention policy of its own. So:
+
+  - `typeNames` — every type that carried curation, because "was the work on `Dispute` in it" is the
+    question actually asked six months later.
+  - `properties` — how many per-property entries went with them, as one number. The property names are
+    where the summary would become the dump.
+  - `classifications` — every classification that stopped applying, with its value, in full. They are
+    the one part of the overlay whose loss changes what the catalog shows to whom, they are a small
+    subset of it, and re-typing them is the only recovery available.
+
+  There is no `principalId`, and the absence is a limit rather than a claim that the actor does not
+  matter: `resetOverlay()` takes no principal and the route that calls it resolves none, so the field
+  would be empty on every row — which an audit table reads as "nobody did this" rather than "not
+  captured". `type.curated` has the same gap; closing it is a change to the controller, the service and
+  every registry.
+
+  **`StoredCatalogRegistry` deliberately emits nothing.** It has no overlay — the published values _are_
+  the stored values — so it still throws, and a refusal that wrote an audit row would claim a reset
+  happened while the caller got an exception and every stored label stayed put.
+
+  `InMemoryCatalogOverlayStore` no longer describes itself as being for "deployments that want the
+  catalog strictly read-only". It never was: `save` accepts writes, `PATCH /catalog/types/:name`
+  answers 200 and emits `type.curated`, and the edit is real until the process ends — but it lives in
+  one process's heap, so replicas disagree about what a column is called. Read-only is the host guard's
+  decision about the `catalog:curate` scope, not a store's, so the docblock now says what the store
+  actually is: non-persistent, and single-process.
+
 ## 0.4.1
 
 ### Patch Changes
