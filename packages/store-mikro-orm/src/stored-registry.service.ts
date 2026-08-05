@@ -6,6 +6,7 @@ import {
   type CatalogSnapshot,
   type RelationKind,
   type ScalarType,
+  curationActor,
   emitCatalog,
 } from '@dudousxd/nestjs-catalog';
 import type { MikroORM } from '@mikro-orm/core';
@@ -141,9 +142,11 @@ export class StoredCatalogRegistry extends CatalogRegistry implements OnModuleIn
   // hold a second copy of the edge rule, under a comment asking whoever changed
   // one to change both.
 
+  /** @param curatedBy the acting principal's id, recorded on `type.curated`. */
   async patchType(
     typeName: string,
     patch: Partial<CatalogOverlay['types'][string]>,
+    curatedBy: string,
   ): Promise<CatalogObjectTypeDef | undefined> {
     const em = this.em.fork();
     const row = await em.findOne(ObjectTypeRow, { name: typeName });
@@ -164,6 +167,12 @@ export class StoredCatalogRegistry extends CatalogRegistry implements OnModuleIn
     emitCatalog('type.curated', {
       typeName,
       changed: Object.keys(patch),
+      // Through `curationActor` for the reason its own docblock gives, and with
+      // one more edge here: this registry is reachable through
+      // `RoutingCatalogRegistry`, a hand-written proxy in this same package. A
+      // forwarder that drops the argument would leave the actor empty in exactly
+      // the multi-environment deployments where the trail is consulted most.
+      principalId: curationActor(curatedBy),
     });
     return this.getType(typeName);
   }
@@ -179,11 +188,16 @@ export class StoredCatalogRegistry extends CatalogRegistry implements OnModuleIn
    * overlay is keyed by property name and a relation's name is in the same
    * namespace — so this is the persisted path catching up rather than a new
    * idea.
+   *
+   * @param curatedBy the acting principal's id, recorded on `type.curated`. The
+   * same argument whichever of the two the patch lands on: a reader asking who
+   * renamed `base` is not asking whether `base` turned out to be a column.
    */
   async patchProperty(
     typeName: string,
     propertyName: string,
     patch: NonNullable<CatalogOverlay['types'][string]['properties']>[string],
+    curatedBy: string,
   ): Promise<CatalogObjectTypeDef | undefined> {
     const em = this.em.fork();
     const row = await em.findOne(PropertyRow, {
@@ -209,6 +223,7 @@ export class StoredCatalogRegistry extends CatalogRegistry implements OnModuleIn
       typeName,
       property: propertyName,
       changed: Object.keys(patch),
+      principalId: curationActor(curatedBy),
     });
     return this.getType(typeName);
   }
@@ -264,6 +279,12 @@ export class StoredCatalogRegistry extends CatalogRegistry implements OnModuleIn
    * the audit table saying a reset happened when the caller got an exception and
    * every stored label is still exactly where it was. The refusal is the honest
    * answer, and it reaches the caller rather than the trail.
+   *
+   * **And so it declares no actor**, where the base class and the two patches
+   * above take one. An override may take fewer parameters than it was promised,
+   * and accepting a `resetBy` here would advertise a record this method never
+   * writes — the next reader would go looking in the audit table for the reset
+   * this signature implies, and find the exception instead.
    */
   async resetOverlay(): Promise<void> {
     throw new Error(

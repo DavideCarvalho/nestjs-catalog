@@ -186,6 +186,17 @@ export function createCatalogController(
     /**
      * Tier 0. Renames a type, regroups it, changes its icon. No migration, no
      * deploy, no engineer.
+     *
+     * The principal is passed for the reason the sharing routes below pass one:
+     * a curated label outlives the publisher's next deploy, so "who renamed this
+     * column" is asked long after any log has rotated. `actorOf` and not
+     * `request.principal.id` directly, so an unguarded mount records `console`
+     * rather than an empty actor — see the note on it.
+     *
+     * The body deliberately names no `createdBy`-style override, unlike the
+     * saved-query create route. Nothing here stores an author; the only consumer
+     * of the name is the audit entry, and a caller that can write any string into
+     * the trail's actor column is worse than one recorded as the console.
      */
     @Patch('types/:name')
     @RequireScopes('catalog:curate')
@@ -200,8 +211,9 @@ export function createCatalogController(
         group?: string;
         titleProperty?: string;
       },
+      @Req() request?: { principal?: CatalogPrincipal },
     ) {
-      const updated = await this.registry.patchType(name, body);
+      const updated = await this.registry.patchType(name, body, actorOf(request));
       if (!updated) throw new NotFoundException(`Unknown object type: ${name}`);
       return updated;
     }
@@ -221,19 +233,29 @@ export function createCatalogController(
         classification?: string;
         unit?: string;
       },
+      @Req() request?: { principal?: CatalogPrincipal },
     ) {
-      const updated = await this.registry.patchProperty(name, property, body);
+      const updated = await this.registry.patchProperty(name, property, body, actorOf(request));
       if (!updated) {
         throw new NotFoundException(`Unknown property: ${name}.${property}`);
       }
       return updated;
     }
 
-    /** Drops every tier-0 edit and falls back to what the ORM says. */
+    /**
+     * Drops every tier-0 edit and falls back to what the ORM says.
+     *
+     * The actor matters most here of the three. This destroys every curated
+     * label, unit and **classification** in the catalog in one request, under the
+     * same `catalog:curate` a rename needs — and un-classifying a property
+     * re-admits its name to searches by principals who could not see it an
+     * instant earlier. Nothing versions the overlay, so after this the only
+     * record that it happened, and of who did it, is the event.
+     */
     @Post('reset')
     @RequireScopes('catalog:curate')
-    async reset() {
-      await this.registry.resetOverlay();
+    async reset(@Req() request?: { principal?: CatalogPrincipal }) {
+      await this.registry.resetOverlay(actorOf(request));
       return this.registry.getSnapshot();
     }
 
@@ -587,7 +609,12 @@ export function createCatalogController(
 }
 
 /**
- * Who to record a workspace change against.
+ * Who to record a change against — a workspace one, and now a curation one.
+ *
+ * Shared by both on purpose. The two halves of the trail used to answer the "who"
+ * question differently: sharing named its principal and curation named nobody at
+ * all, which reads as a bug in whichever half you look at second. One helper is
+ * what keeps the two from drifting again, including on the fallback below.
  *
  * The host's resolved principal wins over anything the body claimed, and that
  * order is the whole point: a `createdBy` in a request body is a name the caller

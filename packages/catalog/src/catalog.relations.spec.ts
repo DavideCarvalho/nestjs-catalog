@@ -29,6 +29,10 @@ import { MikroOrmCatalogRegistry } from './catalog.registry';
  * `catalog.registry.spec.ts` does: every derivation here is a reading of
  * metadata, so metadata is the right input.
  */
+
+/** The acting principal the one curation call here is made as. */
+const CURATOR = 'catalog-console#ana@example.com';
+
 function entity(
   className: string,
   props: Array<Partial<EntityProperty>>,
@@ -346,7 +350,7 @@ describe('naming a link', () => {
     // outlives the metadata it was made against.
     const registry = registryOver(fleet());
 
-    return registry.patchProperty('Mvr', 'base', { displayName: 'Home base' }).then(() => {
+    return registry.patchProperty('Mvr', 'base', { displayName: 'Home base' }, CURATOR).then(() => {
       expect(registry.getType('Mvr')?.relations[0]?.displayName).toBe('Home base');
       expect(registry.getType('Mvr')?.relations[0]?.enriched).toBe(true);
       expect(registry.getGraph().edges[0]?.label).toBe('Home base');

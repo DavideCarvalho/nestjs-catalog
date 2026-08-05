@@ -31,6 +31,9 @@ import {
 } from './entities/model';
 import { StoredCatalogRegistry } from './stored-registry.service';
 
+/** The acting principal every curation call below is made as. */
+const CURATOR = 'catalog-console#ana@example.com';
+
 function relation(fields: Partial<StoredRelation> & Pick<StoredRelation, 'name'>): StoredRelation {
   return {
     kind: 'm:1',
@@ -263,7 +266,12 @@ describe('naming a link', () => {
     const { registry, flush } = registryOver(rows);
     await registry.reload();
 
-    const patched = await registry.patchProperty('Mvr', 'base', { displayName: 'Home base' });
+    const patched = await registry.patchProperty(
+      'Mvr',
+      'base',
+      { displayName: 'Home base' },
+      CURATOR,
+    );
 
     expect(patched?.relations[0]?.displayName).toBe('Home base');
     expect(flush).toHaveBeenCalled();
@@ -274,9 +282,12 @@ describe('naming a link', () => {
     const { registry } = registryOver(rows);
     await registry.reload();
 
-    const patched = await registry.patchProperty('Mvr', 'base', {
-      description: 'Where the vehicle lives.',
-    });
+    const patched = await registry.patchProperty(
+      'Mvr',
+      'base',
+      { description: 'Where the vehicle lives.' },
+      CURATOR,
+    );
 
     expect(patched?.relations[0]?.enriched).toBe(true);
     expect(patched?.enriched).toBe(true);
@@ -286,7 +297,12 @@ describe('naming a link', () => {
     const { registry } = registryOver(fleet());
     await registry.reload();
 
-    const patched = await registry.patchProperty('Mvr', 'base', { hidden: true, order: 7 });
+    const patched = await registry.patchProperty(
+      'Mvr',
+      'base',
+      { hidden: true, order: 7 },
+      CURATOR,
+    );
 
     expect(patched?.relations[0]).toMatchObject({ hidden: true, order: 7 });
   });
@@ -298,9 +314,9 @@ describe('naming a link', () => {
     const { registry } = registryOver(fleet());
     await registry.reload();
 
-    await expect(registry.patchProperty('Mvr', 'nope', { displayName: 'x' })).resolves.toBe(
-      undefined,
-    );
+    await expect(
+      registry.patchProperty('Mvr', 'nope', { displayName: 'x' }, CURATOR),
+    ).resolves.toBe(undefined);
   });
 
   it('replaces the array rather than editing the object in it', async () => {
@@ -312,7 +328,7 @@ describe('naming a link', () => {
     const { registry } = registryOver(rows);
     await registry.reload();
 
-    await registry.patchProperty('Mvr', 'base', { displayName: 'Home base' });
+    await registry.patchProperty('Mvr', 'base', { displayName: 'Home base' }, CURATOR);
 
     expect(relationsOf(rows[1] as ObjectTypeRow)).not.toBe(before);
   });

@@ -93,25 +93,42 @@ export class CatalogService {
     return this.registry.getGraph();
   }
 
-  /** Presentation-only. Never a schema change. */
+  /**
+   * Presentation-only. Never a schema change.
+   *
+   * @param curatedBy who is doing it, for the audit trail — the same required
+   * argument the sharing methods below take, and required for the same reason
+   * `deleteSavedQuery` gives. This facade forwards it rather than resolving it:
+   * a host writing its own controller has the request and this does not, and a
+   * default here would attribute every such host's curation to nobody.
+   */
   patchType(
     typeName: string,
     patch: Partial<CatalogOverlay['types'][string]>,
+    curatedBy: string,
   ): Promise<CatalogObjectTypeDef | undefined> {
-    return this.registry.patchType(typeName, patch);
+    return this.registry.patchType(typeName, patch, curatedBy);
   }
 
+  /** @param curatedBy who is doing it, for the audit trail. */
   patchProperty(
     typeName: string,
     propertyName: string,
     patch: NonNullable<CatalogOverlay['types'][string]['properties']>[string],
+    curatedBy: string,
   ): Promise<CatalogObjectTypeDef | undefined> {
-    return this.registry.patchProperty(typeName, propertyName, patch);
+    return this.registry.patchProperty(typeName, propertyName, patch, curatedBy);
   }
 
-  /** Drops every runtime edit, where the registry supports it. */
-  resetOverlay(): Promise<void> {
-    return this.registry.resetOverlay();
+  /**
+   * Drops every runtime edit, where the registry supports it.
+   *
+   * @param resetBy who is doing it. The one act here that destroys curation in
+   * bulk, so it is the one whose actor is hardest to reconstruct afterwards —
+   * nothing versions an overlay, and after this there is nothing left to read.
+   */
+  resetOverlay(resetBy: string): Promise<void> {
+    return this.registry.resetOverlay(resetBy);
   }
 
   /** Columns a generic UI may render: visible, and not a blob. */

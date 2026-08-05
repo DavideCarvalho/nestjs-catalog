@@ -104,6 +104,46 @@ export function catalogEventPhase(event: string): number {
   return typeof phase === 'number' ? phase : CATALOG_EVENT_PHASE_FALLBACK;
 }
 
+/**
+ * What a curation entry says when nothing told it who.
+ *
+ * A value rather than an empty string or a missing key, and that difference is
+ * the whole reason it exists. The shipped recorder writes
+ * `principalId: undefined` for anything falsy, which lands as NULL in the column
+ * every governance query filters on — and a NULL there is indistinguishable from
+ * the rows written before this library recorded actors at all. "Not captured"
+ * and "nobody did this" are different statements, and only the first one is true.
+ *
+ * Deliberately not the same string as the controller's `console` fallback, which
+ * is a narrower and more useful claim: `console` says a request came through
+ * this library's own HTTP surface and no guard resolved a principal onto it —
+ * the deployment has an unauthenticated mount. This one says the registry API
+ * was called in-process and the caller named nobody: a host script, a scheduled
+ * job, or a subclass compiled against the signature before it took an actor.
+ * Collapsing them would throw away the only clue about where to go looking, in
+ * exchange for one fewer constant.
+ */
+export const UNATTRIBUTED_PRINCIPAL_ID = 'unattributed';
+
+/**
+ * The actor a curation event will carry, given whatever the caller passed.
+ *
+ * Exported because both registries need it and they ship in different packages —
+ * the in-app one here, the stored one in `store-mikro-orm` — so a copy each is a
+ * rule that holds in two places right up until it holds in one.
+ *
+ * Total, and it re-checks a parameter the types already made required. That is
+ * not belt-and-braces: `CatalogRegistry` binds TypeScript callers, and the
+ * callers whose omission must never reach the trail are precisely the ones it
+ * does not bind — a JavaScript host, and a subclass declaring the older
+ * argument list, which stays a legal override because TypeScript lets an
+ * implementation take fewer parameters than it promised.
+ */
+export function curationActor(principalId: string | undefined): string {
+  const trimmed = typeof principalId === 'string' ? principalId.trim() : '';
+  return trimmed.length > 0 ? trimmed : UNATTRIBUTED_PRINCIPAL_ID;
+}
+
 export interface CatalogEventPayloads {
   /** DDL was applied to an object type's physical table. Always additive. */
   'schema.changed': {
@@ -140,6 +180,38 @@ export interface CatalogEventPayloads {
     typeName: string;
     property?: string;
     changed: string[];
+    /**
+     * Who renamed it — the half of that sentence this payload used to leave out.
+     *
+     * It carried `typeName`, `property` and `changed`, which answers "what" and
+     * (with the row's timestamp) "when", and never "who" — while `query.shared`
+     * two screens away named its actor from the day it was added. An audit trail
+     * that is inconsistent about attribution reads as broken in whichever half
+     * you look at second, and curation is the side where it matters more:
+     * a curated label is the one decision this library describes as surviving
+     * the publisher's next deploy.
+     *
+     * **`principalId`, not `curatedBy`,** because the spelling is a contract with
+     * a recorder this package cannot import. `CatalogAuditRecorder` lifts exactly
+     * this key into the audit table's indexed column; a payload that names it
+     * anything else still carries the actor, in a JSON blob no query anybody runs
+     * will look inside, and the entry lands attributed to nobody while looking
+     * complete.
+     *
+     * **The whole `CatalogPrincipal.id`, composite half included.** The same
+     * choice `query.shared` made, for the reason `catalog.principal.ts` argues at
+     * length: `parsePrincipalId` recovers the application from an
+     * `<app>#<person>` id, so carrying the person costs the machine-level
+     * question nothing — while dropping to `applicationId` would file a curator's
+     * decision under the console they happened to sign into, and "the console
+     * renamed this column" is the answer that file says nobody accepts.
+     *
+     * **Required, and never the empty string.** The recorder treats a falsy value
+     * as absent and writes NULL, which reads as "nobody did this" rather than
+     * "this was not captured". A producer holding no principal emits
+     * {@link UNATTRIBUTED_PRINCIPAL_ID} instead, which is a statement.
+     */
+    principalId: string;
   };
   /**
    * The whole overlay was discarded — every curated label, description, unit,
@@ -183,20 +255,24 @@ export interface CatalogEventPayloads {
    *   to whom, they are a small subset of it, and re-typing them is the only
    *   recovery anybody can perform.
    *
-   * **No `principalId`, and the absence is a limit rather than a decision that
-   * the actor does not matter.** `resetOverlay()` takes no principal, the route
-   * that calls it resolves none, and `RoutingCatalogRegistry` forwards the call
-   * by hand — so a field here would be `undefined` on every row, and an audit
-   * table lifts `principalId` into a column where empty reads as "nobody did
-   * this" rather than "this was not captured". `type.curated` has the same gap.
-   * Closing it means threading a principal through the controller, the service
-   * and every registry, which is a change to those, not a field on this payload.
+   * **It carries `principalId`, which it did not at first**, and the reason the
+   * gap existed is worth keeping: `resetOverlay()` took no principal, the route
+   * resolved none for it, and `RoutingCatalogRegistry` forwards the call by hand,
+   * so a field here would have been empty on every row — and an audit table
+   * lifts `principalId` into a column where empty reads as "nobody did this"
+   * rather than "this was not captured". The answer was to thread the actor
+   * through all three rather than to keep documenting its absence, because this
+   * is the one act on the catalog that destroys decisions in bulk and needs only
+   * `catalog:curate` to do it. See `type.curated` above for what the field holds
+   * and why it is spelled that way.
    *
    * Emitted even when the overlay was empty, with zeroes. A trail that recorded
    * only destructive resets cannot tell "nobody pressed it" from "somebody
    * pressed it and nothing was there", and the second is worth seeing.
    */
   'overlay.reset': {
+    /** Who reverted the catalog. See `type.curated`'s `principalId`. */
+    principalId: string;
     /** Every type that carried curation, so the trail names what was lost. */
     typeNames: string[];
     /** How many per-property entries went with them, across every type. */

@@ -123,16 +123,67 @@ export abstract class CatalogRegistry {
     return buildCatalogGraph(this.getSnapshot().types);
   }
 
-  /** Presentation-only edits. Never a schema change. */
+  // ---------------------------------------------------------------------------
+  // Curation, and who did it.
+  //
+  // The three methods below each take the acting principal's id as their last
+  // argument, and it is required. That is a breaking change to an exported
+  // abstract class, so it is worth saying what was weighed.
+  //
+  // **Why a parameter at all, rather than emitting one layer up.** Moving the
+  // emit into `CatalogService` or the controller is the cheap fix and it is the
+  // wrong one twice over. A host that injects `CatalogRegistry` and calls
+  // `patchProperty` from a migration script or an admin job would then emit
+  // nothing — so the trail would silently mean "curation that happened to go
+  // through the bundled controller", which is the same class of gap the actor was
+  // missing from. And the two implementations know things the layer above does
+  // not: the stored registry decides whether the patch landed on a column or on a
+  // link, and only the in-app one can summarise the overlay it is about to
+  // destroy. The event belongs where the act happens.
+  //
+  // **Why not an ambient `AsyncLocalStorage`**, the way the environment travels
+  // in `@dudousxd/nestjs-catalog-store-mikro-orm`. It would survive the routing
+  // hop for free, and it would be invisible: nothing in the signature would tell
+  // a host implementing this class that an actor exists to be read, and a host
+  // calling it from a script would get an unattributed row with no hint that
+  // there was a value to set. Worse, the store lives in a second package, so the
+  // storage would be module state read across a package boundary — a duplicated
+  // install of this library gives two `AsyncLocalStorage` instances, and the
+  // symptom is an actor that is empty in production and fine in every test.
+  //
+  // **Why required rather than optional.** The same argument
+  // `CatalogService.deleteSavedQuery` makes about its own `deletedBy`: a default
+  // quietly attributes the act to nobody in every caller that was not updated,
+  // and naming somebody is the entire value of the record. Required means the
+  // compiler names the call sites; optional means the audit table does, months
+  // later, in a column nobody can reconstruct.
+  //
+  // **What a subclassing host does.** Add the argument at every call site — the
+  // compiler will point at each. Overriding implementations keep compiling even
+  // if they ignore it, because TypeScript lets an override take fewer parameters
+  // than it promised; what stops that being a silent regression is that
+  // `CatalogEventPayloads['type.curated']` now *requires* `principalId`, so an
+  // implementation that emits its own curation event fails to compile until it
+  // has one to put there. Pass `curationActor(...)` if the value may be missing.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Presentation-only edits. Never a schema change.
+   *
+   * @param curatedBy the acting principal's id, recorded on `type.curated`.
+   */
   abstract patchType(
     typeName: string,
     patch: Partial<CatalogOverlay['types'][string]>,
+    curatedBy: string,
   ): Promise<CatalogObjectTypeDef | undefined>;
 
+  /** @param curatedBy the acting principal's id, recorded on `type.curated`. */
   abstract patchProperty(
     typeName: string,
     propertyName: string,
     patch: NonNullable<CatalogOverlay['types'][string]['properties']>[string],
+    curatedBy: string,
   ): Promise<CatalogObjectTypeDef | undefined>;
 
   /**
@@ -154,6 +205,12 @@ export abstract class CatalogRegistry {
    * Which of those a deployment runs is why the event is worth more than the
    * call it accompanies: a registry that quietly resets without emitting looks
    * exactly like one that never ran a reset at all.
+   *
+   * @param resetBy the acting principal's id, recorded on `overlay.reset`. An
+   * implementation that refuses is free to declare no parameter at all — an
+   * override may take fewer than it was promised — and `StoredCatalogRegistry`
+   * does, because an argument it accepted and never recorded would read as a
+   * dropped actor rather than as a reset that never happened.
    */
-  abstract resetOverlay(): Promise<void>;
+  abstract resetOverlay(resetBy: string): Promise<void>;
 }

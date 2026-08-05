@@ -8,7 +8,7 @@ import {
   readPropertyOptions,
   readTypeOptions,
 } from './catalog.decorators';
-import { type CatalogEventPayloads, emitCatalog } from './catalog.events';
+import { type CatalogEventPayloads, curationActor, emitCatalog } from './catalog.events';
 import { CATALOG_OPTIONS, type CatalogModuleOptions } from './catalog.options';
 import type { CatalogOverlayStore } from './catalog.overlay-store';
 import { CATALOG_OVERLAY_STORE } from './catalog.overlay-store.token';
@@ -188,6 +188,7 @@ export class MikroOrmCatalogRegistry extends CatalogRegistry implements OnModule
   async patchType(
     typeName: string,
     patch: Partial<CatalogOverlay['types'][string]>,
+    curatedBy: string,
   ): Promise<CatalogObjectTypeDef | undefined> {
     const type = this.getType(typeName);
     if (!type) return undefined;
@@ -200,6 +201,10 @@ export class MikroOrmCatalogRegistry extends CatalogRegistry implements OnModule
     emitCatalog('type.curated', {
       typeName: type.name,
       changed: Object.keys(rest),
+      // Through `curationActor` rather than passed straight in, even though the
+      // parameter is required: the callers this class actually has to survive are
+      // the ones the compiler never saw. See the note on that function.
+      principalId: curationActor(curatedBy),
     });
     return this.getType(type.name);
   }
@@ -209,6 +214,7 @@ export class MikroOrmCatalogRegistry extends CatalogRegistry implements OnModule
     typeName: string,
     propertyName: string,
     patch: NonNullable<CatalogOverlay['types'][string]['properties']>[string],
+    curatedBy: string,
   ): Promise<CatalogObjectTypeDef | undefined> {
     const type = this.getType(typeName);
     if (!type) return undefined;
@@ -231,6 +237,7 @@ export class MikroOrmCatalogRegistry extends CatalogRegistry implements OnModule
       typeName: type.name,
       property: propertyName,
       changed: Object.keys(patch),
+      principalId: curationActor(curatedBy),
     });
     return this.getType(type.name);
   }
@@ -245,12 +252,18 @@ export class MikroOrmCatalogRegistry extends CatalogRegistry implements OnModule
    *
    * Emitted after the write, like the two patches above, so the trail says what
    * happened rather than what was about to.
+   *
+   * The actor is applied here rather than inside {@link summariseOverlay}, which
+   * stays a pure function of the overlay. What was destroyed and who destroyed it
+   * are facts from two different places, and folding the principal into the
+   * summariser would mean the one function that must be callable with nothing but
+   * an old overlay suddenly needing the request as well.
    */
-  async resetOverlay(): Promise<void> {
+  async resetOverlay(resetBy: string): Promise<void> {
     const discarded = summariseOverlay(this.overlay);
     this.overlay = { types: {} };
     await this.persist();
-    emitCatalog('overlay.reset', discarded);
+    emitCatalog('overlay.reset', { ...discarded, principalId: curationActor(resetBy) });
   }
 
   private async persist(): Promise<void> {
@@ -416,12 +429,21 @@ export class MikroOrmCatalogRegistry extends CatalogRegistry implements OnModule
  * order is forced: a caller has to hold the old overlay to call it, and cannot
  * accidentally summarise the empty one it just installed.
  *
+ * Everything the payload holds except the actor, stated as an `Omit` of the
+ * payload rather than a shape of its own. A hand-written interface here would be
+ * a second copy of the contract, free to fall behind the day a field is added —
+ * and the failure would be a summary silently missing a key that the type says
+ * is required. `principalId` is the caller's to supply because it is a fact about
+ * the request, not about the overlay.
+ *
  * A type entry counts whatever it holds, including an entry that ended up empty.
  * `buildType` treats a present entry as enrichment on the same terms, and the
  * honest reading of one is "somebody patched this type" — which is exactly what
  * the reset undid.
  */
-function summariseOverlay(overlay: CatalogOverlay): CatalogEventPayloads['overlay.reset'] {
+function summariseOverlay(
+  overlay: CatalogOverlay,
+): Omit<CatalogEventPayloads['overlay.reset'], 'principalId'> {
   const typeNames = Object.keys(overlay.types);
   const classifications: CatalogEventPayloads['overlay.reset']['classifications'] = [];
   let properties = 0;

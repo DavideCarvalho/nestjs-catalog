@@ -6,6 +6,20 @@ import { InMemoryCatalogOverlayStore } from './catalog.overlay-store';
 import { MikroOrmCatalogRegistry } from './catalog.registry';
 
 /**
+ * Who these edits are attributed to.
+ *
+ * A curation call takes the acting principal's id, so every patch below has to
+ * name one. Spelled as a delegated composite rather than `'test'` because that is
+ * the shape a real console produces — and a fixture that used the simple shape
+ * would let a producer that dropped the person half go on passing.
+ *
+ * What it lands as is asserted in `catalog.curation-audit.integration.spec.ts`,
+ * not here: these cases are about the overlay, and threading the actor through
+ * them is a consequence of the signature rather than the subject.
+ */
+const CURATOR = 'catalog-console#ana@example.com';
+
+/**
  * The registry reads a MikroORM metadata graph and nothing else, so these tests
  * hand it a real `EntityMetadata` built by hand rather than a database. That is
  * the point: every derivation below — the display name, the scalar type, the
@@ -328,10 +342,11 @@ describe('the overlay', () => {
   });
 
   it('renames a type without touching the database', async () => {
-    const patched = await registry.patchType('WorkOrder', {
-      displayName: 'Work Order',
-      group: 'Maintenance',
-    });
+    const patched = await registry.patchType(
+      'WorkOrder',
+      { displayName: 'Work Order', group: 'Maintenance' },
+      CURATOR,
+    );
     expect(patched?.displayName).toBe('Work Order');
     expect(patched?.group).toBe('Maintenance');
     // Derived from the new display name, not the old one.
@@ -342,18 +357,29 @@ describe('the overlay', () => {
   // Property overlays are written through patchProperty. A type patch that
   // spread its whole payload would wipe every column label somebody had fixed.
   it('does not let a type patch clobber the property overlay', async () => {
-    await registry.patchProperty('WorkOrder', 'acftSn', { displayName: 'Aircraft Serial' });
-    await registry.patchType('WorkOrder', {
-      displayName: 'Work Order',
-      properties: { acftSn: { displayName: 'Wiped' } },
-    });
+    await registry.patchProperty(
+      'WorkOrder',
+      'acftSn',
+      { displayName: 'Aircraft Serial' },
+      CURATOR,
+    );
+    await registry.patchType(
+      'WorkOrder',
+      { displayName: 'Work Order', properties: { acftSn: { displayName: 'Wiped' } } },
+      CURATOR,
+    );
     const property = registry.getType('WorkOrder')?.properties.find((p) => p.name === 'acftSn');
     expect(property?.displayName).toBe('Aircraft Serial');
   });
 
   it('merges successive patches rather than replacing them', async () => {
-    await registry.patchProperty('WorkOrder', 'acftSn', { displayName: 'Aircraft Serial' });
-    await registry.patchProperty('WorkOrder', 'acftSn', { unit: 'serial' });
+    await registry.patchProperty(
+      'WorkOrder',
+      'acftSn',
+      { displayName: 'Aircraft Serial' },
+      CURATOR,
+    );
+    await registry.patchProperty('WorkOrder', 'acftSn', { unit: 'serial' }, CURATOR);
     const property = registry.getType('WorkOrder')?.properties.find((p) => p.name === 'acftSn');
     expect(property?.displayName).toBe('Aircraft Serial');
     expect(property?.unit).toBe('serial');
@@ -363,14 +389,16 @@ describe('the overlay', () => {
   // forever, invisible, and read as a rename that quietly did nothing.
   it('refuses a patch against a property nobody has', async () => {
     await expect(
-      registry.patchProperty('WorkOrder', 'noSuchColumn', { hidden: true }),
+      registry.patchProperty('WorkOrder', 'noSuchColumn', { hidden: true }, CURATOR),
     ).resolves.toBeUndefined();
   });
 
   it('refuses a patch against a type nobody has', async () => {
-    await expect(registry.patchType('NoSuchType', { displayName: 'x' })).resolves.toBeUndefined();
     await expect(
-      registry.patchProperty('NoSuchType', 'id', { hidden: true }),
+      registry.patchType('NoSuchType', { displayName: 'x' }, CURATOR),
+    ).resolves.toBeUndefined();
+    await expect(
+      registry.patchProperty('NoSuchType', 'id', { hidden: true }, CURATOR),
     ).resolves.toBeUndefined();
   });
 
@@ -381,20 +409,23 @@ describe('the overlay', () => {
       { name: 'owner', kind: ReferenceKind.MANY_TO_ONE, type: 'Owner', targetMeta: owner },
     ]);
     const withRelations = registryOver([owner, widget]);
-    const patched = await withRelations.patchProperty('Widget', 'owner', {
-      displayName: 'Owned by',
-    });
+    const patched = await withRelations.patchProperty(
+      'Widget',
+      'owner',
+      { displayName: 'Owned by' },
+      CURATOR,
+    );
     expect(patched?.relations[0]?.displayName).toBe('Owned by');
   });
 
   it('reorders properties by the order the overlay gives them', async () => {
-    await registry.patchProperty('WorkOrder', 'acftSn', { order: -1 });
+    await registry.patchProperty('WorkOrder', 'acftSn', { order: -1 }, CURATOR);
     expect(registry.getType('WorkOrder')?.properties.map((p) => p.name)).toEqual(['acftSn', 'id']);
   });
 
   it('puts everything back where it started', async () => {
-    await registry.patchType('WorkOrder', { displayName: 'Work Order' });
-    await registry.resetOverlay();
+    await registry.patchType('WorkOrder', { displayName: 'Work Order' }, CURATOR);
+    await registry.resetOverlay(CURATOR);
     const type = registry.getType('WorkOrder');
     expect(type?.displayName).toBe('Work Order');
     // Derived again, not remembered: the humanised guess happens to match here,
@@ -409,7 +440,7 @@ describe('the overlay', () => {
       {},
       store,
     );
-    await first.patchType('WorkOrder', { displayName: 'Work Order' });
+    await first.patchType('WorkOrder', { displayName: 'Work Order' }, CURATOR);
 
     const second = new MikroOrmCatalogRegistry(
       ormOver([entity('WorkOrder', [scalar('id')])]),
@@ -422,7 +453,7 @@ describe('the overlay', () => {
 
   it('bumps the snapshot version on every rebuild, so a cache can tell', async () => {
     const before = registry.getSnapshot().version;
-    await registry.patchType('WorkOrder', { displayName: 'Work Order' });
+    await registry.patchType('WorkOrder', { displayName: 'Work Order' }, CURATOR);
     expect(registry.getSnapshot().version).toBeGreaterThan(before);
   });
 });

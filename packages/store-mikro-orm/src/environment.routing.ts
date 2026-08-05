@@ -137,23 +137,62 @@ export class RoutingCatalogRegistry extends CatalogRegistry {
     return requireEnvironmentBundle().registry.getGraph();
   }
 
+  // The curation actor is forwarded, and this is the hop it would be lost at.
+  //
+  // Not a rewording of "forward everything": an argument dropped here fails
+  // differently from a method left off. A missing method is a crash or a
+  // structural probe answering "cannot"; a missing *argument* is a call that
+  // succeeds, a patch that lands, and an audit row that says the catalog was
+  // curated by `unattributed` — in a multi-environment deployment, which is
+  // exactly the kind that has a governance team reading the trail. Nothing about
+  // the request looks wrong afterwards, and the registry underneath is doing its
+  // job perfectly, so the search would start in the wrong package.
+  //
+  // These parameters are therefore named and passed rather than the whole call
+  // being splatted through, and `environment.routing.curation.spec.ts` asserts
+  // what the inner registry actually received.
+
   patchType(
     typeName: string,
     patch: Partial<CatalogOverlay['types'][string]>,
+    curatedBy: string,
   ): Promise<CatalogObjectTypeDef | undefined> {
-    return requireEnvironmentBundle().registry.patchType(typeName, patch);
+    return requireEnvironmentBundle().registry.patchType(typeName, patch, curatedBy);
   }
 
   patchProperty(
     typeName: string,
     propertyName: string,
     patch: NonNullable<CatalogOverlay['types'][string]['properties']>[string],
+    curatedBy: string,
   ): Promise<CatalogObjectTypeDef | undefined> {
-    return requireEnvironmentBundle().registry.patchProperty(typeName, propertyName, patch);
+    return requireEnvironmentBundle().registry.patchProperty(
+      typeName,
+      propertyName,
+      patch,
+      curatedBy,
+    );
   }
 
-  resetOverlay(): Promise<void> {
-    return requireEnvironmentBundle().registry.resetOverlay();
+  /**
+   * Forwarded with its actor even though the registry behind it refuses.
+   *
+   * `StoredCatalogRegistry.resetOverlay` throws and declares no actor, and every
+   * environment bundle holds one — so today this argument is dropped one call
+   * deeper, on purpose and harmlessly. It is still passed, and the call is made
+   * through the abstract contract rather than through the concrete class the
+   * bundle happens to hold, because those are two different promises: a proxy
+   * typed against today's implementation silently narrows to whatever that
+   * implementation stopped accepting, and the day a bundle holds a registry that
+   * *can* reset is the day every reset in the trail is attributed to nobody.
+   *
+   * An annotation, not an assertion — the base class really is a supertype here,
+   * and an override taking fewer parameters is a legal implementation of one
+   * taking more.
+   */
+  resetOverlay(resetBy: string): Promise<void> {
+    const registry: CatalogRegistry = requireEnvironmentBundle().registry;
+    return registry.resetOverlay(resetBy);
   }
 
   /**

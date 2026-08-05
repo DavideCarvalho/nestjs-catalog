@@ -30,6 +30,9 @@ import { MikroOrmCatalogRegistry } from './catalog.registry';
  * that list is part of what is under test.
  */
 
+/** The acting principal every curation call below is made as. */
+const CURATOR = 'catalog-console#ana@example.com';
+
 function entity(className: string, props: Array<Partial<EntityProperty>>): EntityMetadata {
   const meta = new EntityMetadata({
     className,
@@ -132,21 +135,21 @@ describe('resetting the overlay is audited', () => {
 
   it('records the reset, under a name a recorder is listening for', async () => {
     const registry = catalogOfTwo();
-    await registry.patchType('Dispute', { displayName: 'Case' });
+    await registry.patchType('Dispute', { displayName: 'Case' }, CURATOR);
 
     const trail = recording();
-    await registry.resetOverlay();
+    await registry.resetOverlay(CURATOR);
 
     expect(trail.of('overlay.reset')).toHaveLength(1);
   });
 
   it('names every type whose curation it destroyed', async () => {
     const registry = catalogOfTwo();
-    await registry.patchType('Dispute', { displayName: 'Case' });
-    await registry.patchProperty('WorkOrder', 'acftSn', { displayName: 'Tail number' });
+    await registry.patchType('Dispute', { displayName: 'Case' }, CURATOR);
+    await registry.patchProperty('WorkOrder', 'acftSn', { displayName: 'Tail number' }, CURATOR);
 
     const trail = recording();
-    await registry.resetOverlay();
+    await registry.resetOverlay(CURATOR);
 
     const [payload] = trail.of('overlay.reset');
     expect(asStrings(payload?.typeNames).sort()).toEqual(['Dispute', 'WorkOrder']);
@@ -154,14 +157,14 @@ describe('resetting the overlay is audited', () => {
 
   it('counts the property entries that went with them', async () => {
     const registry = catalogOfTwo();
-    await registry.patchProperty('Dispute', 'settlementAmount', { hidden: true });
-    await registry.patchProperty('WorkOrder', 'acftSn', { displayName: 'Tail number' });
+    await registry.patchProperty('Dispute', 'settlementAmount', { hidden: true }, CURATOR);
+    await registry.patchProperty('WorkOrder', 'acftSn', { displayName: 'Tail number' }, CURATOR);
     // A second patch of the same property is still one entry: the payload counts
     // what was lost, not how many times somebody typed it.
-    await registry.patchProperty('WorkOrder', 'acftSn', { order: 3 });
+    await registry.patchProperty('WorkOrder', 'acftSn', { order: 3 }, CURATOR);
 
     const trail = recording();
-    await registry.resetOverlay();
+    await registry.resetOverlay(CURATOR);
 
     expect(trail.of('overlay.reset')[0]?.properties).toBe(2);
   });
@@ -175,11 +178,11 @@ describe('resetting the overlay is audited', () => {
    */
   it('lists every classification that stopped applying, with its value', async () => {
     const registry = catalogOfTwo();
-    await registry.patchProperty('Dispute', 'settlementAmount', { classification: 'CUI' });
-    await registry.patchProperty('WorkOrder', 'acftSn', { displayName: 'Tail number' });
+    await registry.patchProperty('Dispute', 'settlementAmount', { classification: 'CUI' }, CURATOR);
+    await registry.patchProperty('WorkOrder', 'acftSn', { displayName: 'Tail number' }, CURATOR);
 
     const trail = recording();
-    await registry.resetOverlay();
+    await registry.resetOverlay(CURATOR);
 
     expect(asRecords(trail.of('overlay.reset')[0]?.classifications)).toEqual([
       { typeName: 'Dispute', property: 'settlementAmount', classification: 'CUI' },
@@ -190,10 +193,18 @@ describe('resetting the overlay is audited', () => {
     const registry = catalogOfTwo();
 
     const trail = recording();
-    await registry.resetOverlay();
+    await registry.resetOverlay(CURATOR);
 
     const [payload] = trail.of('overlay.reset');
-    expect(payload).toEqual({ typeNames: [], properties: 0, classifications: [] });
+    // The actor is there even when nothing was destroyed, and that is the point
+    // of recording an empty reset at all: "somebody pressed it and nothing was
+    // there" is a fact about somebody.
+    expect(payload).toEqual({
+      typeNames: [],
+      properties: 0,
+      classifications: [],
+      principalId: CURATOR,
+    });
   });
 
   /**
@@ -201,21 +212,33 @@ describe('resetting the overlay is audited', () => {
    * holding a verbatim copy of the overlay is a backup nobody designed — and the
    * way that would arrive is somebody adding "just the labels too" and then "just
    * the descriptions". This is the assertion that has to be edited first.
+   *
+   * `principalId` is in the list and is not part of the summary: it says who,
+   * where the other three say what was lost. It is pinned here anyway because
+   * this is the test that enumerates the payload, and a key that appeared without
+   * anyone deciding to add it is exactly what this case exists to catch.
    */
   it('carries a summary and not the overlay', async () => {
     const registry = catalogOfTwo();
-    await registry.patchType('Dispute', { displayName: 'Case', description: 'Money at stake' });
-    await registry.patchProperty('Dispute', 'settlementAmount', {
-      displayName: 'Amount',
-      unit: 'USD',
-    });
+    await registry.patchType(
+      'Dispute',
+      { displayName: 'Case', description: 'Money at stake' },
+      CURATOR,
+    );
+    await registry.patchProperty(
+      'Dispute',
+      'settlementAmount',
+      { displayName: 'Amount', unit: 'USD' },
+      CURATOR,
+    );
 
     const trail = recording();
-    await registry.resetOverlay();
+    await registry.resetOverlay(CURATOR);
 
     const [payload] = trail.of('overlay.reset');
     expect(Object.keys(payload ?? {}).sort()).toEqual([
       'classifications',
+      'principalId',
       'properties',
       'typeNames',
     ]);
@@ -225,21 +248,21 @@ describe('resetting the overlay is audited', () => {
 
   it('is one event, not one per curated type', async () => {
     const registry = catalogOfTwo();
-    await registry.patchType('Dispute', { displayName: 'Case' });
-    await registry.patchType('WorkOrder', { displayName: 'Work Order' });
+    await registry.patchType('Dispute', { displayName: 'Case' }, CURATOR);
+    await registry.patchType('WorkOrder', { displayName: 'Work Order' }, CURATOR);
 
     const trail = recording();
-    await registry.resetOverlay();
+    await registry.resetOverlay(CURATOR);
 
     expect(trail.events.map((e) => e.event)).toEqual(['overlay.reset']);
   });
 
   it('still puts the catalog back, which is what it was for', async () => {
     const registry = catalogOfTwo();
-    await registry.patchType('Dispute', { displayName: 'Case' });
+    await registry.patchType('Dispute', { displayName: 'Case' }, CURATOR);
 
     const trail = recording();
-    await registry.resetOverlay();
+    await registry.resetOverlay(CURATOR);
 
     expect(registry.getType('Dispute')?.displayName).toBe('Dispute');
     expect(trail.of('overlay.reset')).toHaveLength(1);

@@ -11,8 +11,10 @@ export {
   CATALOG_LIB,
   type CatalogEvent,
   type CatalogEventPayloads,
+  UNATTRIBUTED_PRINCIPAL_ID,
   catalogEventPhase,
   channelNameFor,
+  curationActor,
   emitCatalog,
 } from './catalog.events';
 export { CatalogModule } from './catalog.module';
