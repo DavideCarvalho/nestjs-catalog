@@ -224,6 +224,11 @@ async function storedRegistry(): Promise<StoredCatalogRegistry> {
       if (target === SnapshotRow) return [];
       throw new Error('unexpected entity in reload');
     },
+    // `reload` asks the database which snapshots are the serving ones before
+    // hydrating any. No fixture here has committed a load, so the honest answer
+    // is none — and on that answer the registry skips the snapshot read
+    // entirely. Nothing in this file is about freshness; the graph is.
+    getConnection: () => ({ execute: async () => [] }),
   });
   const registry = Object.create(StoredCatalogRegistry.prototype);
   Object.assign(registry, {

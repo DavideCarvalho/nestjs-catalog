@@ -109,6 +109,10 @@ function registryOver(): StoredCatalogRegistry {
       throw new Error('unexpected entity in findOne');
     },
     flush: async () => undefined,
+    // See `stored-registry.freshness.spec.ts`: `reload` asks which snapshots are
+    // serving before hydrating any, and no fixture here commits a load. An empty
+    // answer means the snapshot read is skipped altogether.
+    getConnection: () => ({ execute: async () => [] }),
   });
 
   const registry: StoredCatalogRegistry = Object.create(StoredCatalogRegistry.prototype);

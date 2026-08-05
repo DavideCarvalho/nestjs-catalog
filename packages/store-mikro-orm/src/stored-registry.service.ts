@@ -25,6 +25,25 @@ function toScalar(value: string): ScalarType {
   return found ?? 'unknown';
 }
 
+/**
+ * The `id` out of a raw driver row, or undefined if it is not there.
+ *
+ * A guard rather than a cast because the driver's return type is genuinely
+ * unknown — `execute` hands back whatever the server sent — and the alternative
+ * is asserting a shape that a renamed column would make a lie at runtime while
+ * still compiling. `Reflect.get` rather than indexing, so narrowing `value` to
+ * an object is enough and no index signature has to be invented for it.
+ */
+function idOf(value: unknown): string | undefined {
+  if (typeof value !== 'object' || value === null) return undefined;
+  const id = Reflect.get(value, 'id');
+  return typeof id === 'string' ? id : undefined;
+}
+
+function isPresent<T>(value: T | undefined): value is T {
+  return value !== undefined;
+}
+
 const RELATION_KINDS: RelationKind[] = ['1:1', '1:m', 'm:1', 'm:n'];
 
 /**
@@ -293,22 +312,79 @@ export class StoredCatalogRegistry extends CatalogRegistry implements OnModuleIn
   }
 
   /**
-   * The newest COMMITTED snapshot per type, in one query.
-   *
-   * One query rather than one per type, because this runs on every reload and a
-   * catalog with two hundred types would otherwise pay two hundred round trips
-   * to answer a question nobody asked yet. Ordered newest-first and kept on
-   * first sight, so the map holds the serving snapshot for each type.
+   * The newest COMMITTED snapshot per type — bounded by the number of TYPES,
+   * never by the number of snapshots ever written.
    *
    * `committed: true` is the filter that makes this mean anything: an
    * uncommitted snapshot is a load in flight or a load that failed, and neither
    * is what readers are being served.
+   *
+   * **Why this is two statements and not one `find`.** It used to be
+   * `em.find(SnapshotRow, { committed: true }, { orderBy: { committedAt: 'desc' } })`
+   * — every committed snapshot ever written, dragged over the wire and hydrated
+   * into managed entities, to keep one row per type and drop the rest. That is
+   * the wrong shape for a table nothing ever deletes from. Measured on MySQL 8.0
+   * at 200 types / 50k committed snapshots: `reload()` took 450-500 ms and the
+   * hydrated rows added **161 MB** to the heap. Both of those land on the host
+   * this package is mounted inside — its event loop does the hydration and its
+   * pod holds the heap — and both grow forever, because a snapshot row is
+   * written per load per type and nothing prunes them (see the retention note on
+   * {@link SnapshotRow}). The old cost was not "a slow catalog screen"; at a
+   * year of nightly loads it is a memory spike in somebody else's process.
+   *
+   * So: ask the database which rows are the serving ones and hydrate only
+   * those. The first statement is a grouped join returning ~one id per type; the
+   * second is a primary-key `IN` over that handful. Two small round trips beat
+   * one enormous one, and doing the narrowing in SQL rather than in JS is the
+   * whole point — the rejected rows never cross the wire.
+   *
+   * **What this costs elsewhere.** The grouped query still SCANS the table: the
+   * only declared index is `(type_name, created_at)`, which covers neither the
+   * `committed` filter nor the `committed_at` ordering, so MySQL reads every row
+   * to compute the per-type maximum. That is now the database server's work
+   * instead of the host's, which is the trade being made deliberately — but it
+   * does not vanish. An index on `(committed, type_name, committed_at)` takes the
+   * grouped query from ~85 ms to ~14 ms at 50k rows. It is not added here
+   * because it is a deployment decision, not a defect: `fingerprintOf` in
+   * `schema.ts` hashes only column names, types and nullability, so an added
+   * `@Index` would not move the fingerprint and would never be applied to an
+   * already-booted database at all.
+   *
+   * **Ties.** `committed_at` is a `DATETIME` with no fractional seconds, so two
+   * loads of one type committing in the same second share a maximum and both ids
+   * come back. The `orderBy` below makes the winner the highest id rather than
+   * whichever row the engine happened to return first — the previous code broke
+   * such ties arbitrarily, so this is strictly more determinism, not less.
+   *
+   * Table and column names are written out rather than derived from metadata,
+   * matching `audit-recorder.service.ts`. Both assume MikroORM's underscored
+   * naming strategy, which this package's entities are declared against.
    */
   private async servingSnapshots(em: EntityManager): Promise<Map<string, SnapshotRow>> {
+    const newest = await em.getConnection().execute<unknown[]>(
+      `SELECT s.id
+         FROM catalog_snapshot s
+         JOIN (
+                SELECT type_name, MAX(committed_at) AS newest
+                  FROM catalog_snapshot
+                 WHERE committed = TRUE
+              GROUP BY type_name
+              ) latest
+           ON latest.type_name = s.type_name
+          AND latest.newest = s.committed_at
+        WHERE s.committed = TRUE`,
+    );
+
+    const ids = newest.map(idOf).filter(isPresent);
+    // Guarded rather than left to the query builder: an empty `$in` is a
+    // `WHERE id IN ()`, which is a syntax error on MySQL, and a catalog with no
+    // committed loads yet is the ordinary state on a fresh deployment.
+    if (ids.length === 0) return new Map();
+
     const rows = await em.find(
       SnapshotRow,
-      { committed: true },
-      { orderBy: { committedAt: 'desc' } },
+      { id: { $in: ids } },
+      { orderBy: { committedAt: 'desc', id: 'desc' } },
     );
 
     const serving = new Map<string, SnapshotRow>();

@@ -125,7 +125,29 @@ export function relationsFor(types: CatalogObjectTypeDef[]): CatalogQueryRelatio
  * `START TRANSACTION READ ONLY` is the guarantee — MySQL refuses any write
  * inside it, whatever the statement turned out to parse as. The keyword check
  * upstream only exists to produce a readable message; this is what makes the
- * screen safe to expose.
+ * screen safe to expose. Verified against MySQL 8.0 rather than assumed: an
+ * `INSERT` issued between the `START TRANSACTION` and the `ROLLBACK` below comes
+ * back as `Cannot execute statement in a READ ONLY transaction`, sequentially
+ * and with eight of these sequences in flight at once. The statements do share
+ * one session — the connection id is stable across all four.
+ *
+ * The timeout is a per-statement optimizer HINT rather than `SET SESSION
+ * MAX_EXECUTION_TIME`, and that difference matters to whoever is hosting this.
+ * A session variable rides on the pooled connection: set it here and it stays
+ * set on that connection after the query returns, for whoever borrows it next.
+ * With no `contextName` configured, `catalogConnectionProviders` binds this
+ * package to the HOST's `EntityManager` (see `context.ts`) — so the connection
+ * being poisoned is one of the host's, and the next thing the host runs on it
+ * silently inherits a 15-second statement timeout it never asked for and cannot
+ * see. Measured: after one query-console request, a *different* `em.fork()`
+ * read `@@SESSION.MAX_EXECUTION_TIME` back as the value set here.
+ *
+ * The hint has the same teeth and no residue. Both forms interrupt a runaway
+ * cross join at 1.00 s; the hint leaves the session variable at 0. It also
+ * removes a round trip, since it rides on the statement instead of preceding
+ * it. It attaches to the outer `SELECT` — the wrapper below, which is always a
+ * plain `SELECT`, never the caller's text — so the caller's statement is not
+ * rewritten and a `WITH` that starts their query is untouched.
  */
 export async function runReadOnlyQuery(
   em: EntityManager,
@@ -135,18 +157,16 @@ export async function runReadOnlyQuery(
   const timeoutMs = request.timeoutMs ?? 15_000;
   const started = Date.now();
 
+  // MySQL's own kill switch, so a runaway join cannot hold a connection for as
+  // long as it likes. Floored at a second, matching what the session form did.
+  const budgetMs = Math.max(1000, Math.floor(timeoutMs));
   // Fetch one extra row: if it comes back, the cap cut the result short and the
   // UI can say so rather than quietly showing a prefix as if it were the whole.
-  const wrapped = `SELECT * FROM (${request.sql.trim().replace(/;\s*$/, '')}) AS ${ident('q')} LIMIT ${maxRows + 1}`;
+  const wrapped = `SELECT /*+ MAX_EXECUTION_TIME(${budgetMs}) */ * FROM (${request.sql.trim().replace(/;\s*$/, '')}) AS ${ident('q')} LIMIT ${maxRows + 1}`;
 
   const connection = em.getConnection();
   await connection.execute('START TRANSACTION READ ONLY');
   try {
-    // MySQL's own kill switch, so a runaway join cannot hold a connection for
-    // as long as it likes.
-    await connection.execute(
-      `SET SESSION MAX_EXECUTION_TIME = ${Math.max(1000, Math.floor(timeoutMs))}`,
-    );
     const rows = await connection.execute<Array<Record<string, unknown>>>(wrapped);
     const truncated = rows.length > maxRows;
     const page = truncated ? rows.slice(0, maxRows) : rows;

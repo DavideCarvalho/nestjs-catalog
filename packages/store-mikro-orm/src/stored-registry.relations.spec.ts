@@ -85,6 +85,10 @@ function emOver(types: ObjectTypeRow[]) {
       throw new Error('unexpected entity in findOne');
     },
     flush,
+    // See `stored-registry.freshness.spec.ts`: `reload` asks which snapshots are
+    // serving before hydrating any, and no fixture here commits a load. An empty
+    // answer means the snapshot read is skipped altogether.
+    getConnection: () => ({ execute: async () => [] }),
   });
   return { em: { fork }, flush };
 }

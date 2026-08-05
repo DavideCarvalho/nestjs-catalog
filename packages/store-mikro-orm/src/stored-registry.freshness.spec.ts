@@ -35,35 +35,96 @@ function typeRow(name: string): ObjectTypeRow {
 
 function snapshotRow(fields: Partial<SnapshotRow>): SnapshotRow {
   const row = Object.create(SnapshotRow.prototype);
-  return Object.assign(row, { rowCount: 0, committed: true, ...fields });
+  const assigned = Object.assign(row, { rowCount: 0, committed: true, ...fields });
+  // Snapshot ids are `<type>:<snapshotId>` in the real schema, and the registry
+  // now hydrates BY id, so a fixture without one silently matches nothing.
+  assigned.id ??= `${assigned.typeName}:${assigned.snapshotId}`;
+  return assigned;
 }
 
 /**
- * An EntityManager that answers only the two finds `reload` makes, keyed by the
- * entity asked for — so a change that starts asking for something else fails
- * here rather than silently receiving the wrong rows.
+ * Which rows MySQL's grouped query would name as serving.
+ *
+ * The narrowing genuinely happens in SQL now, and a fake cannot test SQL — so
+ * this reproduces the grouping only so the mapping cases below still have
+ * realistic input. **The real proof that the statement selects the right rows is
+ * `stored-registry.freshness.db.spec.ts`, which runs it against MySQL 8.** What
+ * these unit cases still test honestly is everything on the JS side: that the
+ * registry hydrates only what the query named, that it never falls back to
+ * scanning, and how `toDef` renders the result.
+ */
+function servingIds(snapshots: SnapshotRow[]): Array<{ id: string }> {
+  const newest = new Map<string, number>();
+  for (const row of snapshots) {
+    if (!row.committed || !row.committedAt) continue;
+    const at = row.committedAt.getTime();
+    if (at > (newest.get(row.typeName) ?? Number.NEGATIVE_INFINITY)) {
+      newest.set(row.typeName, at);
+    }
+  }
+  return snapshots
+    .filter((row) => row.committed && row.committedAt?.getTime() === newest.get(row.typeName))
+    .map((row) => ({ id: row.id }));
+}
+
+/**
+ * An EntityManager that answers only what `reload` asks for, keyed by the entity
+ * — so a change that starts asking for something else fails here rather than
+ * silently receiving the wrong rows.
+ *
+ * The `SnapshotRow` branch REFUSES an unkeyed read. That refusal is the point:
+ * the bug this file guards against is the registry reading the whole snapshot
+ * table, and a fake that cheerfully answered such a read would let it back in.
  */
 function emReturning(types: ObjectTypeRow[], snapshots: SnapshotRow[]) {
   const find = vi.fn(async (entity: unknown, where: Record<string, unknown>) => {
     if (entity === ObjectTypeRow) return types;
     if (entity === SnapshotRow) {
-      return where.committed === true ? snapshots.filter((s) => s.committed) : snapshots;
+      const ids = idsIn(where.id);
+      if (!ids) {
+        throw new Error(
+          `snapshots must be hydrated by id, not scanned — got ${JSON.stringify(where)}`,
+        );
+      }
+      // Sorted the way the real query's `orderBy` sorts, because "keep the row
+      // seen first" is only correct if the rows arrive newest-first.
+      return snapshots
+        .filter((row) => ids.includes(row.id))
+        .sort(
+          (a, b) =>
+            (b.committedAt?.getTime() ?? 0) - (a.committedAt?.getTime() ?? 0) ||
+            b.id.localeCompare(a.id),
+        );
     }
     throw new Error('unexpected entity in reload');
   });
-  return { find: { fork: () => ({ find }) }, spy: find };
+  // The parameter is declared even though the fake ignores it: the statement
+  // itself is what two cases below assert on.
+  const execute = vi.fn(async (_sql: string) => servingIds(snapshots));
+  const fork = () => ({ find, getConnection: () => ({ execute }) });
+  return { find: { fork }, spy: find, sql: execute };
+}
+
+/** The `$in` list out of a where clause, or undefined if the read is not keyed. */
+function idsIn(clause: unknown): string[] | undefined {
+  if (typeof clause !== 'object' || clause === null) return undefined;
+  const values = Reflect.get(clause, '$in');
+  if (!Array.isArray(values)) return undefined;
+  return values.filter((value): value is string => typeof value === 'string');
 }
 
 function registryOver(types: ObjectTypeRow[], snapshots: SnapshotRow[]) {
   const em = emReturning(types, snapshots);
   const registry = Object.create(StoredCatalogRegistry.prototype);
+  const orm: MikroORM | undefined = undefined;
   Object.assign(registry, {
     em: em.find,
-    orm: {} as MikroORM,
+    orm,
     options: {},
     snapshot: { version: 0, generatedAt: '', stats: {}, types: [] },
   });
-  return { registry: registry as StoredCatalogRegistry, spy: em.spy };
+  const typed: StoredCatalogRegistry = registry;
+  return { registry: typed, spy: em.spy, sql: em.sql };
 }
 
 describe('a type reports when its data was last committed', () => {
@@ -131,7 +192,8 @@ describe('a type reports when its data was last committed', () => {
     expect(type.rowCount).toBe(4200);
     // Filtered in the QUERY, not after: a catalog with a long history would
     // otherwise drag every snapshot it ever wrote across the wire on each boot.
-    expect(spy).toHaveBeenCalledWith(SnapshotRow, { committed: true }, expect.anything());
+    // The uncommitted row is never hydrated at all, so it cannot be picked.
+    expect(spy).not.toHaveBeenCalledWith(SnapshotRow, { committed: true }, expect.anything());
   });
 
   it('leaves the fields absent for a type nothing was ever committed to', async () => {
@@ -216,5 +278,82 @@ describe('a type reports when its data was last committed', () => {
     expect(type.lastCommittedAt).toBe('2026-08-04T09:00:00.000Z');
     expect(type.rowCount).toBe(4300);
     expect(type.lastPrincipalId).toBe('flip-nestjs');
+  });
+});
+
+/**
+ * The cost of dating a type, which is a different question from the answer.
+ *
+ * This ran on every boot, every publish and every curation edit, and it read
+ * every committed snapshot the deployment had ever written in order to keep one
+ * per type. Measured against MySQL 8.0 at 200 types and 50k snapshots, that was
+ * 450-500 ms of `reload()` and 161 MB of heap for rows that were discarded
+ * immediately. Both are spent in the HOST's process — this package is mounted
+ * inside somebody else's application — and both grow forever, because nothing
+ * in this repo ever deletes a snapshot row.
+ *
+ * So the invariant worth defending is not a duration, which drifts with the
+ * machine, but a shape: **what gets hydrated is bounded by the number of types,
+ * not by the number of loads.** That survives a rewrite of the SQL; a timing
+ * assertion would not.
+ */
+describe('dating a type does not read the whole snapshot history', () => {
+  /** One type, loaded nightly for two years. */
+  function history(typeName: string, loads: number): SnapshotRow[] {
+    return Array.from({ length: loads }, (_, i) =>
+      snapshotRow({
+        typeName,
+        snapshotId: `s-${String(i).padStart(4, '0')}`,
+        principalId: 'flip-nestjs',
+        rowCount: i,
+        committedAt: new Date(Date.UTC(2024, 0, 1) + i * 86_400_000),
+      }),
+    );
+  }
+
+  it('hydrates one row per type, not one per load', async () => {
+    const { registry, spy } = registryOver(
+      [typeRow('Mvr'), typeRow('Subwo')],
+      [...history('Mvr', 700), ...history('Subwo', 700)],
+    );
+
+    await registry.reload();
+
+    const snapshotReads = spy.mock.calls.filter((call) => call[0] === SnapshotRow);
+    expect(snapshotReads).toHaveLength(1);
+    // TWO ids for two types, out of fourteen hundred rows. This is the whole
+    // fix: the 1398 superseded rows never leave the database.
+    expect(idsIn(snapshotReads[0][1].id)).toHaveLength(2);
+  });
+
+  it('asks the database to do the narrowing, and reads what it names', async () => {
+    // The grouping is pushed into SQL rather than done in JS over the result.
+    // Doing it in JS is what the unbounded version was: the rows still cross the
+    // wire and still land in the host's heap, whichever process picks the winner.
+    const { registry, sql, spy } = registryOver([typeRow('Mvr')], history('Mvr', 500));
+
+    await registry.reload();
+
+    expect(sql).toHaveBeenCalledTimes(1);
+    const statement = sql.mock.calls[0][0];
+    expect(statement).toMatch(/GROUP BY\s+type_name/i);
+    expect(statement).toMatch(/MAX\(committed_at\)/i);
+    // And the filter is in the statement, so an uncommitted load is excluded by
+    // the engine rather than by a `.filter()` on rows already paid for.
+    expect(statement).toMatch(/committed = TRUE/i);
+    expect(spy.mock.calls.filter((call) => call[0] === SnapshotRow)).toHaveLength(1);
+  });
+
+  it('issues no snapshot read at all when nothing has ever been committed', async () => {
+    // Not just an optimisation. An empty `$in` compiles to `WHERE id IN ()`,
+    // which is a syntax error on MySQL — and a catalog whose types are published
+    // but not yet loaded is the ordinary state of a fresh deployment, not an
+    // edge case. Booting into a SQL error there would look like a broken schema.
+    const { registry, spy } = registryOver([typeRow('Subwo')], []);
+
+    await registry.reload();
+
+    expect(spy.mock.calls.filter((call) => call[0] === SnapshotRow)).toHaveLength(0);
+    expect('lastCommittedAt' in registry.getSnapshot().types[0]).toBe(false);
   });
 });
