@@ -142,6 +142,21 @@ export type DeleteReconciliation =
  * A type that loses 90% has almost never had a good day. Bounding both sides by
  * the same number would mean picking a growth bound loose enough to be useless
  * as a shrink bound, or a shrink bound tight enough to refuse every backfill.
+ *
+ * **Conditional on the store, and a host configuring this should know which
+ * condition.** {@link refuseRowCountDrift} is pure and decides on two numbers;
+ * somebody has to fetch them, and both come from members that are optional on
+ * the store interface. Without `currentSnapshot` there is no served baseline;
+ * without `listSnapshots`, or from a `listSnapshots` whose window does not
+ * reach the snapshot about to be committed, there is no count for the pending
+ * one. Either way the bound is not applied to that commit. That is the same
+ * permissive-rather-than-punishing stance {@link CARRIED_FROM_LABEL} takes for
+ * the same reason — an adapter that records less than the bundled one is not
+ * the failure this file exists for — but it means a number written here is a
+ * bound the store has to be able to measure, not one it is guaranteed to have.
+ * `PublishService.assertRowCountIsPlausible` is where that is decided; a skip
+ * that is not said out loud there is a bound believed to be on and off, which
+ * is the one outcome neither this file nor that one may produce.
  */
 export interface RowCountBound {
   /**
@@ -318,6 +333,18 @@ export function refuseUndeclaredDeletes(
  * it contains no full snapshot at all the load is refused, because the truthful
  * statement is "the last reconciliation is at least as old as everything this
  * store can still see", and that is worse than the interval rather than better.
+ *
+ * **Dated by the parsed instant, never by comparing the two strings.**
+ * `createdAt` is a string on the wire, and two of them sort chronologically
+ * only while every store writes the same UTC ISO-8601 shape — which this cannot
+ * check and which did not hold. A timestamp this cannot read at all was the
+ * expensive case: `"unknown"`, or anything else beginning past a digit, sorted
+ * above every real timestamp, won the comparison for newest, and produced a
+ * `NaN` age that no `>` is ever true of. One unreadable row in a list whose
+ * other rows could have dated the type perfectly well switched the check off,
+ * and nothing said so. An offset other than `Z` was the cheaper case, wrong in
+ * the safe direction: it mis-ordered by up to a day and refused slightly more
+ * than it should.
  */
 export function refuseStaleReconciliation(
   typeName: string,
@@ -339,14 +366,28 @@ export function refuseStaleReconciliation(
     return `${typeName} reconciles deletes by a full reload every ${describeInterval(deletes.withinMs)}, and none of the ${snapshots.length} snapshots this store still reports is one. The last full read is therefore at least as old as the oldest of them, so this incremental load is refused rather than carrying forward rows that may have been deleted upstream months ago. Run this connector in "full" mode once.`;
   }
 
-  const newest = full.reduce((left, right) => (left.createdAt >= right.createdAt ? left : right));
-  const age = now - Date.parse(newest.createdAt);
-  // `NaN` from an unparseable timestamp compares false against everything, so a
-  // store handing back a `createdAt` this cannot read admits the load rather
-  // than refusing it on a comparison that means nothing.
+  // Parsed once, and the unreadable ones dropped BEFORE the newest is chosen
+  // rather than after — see the docblock. Choosing first and parsing second is
+  // what let a single `createdAt` this cannot read decide the answer for the
+  // whole list.
+  const dated = full
+    .map((snapshot) => ({ snapshot, at: Date.parse(snapshot.createdAt) }))
+    .filter((candidate) => Number.isFinite(candidate.at));
+
+  // Full snapshots exist and not one of them carries a timestamp this can read.
+  // Admitted, on the same reasoning as {@link CARRIED_FROM_LABEL}: a check that
+  // refused because the store recorded less than the bundled one would be
+  // punishing the adapter rather than the data, and there is nothing here to
+  // refuse ON — every comparison available is against `NaN`. This is narrower
+  // than the branch it replaces, which needed only ONE unreadable timestamp
+  // anywhere in the list to reach the same silence.
+  if (dated.length === 0) return undefined;
+
+  const newest = dated.reduce((left, right) => (left.at >= right.at ? left : right));
+  const age = now - newest.at;
   if (!(age > deletes.withinMs)) return undefined;
 
-  return `${typeName} reconciles deletes by a full reload every ${describeInterval(deletes.withinMs)}, and the last one — snapshot ${newest.id} — was ${describeInterval(age)} ago. Every incremental load since then has carried forward rows that may no longer exist at the source, so this one is refused. Run this connector in "full" mode, then resume.`;
+  return `${typeName} reconciles deletes by a full reload every ${describeInterval(deletes.withinMs)}, and the last one — snapshot ${newest.snapshot.id} — was ${describeInterval(age)} ago. Every incremental load since then has carried forward rows that may no longer exist at the source, so this one is refused. Run this connector in "full" mode, then resume.`;
 }
 
 /**
