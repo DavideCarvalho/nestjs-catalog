@@ -12,6 +12,59 @@ import type {
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_OUTPUT_BYTES = 32 * 1024 * 1024;
 
+/**
+ * How much of what a transform logged is carried back, on both axes.
+ *
+ * Both, because either one alone leaves the capture unbounded in the dimension
+ * it does not cover, and this capture is *user code writing whatever it likes*.
+ * A transform that logs one line per record — the most natural debugging move
+ * there is — puts a copy of the source's data into `logs`, and `logs` is the one
+ * thing that crosses a durable step boundary and lands in the run record. So the
+ * ceiling is fixed here, in the child, before any of it is serialised: the
+ * alternative is a `finishRun` write whose size is a property of somebody's
+ * data.
+ *
+ * The same two numbers for JavaScript and for Python, applied by the two
+ * harnesses below in the same order. A transform's log behaviour changing
+ * because of the language it happens to be written in is a difference nobody can
+ * predict from reading either one.
+ *
+ * Deliberately far above what anything downstream keeps — the connector runner
+ * takes fifty lines, the workflow runner twenty per node at four hundred
+ * characters — because this is the *safety* bound and those are the *display*
+ * bounds. A harness that truncated at the display limit would decide, in the
+ * child, what a future consumer is allowed to see.
+ *
+ * What is dropped is said out loud, in a final line, rather than dropped
+ * quietly. Silence about a missing log is the exact failure this whole capture
+ * exists to remove; reproducing it at line 501 would only move it.
+ */
+const MAX_LOG_LINES = 500;
+const MAX_LOG_LINE_CHARS = 2_000;
+
+/**
+ * How much of what a *failing* transform logged is folded into the error.
+ *
+ * A failure throws, and a throw carries a message and nothing else — so the
+ * `logs` of a run that raised never reach the caller at all, and every consumer
+ * records the traceback with none of the output that led to it. Capturing
+ * `print` and then discarding it at the exact moment it is most wanted would be
+ * a fix that stops one step short of the case it was written for.
+ *
+ * The **last** lines, not the first, which is the opposite of what the display
+ * caps downstream do — and deliberately. Those are trimming a successful run's
+ * narrative, where the beginning is the story; this is the approach to a
+ * traceback, where the last thing printed is the one that says where the code
+ * got to.
+ *
+ * Small on both axes because this lands in an error message, and an error
+ * message ends up in a run row, a log line and a console toast. The full set is
+ * still on the result whenever the transform returned at all; this is the
+ * consolation for the path where there is no result.
+ */
+const FAILURE_LOG_LINES = 10;
+const FAILURE_LOG_CHARS = 200;
+
 /** Packages worth telling the author about, if the environment has them. */
 const REPORTED_PACKAGES = ['pandas', 'numpy', 'pyarrow', 'requests'];
 
@@ -148,7 +201,9 @@ export class SubprocessTransformRunner implements TransformRunner {
       );
     }
 
-    if (parsed.error) throw new Error(parsed.error);
+    const logs = Array.isArray(parsed.logs) ? parsed.logs.map(String) : [];
+
+    if (parsed.error) throw new Error(withFinalLogs(parsed.error, logs));
     if (!Array.isArray(parsed.rows)) {
       throw new Error(
         'The transform must return an array of rows. Returning anything else would leave the load ambiguous.',
@@ -160,7 +215,7 @@ export class SubprocessTransformRunner implements TransformRunner {
         (row): row is Record<string, unknown> =>
           typeof row === 'object' && row !== null && !Array.isArray(row),
       ),
-      logs: Array.isArray(parsed.logs) ? parsed.logs.map(String) : [],
+      logs,
       elapsedMs: Date.now() - started,
     };
   }
@@ -255,17 +310,70 @@ export class SubprocessTransformRunner implements TransformRunner {
 }
 
 /**
+ * The traceback, plus the tail of what the code printed on its way to it.
+ *
+ * Named in the message rather than appended bare, and counted rather than
+ * merely truncated: "the last 10 of 57 lines" tells a reader there is more to
+ * find on the run's own log, where a silent tail would let them believe they
+ * were looking at everything the transform said.
+ */
+function withFinalLogs(error: string, logs: string[]): string {
+  if (logs.length === 0) return error;
+  const tail = logs
+    .slice(-FAILURE_LOG_LINES)
+    .map((line) =>
+      line.length > FAILURE_LOG_CHARS ? `${line.slice(0, FAILURE_LOG_CHARS)}…` : line,
+    );
+  const heading =
+    logs.length > tail.length
+      ? `The last ${tail.length} of ${logs.length} lines it logged first:`
+      : `${tail.length === 1 ? 'The line' : `The ${tail.length} lines`} it logged first:`;
+  return `${error}\n${heading}\n${tail.map((line) => `  ${line}`).join('\n')}`;
+}
+
+/**
  * The JavaScript and TypeScript harness.
  *
  * `console.log` is captured rather than left on stdout so user code cannot
  * corrupt the single JSON line this prints — a transform that logs a `{` would
  * otherwise break its own result parsing, which is a maddening thing to debug.
+ *
+ * Every console channel that reaches a terminal is overridden, not just the four
+ * that were here first. `console.debug` writes to stdout exactly as `console.log`
+ * does, so leaving it alone left one spelling of "log something" that silently
+ * corrupted the result line; `console.trace` writes to stderr, so leaving it
+ * alone left one spelling that silently went nowhere. Both are the same mistake
+ * the Python harness made with `print`, and there is no reading of "anything the
+ * code logged" under which they are not it.
+ *
+ * The channels share one array and keep call order, which is the only ordering
+ * that answers the question logs are read for — what happened, and in what
+ * sequence. Nothing marks which channel a line came from: a reader looking at a
+ * failed run wants the sequence, and splitting it into two lists would make the
+ * interleaving unrecoverable to buy a label the line's own text usually carries.
+ *
+ * Bounded by {@link MAX_LOG_LINES} and {@link MAX_LOG_LINE_CHARS}, applied here
+ * rather than after the fact, so a transform that logs a copy of its input never
+ * gets as far as being serialised.
  */
 function javascriptHarness(code: string): string {
   return `
 const logs = [];
-const write = (...args) => logs.push(args.map(a => typeof a === "string" ? a : JSON.stringify(a)).join(" "));
+let dropped = 0;
+const keep = (line) => {
+  if (logs.length >= ${MAX_LOG_LINES}) { dropped += 1; return; }
+  logs.push(
+    line.length > ${MAX_LOG_LINE_CHARS}
+      ? line.slice(0, ${MAX_LOG_LINE_CHARS}) + "… (" + (line.length - ${MAX_LOG_LINE_CHARS}) + " more characters)"
+      : line,
+  );
+};
+const write = (...args) => keep(args.map(a => typeof a === "string" ? a : JSON.stringify(a)).join(" "));
 console.log = write; console.info = write; console.warn = write; console.error = write;
+console.debug = write; console.trace = write;
+const captured = () => dropped === 0
+  ? logs
+  : logs.concat(["… " + dropped + " more line(s) were logged and dropped: a transform keeps its first ${MAX_LOG_LINES}."]);
 
 let input = "";
 process.stdin.setEncoding("utf8");
@@ -275,11 +383,11 @@ try {
   const records = JSON.parse(input || "[]");
   const transform = async (records) => { ${code} };
   const rows = await transform(records);
-  process.stdout.write(JSON.stringify({ rows: rows ?? [], logs }));
+  process.stdout.write(JSON.stringify({ rows: rows ?? [], logs: captured() }));
 } catch (error) {
   process.stdout.write(JSON.stringify({
     error: error instanceof Error ? \`\${error.name}: \${error.message}\` : String(error),
-    logs,
+    logs: captured(),
   }));
 }
 `;
@@ -292,6 +400,44 @@ try {
  * that reaches for pandas will naturally end with one — making it write
  * `.to_dict("records")` would be a papercut on the only path pandas is worth
  * importing for.
+ *
+ * **`print` is redirected, for the same reason `console.log` is.** It used to go
+ * straight through to the child's real stdout, where the last-line result parse
+ * discarded it — so the single most obvious thing a person writes while working
+ * out what their transform is doing produced an empty log panel and no
+ * explanation. That is not a missing nicety: it costs the author their trust in
+ * the runner before they have written anything real, and the conclusion it
+ * invites ("my code never ran") is the wrong one. `log()` still exists, because
+ * transforms in the wild call it and a `NameError` is a worse answer than a
+ * redundant helper, but it is now literally `print` — one buffer, one ordering,
+ * and nothing that only works if you already knew about it.
+ *
+ * **stderr is captured too**, into the same list and in call order. `warnings`,
+ * a `logging` handler at its default configuration, and a traceback the code
+ * printed itself all land there, and those are precisely the lines somebody is
+ * looking for when a transform misbehaves. It is not marked as stderr, matching
+ * the JavaScript harness, which does not distinguish `console.error` either: the
+ * sequence is what a reader is reconstructing, and two lists would make the
+ * interleaving unrecoverable.
+ *
+ * What was written **before** an exception survives it. The redirect is a
+ * context manager around the call rather than a swap held for the whole script,
+ * so it unwinds on the way out of a traceback with the buffer intact, and the
+ * error branch reports the same lines the success branch would have. A
+ * transform that printed three things and then divided by zero is the case logs
+ * matter most for, and it is the case a naive swap loses.
+ *
+ * Bounded by {@link MAX_LOG_LINES} and {@link MAX_LOG_LINE_CHARS}, the same two
+ * numbers the JavaScript harness applies. Note that this bounds the *sink*, not
+ * only the result: an unterminated write longer than a line's ceiling is flushed
+ * as its own line rather than accumulated, so a transform writing without
+ * newlines cannot grow the child's memory either.
+ *
+ * The limit worth stating: this redirects Python-level writes to `sys.stdout`
+ * and `sys.stderr`. Output from a C extension or a subprocess that writes to the
+ * file descriptors underneath goes to the real streams, exactly as it does past
+ * an overridden `console` in Node. Redirecting the descriptors themselves would
+ * take the result channel with it.
  */
 function pythonHarness(code: string): string {
   const indented = code
@@ -299,11 +445,68 @@ function pythonHarness(code: string): string {
     .map((line) => `    ${line}`)
     .join('\n');
   return `
-import sys, json
+import sys, json, contextlib
 
 logs = []
+# A one-element list rather than a module global reassigned inside the helper,
+# so the counter needs no \`global\` statement in generated code.
+dropped = [0]
+
+def keep(line):
+    if len(logs) >= ${MAX_LOG_LINES}:
+        dropped[0] += 1
+        return
+    if len(line) > ${MAX_LOG_LINE_CHARS}:
+        line = "{}… ({} more characters)".format(
+            line[:${MAX_LOG_LINE_CHARS}], len(line) - ${MAX_LOG_LINE_CHARS}
+        )
+    logs.append(line)
+
+class Sink:
+    """Stands in for stdout and stderr while the transform runs.
+
+    Line-buffered by hand because \`print("a", "b")\` arrives as four separate
+    writes — the parts, the separators and the terminator — and appending each
+    one as its own entry would shred every multi-argument call.
+    """
+
+    def __init__(self):
+        self.partial = ""
+
+    def write(self, text):
+        if not isinstance(text, str):
+            text = str(text)
+        self.partial += text
+        while "\\n" in self.partial:
+            line, self.partial = self.partial.split("\\n", 1)
+            keep(line)
+        # A write with no newline in it is still bounded: past a line's ceiling
+        # there is nothing more to keep, so it is emitted rather than held.
+        if len(self.partial) > ${MAX_LOG_LINE_CHARS}:
+            keep(self.partial)
+            self.partial = ""
+        return len(text)
+
+    def writelines(self, lines):
+        for line in lines:
+            self.write(line)
+
+    def flush(self):
+        pass
+
+    def isatty(self):
+        return False
+
+    def drain(self):
+        """Whatever was written without a trailing newline is still output."""
+        if self.partial:
+            keep(self.partial)
+            self.partial = ""
+
+sink = Sink()
+
 def log(*args):
-    logs.append(" ".join(str(a) for a in args))
+    print(*args)
 
 def transform(records):
 ${indented || '    return records'}
@@ -317,15 +520,31 @@ def to_rows(result):
         return result.to_dict("records")
     return result
 
+def captured():
+    sink.drain()
+    if dropped[0] == 0:
+        return logs
+    return logs + [
+        "… {} more line(s) were logged and dropped: a transform keeps its first {}.".format(
+            dropped[0], ${MAX_LOG_LINES}
+        )
+    ]
+
 try:
     raw = sys.stdin.read()
     records = json.loads(raw) if raw.strip() else []
-    rows = to_rows(transform(records))
-    sys.stdout.write(json.dumps(rows and {"rows": rows, "logs": logs} or {"rows": [], "logs": logs}, default=str))
+    # \`to_rows\` is inside the redirect as well: a lazily-evaluated return value
+    # does its printing here, not before.
+    with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+        rows = to_rows(transform(records))
+    # Back on the real stdout by now — the context manager restores on the way
+    # out, including out of an exception — so this is the only thing on it.
+    out = captured()
+    sys.stdout.write(json.dumps(rows and {"rows": rows, "logs": out} or {"rows": [], "logs": out}, default=str))
 except Exception as error:
     sys.stdout.write(json.dumps({
         "error": "{}: {}".format(type(error).__name__, error),
-        "logs": logs,
+        "logs": captured(),
     }))
 `;
 }

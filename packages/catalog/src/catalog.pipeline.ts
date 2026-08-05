@@ -182,7 +182,28 @@ export interface CatalogTransform {
 
 export interface TransformResult {
   rows: Array<Record<string, unknown>>;
-  /** Anything the code logged. Surfaced in the run, never in the rows. */
+  /**
+   * Anything the code logged. Surfaced in the run, never in the rows.
+   *
+   * "Anything the code logged" is meant literally, and in whichever language the
+   * transform is written: `console.log` and its siblings in JavaScript and
+   * TypeScript, `print` and anything written to `sys.stderr` in Python. A
+   * transform author's first instinct for finding out what their code is doing
+   * has to be the thing that works, because the alternative — an empty panel and
+   * no explanation — reads as "my code never ran" rather than as "you used the
+   * wrong function".
+   *
+   * In call order, with the channels interleaved rather than separated: a reader
+   * is reconstructing a sequence, and two lists cannot be zipped back together.
+   *
+   * **Bounded, by the runner, before it is returned.** These are lines user code
+   * chose and they cross a durable step boundary into the run record, so an
+   * unbounded capture would make the size of a `finishRun` write a property of
+   * somebody's source data. The bundled runner keeps the first 500 lines at
+   * 2,000 characters each and appends a line saying how many it dropped — a
+   * truncation nobody is told about is the same failure as a log nobody is told
+   * about. Consumers cap again for display, more tightly.
+   */
   logs: string[];
   elapsedMs: number;
 }

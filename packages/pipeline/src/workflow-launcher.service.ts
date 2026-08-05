@@ -1,5 +1,4 @@
 import type { CatalogWorkflow, ConnectorRun } from '@dudousxd/nestjs-catalog';
-import { requireEnvironmentBundle } from '@dudousxd/nestjs-catalog-store-mikro-orm';
 import { WorkflowEngine } from '@dudousxd/nestjs-durable';
 import { BadRequestException, Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { CATALOG_PIPELINE_DURABILITY_DETAIL } from './seams';
@@ -68,42 +67,89 @@ export class WorkflowLauncher {
   /**
    * Whether a run started here and now would be checkpointed per node.
    *
-   * Three separate ways the answer is no, and they are kept separate because
-   * each has a different fix. There is no engine at all; there is one but this
-   * pod serves no handlers for it; or there is one and it belongs to a
-   * different environment than the caller asked for. The last is the subtle
-   * one and it is a correctness matter rather than a nicety: a worker serves
-   * exactly one environment, so dispatching a run requested against `staging`
-   * to a `dev` worker would load dev's data and report it under staging's
-   * name. Running it inline, in the caller's own scope, is the only honest
-   * answer available here.
+   * **One check, because one is all this package can make honestly.** The
+   * question asked is whether a `WorkflowEngine` resolved in this injector, and
+   * the answer is reported as the observation it is. This docblock used to
+   * describe three checks — an engine, whether this pod serves handlers for it,
+   * and whether that engine belongs to the environment the caller asked for —
+   * and the body has only ever performed the first. The other two are written
+   * out here rather than dropped, because "not checked" and "checked and fine"
+   * are the same silence from the outside, and each is a real way a run can be
+   * routed wrongly:
+   *
+   * - **Handlers.** An engine can resolve in a process that never registers
+   *   `CATALOG_WORKFLOW_RUN`. The engine's `workflowBody(name, version)` answers
+   *   only half of it: a body means definitely registered, but *no* body is
+   *   equally a `registerRemote` worker in another SDK or a group this pod
+   *   resolves by convention against a live worker — both of which run the graph
+   *   perfectly well. Treating that half-answer as "no" would send a durable run
+   *   inline, and an inline run carries none of the singleton mutex, so two
+   *   workers would load one connector's type at once. That is a worse failure
+   *   than the one it would be guarding against, and the genuinely-unregistered
+   *   case already fails loudly: `engine.start` throws "workflow … is not
+   *   registered", which {@link startDurable} turns into a refusal rather than a
+   *   quiet fallback.
+   * - **Environment.** A worker serves exactly one environment, so dispatching a
+   *   run requested against `staging` to a `dev` worker would load dev's data and
+   *   report it under staging's name. It is the one with real damage behind it
+   *   and it is the one least available from here: a `WorkflowEngine` carries no
+   *   environment identity that this package can read, so the most this could
+   *   ever compute is which environment the *caller* is in — half a comparison,
+   *   which is exactly why the fossilised `requireEnvironmentBundle` import and
+   *   the `safely()` helper that would have read it through were both left
+   *   unused. Whichever environment a run belongs to, the host decided it, from
+   *   `CATALOG_DURABLE`, `APP_TYPE` and `CATALOG_ENVIRONMENT` — topology a
+   *   library cannot read without inventing the host's deployment model.
+   *
+   * Both are therefore reported rather than detected: a host that knows either
+   * answer says so through {@link CATALOG_PIPELINE_DURABILITY_DETAIL}, which is
+   * added to the sentence below rather than replacing it. What must not happen
+   * is this claiming "checkpointed" on the strength of an engine merely being
+   * injectable — the console renders this as a promise about restartability, and
+   * a graph built on a false one is a graph nobody can restart. So the sentence
+   * says what was observed, in those words, and leaves the deployment's own
+   * caveats to the deployment.
    */
   durability(): WorkflowDurability {
-    // Reported from what this package can OBSERVE — whether an engine resolved —
-    // and nothing else. The application this came from decided the same question
-    // from its own env (`CATALOG_DURABLE`, `APP_TYPE`, `CATALOG_ENVIRONMENT`),
-    // which is host topology and cannot be read from a library without the
-    // library inventing the host's deployment model.
-    //
-    // A host that knows more says so through `durabilityDetail`. What must not
-    // happen is this reporting "checkpointed" on the strength of an engine being
-    // injected somewhere that will not actually run the handlers: the console
-    // renders this as a promise about restartability, and a graph built on a
-    // false one is a graph nobody can restart.
     if (!this.engine) {
       return {
         available: false,
-        detail:
-          this.detail ??
+        detail: this.withHostDetail(
           'No durable engine resolved in this process, so a workflow runs inline: it still commits atomically at the sink, but a failure at node seven re-runs node one.',
+        ),
       };
     }
     return {
       available: true,
-      detail:
-        this.detail ??
+      // The class that resolved, which is the whole of what "which engine" can
+      // mean here. Declared on {@link WorkflowDurability} as something a console
+      // can print and never populated until now — a third promise in this method
+      // that the body was not keeping. It is a weak signal and worth naming as
+      // one: it distinguishes a real engine from a host's stand-in or decorator,
+      // and says nothing at all about which broker or which environment is
+      // behind it.
+      engine: this.engine.constructor.name,
+      detail: this.withHostDetail(
         'A durable engine resolved here, so each node is checkpointed and a failed run resumes at the node that failed.',
+      ),
     };
+  }
+
+  /**
+   * The observation, then whatever the host wanted added to it.
+   *
+   * Composed rather than substituted, which is what {@link
+   * CATALOG_PIPELINE_DURABILITY_DETAIL} has always said it is for — "only ever
+   * ADDS to what the package observed". It was substituting: a host binding the
+   * detail to something true and specific ("this pod registers no workflow
+   * handlers") replaced the sentence that said an engine had not resolved at
+   * all, so the one line a reader gets about why their run was not checkpointed
+   * lost the part that was actually checked. The seam exists because a host
+   * knows things a library cannot; it was never meant to cost the reader the
+   * things the library does know.
+   */
+  private withHostDetail(observed: string): string {
+    return this.detail ? `${observed} ${this.detail}` : observed;
   }
 
   /**
@@ -235,15 +281,6 @@ export class WorkflowLauncher {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-/** Run something that may throw because configuration is absent, quietly. */
-function safely(read: () => string): string | undefined {
-  try {
-    return read();
-  } catch {
-    return undefined;
-  }
 }
 
 function positiveInt(raw: string | undefined, fallback: number): number {
