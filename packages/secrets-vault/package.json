@@ -1,0 +1,54 @@
+{
+  "name": "@dudousxd/nestjs-catalog-secrets-vault",
+  "version": "0.0.0",
+  "description": "HashiCorp Vault Transit secret vault for @dudousxd/nestjs-catalog: connection credentials encrypted by Vault, so the key never reaches the application and rotation never reaches the database.",
+  "license": "MIT",
+  "author": "Davide Carvalho",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/DavideCarvalho/nestjs-catalog.git",
+    "directory": "packages/secrets-vault"
+  },
+  "keywords": [
+    "nestjs",
+    "catalog",
+    "vault",
+    "hashicorp",
+    "transit",
+    "secrets",
+    "encryption"
+  ],
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "//sideEffects": "Safe to be false: nothing runs at import time. Every export is a declaration, a pure function or a factory, and the first network call happens on the first seal or open.",
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsc -p tsconfig.json --watch",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "//dependencies": "There are none, and for this package that is a feature rather than an accident. Every credential in the catalog passes through this code, so its transitive dependency set is its supply-chain blast radius. The whole Vault surface used here is three JSON POSTs over the global fetch — see src/http.ts for why node-vault was not worth a package.",
+  "peerDependencies": {
+    "@dudousxd/nestjs-catalog": ">=0.1.0",
+    "@nestjs/common": ">=10"
+  },
+  "devDependencies": {
+    "@dudousxd/nestjs-catalog": "workspace:*",
+    "@nestjs/common": "11.1.19",
+    "@types/node": "25.6.0",
+    "typescript": "5.9.3"
+  },
+  "//engines": "18 is where global fetch became available unflagged enough to rely on, and AbortSignal.timeout landed in 17.3. A host on an older runtime can still use this by passing its own `fetch`.",
+  "engines": {
+    "node": ">=18"
+  }
+}

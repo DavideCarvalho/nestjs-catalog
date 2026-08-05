@@ -1,0 +1,12 @@
+{
+  "//": "Typechecking for the specs, which the build config MUST exclude — they would otherwise be emitted into dist and published. Extends BOTH: the build config, so strictness here can never drift from what ships; then ../../tsconfig.spec.base.json, which carries the few settings that must differ because vitest, not Node, loads these files (and the workspace-package-to-source map both it and vitest read). Later entries in an `extends` array win, so the spec base's overrides sit on top.",
+  "extends": ["./tsconfig.json", "../../tsconfig.spec.base.json"],
+  "include": [
+    "src/**/*.spec.ts",
+    "src/**/*.spec.tsx",
+    "src/**/*.test.ts",
+    "src/**/*.test.tsx",
+    "test/**/*"
+  ],
+  "exclude": ["node_modules", "dist"]
+}
