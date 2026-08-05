@@ -88,7 +88,9 @@ function emOver(types: ObjectTypeRow[]) {
     // See `stored-registry.freshness.spec.ts`: `reload` asks which snapshots are
     // serving before hydrating any, and no fixture here commits a load. An empty
     // answer means the snapshot read is skipped altogether.
-    getConnection: () => ({ execute: async () => [] }),
+    getConnection: () => ({
+      execute: async (sql: string) => (sql.includes('catalog_snapshot') ? [] : WATERMARK_ANSWER),
+    }),
   });
   return { em: { fork }, flush };
 }
@@ -99,7 +101,9 @@ function registryOver(types: ObjectTypeRow[]) {
   Object.assign(registry, {
     em,
     orm: {} as MikroORM,
-    options: {},
+    // The background staleness check off: these fixtures are about what
+    // `reload` builds, not about a sibling process noticing a write.
+    options: { staleAfterMs: 0 },
     snapshot: { version: 0, generatedAt: '', stats: {}, types: [] },
   });
   return { registry: registry as StoredCatalogRegistry, flush };
@@ -137,6 +141,17 @@ function fleet(options: { linked?: boolean; base?: boolean } = {}) {
   }
   return rows;
 }
+
+/**
+ * `reload` reads a staleness watermark over the model tables before anything
+ * else, so the fakes below have to answer it or the rebuild stops there. Its
+ * contents do not matter here — the check that would consult it is turned off,
+ * with `staleAfterMs: 0` — and what it does is
+ * `stored-registry.staleness.spec.ts`'s subject.
+ */
+const WATERMARK_ANSWER = [
+  { type_rows: 0, type_at: null, property_rows: 0, property_at: null, db_now: new Date(0) },
+];
 
 describe('a published link reaches the type', () => {
   it('serves the relations stored on the row', async () => {
