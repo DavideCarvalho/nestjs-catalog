@@ -1,5 +1,131 @@
 # @dudousxd/nestjs-catalog-pipeline
 
+## 0.10.0
+
+### Minor Changes
+
+- 800a61b: A property name that can never be a column is refused at the publish, not at the load
+
+  `PUT :type/schema` accepted `{"name": "Asset Id"}`, stored it, and answered 200.
+  The refusal — `Refusing to use "Asset Id" as a SQL identifier: letters, digits
+and underscore only, …` — arrived at the first commit, which is after the
+  connector has read the whole source and written every row of it. An observed run
+  reported `fetched=6905, written=6905` and then discovered the schema could never
+  have worked. Real column headers look like this: `Asset Id`, `Work Order Id`,
+  `Asset LIN/TAMCN`.
+
+  Everything needed to answer the question is in the publish payload, so
+  `upsertType` now answers it there: before the row is created, before the flush,
+  before `ensureType`. The rule is not restated — `identifierRefusal` runs
+  `assertSafeIdentifier` from `@dudousxd/nestjs-catalog`, the same call every
+  store's `ident` makes before it quotes anything, and hands back the error it
+  raises. So the publish-time refusal and the DDL-time one cannot come to disagree
+  about the character set, the length or the wording, whichever store is mounted.
+
+  The refusal names every offending property, not the first, and offers the
+  payload that would have worked: `{ "name": "Asset_Id", "columnName": "Asset Id"
+}` — the shape the API already supports, where `columnName` is free-form by
+  design and is what the loader looks up in the source record. A `columnName` the
+  caller already sent is kept rather than overwritten. Nothing is sanitised on the
+  caller's behalf: `name` is how the catalog, every query and every row a
+  publisher sends refer to the field, and quietly rewriting it would leave the
+  next batch — still keyed by `Asset Id` — writing nothing into that column.
+
+  **A name a type already holds is warned about, not refused.** `upsertType` only
+  ever adds properties and nothing anywhere removes one, so refusing the republish
+  of a type that picked up `Asset Id` before this check existed would leave a type
+  nobody can now repair — including the publisher trying to add the correctly
+  named property beside it. Those types republish exactly as they did, their
+  commits keep failing exactly as they did, and the log now names the properties
+  and says that fixing them means the database or a new type. A _new_ bad name on
+  that same republish is still refused.
+
+  New exports: `identifierRefusal`, `isUnpublishableName`,
+  `refuseUnpublishablePropertyNames`, `describeStoredUnpublishableNames`.
+
+- 800a61b: A delete strategy can be declared by an operator, not only by a deployment
+
+  `CATALOG_LOAD_EXPECTATIONS` was the only way to say how a type reconciles rows
+  deleted at its source, and it is a provider bound at boot. So the path was:
+  build a connector in the console, run it in `full`, and the moment you wanted
+  `incremental` you needed an engineer, a commit and a deploy. For a console whose
+  whole premise is that you assemble a pipeline on screen, that is the wrong shape.
+
+  The control was never about compilation. Read its own docblock: what it wants is
+  that **somebody chose a strategy and wrote down why**. That needs attribution and
+  visibility, which a row can carry as well as a provider can.
+
+  So the policy now resolves through three layers, field by field:
+
+      host.byType[type]   >   stored row   >   host.default
+
+  A deployment that declared something about a type still wins — that is what lets
+  one pin a type down and keep it pinned. Where the host is silent, an operator's
+  stored decision applies. `host.default` stays weakest, so a house-wide bound
+  never beats a specific one. `expectationFor` is now literally the same merge with
+  no stored layer, so there is one precedence rule in the codebase rather than two.
+
+  The enforcement functions did not move and did not become async.
+  `refuseUndeclaredDeletes`, `refuseStaleReconciliation` and `refuseRowCountDrift`
+  are still pure and synchronous; only the _sourcing_ of the policy reaches a
+  store, and it reaches it through `supportsLoadExpectations`, so a store that
+  implements none of the four new optional members behaves exactly as it does
+  today. The four members are optional for that reason: this package is not the
+  only implementation of `CatalogPipelineStore`, and widening a required interface
+  silently disqualifies every other one.
+
+  `PUT`/`DELETE pipeline/expectations/:type` ask for `catalog:curate` — the scope
+  that already governs what the catalog says about a type — and for a person.
+  `@RequireHuman()` is not decoration here: `because` is a sentence somebody is
+  accountable for, and an application key has no author. The writes merge over the
+  stored row, so an absent field means "leave it alone" rather than "clear it", and
+  a write to a field the host owns is a 409 naming that field rather than a silent
+  no-op. Both writes emit `type.curated`, the same event `patchType` emits, so the
+  recorder that already lifts `principalId` into the audit table needs no change.
+
+  The connector's cheap pre-flight gate resolves through the same three layers.
+  Without that the feature would work everywhere except where it is used: a
+  scheduled incremental run would still be refused by the early check after an
+  operator had stored a strategy.
+
+  `deletes` and `rowCount` are stored as JSON rather than as columns, and that is
+  load-bearing rather than lazy. MikroORM infers `int` for a `number`, which would
+  round `maxShrink: 0.5` to `0` — a bound that refuses a load for losing a single
+  row — and would overflow a thirty-day `withinMs` past a signed INT.
+
+### Patch Changes
+
+- 800a61b: One rule about what may be a SQL identifier, rather than two that agreed
+
+  `store-mikro-orm` and `store-clickhouse` each carried the pattern
+  `/^[A-Za-z_][A-Za-z0-9_]{0,62}$/`, an `UnsafeIdentifierError`, and the sentence
+  `Refusing to use "…" as a SQL identifier: letters, digits and underscore only,
+starting with a letter or underscore, 63 characters max.` — byte for byte
+  identical, in two files, with nothing anywhere comparing them.
+
+  That mattered because the publish-time refusal added alongside this reuses a
+  store's rule on purpose, so that a name refused at publish and the same name
+  refused at DDL cannot be described differently. It reused the MySQL copy. Which
+  bought the guarantee for a MySQL deployment and left a ClickHouse-only one
+  trusting two files to have been edited in step.
+
+  The rule now lives in `@dudousxd/nestjs-catalog` beside
+  `CATALOG_RESERVED_COLUMNS`, which is already shared for exactly this reason:
+  both are part of what the catalog promises a _publisher_, and a publisher should
+  be able to read the answer out of the contract rather than out of whichever
+  adapter happens to be mounted. New exports: `isSafeIdentifier`,
+  `assertSafeIdentifier`, `UnsafeIdentifierError`.
+
+  Each store keeps its own `ident`, because _quoting_ is engine syntax and not the
+  catalog's business — what may be quoted at all is. Both now call
+  `assertSafeIdentifier` and re-export the core's `UnsafeIdentifierError` rather
+  than declaring one, which also makes `error instanceof UnsafeIdentifierError` a
+  question worth asking across packages: it used to be false whenever the mounted
+  store was not the one the catching code imported from.
+
+  No behaviour changes. The character set, the 63-character limit, the wording and
+  the quoting are all what they were; there is one copy of them instead of two.
+
 ## 0.9.0
 
 ### Minor Changes
