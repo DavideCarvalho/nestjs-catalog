@@ -44,6 +44,126 @@ function isPresent<T>(value: T | undefined): value is T {
   return value !== undefined;
 }
 
+/** See {@link CatalogStoreModuleOptions.staleAfterMs}. */
+const DEFAULT_STALE_AFTER_MS = 1_000;
+
+/**
+ * How the model tables look right now, in five numbers.
+ *
+ * Counts *and* maxima, because neither alone is enough: a rename moves no count,
+ * and a type deleted and another published inside one second can leave the
+ * maximum where it was. `db_now` is the database's own clock rather than this
+ * process's — see {@link settledAt}, and note that clock skew between a pod and
+ * the database would otherwise decide correctness.
+ *
+ * Table and column names are written out rather than derived from metadata,
+ * matching `servingSnapshots` below and `audit-recorder.service.ts`. All three
+ * assume MikroORM's underscored naming strategy, which this package's entities
+ * are declared against.
+ */
+const WATERMARK_SQL = `SELECT
+       (SELECT COUNT(*)        FROM catalog_object_type) AS type_rows,
+       (SELECT MAX(updated_at) FROM catalog_object_type) AS type_at,
+       (SELECT COUNT(*)        FROM catalog_property)    AS property_rows,
+       (SELECT MAX(updated_at) FROM catalog_property)    AS property_at,
+       NOW() AS db_now`;
+
+/**
+ * The columns of {@link WATERMARK_SQL} that make up the watermark itself.
+ *
+ * `db_now` is deliberately not among them. It moves on its own, so folding it
+ * into the key would make every single read look like a change and turn the
+ * cheap check into an unconditional reload.
+ */
+const WATERMARK_COLUMNS = ['type_rows', 'type_at', 'property_rows', 'property_at'];
+
+/** What one process knows about the state of the model in the database. */
+interface Watermark {
+  /** Equal to the last one means nothing has been written since. */
+  readonly key: string;
+  /**
+   * Whether the key can still change without the model changing. See
+   * {@link settledAt}.
+   */
+  readonly settled: boolean;
+}
+
+/**
+ * One column of a raw driver row, normalised to a comparable string.
+ *
+ * `undefined` when the column is absent, which is a different answer from `''`:
+ * absent means the statement did not return what this file asked for and no
+ * watermark can be formed at all, whereas `''` is a perfectly ordinary `MAX()`
+ * over a table with no rows in it.
+ *
+ * A guard rather than a cast, for the reason {@link idOf} gives — and with an
+ * extra one here, since the shapes really do vary: `COUNT(*)` arrives as a
+ * number or as a string depending on the driver's big-number settings, and a
+ * `DATETIME` as a `Date` or as a string depending on `dateStrings`. Every one of
+ * those is stable across reads of an unchanged table, which is all a watermark
+ * needs.
+ */
+function cell(row: unknown, column: string): string | undefined {
+  if (typeof row !== 'object' || row === null) return undefined;
+  const value = Reflect.get(row, column);
+  if (value === undefined) return undefined;
+  if (value === null) return '';
+  if (value instanceof Date) return String(value.getTime());
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'bigint') {
+    return String(value);
+  }
+  return undefined;
+}
+
+/**
+ * One column of a raw driver row as an instant, or undefined if it cannot be
+ * read as one.
+ *
+ * Only ever used to subtract two columns of the SAME row from each other, which
+ * is what makes the sloppiness of `Date.parse` on a MySQL `DATETIME` literal
+ * (`2026-08-05 09:00:00`, which V8 reads as local time) harmless: both operands
+ * are misread by the same offset and the difference survives it.
+ */
+function instant(row: unknown, column: string): number | undefined {
+  if (typeof row !== 'object' || row === null) return undefined;
+  const value = Reflect.get(row, column);
+  if (value instanceof Date) return value.getTime();
+  if (typeof value !== 'string') return undefined;
+  const parsed = Date.parse(value.replace(' ', 'T'));
+  return Number.isNaN(parsed) ? undefined : parsed;
+}
+
+/**
+ * Whether a watermark can be trusted not to change again without the model
+ * changing.
+ *
+ * `updated_at` is a `DATETIME`, which MySQL stores to the second. Two writes
+ * inside one second therefore share a maximum, and if a process reads the
+ * watermark between them it records a key that the second write will not move —
+ * so that write would stay invisible to it forever. This is the same
+ * second-resolution trap the `committedAt` tie-breaking note on
+ * {@link StoredCatalogRegistry.servingSnapshots} describes, in its other form.
+ *
+ * The fix is to notice, not to widen the column: a watermark whose newest write
+ * is in the second the database is still *in* is provisional, and the caller
+ * records nothing rather than recording something it may have to disbelieve.
+ * The cost is bounded and small — at most one extra rebuild per write, because
+ * the following check happens at least `staleAfterMs` later and the second has
+ * closed by then.
+ *
+ * Unreadable clocks answer `true`, deliberately. This is a refinement over the
+ * count-and-maximum comparison, and a driver that hands back a shape these
+ * helpers cannot parse should degrade to that comparison rather than to a
+ * process that rebuilds its whole model on every check forever.
+ */
+function settledAt(row: unknown): boolean {
+  const now = instant(row, 'db_now');
+  if (now === undefined) return true;
+  const written = [instant(row, 'type_at'), instant(row, 'property_at')].filter(isPresent);
+  if (written.length === 0) return true;
+  return now - Math.max(...written) >= 1_000;
+}
+
 const RELATION_KINDS: RelationKind[] = ['1:1', '1:m', 'm:1', 'm:n'];
 
 /**
@@ -67,6 +187,24 @@ function toRelationKind(value: string): RelationKind {
  * request to re-read something that changes a handful of times a day would be
  * the wrong trade.
  *
+ * **Which makes "on write" the interesting word, once there are two replicas.**
+ * A write rebuilds the model of the one process that handled the request. Its
+ * siblings keep serving what they loaded at boot, so a published type exists for
+ * part of the traffic and does not exist for the rest, and which a caller gets
+ * is load-balancer luck. That is not a race with a small window: it lasts until
+ * the stale process happens to serve a write itself, or restarts.
+ *
+ * So the model is also **self-healing**, and the mechanism deliberately involves
+ * no writer at all. Writers are the wrong place: an invalidation every write
+ * path has to remember is correct exactly until somebody adds one that forgets,
+ * and a model that is quietly a day out of date reports no error. Instead each
+ * process re-reads a cheap {@link Watermark} over the two model tables —
+ * something every replica already reaches, and which the rows themselves move —
+ * and rebuilds when it has moved. A process that never writes anything converges
+ * on its own; so does one whose sibling was updated by a code path this file has
+ * never heard of. See {@link StoredCatalogRegistry.refreshIfDue} for the cost
+ * and `CatalogStoreModuleOptions.staleAfterMs` for the knob.
+ *
  * Presentation edits land in the same rows the publisher wrote. There is no
  * separate overlay here, unlike the in-app library: the publisher's values
  * arrive over HTTP and are already just data, so a curator editing them is
@@ -87,6 +225,20 @@ function toRelationKind(value: string): RelationKind {
 export class StoredCatalogRegistry extends CatalogRegistry implements OnModuleInit {
   private readonly logger = new Logger(StoredCatalogRegistry.name);
   private snapshot: CatalogSnapshot = emptySnapshot();
+  /**
+   * The watermark the current {@link snapshot} was built from, when it is one
+   * that can be compared against later. Undefined means "cannot claim to be
+   * current" — at boot, after a read that failed, and after a read taken inside
+   * the second of its own newest write ({@link settledAt}) — and the next check
+   * rebuilds rather than assuming.
+   */
+  private watermark?: string;
+  /** When the database was last asked whether {@link watermark} still holds. */
+  private lastCheckedAt = 0;
+  /** Whether a check is in flight. See {@link refreshIfStale}. */
+  private refreshing = false;
+  /** So an unreadable watermark is reported once, not once per window. */
+  private warnedAboutWatermark = false;
 
   constructor(
     // Both by token rather than positionally. `this.orm` is the one that really
@@ -122,6 +274,15 @@ export class StoredCatalogRegistry extends CatalogRegistry implements OnModuleIn
 
   async reload(): Promise<void> {
     const em = this.em.fork();
+    // The watermark BEFORE the rows it will label, and the order is the whole
+    // safety argument. Read afterwards, it could describe a write that landed
+    // *during* the reads below — the model would then be one write behind a
+    // watermark claiming to cover it, and nothing would ever look again. Read
+    // first, the error can only go the other way: a write that slips in between
+    // is not covered by the recorded key, so the next check sees a difference
+    // and rebuilds once more. One redundant rebuild is a cost; a permanently
+    // stale replica is the bug this exists to end.
+    const mark = await this.readWatermark(em);
     const rows = await em.find(
       ObjectTypeRow,
       {},
@@ -145,14 +306,133 @@ export class StoredCatalogRegistry extends CatalogRegistry implements OnModuleIn
       },
       types,
     };
+    this.watermark = mark?.settled === true ? mark.key : undefined;
+    // Stamped here too, not only in `refreshIfDue`: this process has just read
+    // the model, so a check a millisecond later would be asking a question it
+    // already has the answer to. Without this, every write — which ends in a
+    // `reload()` and then a `getType()` — would be followed by a pointless
+    // round trip.
+    this.lastCheckedAt = Date.now();
   }
 
   getSnapshot(): CatalogSnapshot {
+    this.refreshIfDue();
     return this.snapshot;
   }
 
   getType(name: string): CatalogObjectTypeDef | undefined {
+    this.refreshIfDue();
     return this.snapshot.types.find((t) => t.name.toLowerCase() === name.toLowerCase());
+  }
+
+  /**
+   * Start a staleness check if one is due, and **serve the current snapshot
+   * either way**.
+   *
+   * Both halves of that sentence are load-bearing.
+   *
+   * *Serve either way*, because these two methods are the hot path — every
+   * browse, every publish, every connector preflight goes through them — and
+   * their signatures are synchronous in `CatalogRegistry`, so there is no
+   * version of this that awaits anything. Nor should there be: a database round
+   * trip per call would trade a correctness bug for a performance one, on a
+   * package whose whole premise is that it must not degrade the application it
+   * is mounted inside. The check runs on its own; the caller is handed the
+   * snapshot that was already in memory.
+   *
+   * *If one is due*, because the rate has to be bounded by time rather than by
+   * traffic. What a call costs is one subtraction and one comparison. What the
+   * database sees is at most one small statement per `staleAfterMs` per process
+   * — the same under ten requests a second as under ten thousand.
+   *
+   * The window is stamped **before** the check runs rather than after it
+   * finishes, so a slow or failing database cannot turn every arriving request
+   * into another attempt. A check that takes three seconds is one check, not a
+   * queue of them.
+   */
+  private refreshIfDue(): void {
+    const staleAfterMs = this.options.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
+    if (staleAfterMs <= 0) return;
+    const now = Date.now();
+    if (now - this.lastCheckedAt < staleAfterMs) return;
+    this.lastCheckedAt = now;
+    void this.refreshIfStale();
+  }
+
+  /**
+   * Read the watermark, and rebuild only if it moved.
+   *
+   * Single-flight: `refreshing` keeps a second caller from opening a second fork
+   * while one is already in flight. Two *processes* checking at once need no
+   * coordination at all and get none — both are reads, they arrive at the same
+   * answer, and each rebuilds its own memory. Locking replicas against each
+   * other here would be inventing a distributed problem to solve.
+   *
+   * **A failure leaves the old snapshot serving.** Nothing is cleared before the
+   * new model is in hand: `reload()` assigns `this.snapshot` in one statement
+   * after every read has succeeded, so a database that goes away mid-check
+   * leaves a registry serving a model that is merely old — which is what it was
+   * doing before this method existed, and is very much better than a registry
+   * that answers "no such type" for everything. The window is retried on the
+   * next call.
+   */
+  private async refreshIfStale(): Promise<void> {
+    if (this.refreshing) return;
+    this.refreshing = true;
+    try {
+      const mark = await this.readWatermark(this.em.fork());
+      if (mark !== undefined && mark.key === this.watermark) return;
+      await this.reload();
+    } catch (error) {
+      this.logger.warn(
+        `Could not check whether the catalog model has changed: ${
+          error instanceof Error ? error.message : String(error)
+        }. Still serving ${this.snapshot.stats.types} object types loaded at ${
+          this.snapshot.generatedAt
+        }.`,
+      );
+    } finally {
+      this.refreshing = false;
+    }
+  }
+
+  /**
+   * What the model tables look like right now, cheaply enough to ask often.
+   *
+   * One statement, four aggregates, over the two tables the snapshot is built
+   * from — a few hundred types and their columns. Note what is NOT in it:
+   * `catalog_snapshot`, the one table here that grows without bound, and whose
+   * cost `servingSnapshots` below goes to some length to avoid. It does not need
+   * to be: committing a load sets `ObjectTypeRow.currentSnapshotId`, so a commit
+   * moves `catalog_object_type.updated_at` and the watermark already sees it.
+   *
+   * Neither aggregate is indexed, so both are scans. At this size that is
+   * microseconds and the right trade — and the reason no `@Index` is declared is
+   * the one `servingSnapshots` gives for the index it also wants: `fingerprintOf`
+   * in `schema.ts` hashes column names, types and nullability, so an added index
+   * would not move the fingerprint and would never reach an already-booted
+   * database at all. A deployment whose model has grown to tens of thousands of
+   * properties can add `(updated_at)` on `catalog_property` by hand; nothing
+   * here needs to change for it to be used.
+   *
+   * Undefined when the statement answers a shape this cannot read. The caller
+   * treats that as "cannot claim to be current" and rebuilds, which is the safe
+   * direction: the alternative is a process that believes a watermark it did not
+   * actually parse.
+   */
+  private async readWatermark(em: EntityManager): Promise<Watermark | undefined> {
+    const [row] = await em.getConnection().execute<unknown[]>(WATERMARK_SQL);
+    const parts = WATERMARK_COLUMNS.map((column) => cell(row, column)).filter(isPresent);
+    if (parts.length !== WATERMARK_COLUMNS.length) {
+      if (!this.warnedAboutWatermark) {
+        this.warnedAboutWatermark = true;
+        this.logger.warn(
+          `The catalog model watermark came back without ${WATERMARK_COLUMNS.join(', ')}. This process will rebuild its model on every check rather than assume it is current.`,
+        );
+      }
+      return undefined;
+    }
+    return { key: parts.join('|'), settled: settledAt(row) };
   }
 
   // `getGraph` is deliberately absent: the base class draws the ontology from

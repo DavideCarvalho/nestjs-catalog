@@ -51,6 +51,25 @@ an imported one, so the default wins silently.
 | `contextName` | Which MikroORM connection to resolve the EntityManager from. **Set this whenever the catalog lives in its own database.** Omit it and the store resolves the *default* EntityManager, creating the catalog's tables and loading every snapshot into the host application's schema. Nothing reports an error, because writing to the wrong database is not a type error and the rows land successfully. |
 | `autoSchema` | Manage this package's tables at boot instead of through the host's migrations. |
 | `audit` | Record `aviary:catalog:*` events into the audit table. Note that the library emits them process-wide over `diagnostics_channel`, so if two catalogs share one process the trail over-reports. |
+| `staleAfterMs` | How long a process may serve its in-memory model before checking the database for a newer one. Default `1000`; `0` turns the check off. See below. |
+
+## More than one replica
+
+The model is held in memory and rebuilt when something writes. On a deployment with two replicas
+that used to mean a published type existed for part of the traffic and did not exist for the rest —
+`PUT publish/:type/schema` answered 200 from the pod that handled it, and a connector run routed to
+its sibling was refused — until the stale pod happened to serve a write itself, or restarted.
+
+Each process now re-reads a **watermark** over the model tables (their row counts and newest
+`updated_at`) and rebuilds only when it has moved. No writer participates: an invalidation every
+write path has to remember is correct exactly until one forgets, and the symptom is a model quietly
+a day out of date. A replica that never writes anything converges on its own.
+
+What it costs the read path is nothing — `getSnapshot()` and `getType()` stay synchronous, the check
+runs without them waiting for it, and the caller is served the snapshot already in memory. What it
+costs the database is at most one small statement per `staleAfterMs` per process, whatever the
+traffic. Set `staleAfterMs: 0` on a deployment that genuinely runs one process and wants its query
+count exactly as it was.
 
 ## Keeping the host's migration differ away
 

@@ -228,13 +228,17 @@ async function storedRegistry(): Promise<StoredCatalogRegistry> {
     // hydrating any. No fixture here has committed a load, so the honest answer
     // is none — and on that answer the registry skips the snapshot read
     // entirely. Nothing in this file is about freshness; the graph is.
-    getConnection: () => ({ execute: async () => [] }),
+    getConnection: () => ({
+      execute: async (sql: string) => (sql.includes('catalog_snapshot') ? [] : WATERMARK_ANSWER),
+    }),
   });
   const registry = Object.create(StoredCatalogRegistry.prototype);
   Object.assign(registry, {
     em: { fork },
     orm: {},
-    options: {},
+    // The background staleness check off: these fixtures are about what
+    // `reload` builds, not about a sibling process noticing a write.
+    options: { staleAfterMs: 0 },
     snapshot: { version: 0, generatedAt: '', stats: {}, types: [] },
   });
   const built: StoredCatalogRegistry = registry;
@@ -277,6 +281,17 @@ const EXPECTED = {
     { id: 'Mvr.homeBase', source: 'Mvr', target: 'Base', label: 'Home Base', kind: 'm:1' },
   ],
 };
+
+/**
+ * `reload` reads a staleness watermark over the model tables before anything
+ * else, so the fakes below have to answer it or the rebuild stops there. Its
+ * contents do not matter here — the check that would consult it is turned off,
+ * with `staleAfterMs: 0` — and what it does is
+ * `stored-registry.staleness.spec.ts`'s subject.
+ */
+const WATERMARK_ANSWER = [
+  { type_rows: 0, type_at: null, property_rows: 0, property_at: null, db_now: new Date(0) },
+];
 
 describe('the two registries draw one ontology the same way', () => {
   it('agrees edge for edge and node for node', async () => {

@@ -132,6 +132,50 @@ export interface CatalogStoreModuleOptions {
    */
   secretVault?: Provider;
   /**
+   * How long this process may serve its in-memory model before asking the
+   * database whether somebody else has changed it. Milliseconds, default 1000.
+   * **`0` turns the check off entirely.**
+   *
+   * The problem it exists for is a deployment with more than one replica.
+   * `StoredCatalogRegistry` loads the model once at boot and rebuilds it when
+   * something in *its own process* writes — so `PUT publish/:type/schema`
+   * answers 200 from the pod that handled it, and a connector run routed to a
+   * sibling pod moments later is told the type has not been published. It
+   * self-heals only when that pod happens to serve a publish itself, or
+   * restarts. Every host running two replicas has that window.
+   *
+   * So the registry re-reads a **watermark** — the row counts and newest
+   * `updated_at` of `catalog_object_type` and `catalog_property` — and rebuilds
+   * only when it has moved. This is how often it is allowed to ask.
+   *
+   * ## What it costs
+   *
+   * Nothing per call. `getSnapshot()` and `getType()` stay synchronous field
+   * reads; what they gained is one integer comparison, and when it says the
+   * window has elapsed they start the check **without waiting for it** — the
+   * caller is served the snapshot it already had. So no request is ever slower
+   * for this, however many arrive.
+   *
+   * What it costs the database is at most one statement per window per process,
+   * regardless of traffic: two counts and two maxima over the model tables,
+   * which hold a few hundred types and their columns. Neither aggregate is
+   * indexed, so both are scans of small tables — see `readWatermark` for why an
+   * index is not declared and what to add by hand if a deployment's model ever
+   * gets big enough to want one.
+   *
+   * ## Choosing a value
+   *
+   * The default is the width of the window the bug lives in, so keep it small.
+   * Raising it trades convergence time for query rate linearly; there is no
+   * cliff in either direction.
+   *
+   * `0` is for a deployment that genuinely runs one process and wants its
+   * behaviour and its query count exactly as they were before this existed.
+   * It is not the default, because the failure it re-enables is invisible: a
+   * stale replica answers 200s and 404s that look like the truth.
+   */
+  staleAfterMs?: number;
+  /**
    * The MikroORM context name this store reads and writes — the same string
    * passed to `MikroOrmModule.forRoot({ contextName })`. Omit for the default
    * connection, which is what a service that owns its process wants.

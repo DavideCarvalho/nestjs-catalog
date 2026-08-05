@@ -98,11 +98,35 @@ function emReturning(types: ObjectTypeRow[], snapshots: SnapshotRow[]) {
     }
     throw new Error('unexpected entity in reload');
   });
-  // The parameter is declared even though the fake ignores it: the statement
-  // itself is what two cases below assert on.
-  const execute = vi.fn(async (_sql: string) => servingIds(snapshots));
+  // Two statements reach this now. `reload` reads the staleness watermark over
+  // the model tables first, and then the grouped snapshot query these cases are
+  // about. Routed by what the statement names rather than by call order, so
+  // neither one moving cannot silently hand a case the other's rows.
+  const execute = vi.fn(async (sql: string) =>
+    sql.includes('catalog_snapshot') ? servingIds(snapshots) : [watermarkRow(types)],
+  );
   const fork = () => ({ find, getConnection: () => ({ execute }) });
   return { find: { fork }, spy: find, sql: execute };
+}
+
+/**
+ * What the watermark statement would answer for these fixtures. Its own
+ * behaviour is `stored-registry.staleness.spec.ts`'s subject; here it only has
+ * to be readable, so that `reload` proceeds to the read these cases inspect.
+ */
+function watermarkRow(types: ObjectTypeRow[]): Record<string, unknown> {
+  return {
+    type_rows: types.length,
+    type_at: null,
+    property_rows: 0,
+    property_at: null,
+    db_now: new Date(),
+  };
+}
+
+/** The grouped snapshot statements the fake was asked to run, in order. */
+function snapshotStatements(execute: ReturnType<typeof emReturning>['sql']): string[] {
+  return execute.mock.calls.map(([sql]) => sql).filter((sql) => sql.includes('catalog_snapshot'));
 }
 
 /** The `$in` list out of a where clause, or undefined if the read is not keyed. */
@@ -120,7 +144,10 @@ function registryOver(types: ObjectTypeRow[], snapshots: SnapshotRow[]) {
   Object.assign(registry, {
     em: em.find,
     orm,
-    options: {},
+    // The background staleness check off, so these cases see exactly the reads
+    // `reload` makes and no others. That it fires at all — and that a sibling
+    // process notices a write through it — is `stored-registry.staleness.spec.ts`.
+    options: { staleAfterMs: 0 },
     snapshot: { version: 0, generatedAt: '', stats: {}, types: [] },
   });
   const typed: StoredCatalogRegistry = registry;
@@ -334,8 +361,8 @@ describe('dating a type does not read the whole snapshot history', () => {
 
     await registry.reload();
 
-    expect(sql).toHaveBeenCalledTimes(1);
-    const statement = sql.mock.calls[0][0];
+    expect(snapshotStatements(sql)).toHaveLength(1);
+    const [statement] = snapshotStatements(sql);
     expect(statement).toMatch(/GROUP BY\s+type_name/i);
     expect(statement).toMatch(/MAX\(committed_at\)/i);
     // And the filter is in the statement, so an uncommitted load is excluded by

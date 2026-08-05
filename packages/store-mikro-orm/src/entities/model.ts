@@ -262,4 +262,47 @@ export class PropertyRow {
 
   @Property({ length: 64, nullable: true })
   unit?: string;
+
+  /**
+   * When this row was last written. Not shown anywhere — it exists so a process
+   * can tell that somebody ELSE changed the model.
+   *
+   * `StoredCatalogRegistry` holds its snapshot in memory and, before this
+   * existed, refreshed it only when something in its own process wrote. Two
+   * replicas behind a load balancer therefore disagreed after every publish, and
+   * which one a request hit was luck. The registry now compares a watermark over
+   * these two tables against the one it loaded at; see `readWatermark` there for
+   * the statement and `CatalogStoreModuleOptions.staleAfterMs` for how often it
+   * is read.
+   *
+   * **Why the column has to be here and not only on {@link ObjectTypeRow}.**
+   * Half the model lives in this table and there are writes that touch nothing
+   * else: `patchProperty` renames one field, and a re-publish whose only change
+   * is a column's scalar type or nullability leaves the type row byte-identical
+   * so MikroORM computes no changeset for it. A watermark that watched only the
+   * type table would call those writes invisible, and the next reader on another
+   * replica would keep serving the old label for as long as the process lived.
+   *
+   * The point of deriving staleness from the rows themselves is that no writer
+   * has to know about it. `onUpdate` fires for any flush that dirties this
+   * entity, from any package, through any code path, including ones written
+   * later — which is exactly what a hand-maintained list of invalidation calls
+   * cannot promise.
+   *
+   * **Nullable, and on an existing deployment it stays null for a while.**
+   * Adding a scalar column moves the schema fingerprint (`fingerprintOf` in
+   * `schema.ts` hashes column names, types and nullability), so `autoSchema`
+   * really does apply it to an already-booted database — unlike an `@Index`,
+   * which the fingerprint does not see. What it cannot do is backfill: MikroORM
+   * initialisers and `onCreate` run for rows this process constructs, never for
+   * rows already in the table, so every property written before this shipped
+   * holds `NULL`. That is harmless by construction — `MAX()` ignores nulls, and
+   * the row counts in the same watermark still move — and each row fills itself
+   * in the first time anything writes it. A non-null column would instead have
+   * meant a default nobody chose, and would have forced every
+   * `em.create(PropertyRow, …)` in this repo and in every host to name a field
+   * it has nothing to say about.
+   */
+  @Property({ onCreate: () => new Date(), onUpdate: () => new Date(), nullable: true })
+  updatedAt?: Date;
 }
