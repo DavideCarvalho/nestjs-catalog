@@ -10,7 +10,7 @@ import { paramFromLocation } from './ObjectExplorer';
 import { SavedQueryPanel, savedQueryKeys } from './SavedQueryPanel';
 import { cn } from './cn';
 import { useCatalogClient } from './context';
-import { CodeEditor } from './ui/code-editor';
+import { CodeEditor, type CodeEditorHandle } from './ui/code-editor';
 import { DataTable, renderUnknown } from './ui/data-table';
 import { Tooltip, TooltipProvider } from './ui/tooltip';
 
@@ -150,7 +150,7 @@ export function QueryConsole({
   const [sql, setSql] = useState(STARTER);
   const [prompt, setPrompt] = useState('');
   const [askOpen, setAskOpen] = useState(false);
-  const editorRef = useRef<HTMLTextAreaElement>(null);
+  const editorRef = useRef<CodeEditorHandle | null>(null);
 
   /**
    * The id somebody asked for, and the id actually in the editor.
@@ -264,29 +264,37 @@ export function QueryConsole({
     return [...byType.entries()].sort(([a], [b]) => a.localeCompare(b));
   }, [relations]);
 
+  /**
+   * Put a relation or column name where the caret is.
+   *
+   * One call now, where it used to be a `selectionStart` splice, a `setSql` and
+   * a `requestAnimationFrame` to put the caret back — the editor owns its
+   * document, so the insert goes THROUGH it and lands on its undo stack.
+   * Ctrl+Z takes an inserted table name back out again, which the splice
+   * version could not do: React rewrote the whole value and the browser's undo
+   * stack lost its boundary. The `setSql` still happens, via `onChange`.
+   */
   function insert(text: string) {
     const editor = editorRef.current;
     if (!editor) {
       setSql((current) => `${current}${text}`);
       return;
     }
-    const start = editor.selectionStart;
-    const end = editor.selectionEnd;
-    setSql((current) => current.slice(0, start) + text + current.slice(end));
-    requestAnimationFrame(() => {
-      editor.focus();
-      editor.selectionStart = editor.selectionEnd = start + text.length;
-    });
+    editor.insertAtCursor(text);
   }
 
-  function onEditorKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+  function onEditorKeyDown(event: KeyboardEvent<HTMLDivElement>) {
     // Cmd/Ctrl+Enter runs, the way every SQL console does.
     if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
       event.preventDefault();
       run.mutate();
     }
     // A textarea that eats Tab is a textarea nobody can leave by keyboard, so
-    // Tab still moves focus; indentation is Shift-agnostic two spaces on Enter.
+    // Tab is the editor's own now — it indents rather than moving focus, which
+    // is why `CodeEditor` puts an Escape hatch in front of it. And ⌘↵ has to be
+    // claimed here rather than merely observed: the editor's default keymap
+    // binds it to "insert a blank line", so a handler that did not
+    // `preventDefault` would run the query AND leave a blank line behind.
   }
 
   const error = run.error instanceof Error ? run.error.message : null;
@@ -378,7 +386,7 @@ export function QueryConsole({
             value={sql}
             onChange={setSql}
             onKeyDown={onEditorKeyDown}
-            textareaRef={editorRef}
+            editorRef={editorRef}
           />
 
           <div className="min-h-0 flex-1 overflow-auto">
@@ -489,37 +497,35 @@ function RelationRow({
 }
 
 /**
- * A highlighted editor built from a textarea under a `<pre>`.
+ * The SQL box.
  *
- * The textarea keeps every behaviour a text input is supposed to have —
- * selection, undo, IME, screen readers, native keyboard shortcuts — while the
- * highlighted copy sits behind it, transparent text, identical metrics. A
- * contenteditable would look the same and lose all of it.
+ * One `CodeEditor`, which is the same component the transform editor and the
+ * workflow canvas's code sheet render — there is deliberately no second
+ * implementation for "the primary input". What differs between the callers is
+ * the box it sits in, and that is a class name.
  */
 function SqlEditor({
   value,
   onChange,
   onKeyDown,
-  textareaRef,
+  editorRef,
 }: {
   value: string;
   onChange: (next: string) => void;
-  onKeyDown: (event: KeyboardEvent<HTMLTextAreaElement>) => void;
-  textareaRef: React.RefObject<HTMLTextAreaElement | null>;
+  onKeyDown: (event: KeyboardEvent<HTMLDivElement>) => void;
+  editorRef: React.RefObject<CodeEditorHandle | null>;
 }) {
   return (
     <CodeEditor
       value={value}
       onChange={onChange}
       onKeyDown={onKeyDown}
-      textareaRef={textareaRef}
+      handleRef={editorRef}
       language="sql"
       label="SQL query"
       // Roomier than the transform pane: this is the screen's primary input,
       // not a side panel.
       className={cn('h-56 shrink-0 border-b', RULE, PANEL)}
-      padding="p-4"
-      fontSize="text-[13px]"
     />
   );
 }

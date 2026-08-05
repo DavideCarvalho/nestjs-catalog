@@ -23,6 +23,7 @@ import type {
   RowCountBound,
   SaveQueryInput,
   SavedQuery,
+  SnapshotRef,
   StoredLoadExpectation,
   TraceQuery,
   TransformLanguage,
@@ -321,6 +322,17 @@ export interface PersonUpsertResult {
 export interface CatalogClient {
   snapshot(): Promise<CatalogSnapshot>;
   objects(type: string, params: ObjectQueryParams): Promise<CatalogObjectPage>;
+  /**
+   * Every load of one type, newest first. Empty on a store that keeps no
+   * history, which is what makes the snapshot picker able to hide itself rather
+   * than offer a control that cannot work.
+   *
+   * A separate call from {@link objects} rather than a field on the page: the
+   * list changes once a load, and the page is refetched on every keystroke,
+   * every sort and every page turn. Carried on the page it would be a query per
+   * one of those.
+   */
+  snapshots(type: string): Promise<SnapshotRef[]>;
   patchType(name: string, patch: TypePatch): Promise<unknown>;
   patchProperty(name: string, property: string, patch: PropertyPatch): Promise<unknown>;
   reset(): Promise<CatalogSnapshot>;
@@ -618,6 +630,7 @@ export function CatalogProvider({
         transport.get<CatalogObjectPage>(catalogRoutes.objects(type), {
           ...params,
         }),
+      snapshots: (type) => transport.get<SnapshotRef[]>(catalogRoutes.snapshots(type)),
       patchType: (name, patch) => transport.patch(catalogRoutes.type(name), patch),
       patchProperty: (name, property, patch) =>
         transport.patch(catalogRoutes.property(name, property), patch),
@@ -749,6 +762,15 @@ export const catalogQueryKeys = {
   snapshot: ['nestjs-catalog', 'snapshot'] as const,
   objects: (type: string, params: ObjectQueryParams) =>
     ['nestjs-catalog', 'objects', type, params] as const,
+
+  /**
+   * A type's loads, keyed by type and NOT by the read's parameters.
+   *
+   * The list is a property of the type, so paging, sorting and filtering must
+   * not re-ask for it — keyed under `objects(type, params)` it would be fetched
+   * again on every keystroke of a search box.
+   */
+  objectSnapshots: (type: string) => ['nestjs-catalog', 'objects', type, 'snapshots'] as const,
 
   /**
    * Keyed on the term, so react-query caches per term and a backspace shows the

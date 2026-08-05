@@ -1,4 +1,8 @@
-import { assertNoColumnCollisions, emitCatalog } from '@dudousxd/nestjs-catalog';
+import {
+  CATALOG_FILTER_OPERATORS,
+  assertNoColumnCollisions,
+  emitCatalog,
+} from '@dudousxd/nestjs-catalog';
 import type {
   CatalogQueryRelation,
   CatalogQueryRequest,
@@ -7,11 +11,13 @@ import type {
 } from '@dudousxd/nestjs-catalog';
 import type {
   CarryForwardResult,
+  CatalogFilteringReadStore,
   CatalogMergeStore,
   CatalogObjectTypeDef,
   CatalogPropertyDef,
   CatalogReadQuery,
   CatalogReadResult,
+  CatalogResolvedFilter,
   CatalogStoreCapabilities,
   ScalarType,
   SnapshotRef,
@@ -71,8 +77,19 @@ const CARRIED_FROM_NOTHING = 'none';
 const CARRY_FORWARD_STALE_LABEL = '_carryForwardStale';
 
 @Injectable()
-export class MySqlWarehouseStore implements CatalogMergeStore, CatalogQueryStore {
+export class MySqlWarehouseStore
+  implements CatalogMergeStore, CatalogQueryStore, CatalogFilteringReadStore
+{
   private readonly logger = new Logger(MySqlWarehouseStore.name);
+
+  /**
+   * All nine, because all nine become one conjunct in the `WHERE` this store
+   * already builds. Declared rather than left to be inferred from the class: the
+   * service offers a screen exactly what is listed here, so a store that stopped
+   * applying one of these would have to say so here to be honest, and saying so
+   * is what removes the control rather than leaving it to return unfiltered rows.
+   */
+  readonly objectFilterOperators = CATALOG_FILTER_OPERATORS;
 
   /**
    * Measured against what this class actually issues, not against what MySQL is
@@ -811,6 +828,21 @@ export class MySqlWarehouseStore implements CatalogMergeStore, CatalogQueryStore
     return rows.map(toRef);
   }
 
+  /**
+   * Rows of one type, as of one snapshot.
+   *
+   * **Reading history is the same read with a different id.** The snapshot is a
+   * column on this table, so `WHERE _snapshot_id = ?` against `ix_snapshot` is
+   * the whole of time travel — an old load costs exactly what the current one
+   * costs, and nothing here touches the SQL view. That matters: the view is what
+   * the query console selects from and it names the *committed* snapshot, so
+   * reading last Tuesday by pointing the view at last Tuesday would have every
+   * ad-hoc query in the deployment silently answering about last Tuesday too,
+   * until somebody committed again. The view moves on commit and only on commit.
+   *
+   * Two statements per read, unchanged by any of this: one `COUNT`, one page.
+   * Filters and the snapshot are conjuncts in both.
+   */
   async read(
     type: CatalogObjectTypeDef,
     fields: string[],
@@ -824,22 +856,27 @@ export class MySqlWarehouseStore implements CatalogMergeStore, CatalogQueryStore
     // Nothing committed yet is an empty result, not an error: the type is real
     // and known, it simply has no load anyone has blessed.
     if (!snapshotId) return { rows: [], total: 0 };
+    // Answered from the row already fetched, so saying which load these rows are
+    // costs no query at all. `current` is the comparison a reader cares about and
+    // is the one thing they cannot work out for themselves.
+    const snapshot = { id: snapshotId, current: snapshotId === typeRow?.currentSnapshotId };
 
     const selected = type.properties.filter((p) => fields.includes(p.name));
-    if (selected.length === 0) return { rows: [], total: 0 };
+    if (selected.length === 0) return { rows: [], total: 0, snapshot };
 
     const params: unknown[] = [snapshotId];
     let where = `${ident(SNAPSHOT_COLUMN)} = ?`;
 
-    const term = query.search?.trim();
-    if (term) {
-      const searchable = selected.filter((p) => p.type === 'string' && !p.classification);
-      if (searchable.length > 0) {
-        where += ` AND (${searchable
-          .map((p) => `${ident(physicalColumn(p.name))} LIKE ?`)
-          .join(' OR ')})`;
-        for (const _ of searchable) params.push(`%${term}%`);
-      }
+    const search = searchPredicate(selected, query.search);
+    if (search) {
+      where += ` AND ${search.sql}`;
+      params.push(...search.values);
+    }
+
+    for (const filter of query.filters ?? []) {
+      const { sql, values } = filterPredicate(selected, filter);
+      where += ` AND ${sql}`;
+      params.push(...values);
     }
 
     const [{ total }] = await em
@@ -868,6 +905,7 @@ export class MySqlWarehouseStore implements CatalogMergeStore, CatalogQueryStore
     return {
       total: Number(total ?? 0),
       rows: rows.map((row) => normalise(row, selected)),
+      snapshot,
     };
   }
 
@@ -995,6 +1033,110 @@ function primaryKeyProperties(type: CatalogObjectTypeDef): CatalogPropertyDef[] 
   }
 
   return resolved;
+}
+
+/**
+ * The search term, over the text columns this read is returning.
+ *
+ * Classified columns are left out: a search that reached one would leak it
+ * through row membership even though the value is never rendered. `undefined`
+ * when there is nothing to search or nothing to search in.
+ */
+function searchPredicate(
+  selected: CatalogPropertyDef[],
+  term: string | undefined,
+): { sql: string; values: unknown[] } | undefined {
+  const trimmed = term?.trim();
+  if (!trimmed) return undefined;
+  const searchable = selected.filter((p) => p.type === 'string' && !p.classification);
+  if (searchable.length === 0) return undefined;
+  return {
+    sql: `(${searchable.map((p) => `${ident(physicalColumn(p.name))} LIKE ?`).join(' OR ')})`,
+    values: searchable.map(() => `%${trimmed}%`),
+  };
+}
+
+/**
+ * One filter, against a column this read is actually returning.
+ *
+ * The membership check is against `selected` rather than against the type, and
+ * that is deliberate. The service already resolves a filter against the visible
+ * columns, so this can only fail for a caller that builds the query itself — and
+ * what it prevents is a predicate over a column the same request declined to
+ * return, which is how a hidden or classified value leaks out through row
+ * membership.
+ *
+ * `ident` is the guard on the column, and it is the same one the SELECT list and
+ * the ORDER BY go through: a name outside a narrow character set is refused
+ * rather than escaped. Nothing a caller sent reaches it — the property came off
+ * the type — and no value reaches the statement text at all.
+ */
+function filterPredicate(
+  selected: CatalogPropertyDef[],
+  filter: CatalogResolvedFilter,
+): { sql: string; values: unknown[] } {
+  const property = selected.find((p) => p.name === filter.property.name);
+  if (!property) {
+    throw new BadRequestException(
+      `${filter.property.name} is not among the columns this read returns, so it cannot be filtered on.`,
+    );
+  }
+  return predicateFor(ident(physicalColumn(property.name)), filter);
+}
+
+/**
+ * One filter as a predicate and its bound values.
+ *
+ * The column arrives already quoted by `ident`, which refuses anything outside
+ * `[A-Za-z_][A-Za-z0-9_]*` rather than escaping it — the rule the whole adapter
+ * uses and the only rule it uses. Every value is a `?`; none of them is
+ * concatenated, including the `%` wrapping for `contains`, which is built as a
+ * parameter rather than into the statement.
+ *
+ * Two of the nine are not the naive translation and both would be wrong if they
+ * were:
+ *
+ * - `ne` matches rows whose column is NULL as well. SQL's `<>` is never true of
+ *   NULL, so "state is not FL" would drop every row with no state at all — and a
+ *   reader reading that list would conclude those rows are in Florida.
+ * - `empty` counts the empty string as well as NULL. `coerce` writes `''` as
+ *   NULL on the way in, so today they are the same set on this store; a column
+ *   loaded by an older version of it, or by hand, is where they come apart, and
+ *   "no value" has to mean no value on both.
+ */
+function predicateFor(
+  column: string,
+  filter: CatalogResolvedFilter,
+): { sql: string; values: unknown[] } {
+  switch (filter.op) {
+    case 'eq':
+      return { sql: `${column} = ?`, values: [filter.value] };
+    case 'ne':
+      return { sql: `(${column} <> ? OR ${column} IS NULL)`, values: [filter.value] };
+    case 'contains':
+      return { sql: `${column} LIKE ?`, values: [`%${String(filter.value)}%`] };
+    case 'gt':
+      return { sql: `${column} > ?`, values: [filter.value] };
+    case 'gte':
+      return { sql: `${column} >= ?`, values: [filter.value] };
+    case 'lt':
+      return { sql: `${column} < ?`, values: [filter.value] };
+    case 'lte':
+      return { sql: `${column} <= ?`, values: [filter.value] };
+    case 'empty':
+      return { sql: `(${column} IS NULL OR ${column} = '')`, values: [] };
+    case 'notEmpty':
+      return { sql: `(${column} IS NOT NULL AND ${column} <> '')`, values: [] };
+    default:
+      // An operator added to the contract and not to this switch fails to
+      // compile here. The alternative to a `never` is a `default` that returns
+      // something true, which is a filter silently matching every row.
+      return unknownOperator(filter.op);
+  }
+}
+
+function unknownOperator(operator: never): never {
+  throw new BadRequestException(`This store cannot filter with ${String(operator)}.`);
 }
 
 /** Property name → physical column. Stable, so it never needs storing twice. */

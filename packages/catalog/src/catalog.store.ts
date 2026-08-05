@@ -1,4 +1,5 @@
 import { BadRequestException } from '@nestjs/common';
+import type { CatalogFilterOperator, CatalogResolvedFilter } from './catalog.filters';
 import type { CatalogObjectQuery, CatalogObjectTypeDef } from './catalog.types';
 
 /**
@@ -170,14 +171,79 @@ export function isCatalogStoreCapabilities(value: unknown): value is CatalogStor
   return true;
 }
 
-export interface CatalogReadQuery extends CatalogObjectQuery {
+/**
+ * What a store is asked for, once the service has vetted it.
+ *
+ * `Omit<..., 'filters'>` and not a plain extension, and the omission is the
+ * point: `CatalogObjectQuery.filters` is the caller's raw
+ * `property:operator:value` text, and a store must never be handed one. What
+ * arrives here instead is {@link CatalogResolvedFilter}, whose property is the
+ * type's own definition — so the column a predicate is built from came off the
+ * type rather than off the request, and the type system says so rather than a
+ * comment. `sort` is a bare string only because every store already re-matches it
+ * against the type before using it; a filter carries more than a name, so
+ * resolving it once in the service is both cheaper and harder to get wrong.
+ */
+export interface CatalogReadQuery extends Omit<CatalogObjectQuery, 'filters'> {
   /** Read as of a specific snapshot. Ignored when `timeTravel` is false. */
   snapshot?: string;
+  /**
+   * Every one of these must be applied. A store that cannot apply one must not
+   * silently return the rows it would have returned anyway — declare the
+   * operators it can honour (see {@link CatalogFilteringReadStore}) and the
+   * service will refuse the read instead.
+   */
+  filters?: CatalogResolvedFilter[];
 }
 
 export interface CatalogReadResult {
   rows: Array<Record<string, unknown>>;
   total: number;
+  /**
+   * Which snapshot these rows came from, and whether it is the one being served.
+   *
+   * Answered by the store because the store is what resolved it: a read that was
+   * given no snapshot falls back to the pointer, so only the store knows which id
+   * the rows actually carry. Reporting it costs nothing — every store that keeps
+   * history has already read both values by the time it builds the query — and it
+   * is what lets a screen say "this is not the current load" on the strength of
+   * what was read rather than of what it thinks it asked for.
+   *
+   * Absent from a store that keeps no history, which is the honest answer there:
+   * the rows are the current state and there is no other state to be reading.
+   */
+  snapshot?: { id: string; current: boolean };
+}
+
+/**
+ * A store that applies {@link CatalogReadQuery.filters}.
+ *
+ * Declared, never assumed, and the reason is the same one the capability object
+ * one file up gives for every field on it: a store that ignores a filter answers
+ * with more rows than were asked for, and there is nothing about that answer to
+ * distinguish it from a filter that genuinely matched everything. So a store says
+ * which operators it can push into its predicate, the service offers exactly
+ * those to the screen, and a filter naming anything else is refused rather than
+ * quietly dropped.
+ *
+ * A guard rather than a field on `CatalogStoreCapabilities`, deliberately: the
+ * capability object is intersected by the fan-out through an exhaustiveness check
+ * that fails to compile when a field is added and not composed, and this is not a
+ * property that composes the way those do — a fan-out reads through its primary,
+ * so what its primary can filter is what it can filter. Asking the object it
+ * holds is the check that stays true when that changes.
+ */
+export interface CatalogFilteringReadStore extends CatalogReadStore {
+  /** Which operators this store can apply. A subset of `CATALOG_FILTER_OPERATORS`. */
+  readonly objectFilterOperators: readonly CatalogFilterOperator[];
+}
+
+export function supportsObjectFilters(store: unknown): store is CatalogFilteringReadStore {
+  return (
+    typeof store === 'object' &&
+    store !== null &&
+    Array.isArray(Reflect.get(store, 'objectFilterOperators'))
+  );
 }
 
 /** The minimum a store must do: return rows of a catalogued type. */

@@ -34,21 +34,32 @@
  *
  * `toBeChecked` / `toBeDisabled` are NOT available — this repo registers no jest-dom setup, and
  * they throw rather than fail. `toHaveProperty` is the equivalent that works.
+ *
+ * The SQL box is read through {@link editorText} rather than by finding a form control and asking
+ * for its `value`. It has not been a `<textarea>` since it became `@pierre/diffs`: it is a
+ * contenteditable inside a shadow root, which Testing Library's queries stop at, so
+ * `getByLabelText('SQL query')` finds nothing at all. That also means the editor needs a DOM jsdom
+ * does not have — see `installCodeSurfaceDom`, without which it renders an EMPTY shadow root and
+ * every assertion here fails for a reason unrelated to what it is asserting.
  */
 import type { Dashboard, SavedQuery } from '@dudousxd/nestjs-catalog/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { installCodeSurfaceDom } from '../../../test/jsdom-code-surface';
 import { DashboardBoard } from './DashboardBoard';
 import { QueryConsole } from './QueryConsole';
 import { CatalogProvider, type CatalogTransport } from './context';
+import { codeEditorText } from './ui/code-editor';
 
 declare global {
   // React refuses to believe a test is a test without this, and warns on every state update.
   var IS_REACT_ACT_ENVIRONMENT: boolean;
 }
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+
+installCodeSurfaceDom();
 
 /**
  * The two things these screens use that jsdom does not implement, because it does no layout.
@@ -153,22 +164,40 @@ const QUERIES = [
 
 const BOARDS = [board('d-1', 'Fleet overview'), board('d-3', 'Risk overview')];
 
+/**
+ * One relation, so there is a way to EDIT the SQL box from a test.
+ *
+ * Clicking a relation name inserts it at the caret, and that is now the only user action in reach
+ * that changes the editor's text: it is a contenteditable in a shadow root, so `fireEvent.change`
+ * has nothing to change and jsdom types nothing into it. The insert path is real — the same one a
+ * person uses — and it goes through `onChange` exactly as typing does.
+ */
+const RELATIONS = [
+  {
+    name: 'mvr',
+    objectType: 'Mvr',
+    kind: 'current' as const,
+    description: 'The committed snapshot.',
+    columns: [],
+  },
+];
+
 /** Everything either screen asks for on mount. */
 const ANSWERS = {
-  '/catalog/query/relations': [],
+  '/catalog/query/relations': RELATIONS,
   '/catalog/saved-queries': QUERIES,
   '/catalog/dashboards': BOARDS,
 };
 
 /** The SQL box, which is where "which saved query is open" is actually visible. */
-const editor = () => screen.getByLabelText('SQL query');
+const editorText = () => codeEditorText(document.body);
 
 describe('the query console opens the saved query the URL names', () => {
   it('opens what the host named, rather than the starter SQL', async () => {
     const { transport } = fakeTransport(ANSWERS);
     render(withCatalog(transport, <QueryConsole savedQueryId="q-7" />));
 
-    await waitFor(() => expect(editor()).toHaveProperty('value', 'SELECT assetId FROM subwo'));
+    await waitFor(() => expect(editorText()).toContain('SELECT assetId FROM subwo'));
   });
 
   it('reads ?savedQuery= out of the hash when the host passes nothing', async () => {
@@ -180,7 +209,7 @@ describe('the query console opens the saved query the URL names', () => {
     const { transport } = fakeTransport(ANSWERS);
     render(withCatalog(transport, <QueryConsole />));
 
-    await waitFor(() => expect(editor()).toHaveProperty('value', 'SELECT assetId FROM subwo'));
+    await waitFor(() => expect(editorText()).toContain('SELECT assetId FROM subwo'));
   });
 
   it('switches when the host names a different query, not only on the first render', async () => {
@@ -189,11 +218,11 @@ describe('the query console opens the saved query the URL names', () => {
     // one — the same bug `ObjectExplorer`'s "the prop wins whenever it changes" comment records.
     const { transport } = fakeTransport(ANSWERS);
     const view = render(withCatalog(transport, <QueryConsole savedQueryId="q-1" />));
-    await waitFor(() => expect(editor()).toHaveProperty('value', 'SELECT * FROM mvr'));
+    await waitFor(() => expect(editorText()).toContain('SELECT * FROM mvr'));
 
     view.rerender(withCatalog(transport, <QueryConsole savedQueryId="q-7" />));
 
-    await waitFor(() => expect(editor()).toHaveProperty('value', 'SELECT assetId FROM subwo'));
+    await waitFor(() => expect(editorText()).toContain('SELECT assetId FROM subwo'));
   });
 
   it('names the saved query a dead link asked for, and opens nothing in its place', async () => {
@@ -208,8 +237,8 @@ describe('the query console opens the saved query the URL names', () => {
     // back to whoever sent you the link, and what tells you it belongs to another environment.
     expect(screen.getByText('q-gone')).toBeTruthy();
     // And nothing was substituted for it.
-    expect(editor()).toHaveProperty('value', expect.stringContaining('SELECT * FROM '));
-    expect(editor()).not.toHaveProperty('value', 'SELECT * FROM mvr');
+    expect(editorText()).toContain('SELECT * FROM ');
+    expect(editorText()).not.toContain('SELECT * FROM mvr');
   });
 
   it('says nothing about a missing query while the list is still in flight', async () => {
@@ -229,7 +258,7 @@ describe('the query console opens the saved query the URL names', () => {
       release(QUERIES);
       await pending;
     });
-    await waitFor(() => expect(editor()).toHaveProperty('value', 'SELECT assetId FROM subwo'));
+    await waitFor(() => expect(editorText()).toContain('SELECT assetId FROM subwo'));
   });
 
   it('reports what you opened, so the host can put it in the address', async () => {
@@ -242,7 +271,7 @@ describe('the query console opens the saved query the URL names', () => {
     fireEvent.click(await screen.findByText('Work orders per vehicle'));
 
     await waitFor(() => expect(onSavedQueryChange).toHaveBeenCalledWith('q-7'));
-    expect(editor()).toHaveProperty('value', 'SELECT assetId FROM subwo');
+    expect(editorText()).toContain('SELECT assetId FROM subwo');
   });
 
   it('does not overwrite what you have typed when the saved list changes underneath', async () => {
@@ -255,9 +284,10 @@ describe('the query console opens the saved query the URL names', () => {
     const { transport } = fakeTransport(answers);
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(withCatalog(transport, <QueryConsole savedQueryId="q-7" />, queryClient));
-    await waitFor(() => expect(editor()).toHaveProperty('value', 'SELECT assetId FROM subwo'));
+    await waitFor(() => expect(editorText()).toContain('SELECT assetId FROM subwo'));
 
-    fireEvent.change(editor(), { target: { value: 'SELECT 1 -- mine' } });
+    fireEvent.click(await screen.findByText('mvr'));
+    await waitFor(() => expect(editorText()).toContain('SELECT assetId FROM subwomvr'));
     // A genuinely DIFFERENT list, because react-query shares structure: handing back a deeply
     // equal answer keeps the previous reference and would not re-run the effect at all, so a test
     // built on that would pass with or without the guard.
@@ -267,7 +297,7 @@ describe('the query console opens the saved query the URL names', () => {
     });
 
     await screen.findByText('Newer');
-    expect(editor()).toHaveProperty('value', 'SELECT 1 -- mine');
+    expect(editorText()).toContain('SELECT assetId FROM subwomvr');
   });
 
   it('marks which of the saved queries a link opened, in the list', async () => {

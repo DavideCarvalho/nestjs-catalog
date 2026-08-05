@@ -7,6 +7,11 @@ import {
   Optional,
 } from '@nestjs/common';
 import { emitCatalog } from './catalog.events';
+import {
+  type CatalogFilterOperator,
+  offeredFilterOperators,
+  resolveObjectFilters,
+} from './catalog.filters';
 import { CATALOG_OPTIONS, type CatalogModuleOptions } from './catalog.options';
 import type { CatalogPrincipal } from './catalog.principal';
 import {
@@ -17,7 +22,12 @@ import {
 } from './catalog.query';
 import { QueryCache } from './catalog.query-cache';
 import { CatalogRegistry } from './catalog.registry.base';
-import { CATALOG_STORE, type CatalogReadStore, type SnapshotRef } from './catalog.store';
+import {
+  CATALOG_STORE,
+  type CatalogReadStore,
+  type SnapshotRef,
+  supportsObjectFilters,
+} from './catalog.store';
 import type {
   CatalogGraph,
   CatalogObjectPage,
@@ -180,15 +190,26 @@ export class CatalogService {
     // must never reach a query builder, whatever the engine.
     const sort = columns.some((c) => c.name === query.sort) ? query.sort : undefined;
 
-    const { rows, total } = await this.store.read(type, fields, {
+    // Filters, against the same `columns` a sort is checked against and for the
+    // same reason — with one difference in what a failure means. An unrecognised
+    // sort falls back to the primary key, because the rows are the same rows in a
+    // different order. An unrecognised filter cannot fall back to anything: the
+    // read would come back holding rows the caller asked to exclude, and neither
+    // the caller nor the screen has any way to tell.
+    const filters = this.resolveFilters(columns, query.filters ?? []);
+
+    const result = await this.store.read(type, fields, {
       page,
       size,
       search: query.search,
       sort,
       dir: query.dir === 'desc' ? 'desc' : 'asc',
       snapshot: query.snapshot,
+      ...(filters.length > 0 ? { filters } : {}),
     });
+    const { rows, total } = result;
 
+    const storeOperators = this.filterOperators();
     return {
       type: type.name,
       page,
@@ -201,9 +222,56 @@ export class CatalogService {
         type: c.type,
         classification: c.classification,
         unit: c.unit,
+        columnName: c.columnName,
+        // What this deployment will actually accept for this column: the rule
+        // derived from the column, narrowed by what the mounted store can do.
+        // Sent per column so a console needs no second request and no table of
+        // its own — see `catalog.filters.ts` on why a hand-kept list is the
+        // failure mode being avoided.
+        filterOperators: offeredFilterOperators(c, storeOperators),
       })),
       rows,
+      ...(result.snapshot ? { snapshot: result.snapshot } : {}),
     };
+  }
+
+  /** What the mounted store can push into a read predicate. Empty when it cannot. */
+  private filterOperators(): readonly CatalogFilterOperator[] {
+    return supportsObjectFilters(this.store) ? this.store.objectFilterOperators : [];
+  }
+
+  /**
+   * Every filter, or a refusal naming all of them at once.
+   *
+   * One message listing every problem rather than the first: somebody who built
+   * four filters and got two of them wrong should learn that in one round trip.
+   *
+   * The store is asked whether it can honour the operators before the read runs,
+   * which is what stops a store that does not filter from answering with an
+   * unfiltered page. That refusal is worth more than it costs — a screen only
+   * offers what `filterOperators` reported, so a caller reaching this branch is
+   * one that built the request itself.
+   */
+  private resolveFilters(columns: CatalogObjectTypeDef['properties'], raw: string[]) {
+    if (raw.length === 0) return [];
+
+    const { filters, problems } = resolveObjectFilters(columns, raw);
+    const supported = this.filterOperators();
+    const unsupported = filters
+      .map((filter) => filter.op)
+      .filter((op) => !supported.some((available) => available === op));
+
+    if (unsupported.length > 0) {
+      throw new BadRequestException(
+        supported.length === 0
+          ? "This catalog's store does not filter object reads, so it can only be paged, searched and sorted."
+          : `This catalog's store cannot filter with ${[...new Set(unsupported)].join(', ')}. It applies ${supported.join(', ')}.`,
+      );
+    }
+    if (problems.length > 0) {
+      throw new BadRequestException(problems.join(' '));
+    }
+    return filters;
   }
 
   /** Empty when the store keeps no history. */

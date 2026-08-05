@@ -16,6 +16,8 @@
  *    it safe to hand the editor to a non-engineer.
  */
 
+import type { CatalogFilterOperator } from './catalog.filters';
+
 export type ScalarType = 'string' | 'number' | 'boolean' | 'date' | 'json' | 'uuid' | 'unknown';
 
 export type RelationKind = '1:1' | '1:m' | 'm:1' | 'm:n';
@@ -283,6 +285,16 @@ export interface CatalogObjectQuery {
   search?: string;
   sort?: string;
   dir?: 'asc' | 'desc';
+  /**
+   * Column filters, as they arrived: `property:operator:value`, one string each.
+   *
+   * Unvalidated, exactly like `sort` and `search` beside it — these are what a
+   * caller typed. `CatalogService.readObjects` resolves them against the type
+   * before any store sees them, and refuses the read if any of them cannot be
+   * honoured. See `catalog.filters.ts`, which owns both halves of that rule and
+   * is also what a console derives its controls from.
+   */
+  filters?: string[];
 }
 
 export interface CatalogObjectPage {
@@ -304,6 +316,53 @@ export interface CatalogObjectPage {
     type: ScalarType;
     classification?: string;
     unit?: string;
+    /**
+     * How the source spells this column, when it is not how the property is
+     * named.
+     *
+     * Carried because on a published type the two really do differ: a source
+     * column called `Asset Id` cannot be a SQL identifier, so the property is
+     * `Asset_Id` and `columnName` keeps the original. A reader recognises the
+     * source spelling — it is what is on their spreadsheet — and a filter has to
+     * be built from the property name, so a screen that shows only one of the two
+     * either fails to be recognised or invites a filter on a name that resolves
+     * to nothing. Both are here so a screen can show one and send the other.
+     *
+     * Optional: a page served by a version of this library that predates the
+     * field simply does not say, and a screen falls back to the property name.
+     */
+    columnName?: string;
+    /**
+     * What this column may be filtered with, here and now.
+     *
+     * Derived from the column by `filterOperatorsFor` and then narrowed to what
+     * the mounted store can actually apply, so the list is the server's answer
+     * rather than the screen's guess. **Empty means not filterable** — a
+     * classified column, a blob, or a store that does not filter at all.
+     *
+     * Optional, and absent is not the same as empty: a server older than this
+     * field has not been asked. A screen must read absent the pessimistic way and
+     * offer nothing, because offering a control the server will refuse is worse
+     * than offering none.
+     */
+    filterOperators?: CatalogFilterOperator[];
   }>;
   rows: Array<Record<string, unknown>>;
+
+  /**
+   * Which load these rows came from, when the store keeps history.
+   *
+   * Reported by the store as part of the read rather than looked up separately,
+   * so it costs nothing and — more importantly — it describes the snapshot that
+   * was actually read rather than the one the caller believes it asked for. A
+   * screen that drew its "you are looking at an old load" banner from its own
+   * state would be trusting the wrong end of the request.
+   *
+   * Absent when the store keeps no snapshots at all.
+   */
+  snapshot?: {
+    id: string;
+    /** False means these rows are NOT what a reader gets by default. */
+    current: boolean;
+  };
 }

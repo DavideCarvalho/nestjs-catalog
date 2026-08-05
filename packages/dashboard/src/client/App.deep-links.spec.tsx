@@ -1,3 +1,4 @@
+import { codeEditorText } from '@dudousxd/nestjs-catalog-react';
 // @vitest-environment jsdom
 //
 // The docblock below must stay attached to the FIRST import in source order, and that import must
@@ -35,6 +36,7 @@ import type { CatalogSearchResult, Dashboard, SavedQuery } from '@dudousxd/nestj
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { installCodeSurfaceDom } from '../../../../test/jsdom-code-surface';
 
 declare global {
   // React refuses to believe a test is a test without this, and warns on every state update.
@@ -42,13 +44,12 @@ declare global {
 }
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 
-/** The two things the tab strip and the boards use that jsdom, having no layout, does not. */
-class NoopResizeObserver implements ResizeObserver {
-  observe(): void {}
-  unobserve(): void {}
-  disconnect(): void {}
-}
-globalThis.ResizeObserver = NoopResizeObserver;
+/**
+ * The things the tab strip, the boards and the SQL editor use that jsdom, having no layout, does
+ * not. The editor needs a `ResizeObserver` that actually FIRES plus canvas text metrics, so the
+ * shared installer replaces the no-op stub this file used to declare — see it for the rest.
+ */
+installCodeSurfaceDom();
 Element.prototype.scrollIntoView = () => {};
 
 /**
@@ -212,12 +213,9 @@ describe('a search result opens the thing it names', () => {
 
     // `q-7` is the SECOND saved query, so a console that navigated and dropped the id would show
     // the starter SQL here and look perfectly healthy doing it.
-    await waitFor(() =>
-      expect(screen.getByLabelText('SQL query')).toHaveProperty(
-        'value',
-        'SELECT assetId, risk FROM subwo',
-      ),
-    );
+    // Read through the shadow root the editor renders into: it is `@pierre/diffs` now, not a
+    // `<textarea>`, so `getByLabelText('SQL query')` finds nothing whatever is on screen.
+    await waitFor(() => expect(codeEditorText(document.body)).toContain('SELECT assetId, risk'));
   });
 
   it('sends a dashboard hit to that dashboard, not to whichever board is first', async () => {

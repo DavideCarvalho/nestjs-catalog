@@ -33,8 +33,12 @@
  *
  * `toBeChecked` / `toBeDisabled` are NOT available — this repo registers no jest-dom setup, and
  * they throw rather than fail. `toHaveProperty` is the equivalent that works. jsdom also does no
- * layout, so nothing here asserts on scroll position or size; the row cap is asserted by counting
- * rendered rows, which is a fact about the DOM rather than about a viewport.
+ * layout, so nothing here asserts on scroll position or size; what IS asserted about the rendered
+ * comparison is which rows exist and how each is classified, which are facts about the DOM.
+ *
+ * The comparison itself is `@pierre/diffs` and renders into a shadow root, so `screen.getByText`
+ * cannot see a single line of it — everything about rendered code goes through `renderedLines` and
+ * `linesOfType` below.
  */
 import type {
   CatalogConnector,
@@ -47,10 +51,12 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { afterEach, describe, expect, it } from 'vitest';
+import { installCodeSurfaceDom } from '../../../../test/jsdom-code-surface';
 import { PipelineConsole } from '../PipelineConsole';
 import { QueryConsole } from '../QueryConsole';
 import { TransformEditor } from '../TransformEditor';
 import { CatalogProvider, type CatalogTransport } from '../context';
+import { codeEditorRoot } from '../ui/code-editor';
 import { DiffBody, RevisionHistory } from './RevisionDiff';
 
 declare global {
@@ -60,15 +66,14 @@ declare global {
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 
 /**
+ * The DOM neither Base UI nor `@pierre/diffs` can do without.
+ *
  * Base UI's select and tooltip observe their anchor's size, which jsdom cannot compute and throws
- * about. Stubbed rather than asserted on: nothing here depends on what they measure.
+ * about; the diff renderer needs the same observer to actually FIRE, plus canvas text metrics and a
+ * box with a size, or it renders an empty shadow root. One installer covers both — see it for why a
+ * no-op observer is not enough any more.
  */
-class NoopResizeObserver implements ResizeObserver {
-  observe(): void {}
-  unobserve(): void {}
-  disconnect(): void {}
-}
-globalThis.ResizeObserver = NoopResizeObserver;
+installCodeSurfaceDom();
 Element.prototype.scrollIntoView = () => {};
 
 afterEach(cleanup);
@@ -155,21 +160,41 @@ function withCatalog(transport: CatalogTransport, children: ReactNode) {
 }
 
 /**
- * The rendered row a line of text sits in, as its own text content.
+ * The rows of a rendered diff, by what happened to each.
  *
- * The sign gutter is the assertion target on purpose. It is the only marker on a diff row that
- * survives a colourblind reader, a printout and a screen reader — the background tint does not —
- * so testing the sign is testing the thing a person actually reads. A row comes out as
- * `<before><after><sign><text>`, e.g. `33 return x` for an unchanged line and `3+return x` for an
- * added one.
+ * Through the shadow root, because the diff is `@pierre/diffs` now and Testing Library's queries
+ * stop at the host element — `screen.getByText('return a + b;')` finds nothing, whatever is on
+ * screen. `data-line-type` is the renderer's own classification of a row and is what the colour,
+ * the background and the gutter marker are all derived from, so asserting on it is asserting on the
+ * one fact all three agree about.
  */
-function rowOf(text: string): string {
-  const found = screen.getByText(text).closest('div');
-  return found?.textContent ?? '';
+function linesOfType(type: 'change-addition' | 'change-deletion' | 'context'): string[] {
+  return rows(`[data-line-type="${type}"]`);
+}
+
+/** Every line of code the diff put on screen, in order. */
+function renderedLines(): string[] {
+  return rows('[data-line-type]');
+}
+
+/**
+ * `:not([data-no-newline])` because the renderer emits a row of its own reading "No newline at end
+ * of file" and classifies it as `context`. It is a note about the file, not a line of it, and
+ * counting it as one made "the two unchanged lines" come out as four.
+ */
+function rows(selector: string): string[] {
+  const root = codeEditorRoot(document.body);
+  const found = root?.querySelectorAll(`[data-content] ${selector}:not([data-no-newline])`) ?? [];
+  return [...found].map((node) => node.textContent ?? '');
+}
+
+/** The rendered diff has had time to paint. Highlighting and layout are both asynchronous. */
+async function painted() {
+  await waitFor(() => expect(renderedLines().length).toBeGreaterThan(0));
 }
 
 describe('the comparison itself', () => {
-  it('marks the one line that changed and leaves the others unmarked', () => {
+  it('marks the one line that changed and leaves the others unmarked', async () => {
     // The whole point, at the level a person sees it. A row list that coloured every line — or
     // the wrong line — still renders as a plausible diff, which is why the unchanged rows are
     // asserted on too rather than only the changed ones.
@@ -179,69 +204,66 @@ describe('the comparison itself', () => {
         after={'const a = 1;\nreturn a * b;\n// done'}
       />,
     );
+    await painted();
 
-    expect(rowOf('return a + b;')).toBe('2−return a + b;');
-    expect(rowOf('return a * b;')).toBe('2+return a * b;');
-    // Unchanged, and saying so: both line numbers present, and the gutter blank.
-    expect(rowOf('const a = 1;')).toBe('11 const a = 1;');
-    expect(rowOf('// done')).toBe('33 // done');
+    expect(linesOfType('change-deletion')).toEqual(['return a + b;']);
+    expect(linesOfType('change-addition')).toEqual(['return a * b;']);
+    expect(linesOfType('context')).toEqual(['const a = 1;', '// done']);
   });
 
-  it('says the two are identical only when they actually are', () => {
+  it('says the two are identical only when they actually are', async () => {
     render(<DiffBody before={'a\nb'} after={'a\nb'} />);
 
-    expect(screen.getByText('These two versions are identical.')).toBeTruthy();
+    expect(await screen.findByText('These two versions are identical.')).toBeTruthy();
   });
 
-  it('counts what changed rather than making somebody count rows', () => {
-    render(<DiffBody before={'a\nb\nc'} after={'a\nB\nc\nd'} />);
+  it('counts what changed rather than making somebody count rows', async () => {
+    render(<DiffBody before={'a\nb\nc\n'} after={'a\nB\nc\nd\n'} />);
 
-    expect(screen.getByText('+2')).toBeTruthy();
+    expect(await screen.findByText('+2')).toBeTruthy();
     expect(screen.getByText('−1')).toBeTruthy();
     expect(screen.queryByText('These two versions are identical.')).toBeNull();
   });
 
-  it('folds a long unchanged stretch and opens it again when asked', () => {
+  it('counts a line that gained a trailing newline as a change, which the old differ did not', async () => {
+    // A real behaviour change, recorded rather than smoothed over. The same two bodies WITHOUT
+    // trailing newlines are `+3 −2`, not `+2 −1`: appending `d` gives the previous last line `c` a
+    // newline it did not have, so `c` genuinely differs at the byte level and both differs are
+    // asked about bytes. The hand-rolled `diffLines` split on `\n` and never saw it. This one is
+    // the more honest answer — a connector pinned to the old version would run different bytes —
+    // and it is asserted so nobody "fixes" the count back.
+    render(<DiffBody before={'a\nb\nc'} after={'a\nB\nc\nd'} />);
+
+    expect(await screen.findByText('+3')).toBeTruthy();
+    expect(screen.getByText('−2')).toBeTruthy();
+  });
+
+  it('leaves out the long unchanged stretches rather than painting all of them', async () => {
     // A transform is hundreds of lines and the answer is almost never more than a handful of
-    // them. Folded rather than dropped: a diff that hides code with no way to see it is a diff
-    // you cannot trust, and this is code somebody is about to make a decision about.
+    // them. Rendering all of it puts the lines that matter somewhere in the middle of a wall.
+    // The hand-rolled fold used to do this and could be clicked open; the renderer does it by
+    // hunk, which is the same promise with the same escape hatch and one fewer implementation.
     const before = Array.from({ length: 40 }, (_, index) => `line ${index}`).join('\n');
     const after = before.replace('line 20', 'line 20 // touched');
     render(<DiffBody before={before} after={after} />);
+    await painted();
 
-    expect(screen.queryByText('line 0')).toBeNull();
-    const fold = screen.getByText(/17 unchanged lines/);
-
-    fireEvent.click(fold);
-
-    expect(screen.getByText('line 0')).toBeTruthy();
+    expect(linesOfType('change-addition')).toEqual(['line 20 // touched']);
+    // The change and its context, not the whole file.
+    expect(renderedLines().length).toBeLessThan(40);
+    expect(renderedLines()).not.toContain('line 0');
   });
 
-  it('caps the rows it paints and says how many it is holding back', () => {
-    // Past a few hundred rows the browser is painting a wall nobody reads and the screen appears
-    // frozen, which is its own dishonesty about what is happening. NOTE what is capped: rows.
-    // Line CONTENT is never truncated, because two lines truncated into equality would be
-    // reported as unchanged — see DIFF_MAX_ROWS for why `capLines` is not the model here.
-    const before = Array.from({ length: 700 }, (_, index) => `old ${index}`).join('\n');
-    const after = Array.from({ length: 700 }, (_, index) => `new ${index}`).join('\n');
-    render(<DiffBody before={before} after={after} />);
-
-    expect(screen.queryByText('old 600')).toBeNull();
-    const more = screen.getByRole('button', { name: /Show the remaining \d+ lines/ });
-
-    fireEvent.click(more);
-
-    expect(screen.getByText('old 600')).toBeTruthy();
-  });
-
-  it('renders a long line whole rather than cutting it', () => {
+  it('renders a long line whole rather than cutting it', async () => {
     // The rule that makes the comparison trustworthy at all: two lines that differ only past a
-    // character cap would be truncated into equality and reported as unchanged.
+    // character cap would be truncated into equality and reported as unchanged. Nothing in this
+    // path caps a line, and this is what says so.
     const long = `x${'y'.repeat(900)}`;
     render(<DiffBody before={`${long}A`} after={`${long}B`} />);
+    await painted();
 
-    expect(screen.getByText(`${long}A`)).toBeTruthy();
-    expect(screen.getByText(`${long}B`)).toBeTruthy();
+    expect(linesOfType('change-deletion')).toEqual([`${long}A`]);
+    expect(linesOfType('change-addition')).toEqual([`${long}B`]);
   });
 });
 
@@ -282,8 +304,9 @@ describe('the history screen', () => {
     );
     expect(screen.getByLabelText('Against version').textContent).toContain('v5');
     // And the comparison really is v3 → v5, not v4 → v5.
-    expect(screen.getByText('return records.map(oldRow)')).toBeTruthy();
-    expect(screen.getByText('// current')).toBeTruthy();
+    await painted();
+    expect(renderedLines()).toContain('return records.map(oldRow)');
+    expect(renderedLines()).toContain('// current');
   });
 
   it('falls back to the last change when no run named a version', async () => {
@@ -359,7 +382,8 @@ describe('the history screen', () => {
     await waitFor(() =>
       expect(screen.getByLabelText('Against version').textContent).toContain('v5'),
     );
-    expect(screen.getByText('return records.map(toRow)')).toBeTruthy();
+    await painted();
+    expect(renderedLines()).toContain('return records.map(toRow)');
   });
 
   it('reports a history it could not read instead of rendering an empty one', async () => {
@@ -412,7 +436,8 @@ describe('the ways in', () => {
     await waitFor(() =>
       expect(screen.getByLabelText('Compare version').textContent).toContain('v3'),
     );
-    expect(screen.getByText('return records.map(oldRow)')).toBeTruthy();
+    await painted();
+    expect(renderedLines()).toContain('return records.map(oldRow)');
   });
 
   it('offers the history from the transform editor', async () => {

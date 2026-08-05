@@ -1,10 +1,11 @@
 import { EntityManager } from '@mikro-orm/core';
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { CATALOG_FILTER_OPERATORS, type CatalogResolvedFilter } from '../catalog.filters';
 import { MikroOrmCatalogRegistry } from '../catalog.registry';
 import type {
+  CatalogFilteringReadStore,
   CatalogReadQuery,
   CatalogReadResult,
-  CatalogReadStore,
   CatalogStoreCapabilities,
 } from '../catalog.store';
 import type { CatalogObjectTypeDef } from '../catalog.types';
@@ -19,12 +20,19 @@ import type { CatalogObjectTypeDef } from '../catalog.types';
  * nothing here can show you last Tuesday.
  */
 @Injectable()
-export class MikroOrmReadStore implements CatalogReadStore {
+export class MikroOrmReadStore implements CatalogFilteringReadStore {
   readonly capabilities: CatalogStoreCapabilities = {
     snapshots: 'none',
     writable: false,
     timeTravel: false,
   };
+
+  /**
+   * All of them: every operator maps onto a MikroORM query-builder operator, and
+   * the ORM writes the column name from the entity metadata rather than from
+   * anything a caller sent.
+   */
+  readonly objectFilterOperators = CATALOG_FILTER_OPERATORS;
 
   constructor(
     private readonly registry: MikroOrmCatalogRegistry,
@@ -51,7 +59,7 @@ export class MikroOrmReadStore implements CatalogReadStore {
     // No explicit type arguments: `findAndCount` declares `Fields extends string
     // = never`, so naming even one generic makes the rest fall back to their
     // defaults and types `fields` as `never[]`. Inference gets it right.
-    const [rows, total] = await em.findAndCount(entityClass, buildWhere(type, query.search), {
+    const [rows, total] = await em.findAndCount(entityClass, buildWhere(type, query), {
       limit: size,
       offset: (page - 1) * size,
       orderBy: buildOrderBy(type, query.sort, query.dir),
@@ -66,21 +74,83 @@ export class MikroOrmReadStore implements CatalogReadStore {
 }
 
 /**
- * Only string columns the catalog says are visible.
+ * The search term and the column filters, ANDed.
  *
- * A search that reached a classified column would leak it through row
- * membership even though the value is never rendered.
+ * Search reaches only string columns the catalog says are visible: a search that
+ * reached a classified column would leak it through row membership even though
+ * the value is never rendered. `filterOperatorsFor` refuses a classified column
+ * for the same reason and a sharper one — a range filter lets a reader
+ * binary-search a value they may not see.
+ *
+ * The filters are ANDed with each other and with the search, which is what makes
+ * a filter narrowing: two conditions on one column express a range, and a caller
+ * that wanted alternatives has `contains` or a second request.
  */
-function buildWhere(type: CatalogObjectTypeDef, search?: string) {
-  const term = search?.trim();
-  if (!term) return {};
+function buildWhere(type: CatalogObjectTypeDef, query: CatalogReadQuery) {
+  const conditions: Array<Record<string, unknown>> = [];
 
-  const searchable = type.properties.filter(
-    (p) => !p.hidden && p.type === 'string' && !p.classification,
-  );
-  if (searchable.length === 0) return {};
+  const term = query.search?.trim();
+  if (term) {
+    const searchable = type.properties.filter(
+      (p) => !p.hidden && p.type === 'string' && !p.classification,
+    );
+    if (searchable.length > 0) {
+      conditions.push({ $or: searchable.map((p) => ({ [p.name]: { $like: `%${term}%` } })) });
+    }
+  }
 
-  return { $or: searchable.map((p) => ({ [p.name]: { $like: `%${term}%` } })) };
+  for (const filter of query.filters ?? []) {
+    conditions.push({ [filter.property.name]: comparison(filter) });
+  }
+
+  if (conditions.length === 0) return {};
+  if (conditions.length === 1) return conditions[0];
+  return { $and: conditions };
+}
+
+/**
+ * One operator as MikroORM spells it.
+ *
+ * The property name is the ORM's own — it came off the type, which was built
+ * from the entity metadata — so the column in the emitted SQL is written by the
+ * ORM from that metadata and never by string concatenation here. That is the same
+ * guarantee the sort above relies on.
+ */
+function comparison(filter: CatalogResolvedFilter): Record<string, unknown> {
+  const value = filter.value;
+  switch (filter.op) {
+    case 'eq':
+      return { $eq: value };
+    case 'ne':
+      // `!=` in SQL is never true of NULL, so a row whose column is empty would
+      // drop out of "is not X" — which reads as those rows having the value.
+      return { $or: [{ $ne: value }, { $eq: null }] };
+    case 'contains':
+      return { $like: `%${String(value)}%` };
+    case 'gt':
+      return { $gt: value };
+    case 'gte':
+      return { $gte: value };
+    case 'lt':
+      return { $lt: value };
+    case 'lte':
+      return { $lte: value };
+    case 'empty':
+      // A blank string is empty to a reader, and only a text column can hold
+      // one. Both spellings, so "no value" means what it says on either.
+      return { $or: [{ $eq: null }, { $eq: '' }] };
+    case 'notEmpty':
+      return { $and: [{ $ne: null }, { $ne: '' }] };
+    default:
+      // No operator falls through to a silent `{}`, which would be a filter
+      // that matches everything. An operator added to the contract and not to
+      // this switch fails to compile here rather than at read time.
+      return unknownOperator(filter.op);
+  }
+}
+
+function unknownOperator(operator: never): never {
+  throw new BadRequestException(`This store cannot filter with ${String(operator)}.`);
 }
 
 /** Only ever a column the catalog vouched for; falls back to the key. */

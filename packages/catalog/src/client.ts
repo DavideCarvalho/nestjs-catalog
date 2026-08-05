@@ -74,6 +74,43 @@ export type {
   ScalarType,
 } from './catalog.types';
 
+/**
+ * The filter rule, shipped to the browser deliberately — the same exception, for
+ * the same reason, that `validateWorkflow` further down is.
+ *
+ * A console has to know which control to draw for a column, and the only way for
+ * that answer to match what the server will accept is for both to run this
+ * function. A screen with its own copy of the rules eventually lies: it offers a
+ * control the read refuses, or omits one that would have worked, and on types
+ * that are created at runtime nobody notices until a publisher adds a column. The
+ * functions are pure and import nothing.
+ *
+ * `SnapshotRef` rides along because a snapshot picker is a browser screen and
+ * `GET objects/:name/snapshots` is what fills it. The endpoints alone are not an
+ * API; the endpoints plus the response types are.
+ */
+export {
+  CATALOG_FILTER_LIMIT,
+  CATALOG_FILTER_OPERATORS,
+  coerceFilterValue,
+  encodeObjectFilter,
+  filterOperatorTakesValue,
+  filterOperatorsFor,
+  isCatalogFilterOperator,
+  offeredFilterOperators,
+  parseObjectFilter,
+  resolveObjectFilters,
+  VALUELESS_FILTER_OPERATORS,
+} from './catalog.filters';
+export type {
+  CatalogFilterableColumn,
+  CatalogFilterOperator,
+  CatalogFilterResolution,
+  CatalogObjectFilter,
+  CatalogResolvedFilter,
+} from './catalog.filters';
+export type { SnapshotRef } from './catalog.store';
+
 /** What a tier-0 edit to a type may change. */
 export interface TypePatch {
   displayName?: string;
@@ -100,6 +137,26 @@ export interface ObjectQueryParams {
   search?: string;
   sort?: string;
   dir?: 'asc' | 'desc';
+  /**
+   * `property:operator:value`, one entry per filter, ANDed by the server.
+   *
+   * Named `filter` rather than `filters` because that is the query parameter the
+   * route reads, and this object is handed to a transport that serialises it
+   * verbatim — a name that disagreed with the route would be a filter that is
+   * sent, ignored, and reported by the screen as applied.
+   *
+   * Build entries with `encodeObjectFilter` rather than by hand: it is what the
+   * server parses with, and the two colons are load-bearing.
+   */
+  filter?: string[];
+  /**
+   * Read the type as of an earlier load. Omit for the current one, which is what
+   * every reader must get by default.
+   *
+   * Ids come from `GET objects/:name/snapshots`. A store that keeps no history
+   * refuses this rather than answering with current state.
+   */
+  snapshot?: string;
 }
 
 /**

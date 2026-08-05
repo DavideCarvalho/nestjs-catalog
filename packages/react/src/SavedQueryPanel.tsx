@@ -377,15 +377,24 @@ export function SavedQueryPanel({
             if (!open) setHistory(null);
           }}
           subject={{ kind: 'saved-query', id: history.id, name: history.name }}
-          // No `current`, and the asymmetry is in the data rather than in this
-          // call. `CatalogTransform` carries a `version` counter, so a transform
-          // editor can hand the sheet "v5 is what is live" and have it noticed
-          // when the recorded history stops at v4. `SavedQuery` has no version
-          // field at all — there is no number to put beside its SQL — so the
-          // newest recorded revision is the newest thing this screen can name.
-          // Passing an invented number to make the two callers look alike would
-          // put a version on somebody's SQL that nothing else in the system
-          // agrees with.
+          // Still no `current`, and the asymmetry is in the data rather than in
+          // this call. `CatalogTransform` carries a `version` counter, so a
+          // transform editor can hand the sheet "v5 is what is live" and have it
+          // noticed when the recorded history stops at v4. `SavedQuery` has no
+          // version field at all, so there is no number to put beside its SQL.
+          //
+          // What that argument never justified — and what this screen went
+          // without for as long as it has existed — is refusing to COMPARE the
+          // SQL in the editor. Not being able to name a version is not the same
+          // as having nothing to say: the newest recorded revision is a perfectly
+          // good thing to diff against, and "what have I changed since I last
+          // saved" is the question somebody opening history mid-edit is actually
+          // asking. So the buffer goes in unnamed, as `Unsaved edits`.
+          //
+          // Only for the query that is OPEN. `currentSql` is the editor's, not
+          // this row's, so offering it under some other query's history would
+          // diff two unrelated bodies and call the result a change.
+          {...(history.id === openId ? { buffer: { body: currentSql } } : {})}
         />
       )}
     </div>
