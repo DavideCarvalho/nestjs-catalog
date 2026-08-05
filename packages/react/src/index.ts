@@ -91,6 +91,40 @@ export {
   type SchemaDrift,
 } from './PipelineConsole';
 export { TransformEditor, type TransformEditorProps } from './TransformEditor';
+
+// Why one load came out different from the last one.
+//
+// The screens above already carry their own way in — the transform editor, the
+// saved-query list, and the `code v3` on a connector run — so a host mounting
+// this console needs none of this. It is exported for the host that wants the
+// comparison somewhere else: beside its own deploy log, in an approval flow, or
+// on a page this package does not ship.
+//
+// `diffLines` and `foldUnchanged` are pure and come with it deliberately. They
+// are the whole of the algorithm, they take no dependency and reach no network,
+// and a host that wants to render a comparison its own way should not have to
+// choose between this package's markup and writing an LCS.
+export {
+  DiffBody,
+  RevisionHistory,
+  type RevisionHistoryProps,
+  RevisionHistoryButton,
+  RevisionHistorySheet,
+  type RevisionHistorySheetProps,
+  type RevisionSubject,
+  type RevisionSubjectKind,
+} from './diff/RevisionDiff';
+export {
+  DIFF_CONTEXT_LINES,
+  DIFF_MAX_CELLS,
+  DIFF_MIN_FOLD,
+  type DiffLine,
+  type DiffOp,
+  type DiffSection,
+  diffLines,
+  foldUnchanged,
+  type LineDiff,
+} from './diff/line-diff';
 export { AccessConsole, type AccessConsoleProps } from './AccessConsole';
 
 // The authored graph: sources wired through transforms into sinks.
@@ -159,6 +193,11 @@ export {
 export {
   type CatalogClient,
   type CatalogIdentity,
+  // One saved version of a transform's code or a saved query's SQL. Owned by
+  // `@dudousxd/nestjs-catalog/client` and re-exported through context.tsx, so a
+  // host typing what this client returns need not know which of the two packages
+  // declares which shape.
+  type CatalogRevision,
   // What `CatalogClient.listPeople` answers with. The interface was exported and
   // the shape of its one paged reply was not, so a host writing a user table
   // could name the client and not the page — and the honest workaround, typing

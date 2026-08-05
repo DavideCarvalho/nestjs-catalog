@@ -3,6 +3,7 @@ import type {
   CatalogConnector,
   CatalogTransform,
   ConnectorKind,
+  ConnectorRun,
   ScalarType,
 } from '@dudousxd/nestjs-catalog/client';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
@@ -26,6 +27,7 @@ import { ConnectionPanel, connectionOptionsFor } from './ConnectionPanel';
 import { TransformEditor } from './TransformEditor';
 import { cn } from './cn';
 import { type ConnectorInput, catalogQueryKeys, useCatalogClient } from './context';
+import { RevisionHistorySheet } from './diff/RevisionDiff';
 // One description of what a source needs, shared with the workflow canvas's
 // source inspector. See the header of that module for why it is not two.
 import {
@@ -511,11 +513,6 @@ function ConnectorCard({
   const client = useCatalogClient();
   const [confirming, setConfirming] = useState(false);
 
-  const { data: runs = [] } = useQuery({
-    queryKey: catalogQueryKeys.runs(connector.id),
-    queryFn: () => client.listRuns(connector.id),
-  });
-
   const remove = useMutation({
     mutationFn: () => client.deleteConnector(connector.id),
     onSuccess: () => {
@@ -619,51 +616,7 @@ function ConnectorCard({
         </button>
       )}
 
-      {runs.length > 0 && (
-        <div className={cn('mt-3 border-t pt-3', RULE)}>
-          <div className={cn('mb-1.5 font-mono text-[10px] uppercase tracking-[0.14em]', MUTED)}>
-            Recent runs
-          </div>
-          <div className="space-y-1">
-            {runs.slice(0, 4).map((entry) => (
-              <Tooltip
-                key={entry.id}
-                content={
-                  entry.error ? (
-                    <span className="font-mono text-[11px]">{entry.error}</span>
-                  ) : (
-                    <span className="font-mono text-[11px]">
-                      {entry.logs.slice(-3).join('\n') || 'No logs.'}
-                    </span>
-                  )
-                }
-              >
-                <div className="flex cursor-help items-center gap-2 text-[11px]">
-                  {/* The icon carries the outcome, so the outcome needs a name
-                      too — otherwise a failed run and a run that found nothing
-                      read identically as "0 fetched · 0 written". */}
-                  <span className="sr-only">{entry.status}: </span>
-                  {entry.status === 'succeeded' ? (
-                    <CircleCheck size={11} aria-hidden className="text-emerald-600" />
-                  ) : entry.status === 'failed' ? (
-                    <CircleX size={11} aria-hidden className="text-red-600" />
-                  ) : (
-                    <Loader2 size={11} aria-hidden className="animate-spin text-sky-600" />
-                  )}
-                  <span className="font-mono">{entry.snapshotId}</span>
-                  <span className={MUTED}>
-                    {entry.fetched} fetched · {entry.written} written
-                    {entry.transformVersion ? ` · code v${entry.transformVersion}` : ''}
-                  </span>
-                  <span className={cn('ml-auto font-mono text-[10px]', MUTED)}>
-                    {new Date(entry.startedAt).toLocaleTimeString()}
-                  </span>
-                </div>
-              </Tooltip>
-            ))}
-          </div>
-        </div>
-      )}
+      <RecentRuns connectorId={connector.id} transform={transform} />
 
       <ConfirmDialog
         open={confirming}
@@ -682,6 +635,161 @@ function ConnectorCard({
         }
       />
     </div>
+  );
+}
+
+/**
+ * What this connector has done lately, and the way from a load to the code that
+ * produced it.
+ *
+ * Its own component rather than a block inside the card, because it owns state
+ * the card has no other use for — which version is being compared — and because
+ * the runs it reads are the card's only query that is not about the connector
+ * itself. Lifting it out is also what keeps `ConnectorCard` under the cognitive
+ * complexity the linter enforces, which is the linter noticing something real:
+ * a card that renders a source, a schedule, a credential, a transform, a run
+ * list AND a comparison panel is doing six things.
+ */
+function RecentRuns({
+  connectorId,
+  transform,
+}: {
+  connectorId: string;
+  transform: CatalogTransform | undefined;
+}) {
+  const client = useCatalogClient();
+  /**
+   * Which run's code is being compared, as the version number it recorded.
+   *
+   * This is where the question actually occurs to somebody: they are looking at
+   * a load that came out different from the last one, and the row in front of
+   * them already says `code v3`. Making that number the way in means nobody has
+   * to carry it to another screen and pick it out of a dropdown — which is the
+   * step where you pick the wrong one and conclude the code was fine.
+   */
+  const [comparing, setComparing] = useState<number | null>(null);
+
+  const { data: runs = [] } = useQuery({
+    queryKey: catalogQueryKeys.runs(connectorId),
+    queryFn: () => client.listRuns(connectorId),
+  });
+
+  if (runs.length === 0) return null;
+
+  return (
+    <>
+      <div className={cn('mt-3 border-t pt-3', RULE)}>
+        <div className={cn('mb-1.5 font-mono text-[10px] uppercase tracking-[0.14em]', MUTED)}>
+          Recent runs
+        </div>
+        <div className="space-y-1">
+          {runs.slice(0, 4).map((entry) => (
+            <Tooltip
+              key={entry.id}
+              content={
+                entry.error ? (
+                  <span className="font-mono text-[11px]">{entry.error}</span>
+                ) : (
+                  <span className="font-mono text-[11px]">
+                    {entry.logs.slice(-3).join('\n') || 'No logs.'}
+                  </span>
+                )
+              }
+            >
+              <div className="flex cursor-help items-center gap-2 text-[11px]">
+                {/* The icon carries the outcome, so the outcome needs a name
+                    too — otherwise a failed run and a run that found nothing
+                    read identically as "0 fetched · 0 written". */}
+                <span className="sr-only">{entry.status}: </span>
+                <RunStatusIcon status={entry.status} />
+                <span className="font-mono">{entry.snapshotId}</span>
+                <span className={MUTED}>
+                  {entry.fetched} fetched · {entry.written} written
+                </span>
+                <RanCodeVersion
+                  version={entry.transformVersion}
+                  comparable={transform !== undefined}
+                  onCompare={setComparing}
+                />
+                <span className={cn('ml-auto font-mono text-[10px]', MUTED)}>
+                  {new Date(entry.startedAt).toLocaleTimeString()}
+                </span>
+              </div>
+            </Tooltip>
+          ))}
+        </div>
+      </div>
+
+      {transform && (
+        <RevisionHistorySheet
+          open={comparing !== null}
+          onOpenChange={(open) => {
+            if (!open) setComparing(null);
+          }}
+          subject={{ kind: 'transform', id: transform.id, name: transform.name }}
+          current={{ version: transform.version, body: transform.code }}
+          ranVersion={comparing ?? undefined}
+        />
+      )}
+    </>
+  );
+}
+
+function RunStatusIcon({ status }: { status: ConnectorRun['status'] }) {
+  if (status === 'succeeded')
+    return <CircleCheck size={11} aria-hidden className="text-emerald-600" />;
+  if (status === 'failed') return <CircleX size={11} aria-hidden className="text-red-600" />;
+  return <Loader2 size={11} aria-hidden className="animate-spin text-sky-600" />;
+}
+
+/**
+ * `code v3` on a run, as a way into the comparison rather than as a fact.
+ *
+ * Where somebody is standing when the question occurs to them. The number was
+ * already on this row and already meant "this load ran that code"; what it did
+ * not have was anywhere to go, because until revisions existed the code it named
+ * had been overwritten. Making it the control means nobody carries a version
+ * number to another screen and picks it out of a dropdown — which is the step
+ * where you pick the wrong one and conclude the code was fine.
+ *
+ * Still only text when there is nothing on the other side: a connector with no
+ * transform never records a version, and a version whose transform has since
+ * been deleted has no current code to compare against. A control that opens an
+ * empty panel is a control that teaches people to stop pressing it.
+ *
+ * Its own component rather than three ternaries inside the run row, because the
+ * row is inside a `Tooltip` inside a `map` inside a card that is already at the
+ * complexity budget — and because "what does the version on a run do" is a
+ * question with one answer, which should be in one place.
+ */
+function RanCodeVersion({
+  version,
+  comparable,
+  onCompare,
+}: {
+  version: number | undefined;
+  comparable: boolean;
+  onCompare: (version: number) => void;
+}) {
+  if (version === undefined) return null;
+  if (!comparable) return <span className={cn('font-mono', MUTED)}>code v{version}</span>;
+
+  return (
+    // Inside the tooltip's trigger rather than beside it, because this row IS
+    // the trigger: pulling the button out would put a gap in the hover target
+    // exactly where the pointer is heading. A click inside it bubbles normally.
+    <button
+      type="button"
+      onClick={() => onCompare(version)}
+      aria-label={`Compare the code that ran (v${version}) with the current code`}
+      className={cn(
+        'rounded-sm px-1 font-mono underline decoration-dotted underline-offset-2',
+        MUTED,
+        'hover:text-sky-600',
+      )}
+    >
+      code v{version}
+    </button>
   );
 }
 

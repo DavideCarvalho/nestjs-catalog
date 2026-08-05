@@ -9,6 +9,7 @@ import { ArrowLeft, Play } from 'lucide-react';
 import { type KeyboardEvent, type RefObject, useRef, useState } from 'react';
 import { cn } from './cn';
 import { useCatalogClient } from './context';
+import { RevisionHistoryButton, RevisionHistorySheet } from './diff/RevisionDiff';
 import { CodeEditor } from './ui/code-editor';
 import { TextField } from './ui/field';
 import { SelectField } from './ui/select';
@@ -191,6 +192,7 @@ export function TransformEditor({
     transform?.code ?? STARTERS[transform?.language ?? 'javascript'],
   );
   const [sample, setSample] = useState(SAMPLE);
+  const [historyOpen, setHistoryOpen] = useState(false);
   const editorRef = useRef<HTMLTextAreaElement>(null);
 
   const tryIt = useMutation({
@@ -338,13 +340,34 @@ export function TransformEditor({
         </div>
       </div>
 
-      <SaveBar
-        transform={transform}
-        nameIsEmpty={name.trim().length === 0}
-        pending={save.isPending}
-        error={save.error}
-        onSave={() => save.mutate()}
-      />
+      <div className="flex flex-wrap items-center gap-2">
+        <SaveBar
+          transform={transform}
+          nameIsEmpty={name.trim().length === 0}
+          pending={save.isPending}
+          error={save.error}
+          onSave={() => save.mutate()}
+        />
+        {/* Only for a transform that exists. A draft has no history and a
+            control that can only ever open an empty panel is a control that
+            teaches people to stop pressing it. */}
+        {transform && (
+          <RevisionHistoryButton className="ml-auto" onClick={() => setHistoryOpen(true)} />
+        )}
+      </div>
+
+      {transform && (
+        <RevisionHistorySheet
+          open={historyOpen}
+          onOpenChange={setHistoryOpen}
+          subject={{ kind: 'transform', id: transform.id, name: transform.name }}
+          // The SAVED code, not what is in the editor above. A history is what
+          // this catalog has recorded; comparing against an unsaved buffer would
+          // put a version number on text that exists only in one browser tab,
+          // and no run will ever have used it.
+          current={{ version: transform.version, body: transform.code }}
+        />
+      )}
     </div>
   );
 }

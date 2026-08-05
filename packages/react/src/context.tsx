@@ -5,6 +5,7 @@ import type {
   CatalogObjectPage,
   CatalogQueryRelation,
   CatalogQueryResult,
+  CatalogRevision,
   CatalogSearchResult,
   CatalogSnapshot,
   CatalogTraceList,
@@ -163,6 +164,26 @@ export interface TransformInput {
   code: string;
 }
 
+/**
+ * One saved version of the two things in this catalog whose text a person edits.
+ *
+ * RE-EXPORTED rather than mirrored, unlike `PipelineCapabilities` above. The
+ * distinction is worth keeping straight: `PipelineCapabilities` is mirrored
+ * because importing it would mean importing `@dudousxd/nestjs-catalog-pipeline`,
+ * a package built for a Node process with database drivers behind optional
+ * imports, into a browser bundle. `CatalogRevision` has no such problem — it is
+ * a plain shape on `@dudousxd/nestjs-catalog/client`, the entry point that
+ * exists precisely so a browser can name the catalog's own contracts, and
+ * restating it here would be the second copy of something two packages already
+ * serve.
+ *
+ * Named here at all, rather than left for callers to import from the client
+ * package, because everything else this file's `CatalogClient` returns is
+ * reachable from this module and a host should not have to know which of the two
+ * packages owns which shape to type a variable.
+ */
+export type { CatalogRevision };
+
 /** The three answers a console can give somebody about what they may do. */
 export type CatalogPersonRole = 'viewer' | 'curator' | 'admin';
 
@@ -291,6 +312,23 @@ export interface CatalogClient {
   deleteSavedQuery(id: string): Promise<{ deleted: boolean }>;
   runSavedQuery(id: string): Promise<{ savedQuery: SavedQuery; result: CatalogQueryResult }>;
   exportUrl(id: string): string;
+  /**
+   * Every SQL this saved query has ever been, newest first.
+   *
+   * Beside {@link listTransformRevisions} rather than one polymorphic
+   * `listRevisions(kind, id)`, because the two are served by different things:
+   * a saved query is the catalog library's own resource and a transform is the
+   * host's. One method taking a kind would hide that a host can move one of the
+   * two endpoints and not the other, which is exactly the mistake `routes.ts`
+   * spends its header preventing.
+   *
+   * An EMPTY list is a real answer and not an error. Every saved query written
+   * before revisions existed has no history, and whether the store backfills a
+   * first revision from the current SQL is a decision belonging to the store.
+   * The screen has to read "nothing recorded" as "nothing recorded" — never as
+   * "nothing has changed".
+   */
+  listSavedQueryRevisions(id: string): Promise<CatalogRevision[]>;
 
   listDashboards(): Promise<Dashboard[]>;
   /**
@@ -420,6 +458,16 @@ export interface CatalogClient {
   saveTransform(input: TransformInput): Promise<CatalogTransform>;
   deleteTransform(id: string): Promise<{ deleted: boolean }>;
   /**
+   * Every version of this transform's code, newest first.
+   *
+   * The list rather than one version by number, because the screen that needs
+   * this is comparing two of them and has to know which exist before it can pick
+   * — including the case where the version a run recorded is NOT among them,
+   * which is what a transform older than the revision store looks like and is a
+   * thing the screen has to be able to say out loud.
+   */
+  listTransformRevisions(id: string): Promise<CatalogRevision[]>;
+  /**
    * Run code against sample records without storing anything.
    *
    * The difference between a transform somebody can iterate on and one they can
@@ -533,6 +581,7 @@ export function CatalogProvider({
       deleteSavedQuery: (id) =>
         transport.delete<{ deleted: boolean }>(catalogRoutes.savedQuery(id)),
       runSavedQuery: (id) => transport.post(catalogRoutes.runSavedQuery(id), {}),
+      listSavedQueryRevisions: (id) => transport.get(catalogRoutes.savedQueryRevisions(id)),
       // A URL rather than a fetch: an export the browser downloads itself can
       // be a link, and a link can be copied, bookmarked or scheduled. Where
       // that link points is the transport's answer, exactly like every other
@@ -592,6 +641,7 @@ export function CatalogProvider({
       listTransforms: () => transport.get(pipeline.transforms()),
       saveTransform: (input) => transport.post<CatalogTransform>(pipeline.transforms(), input),
       deleteTransform: (id) => transport.delete<{ deleted: boolean }>(pipeline.transform(id)),
+      listTransformRevisions: (id) => transport.get(pipeline.transformRevisions(id)),
       tryTransform: (input) => transport.post<TransformResult>(pipeline.tryTransform(), input),
 
       listWorkflows: () => transport.get(pipeline.workflows()),
@@ -650,6 +700,17 @@ export const catalogQueryKeys = {
   connections: ['nestjs-catalog', 'pipeline', 'connections'] as const,
   connectors: ['nestjs-catalog', 'pipeline', 'connectors'] as const,
   transforms: ['nestjs-catalog', 'pipeline', 'transforms'] as const,
+  /**
+   * A transform's history, keyed UNDER `transforms` on purpose.
+   *
+   * `catalogQueryKeys.transforms` is a prefix of this, so the invalidation the
+   * transform list already performs after a save reaches the history too — and
+   * it must, because saving new code is precisely what cuts a revision. Keyed
+   * anywhere else, the diff screen would keep showing yesterday's history beside
+   * today's code, which is the one thing it exists not to do.
+   */
+  transformRevisions: (id: string) =>
+    ['nestjs-catalog', 'pipeline', 'transforms', id, 'revisions'] as const,
   runs: (connectorId?: string) =>
     ['nestjs-catalog', 'pipeline', 'runs', connectorId ?? 'all'] as const,
   workflows: ['nestjs-catalog', 'pipeline', 'workflows'] as const,

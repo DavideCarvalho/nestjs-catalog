@@ -55,6 +55,23 @@ export const embedRoutes = {
   dashboard: (id: string) => `/catalog/embed/dashboards/${encodeURIComponent(id)}`,
 } as const;
 
+/*
+ * A saved query's history is deliberately NOT here.
+ *
+ * `GET /catalog/saved-queries/:id/revisions` is served by the catalog library's
+ * own controller, so by this file's header it belongs beside `catalogRoutes` —
+ * and that is where it is: `catalogRoutes.savedQueryRevisions`. The note is here
+ * because a reader looking for the pair of it will find `transformRevisions` on
+ * `PipelineRoutes` below and reasonably wonder where the other half went. The
+ * split is the whole argument of this file: transforms are served by the host
+ * and move with the base path it chose; saved queries are served by the library
+ * and cannot move at all.
+ *
+ * A plain comment rather than a docblock on purpose — there is no declaration
+ * here for it to belong to, and a `/**` would attach itself to the constant
+ * below and describe the wrong thing in every editor tooltip.
+ */
+
 /** Where the pipeline endpoints sit unless the host says otherwise. */
 export const DEFAULT_PIPELINE_BASE_PATH = '/pipeline';
 
@@ -109,6 +126,21 @@ export interface PipelineRoutes {
   runs(): string;
   transforms(): string;
   transform(id: string): string;
+  /**
+   * Every version of a transform's code that was ever saved, newest first.
+   *
+   * A sub-resource of the transform rather than a `?version=` on it, because the
+   * question this answers is "what were all of them" — a screen comparing the
+   * version that ran against the version that is current has to see the list
+   * before it knows which two ids to name, and one request that answers that is
+   * cheaper than a list request plus two fetches.
+   *
+   * `CatalogTransform.version` is a counter over a row that is overwritten in
+   * place, so before this route existed the number on a run — `code v3` in the
+   * runs list — named code that no longer existed anywhere. The version stayed
+   * traceable and the code did not.
+   */
+  transformRevisions(id: string): string;
   tryTransform(): string;
   /**
    * Authored graphs of transforms. GET lists, POST creates or updates.
@@ -140,6 +172,7 @@ export function pipelineRoutes(basePath: string = DEFAULT_PIPELINE_BASE_PATH): P
     runs: () => `${base}/runs`,
     transforms: () => `${base}/transforms`,
     transform: (id) => `${base}/transforms/${encodeURIComponent(id)}`,
+    transformRevisions: (id) => `${base}/transforms/${encodeURIComponent(id)}/revisions`,
     tryTransform: () => `${base}/transforms/try`,
     workflows: () => `${base}/workflows`,
     workflow: (id) => `${base}/workflows/${encodeURIComponent(id)}`,

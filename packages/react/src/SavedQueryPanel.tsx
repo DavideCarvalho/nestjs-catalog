@@ -1,10 +1,11 @@
 import type { SaveQueryInput, SavedQuery } from '@dudousxd/nestjs-catalog/client';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Bookmark, Download, Timer, Trash2 } from 'lucide-react';
+import { Bookmark, Download, History, Timer, Trash2 } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import { registeredChartLibraries } from './charts/registry';
 import { cn } from './cn';
 import { useCatalogClient } from './context';
+import { RevisionHistorySheet } from './diff/RevisionDiff';
 import { ShareBadge, ShareControl } from './sharing';
 import { Select } from './ui/select';
 import { Tooltip } from './ui/tooltip';
@@ -69,6 +70,14 @@ export function SavedQueryPanel({
   const client = useCatalogClient();
   const queryClient = useQueryClient();
   const [saving, setSaving] = useState(false);
+  /**
+   * Which query's history is open, as the query itself rather than an id.
+   *
+   * The whole row, because the sheet is titled by name and a panel headed with
+   * an opaque id helps nobody. Looking the name back up from the id would be a
+   * second read of an array this component is already holding.
+   */
+  const [history, setHistory] = useState<SavedQuery | null>(null);
   const [draft, setDraft] = useState<SaveQueryInput>({
     name: '',
     sql: '',
@@ -309,6 +318,19 @@ export function SavedQueryPanel({
                     MUTED,
                   )}
                 />
+                <Tooltip content="Every SQL this query has been, and what changed between two of them">
+                  <button
+                    type="button"
+                    onClick={() => setHistory(query)}
+                    className={cn(
+                      'rounded-sm p-1 opacity-0 group-hover:opacity-100 focus-visible:opacity-100',
+                      MUTED,
+                    )}
+                    aria-label={`History of ${query.name}`}
+                  >
+                    <History size={11} />
+                  </button>
+                </Tooltip>
                 <Tooltip content="Download as CSV">
                   <a
                     href={client.exportUrl(query.id)}
@@ -347,6 +369,25 @@ export function SavedQueryPanel({
           </p>
         )}
       </div>
+
+      {history && (
+        <RevisionHistorySheet
+          open
+          onOpenChange={(open) => {
+            if (!open) setHistory(null);
+          }}
+          subject={{ kind: 'saved-query', id: history.id, name: history.name }}
+          // No `current`, and the asymmetry is in the data rather than in this
+          // call. `CatalogTransform` carries a `version` counter, so a transform
+          // editor can hand the sheet "v5 is what is live" and have it noticed
+          // when the recorded history stops at v4. `SavedQuery` has no version
+          // field at all — there is no number to put beside its SQL — so the
+          // newest recorded revision is the newest thing this screen can name.
+          // Passing an invented number to make the two callers look alike would
+          // put a version on somebody's SQL that nothing else in the system
+          // agrees with.
+        />
+      )}
     </div>
   );
 }
