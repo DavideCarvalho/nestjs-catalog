@@ -5,6 +5,7 @@ import type {
   CatalogObjectPage,
   CatalogQueryRelation,
   CatalogQueryResult,
+  CatalogSearchResult,
   CatalogSnapshot,
   CatalogTraceList,
   CatalogTransform,
@@ -269,6 +270,20 @@ export interface CatalogClient {
   queryRelations(): Promise<CatalogQueryRelation[]>;
   runQuery(input: { sql: string; maxRows?: number }): Promise<CatalogQueryResult>;
 
+  /**
+   * One term across object types, properties, saved queries and dashboards.
+   *
+   * One call rather than four, and the ranking is the server's. A client that
+   * merged four lists would own the order across kinds, which means the order
+   * would live in whichever screen was written last — see the block above
+   * `CatalogService.search`, which makes the argument where the code is.
+   *
+   * `limit` is the caller's request and the server's decision: it caps whatever
+   * is asked for, and the answer carries `total` and `truncated` so a screen can
+   * say "50 of 312" rather than implying the list it drew is the list.
+   */
+  search(term: string, limit?: number): Promise<CatalogSearchResult>;
+
   workspaceCapabilities(): Promise<{ workspace: boolean; query: boolean }>;
   listSavedQueries(): Promise<SavedQuery[]>;
   saveQuery(input: SaveQueryInput): Promise<SavedQuery>;
@@ -499,6 +514,16 @@ export function CatalogProvider({
       reset: () => transport.post<CatalogSnapshot>(catalogRoutes.reset()),
       queryRelations: () => transport.get<CatalogQueryRelation[]>(catalogRoutes.queryRelations()),
       runQuery: (input) => transport.post<CatalogQueryResult>(catalogRoutes.query(), input),
+      // `limit` is omitted rather than sent undefined when nobody asked for
+      // one, for the reason `listRuns` states below: a transport that
+      // serialises `limit=` hands the server an empty string, and `Number('')`
+      // is 0 — which the route would floor back to 1 and answer with a single
+      // row that reads as "there is only one match".
+      search: (term, limit) =>
+        transport.get<CatalogSearchResult>(catalogRoutes.search(), {
+          q: term,
+          ...(limit === undefined ? {} : { limit }),
+        }),
 
       workspaceCapabilities: () => transport.get(catalogRoutes.workspaceCapabilities()),
       listSavedQueries: () => transport.get(catalogRoutes.savedQueries()),
@@ -597,6 +622,20 @@ export const catalogQueryKeys = {
   snapshot: ['nestjs-catalog', 'snapshot'] as const,
   objects: (type: string, params: ObjectQueryParams) =>
     ['nestjs-catalog', 'objects', type, params] as const,
+
+  /**
+   * Keyed on the term, so react-query caches per term and a backspace shows the
+   * previous answer instantly instead of re-asking.
+   *
+   * Deliberately NOT keyed on anything about the caller. The answer already
+   * depends on who is asking — the route filters by principal — and a cache key
+   * that did not say so would be a bug; it is safe here only because a browser
+   * session is one principal, and a host that swaps identity in place without a
+   * reload should invalidate `catalogQueryKeys.all`, which is what that prefix
+   * is for.
+   */
+  search: (term: string, limit?: number) =>
+    ['nestjs-catalog', 'search', term, limit ?? null] as const,
 
   /**
    * The pipeline keys are nested under one prefix so a host — or a screen that

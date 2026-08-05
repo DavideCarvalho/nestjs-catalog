@@ -28,6 +28,18 @@ export type {
   CatalogQueryResult,
 } from './catalog.query';
 
+// What `GET /catalog/search` answers. A separate module from the matcher so
+// this entry point stays types-only — the ranking runs on the server, and a
+// browser that re-implemented it would produce a second order for the same
+// term. See search.types.ts for what a hit deliberately does not carry.
+export type {
+  CatalogSearchField,
+  CatalogSearchHit,
+  CatalogSearchKind,
+  CatalogSearchRank,
+  CatalogSearchResult,
+} from './search.types';
+
 export type {
   CatalogGraph,
   CatalogObjectPage,
@@ -77,6 +89,16 @@ export interface ObjectQueryParams {
 export const catalogRoutes = {
   snapshot: () => '/catalog',
   graph: () => '/catalog/graph',
+  /**
+   * One term across types, properties, saved queries and dashboards.
+   *
+   * No arguments, unlike `type(name)` and friends: `q` and `limit` are a query
+   * string, and every route here that takes one — `objects`, `events`, `traces`
+   * — leaves it to the caller's HTTP client, because that is the layer that
+   * already knows how to serialise and encode one. `accessRoutes.people` in the
+   * React package does it the other way and is the odd one out.
+   */
+  search: () => '/catalog/search',
   type: (name: string) => `/catalog/types/${encodeURIComponent(name)}`,
   property: (name: string, property: string) =>
     `/catalog/types/${encodeURIComponent(name)}/properties/${encodeURIComponent(property)}`,

@@ -92,6 +92,32 @@ export {
   type TransformRunnerOptions,
 } from './transform-runner';
 export { CatalogService } from './catalog.service';
+// Search. The result types are on `/client` too, for a browser; these are here
+// because a host that passed `controller: false` and wrote its own routes needs
+// to type the handler, and — more importantly — needs `visibleToPrincipal` and
+// `maySearch` if it calls `searchCatalog` directly rather than going through
+// `CatalogService.search`. Exporting the matcher without them would ship the
+// half that ranks and withhold the half that decides who may see what, which is
+// the exact shape of the gap `index.barrel.spec.ts` was written after.
+export {
+  DEFAULT_SEARCH_LIMIT,
+  MAX_SEARCH_LIMIT,
+  bestMatch,
+  emptySearch,
+  maySearch,
+  type SearchInput,
+  type SearchableDashboard,
+  type SearchableSavedQuery,
+  searchCatalog,
+  visibleToPrincipal,
+} from './search';
+export type {
+  CatalogSearchField,
+  CatalogSearchHit,
+  CatalogSearchKind,
+  CatalogSearchRank,
+  CatalogSearchResult,
+} from './search.types';
 export {
   type AuditQuery,
   CATALOG_TRACE_OUTCOMES,

@@ -73,6 +73,12 @@ import {
  * every label one request at a time. Requiring admin would deny nothing and
  * would push a routine console action into the scope that manages principals.
  *
+ * **`GET search` is the one read here that looks at the principal.** Its scope
+ * is the unsurprising `catalog:read`; what is surprising is that it filters, in
+ * a library whose read routes deliberately do not. The reason it has to is on
+ * the route itself, and it is short: a host can wrap a read whose subject it
+ * knows, and cannot wrap one whose result set is chosen by a stranger's typing.
+ *
  * One consequence is worth stating rather than leaving to be discovered:
  * `shared` rides on the dashboard write routes, so `catalog:curate` carries the
  * power to hand a board to an outside application. That is not an oversight —
@@ -122,6 +128,51 @@ export function createCatalogController(
     @RequireScopes('catalog:read')
     graph() {
       return this.registry.getGraph();
+    }
+
+    /**
+     * One term, across object types, properties, saved queries and dashboards.
+     *
+     * `catalog:read`, which is the scope of the four routes this is a shortcut
+     * to — `GET /catalog`, `GET saved-queries`, `GET dashboards` — and
+     * deliberately not narrower. A discovery route gated harder than the things
+     * it discovers is a route nobody can use; one gated softer is a way around
+     * them. Nothing here reaches a row of data or a statement: it returns names,
+     * labels and ids, which is a strict subset of what `GET /catalog` already
+     * hands the same caller.
+     *
+     * **The principal is passed, and this is one of two routes on this
+     * controller that filter by it.** The library's usual position is that reads
+     * apply no grants and a host wraps them — stated at length above `mayWrite`
+     * in `catalog.principal.ts`, and true of `GET objects/:name` right below.
+     * That position does not survive contact with a search box. A host can wrap
+     * `readObjects` because it knows the type being read and can decide; it
+     * cannot wrap this, because the whole result set is chosen by what somebody
+     * typed and the thing that must not come back is a NAME, which no wrapper
+     * downstream can distinguish from a name that was fine. Filtering has to
+     * happen where the candidates are enumerated, so it happens in
+     * `CatalogService.search`, and `visibleToPrincipal` is where to read the
+     * rules.
+     *
+     * The `@Req()` here is the same shape `actorOf` reads below, and for the
+     * same reason: a guard the host wrote put it there, and when no guard did,
+     * `undefined` arrives and nothing is filtered — see the service.
+     *
+     * Declared before every route carrying a parameter in the first segment,
+     * which today is none of them, so this is defensive rather than load-bearing.
+     * `events/traces` further down is the case where it is not.
+     */
+    @Get('search')
+    @RequireScopes('catalog:read')
+    search(
+      @Query('q') q?: string,
+      @Query('limit') limit?: string,
+      @Req() request?: { principal?: CatalogPrincipal },
+    ) {
+      return this.service.search(q ?? '', {
+        principal: request?.principal,
+        limit: limit ? Number(limit) : undefined,
+      });
     }
 
     @Get('types/:name')

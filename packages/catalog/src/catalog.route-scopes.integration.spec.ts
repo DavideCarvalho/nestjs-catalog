@@ -305,6 +305,10 @@ const ROUTES: Route[] = [
   // The model, and the rows under it.
   { method: 'get', path: '/api/catalog', scope: 'catalog:read' },
   { method: 'get', path: '/api/catalog/graph', scope: 'catalog:read' },
+  // Search is a shortcut to the four `catalog:read` routes below it, so it is
+  // the same scope. What it filters BEYOND the scope — the types and classified
+  // properties this principal may not see — is asserted in search.integration.
+  { method: 'get', path: '/api/catalog/search?q=vehicle', scope: 'catalog:read' },
   { method: 'get', path: '/api/catalog/types/vehicle', scope: 'catalog:read' },
   { method: 'get', path: '/api/catalog/objects/vehicle', scope: 'catalog:read' },
   { method: 'get', path: '/api/catalog/objects/vehicle/snapshots', scope: 'catalog:read' },

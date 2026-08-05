@@ -8,6 +8,7 @@ import {
 } from '@nestjs/common';
 import { emitCatalog } from './catalog.events';
 import { CATALOG_OPTIONS, type CatalogModuleOptions } from './catalog.options';
+import type { CatalogPrincipal } from './catalog.principal';
 import {
   type CatalogQueryRelation,
   type CatalogQueryResult,
@@ -39,6 +40,8 @@ import {
   type SavedQuery,
   embeddedVisualization,
 } from './catalog.workspace';
+import { emptySearch, maySearch, searchCatalog, visibleToPrincipal } from './search';
+import type { CatalogSearchResult } from './search.types';
 
 const DEFAULT_PAGE_SIZE = 25;
 const DEFAULT_MAX_PAGE_SIZE = 200;
@@ -619,5 +622,81 @@ export class CatalogService {
 
   listEvents(query: AuditQuery): Promise<CatalogAuditEvent[]> {
     return this.workspace ? this.workspace.listEvents(query) : Promise.resolve([]);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Search: one term, four kinds of thing.
+  //
+  // **One call that fans out, rather than four the client merges**, and the
+  // reason is not the round trips.
+  //
+  // Half of this is already free: the registry snapshot is in memory, so every
+  // type and every property costs a loop over an object this process is holding
+  // anyway. Only the workspace half touches a store, and it does so as one
+  // `Promise.all` — so the wall clock is the slower of two reads, not four
+  // sequential fetches from a browser. A client that split this to render the
+  // free half a few milliseconds earlier would be buying that with a second
+  // request and a second cache key.
+  //
+  // What actually decides it is that a merged list needs ONE ranking. Four
+  // routes means the client owns the ordering across kinds, which means the
+  // ordering lives in the browser, which means every other consumer of this HTTP
+  // API — and there is meant to be one, that is what `client.ts` is for —
+  // reinvents it slightly differently. And the access filter would have four
+  // places to be forgotten instead of one, which for the thing that decides
+  // whether a caller learns the name of a type they cannot read is not a
+  // trade worth making for a progress spinner.
+  //
+  // The cost, stated because it is real: a deployment whose workspace store is
+  // slow makes the free half wait for it. If that ever bites, the fix is a
+  // `kinds` parameter on this one route, not four routes.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Everything matching `term` that this principal may see.
+   *
+   * @param principal the caller, when the host resolved one. **Optional, and its
+   * absence filters nothing** — the declare-and-enforce split written out above
+   * `mayWrite` in `catalog.principal.ts` means this library never resolves a
+   * principal itself. In a deployment with no guard, `GET /catalog` already
+   * hands over the whole snapshot, so search is exactly as open as what is
+   * already there and strictly narrower the moment a principal appears. See
+   * {@link visibleToPrincipal}.
+   */
+  async search(
+    term: string,
+    options: { principal?: CatalogPrincipal; limit?: number } = {},
+  ): Promise<CatalogSearchResult> {
+    const trimmed = (term ?? '').trim();
+    if (!trimmed) return emptySearch();
+    // Answered before either store is touched. A principal that may read
+    // nothing should not cost a workspace query to be told so.
+    if (!maySearch(options.principal)) return emptySearch(trimmed);
+
+    const [savedQueries, dashboards] = await Promise.all([
+      this.listSavedQueries(),
+      this.listDashboards(),
+    ]);
+
+    return searchCatalog({
+      term: trimmed,
+      types: visibleToPrincipal(options.principal, this.registry.getSnapshot().types),
+      // Narrowed here rather than handed over whole. `searchCatalog` takes the
+      // fields it ranks and nothing else, so `sql` cannot reach the matcher even
+      // by accident — see `SearchableSavedQuery` for why matching a statement is
+      // the wrong feature rather than a missing one.
+      savedQueries: savedQueries.map((query) => ({
+        id: query.id,
+        name: query.name,
+        description: query.description,
+        folder: query.folder,
+      })),
+      dashboards: dashboards.map((dashboard) => ({
+        id: dashboard.id,
+        name: dashboard.name,
+        description: dashboard.description,
+      })),
+      limit: options.limit,
+    });
   }
 }

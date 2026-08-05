@@ -42,6 +42,11 @@ export {
 export { FlowView } from './FlowView';
 export { GovernanceTimeline } from './GovernanceTimeline';
 export { QueryConsole, type QueryConsoleProps } from './QueryConsole';
+// One box across the whole catalog: types, properties, saved queries, boards.
+// Not mounted anywhere by this package — a host places it wherever its shell
+// wants a search, and tells it where each kind of thing lives with the same
+// `explorerHref` shape `CatalogManager` takes.
+export { CatalogSearch, type CatalogSearchProps } from './search-console';
 export { SavedQueryPanel } from './SavedQueryPanel';
 export {
   CATALOG_EVENT_META,
