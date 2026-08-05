@@ -275,18 +275,29 @@ can use is a key that takes an incident to discover you cannot audit.
 This runs in `us-gov-west-1`, and the design of the wiring is what makes that a
 non-event rather than a checklist:
 
-- **KMS is a core GovCloud service**, and `GenerateDataKey` and `Decrypt` are
-  core KMS actions available in every partition. Nothing here uses a KMS feature
-  that is commercial-only: no `GenerateDataKeyPair`, no external key stores, no
-  custom key stores, no multi-Region keys, no `DeriveSharedSecret`.
+- **Only two KMS actions are used, and both are core.** `GenerateDataKey` and
+  `Decrypt` on a symmetric CMK. Nothing here touches a feature whose partition
+  availability would have to be checked before a deploy: no
+  `GenerateDataKeyPair`, no custom or external key stores, no multi-Region keys,
+  no `DeriveSharedSecret`, no grants, no `kms:Encrypt`. The surface is small
+  enough that "is this available in GovCloud" has one answer for all of it.
 - **Nothing in this package parses an ARN**, and GovCloud ARNs are in the
   `aws-us-gov` partition rather than `aws`. `keyId` is stored and echoed back
   verbatim; a test pins that with a real `arn:aws-us-gov:` ARN precisely so a
   future "helpful" parse cannot be added quietly.
 - **Nothing here resolves an endpoint or assumes a region.** The client is the
-  host's, so the GovCloud endpoint — including the FIPS one, which is what the
-  default GovCloud endpoints already are — is selected once, where the rest of
-  your AWS clients are configured.
+  host's, which is what keeps the partition out of this package entirely.
+
+  **This means the FIPS endpoint is your decision, and it is not the default.**
+  GovCloud's ordinary endpoints are not the FIPS-validated ones — AWS documents
+  separate FIPS endpoints (`kms-fips.us-gov-west-1.amazonaws.com`) and says to
+  use them if you require FIPS 140-3. Select them on the client you pass:
+
+  ```ts
+  new KMSClient({ region: "us-gov-west-1", useFipsEndpoint: true });
+  // or set AWS_USE_FIPS_ENDPOINT=true for the whole process
+  ```
+
 - **The local crypto is FIPS-approved.** AES-256-GCM and `crypto.randomBytes`,
   both available under a FIPS-mode OpenSSL provider. A random 96-bit nonce is
   what NIST SP 800-38D permits; the bound that makes random nonces uncomfortable

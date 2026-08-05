@@ -52,11 +52,18 @@ export interface CatalogAwsKmsVaultOptions {
    * A KMS client the host built.
    *
    * This package never constructs one, and that is the entire GovCloud story:
-   * region, endpoint, credential chain, retry policy and FIPS selection are the
-   * host's, made once, in the place where the rest of its AWS clients are made.
-   * A `region` option here would be a second, worse place for the same decision
-   * — and the first thing to be wrong in a partition this package had not been
-   * tested in.
+   * region, endpoint, credential chain and retry policy are the host's, made
+   * once, in the place where the rest of its AWS clients are made. A `region`
+   * option here would be a second, worse place for the same decision — and the
+   * first thing to be wrong in a partition this package had not been tested in.
+   *
+   * It also means **the FIPS endpoint is the host's decision and is not the
+   * default**. GovCloud's ordinary endpoints are not the FIPS-validated ones;
+   * AWS publishes separate `*-fips` endpoints and documents them as what to use
+   * where FIPS 140-3 is required. Pass `useFipsEndpoint: true` when building the
+   * client, or set `AWS_USE_FIPS_ENDPOINT=true`. Nothing this package could do
+   * would make that choice better, and a default here would make a deployment
+   * believe it had been made.
    */
   client: CatalogKmsClient;
   /**
