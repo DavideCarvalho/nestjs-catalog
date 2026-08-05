@@ -11,6 +11,7 @@ import { cn } from './cn';
 import { useCatalogClient } from './context';
 import { RevisionHistoryButton, RevisionHistorySheet } from './diff/RevisionDiff';
 import { CodeEditor } from './ui/code-editor';
+import { TRANSFORM_HIGHLIGHTED_AS } from './ui/code-languages';
 import { TextField } from './ui/field';
 import { SelectField } from './ui/select';
 
@@ -294,7 +295,11 @@ export function TransformEditor({
             value={code}
             onChange={setCode}
             onKeyDown={onKeyDown}
-            language={language === 'python' ? 'python' : 'tsx'}
+            // A table rather than the `language === 'python' ? 'python' : 'tsx'`
+            // that used to be here. The ternary answered a fourth transform
+            // language with `tsx` — silently, and wrongly — where the table
+            // cannot be indexed by one at all until somebody adds the row.
+            language={TRANSFORM_HIGHLIGHTED_AS[language]}
             label="Transform code"
             className="h-72"
           />

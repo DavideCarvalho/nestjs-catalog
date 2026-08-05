@@ -35,6 +35,10 @@
     "./workflow": {
       "types": "./dist/workflow/index.d.ts",
       "default": "./dist/workflow/index.js"
+    },
+    "./bundler": {
+      "types": "./dist/bundler/index.d.ts",
+      "default": "./dist/bundler/index.js"
     }
   },
   "files": [

@@ -3,6 +3,7 @@ import { EditProvider, File } from '@pierre/diffs/react';
 import type { KeyboardEvent, Ref } from 'react';
 import { useImperativeHandle, useRef } from 'react';
 import { cn } from '../cn';
+import type { CatalogCodeLanguage } from './code-languages';
 import { type CodeThemeType, useCodeThemeType } from './code-theme';
 
 /**
@@ -88,8 +89,17 @@ export interface CodeEditorHandle {
 export interface CodeEditorProps {
   value: string;
   onChange: (next: string) => void;
-  /** Anything Shiki knows: `sql`, `json`, `python`, `tsx`, … */
-  language: string;
+  /**
+   * What to highlight it as — one of the four grammars this package ships.
+   *
+   * Not `string`, and that is a size decision as much as a typing one. Shiki
+   * knows ~240 languages and the bundle carries the ones named in
+   * `CATALOG_CODE_LANGUAGES`; a `language` outside that set would render as
+   * plain text with nothing on screen to say why. Narrowing the prop to
+   * {@link CatalogCodeLanguage} makes it a compile error at the call site
+   * instead — see `ui/code-languages.ts` for the rest of that argument.
+   */
+  language: CatalogCodeLanguage;
   /**
    * Required, and it is the editable element's accessible name.
    *

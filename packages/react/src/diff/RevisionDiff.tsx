@@ -8,6 +8,7 @@ import { cn } from '../cn';
 import { type CatalogRevision, catalogQueryKeys, useCatalogClient } from '../context';
 import { Button } from '../ui/button';
 import { codeOptions } from '../ui/code-editor';
+import type { CatalogCodeLanguage } from '../ui/code-languages';
 import { useCodeThemeType } from '../ui/code-theme';
 import { SelectField } from '../ui/select';
 import { Sheet } from '../ui/sheet';
@@ -417,13 +418,18 @@ export function DiffBody({
    * sheet does not carry which, while a saved query is always SQL. Left unset,
    * the name below carries no extension and the diff renders unhighlighted —
    * which is honest, and better than colouring Python as SQL.
+   *
+   * Narrowed to {@link CatalogCodeLanguage} rather than left as `string`,
+   * because only the grammars in `ui/code-languages.ts` are in the bundle: a
+   * name outside them would render exactly like the `undefined` above, and the
+   * two nothings mean opposite things.
    */
   language,
   name = 'version',
 }: {
   before: string;
   after: string;
-  language?: string | undefined;
+  language?: CatalogCodeLanguage | undefined;
   name?: string;
 }) {
   const themeType = useCodeThemeType();

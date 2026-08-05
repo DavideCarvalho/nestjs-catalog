@@ -268,6 +268,18 @@ export {
   codeEditorRoot,
   codeEditorText,
 } from './ui/code-editor';
+// The grammars and themes the editor above can be given, which is a shorter list
+// than Shiki's and is the reason `dist/spa` is not nine tenths grammar files. A
+// host reads `CatalogCodeLanguage` off `CodeEditorProps` anyway; it is named here
+// so the set can be asserted against, and so the build plugin that enforces it —
+// `@dudousxd/nestjs-catalog-react/bundler` — has something to point at.
+export {
+  CATALOG_CODE_LANGUAGES,
+  CATALOG_CODE_THEMES,
+  type CatalogCodeLanguage,
+  type CatalogCodeTheme,
+  TRANSFORM_HIGHLIGHTED_AS,
+} from './ui/code-languages';
 export {
   RichTextField,
   RichTextView,

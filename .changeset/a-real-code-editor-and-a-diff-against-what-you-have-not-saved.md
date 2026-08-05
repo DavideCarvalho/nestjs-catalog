@@ -56,8 +56,14 @@ was a keyboard trap until `CodeEditor` took Escape (park focus on the wrapper)
 and Tab (leave for the next tab stop outside the component).
 
 **Size.** `prism-react-renderer` was ~86 KB minified / 26 KB gzipped, in one
-piece. `@pierre/diffs` brings Shiki: with code splitting the entry chunk is
-~555 KB minified / ~167 KB gzipped, plus a language or theme chunk fetched on
-demand (385 chunks, ~10.9 MB in total, of which a SQL console touches a
-handful). Bundled without splitting it is ~10.2 MB minified. Installed, the new
-subtree is about 40 MB.
+piece. `@pierre/diffs` brings Shiki, which is a different order of thing.
+Measured by bundling exactly the imports `ui/code-editor.tsx` and
+`diff/RevisionDiff.tsx` make, with React external (`vite build --lib`,
+esbuild-minified): the entry chunk is 943 KB minified / 234 KB gzipped, and
+Shiki's language and theme registries split into a further 318 chunks — 10.6 MB
+minified, 2.0 MB gzipped, of which a SQL console touches four. Installed, the new
+subtree is 26 MB (`@pierre/diffs` 10, `@shikijs/langs` 9, the rest 7).
+
+Those lazy chunks are pruned by the `shikiSubset()` build plugin in the changeset
+beside this one, which takes the same measurement to 8 chunks / 1.8 MB. The entry
+figure is not improved by it and is the honest cost of the dependency.
