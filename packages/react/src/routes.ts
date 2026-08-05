@@ -31,6 +31,8 @@
  * somewhere else entirely can pass its own base path, or replace the client.
  */
 
+import { pipelineExpectationRoutes } from '@dudousxd/nestjs-catalog/client';
+
 /**
  * The embed API, which is the exception to everything above.
  *
@@ -155,10 +157,38 @@ export interface PipelineRoutes {
   workflows(): string;
   workflow(id: string): string;
   runWorkflow(id: string): string;
+  /**
+   * Every per-type load expectation an operator has stored.
+   *
+   * Keyed by object type and nothing else. A connector, a workflow sink and an
+   * application POSTing to the publish API all end at the same publish methods
+   * and all have the same delete problem, so a per-connector route would have
+   * given one dataset two answers to one question.
+   */
+  loadExpectations(): string;
+  /**
+   * One type's expectation. GET resolves it and says where each field came
+   * from; PUT stores one; DELETE drops the stored row and leaves the host's.
+   *
+   * The GET answers a merge rather than the stored row, because the stored row
+   * alone cannot tell a screen whether it is the one in force — a host that
+   * declared the same type in code wins, and a screen that showed the stored
+   * value would offer an edit that is refused.
+   */
+  loadExpectation(typeName: string): string;
 }
 
 export function pipelineRoutes(basePath: string = DEFAULT_PIPELINE_BASE_PATH): PipelineRoutes {
   const base = normalise(basePath);
+  // The two expectation paths are BORROWED rather than written out again.
+  // `@dudousxd/nestjs-catalog/client` builds them because the pipeline
+  // controller's own validation reads the same module, and two copies of a path
+  // is how a route ends up moved on one side and 404ing on the other. Everything
+  // else here predates that builder and stays as it is; the argument at the top
+  // of this file — that these are a default a host may move, not a promise the
+  // library makes — is unchanged either way, since that builder takes the base
+  // path too.
+  const expectations = pipelineExpectationRoutes(base);
   return {
     capabilities: () => `${base}/capabilities`,
     connections: () => `${base}/connections`,
@@ -177,6 +207,8 @@ export function pipelineRoutes(basePath: string = DEFAULT_PIPELINE_BASE_PATH): P
     workflows: () => `${base}/workflows`,
     workflow: (id) => `${base}/workflows/${encodeURIComponent(id)}`,
     runWorkflow: (id) => `${base}/workflows/${encodeURIComponent(id)}/run`,
+    loadExpectations: () => expectations.expectations(),
+    loadExpectation: (typeName) => expectations.expectation(typeName),
   };
 }
 

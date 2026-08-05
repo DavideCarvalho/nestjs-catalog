@@ -4,6 +4,7 @@ import {
   ConnectionRow,
   ConnectorRow,
   ConnectorRunRow,
+  LoadExpectationRow,
   TransformRow,
   WorkflowRow,
   WorkflowStageRow,
@@ -32,6 +33,7 @@ export {
   ConnectionRow,
   ConnectorRow,
   ConnectorRunRow,
+  LoadExpectationRow,
   TransformRow,
   WorkflowRow,
   WorkflowStageRow,
@@ -136,6 +138,13 @@ export const catalogStoreEntities = [
   // id rather than a relation, so that deleting a transform cannot cascade away
   // code that a recorded run still names.
   RevisionRow,
+  // Reachable from nothing for the same reason once more: an expectation is
+  // keyed by an object type NAME, and the type it names need not have been
+  // published yet — a deployment may want a policy in place before the first
+  // load of that type ever arrives. So nothing relates to it, and leaving it off
+  // this list means `catalog_load_expectation` is never created and the first
+  // read dies on missing metadata rather than on a missing table.
+  LoadExpectationRow,
   // Reachable from nothing: a connector holds a connection *id*, deliberately
   // not a foreign key, so MikroORM's discovery cannot walk to this entity from
   // any other. It has to be listed by hand, and being absent here is invisible

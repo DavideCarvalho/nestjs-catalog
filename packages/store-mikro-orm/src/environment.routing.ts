@@ -35,6 +35,7 @@ import type {
   CatalogConnector,
   CatalogEnvironment,
   CatalogGraph,
+  CatalogLoadExpectationStore,
   CatalogMergeStore,
   CatalogObjectTypeDef,
   CatalogOverlay,
@@ -60,6 +61,7 @@ import type {
   SaveQueryInput,
   SavedQuery,
   SnapshotRef,
+  StoredLoadExpectation,
 } from '@dudousxd/nestjs-catalog';
 import {
   CatalogRegistry,
@@ -67,6 +69,7 @@ import {
   UnresolvedEnvironmentError,
   isQueryStore,
   stampEnvironment,
+  supportsLoadExpectations,
   supportsSavedQueryRevisions,
   supportsTransformRevisions,
   supportsWorkflowStages,
@@ -512,6 +515,59 @@ export class RoutingPipelineStore implements CatalogPipelineStore {
   dropStages(runId: string): Promise<number> {
     return requireStages(this.inner).dropStages(runId);
   }
+
+  // Operator-set load expectations route like everything else, and the reads and
+  // the writes answer differently on purpose — see `requireWorkflows` below for
+  // the rule: a read may say "none", a write may not pretend to have happened.
+  //
+  // The reads are the ones that would have been silently wrong. Absent is not a
+  // quieter "no": a caller probing with `supportsLoadExpectations` reads an
+  // unforwarded method as "this deployment cannot hold operator expectations",
+  // so the Model screen would have shown every type as host-only — in the one
+  // deployment shape, several environments, where somebody is most likely to
+  // want a per-environment answer.
+
+  listLoadExpectations(): Promise<StoredLoadExpectation[]> {
+    const inner = this.inner;
+    return supportsLoadExpectations(inner) ? inner.listLoadExpectations() : Promise.resolve([]);
+  }
+
+  getLoadExpectation(typeName: string): Promise<StoredLoadExpectation | undefined> {
+    const inner = this.inner;
+    return supportsLoadExpectations(inner)
+      ? inner.getLoadExpectation(typeName)
+      : Promise.resolve(undefined);
+  }
+
+  saveLoadExpectation(
+    typeName: string,
+    expectation: Pick<StoredLoadExpectation, 'deletes' | 'rowCount'>,
+    setBy: string,
+    setByActor?: string,
+  ): Promise<StoredLoadExpectation> {
+    return requireLoadExpectations(this.inner).saveLoadExpectation(
+      typeName,
+      expectation,
+      setBy,
+      // Named and passed rather than splatted, for the reason
+      // `RoutingCatalogRegistry.patchType` gives at length: a dropped METHOD
+      // fails loudly, a dropped ARGUMENT succeeds and writes a row whose author
+      // is nobody. This one is the audit's real subject.
+      setByActor,
+    );
+  }
+
+  /**
+   * A write, so it refuses rather than answering `false`.
+   *
+   * `false` already means something here — "there was no stored row" — and a
+   * store that cannot hold them at all would be answering that same word to a
+   * different question. The caller would read "nothing to clear" and never learn
+   * that the clear was impossible.
+   */
+  clearLoadExpectation(typeName: string): Promise<boolean> {
+    return requireLoadExpectations(this.inner).clearLoadExpectation(typeName);
+  }
 }
 
 /**
@@ -526,6 +582,17 @@ function requireWorkflows(
 ): CatalogPipelineStore & CatalogWorkflowStore {
   if (!supportsWorkflows(store)) {
     throw new BadRequestException("This environment's pipeline store cannot hold workflows.");
+  }
+  return store;
+}
+
+function requireLoadExpectations(
+  store: CatalogPipelineStore,
+): CatalogPipelineStore & CatalogLoadExpectationStore {
+  if (!supportsLoadExpectations(store)) {
+    throw new BadRequestException(
+      "This environment's pipeline store cannot hold load expectations, so this one cannot be set here. The host's CATALOG_LOAD_EXPECTATIONS object is the only layer in this environment.",
+    );
   }
   return store;
 }

@@ -12,14 +12,19 @@ import {
   SubprocessTransformRunner,
   TRANSFORM_LANGUAGES,
   type WorkflowNode,
+  curationActor,
+  emitCatalog,
   hasScope,
   isConnectorKind,
   isTransformLanguage,
+  supportsLoadExpectations,
   supportsTransformRevisions,
 } from '@dudousxd/nestjs-catalog';
+import type { LoadExpectationInput } from '@dudousxd/nestjs-catalog/client';
 import {
   BadRequestException,
   Body,
+  ConflictException,
   Controller,
   Delete,
   ForbiddenException,
@@ -27,8 +32,10 @@ import {
   Inject,
   Logger,
   NotFoundException,
+  Optional,
   Param,
   Post,
+  Put,
   Query,
   Req,
   type Type,
@@ -42,6 +49,14 @@ import {
 } from './config-secrets';
 import { ConnectionChecker } from './connection-checker.service';
 import { ConnectorRunnerService } from './connector-runner.service';
+import {
+  CATALOG_LOAD_EXPECTATIONS,
+  type CatalogLoadExpectations,
+  hostLockedFields,
+  hostOwnedFields,
+  refuseInvalidLoadExpectation,
+  resolveLoadExpectation,
+} from './load-expectations';
 import { discoverConnectorSchema } from './schema-discovery';
 import { CATALOG_PIPELINE_REGISTRY, type CatalogPipelineRegistry } from './seams';
 import { applyConnection, resolveSecret } from './sources';
@@ -93,6 +108,14 @@ export function createPipelineController(
       // can never disagree about what is published.
       @Inject(CATALOG_PIPELINE_REGISTRY)
       private readonly registry: CatalogPipelineRegistry,
+      // The strongest layer of the load policy, read-only here. This controller
+      // never writes it — a host declares it in code — but every one of the four
+      // expectation routes has to report it: the resolved answer, which fields
+      // this deployment has pinned, and the 409 that stops an edit from being
+      // accepted and then silently overruled.
+      @Optional()
+      @Inject(CATALOG_LOAD_EXPECTATIONS)
+      private readonly expectations?: CatalogLoadExpectations,
     ) {}
 
     /** What this deployment can actually execute, and whether a run survives a crash. */
@@ -122,6 +145,214 @@ export function createPipelineController(
         // process rather than probing anything, which is the property its own
         // docblock argues for at length. Nothing here waits on it.
         durable: this.launcher.durability(),
+      };
+    }
+
+    /**
+     * Every expectation an operator has stored, and every type this deployment
+     * has pinned in code.
+     *
+     * Both halves, because either alone is misleading. The stored rows without
+     * the locks would let a screen offer an edit that can never take effect; the
+     * locks without the rows would say what is fixed and not what anybody chose.
+     *
+     * **Declared before `expectations/:type`**, and every literal segment on
+     * this controller has to be — Nest matches in declaration order and a `:param`
+     * captures a literal happily. This pair is safe on its own (one segment
+     * against two), and the sweep in `pipeline.route-order.spec.ts` is what keeps
+     * the next route added under here safe as well; `connections/check` above is
+     * the case where getting it wrong already cost something.
+     *
+     * `supported: false` rather than a refusal, unlike `transforms/:id/revisions`
+     * one screen over, and the difference is what the caller can do about it.
+     * A store that keeps no revisions makes that route answerless. Here the host
+     * layer still resolves and is still worth showing, so refusing would blank a
+     * screen that has something true to draw — while an empty list on its own
+     * cannot tell "this deployment cannot store these" from "nobody has set
+     * one", which is the distinction that route was written to preserve.
+     */
+    @Get('expectations')
+    @RequireScopes('catalog:read')
+    async loadExpectations() {
+      const supported = supportsLoadExpectations(this.pipeline);
+      const stored = supported ? await this.pipeline.listLoadExpectations() : [];
+      const hostLocked: Record<string, { deletes: boolean; rowCount: boolean }> = {};
+      for (const typeName of Object.keys(this.expectations?.byType ?? {})) {
+        // Through the same helper the resolver locks with, so this list and the
+        // `hostLocked` on a single type can never disagree about what is pinned.
+        const locked = hostLockedFields(this.expectations, typeName);
+        if (locked.deletes || locked.rowCount) hostLocked[typeName] = locked;
+      }
+      return { supported, stored, hostLocked };
+    }
+
+    /**
+     * The expectation actually in force for one type, and where each field came
+     * from.
+     *
+     * The provenance is the reason this is not simply the merged object. Three
+     * layers decide it — the host's entry for the type, then the operator's
+     * stored row, then the host's house-wide default — and a screen handed only
+     * the answer would let somebody edit a field this deployment has pinned and
+     * watch the edit disappear on the next read with nothing saying why.
+     *
+     * Answers for a type the registry has never heard of, deliberately. An
+     * expectation is a statement about a NAME, it is legitimately written before
+     * the first load creates the type, and 404-ing here would make the screen
+     * that sets one unusable at exactly the moment it is needed.
+     */
+    @Get('expectations/:type')
+    @RequireScopes('catalog:read')
+    loadExpectation(@Param('type') typeName: string) {
+      return resolveLoadExpectation(this.expectations, this.pipeline, typeName);
+    }
+
+    /**
+     * Set what this catalog expects of loads into one type.
+     *
+     * ## Why this route exists
+     *
+     * `CATALOG_LOAD_EXPECTATIONS` was the only way to declare a delete strategy,
+     * so making an incremental load of a type legal took an engineer and a
+     * deploy — for a connector somebody had just created in the UI. What the
+     * control was ever after is that **somebody chose a strategy and wrote down
+     * why**; that needs attribution and visibility, not compilation. So the row
+     * carries who set it and when, and the whole thing is on the Model screen.
+     *
+     * ## `catalog:curate`, and a person
+     *
+     * `catalog:curate` because that is already the scope for statements the
+     * catalog makes about a type — `PATCH types/:name` is the same act on the
+     * same grain. {@link RequireHuman} because `because` is a sentence somebody
+     * is accountable for: an application key has no author, and attribution is
+     * the point rather than a side effect. That is checked in the handler as
+     * well as declared, for the reason `transforms/try` sets out at length —
+     * `REQUIRES_HUMAN` is metadata for a guard the host wrote, and most hosts
+     * have not written it, so the decorator alone would be a sentence that is
+     * true of the metadata and false of the deployment.
+     *
+     * ## What it refuses
+     *
+     * A field the host has declared in code is refused with **409** naming that
+     * field, rather than stored and then quietly overruled by the precedence
+     * rule. A body that could never be honoured is refused with **400** naming
+     * the field — see {@link refuseInvalidLoadExpectation} for why that is
+     * checked here as well as at the load.
+     *
+     * ## Merged over the stored row, not replacing it
+     *
+     * An absent field means "leave it alone", so a form that renders only the
+     * delete strategy cannot silently drop a row-count bound somebody set.
+     * Clearing is `DELETE`, which is a decision with a verb on it.
+     */
+    @Put('expectations/:type')
+    @RequireScopes('catalog:curate')
+    @RequireHuman()
+    async saveLoadExpectation(
+      @Req() request: { principal?: CatalogPrincipal },
+      @Param('type') typeName: string,
+      @Body() body: LoadExpectationInput,
+    ) {
+      const principal = requirePrincipal(request);
+      this.assertIsPerson(principal, typeName);
+      if (!supportsLoadExpectations(this.pipeline)) {
+        throw new BadRequestException(
+          `This catalog's pipeline store cannot hold per-type load expectations, so there is nowhere to write one for ${typeName}. Declare it under CATALOG_LOAD_EXPECTATIONS in this deployment's configuration instead.`,
+        );
+      }
+
+      const input: LoadExpectationInput = {
+        ...(body?.deletes !== undefined ? { deletes: body.deletes } : {}),
+        ...(body?.rowCount !== undefined ? { rowCount: body.rowCount } : {}),
+      };
+      if (input.deletes === undefined && input.rowCount === undefined) {
+        throw new BadRequestException(
+          `Nothing to set for ${typeName}: send "deletes", "rowCount", or both. An empty write would record a decision nobody made — to drop what is stored, use DELETE.`,
+        );
+      }
+
+      const invalid = refuseInvalidLoadExpectation(input);
+      if (invalid) throw new BadRequestException(invalid);
+
+      const owned = hostOwnedFields(this.expectations, typeName, input);
+      if (owned.length > 0) {
+        throw new ConflictException(
+          `This deployment declares ${owned.join(' and ')} for ${typeName} in code, under CATALOG_LOAD_EXPECTATIONS, and a host declaration wins over a stored one — so storing this would change nothing. Change it where it is declared, or drop ${owned.join(' and ')} from this request.`,
+        );
+      }
+
+      // Merged over whatever is stored, per this route's docblock: the store's
+      // `saveLoadExpectation` takes the whole expectation, so the merge has to
+      // happen on this side of it.
+      const stored = await this.pipeline.getLoadExpectation(typeName);
+      const saved = await this.pipeline.saveLoadExpectation(
+        typeName,
+        {
+          deletes: input.deletes ?? stored?.deletes,
+          rowCount: input.rowCount ?? stored?.rowCount,
+        },
+        principal.id,
+        principal.actor?.id,
+      );
+
+      // The same event a rename of this type emits, with the same key for the
+      // actor. `type.curated` is what a recorder lifts into the audit table's
+      // indexed columns, and a second event name for the same grain would put
+      // the more consequential decision on the feed nobody is subscribed to.
+      emitCatalog('type.curated', {
+        typeName,
+        changed: Object.keys(input).map((field) => `expectation.${field}`),
+        principalId: curationActor(principal.id),
+      });
+      this.logger.log(
+        `${principal.id} set the load expectation for ${typeName} (${Object.keys(input).join(', ')}).`,
+      );
+      return saved;
+    }
+
+    /**
+     * Drop the stored row for a type. The host layer is untouched.
+     *
+     * Untouched because it is not this route's to touch: `host.byType` and
+     * `host.default` are declared in code, and a `DELETE` that appeared to clear
+     * them would be a request that reports success and changes nothing on the
+     * next boot. What comes back is the expectation now in force, so the caller
+     * sees what deleting actually left behind rather than assuming it left
+     * nothing — a type sitting on a house-wide default is the common case.
+     *
+     * `catalog:curate` and a person, exactly as the write is: withdrawing a
+     * declaration is as consequential as making one — it is what puts a type
+     * back to having every incremental load refused — and an audit trail that
+     * recorded who set a policy but not who removed it answers half the
+     * question.
+     */
+    @Delete('expectations/:type')
+    @RequireScopes('catalog:curate')
+    @RequireHuman()
+    async clearLoadExpectation(
+      @Req() request: { principal?: CatalogPrincipal },
+      @Param('type') typeName: string,
+    ) {
+      const principal = requirePrincipal(request);
+      this.assertIsPerson(principal, typeName);
+      if (!supportsLoadExpectations(this.pipeline)) {
+        throw new BadRequestException(
+          `This catalog's pipeline store cannot hold per-type load expectations, so there is none stored for ${typeName} to drop.`,
+        );
+      }
+
+      const cleared = await this.pipeline.clearLoadExpectation(typeName);
+      if (cleared) {
+        emitCatalog('type.curated', {
+          typeName,
+          changed: ['expectation.cleared'],
+          principalId: curationActor(principal.id),
+        });
+        this.logger.log(`${principal.id} dropped the stored load expectation for ${typeName}.`);
+      }
+      return {
+        cleared,
+        remaining: await resolveLoadExpectation(this.expectations, this.pipeline, typeName),
       };
     }
 
@@ -871,6 +1102,30 @@ export function createPipelineController(
       if (!principal.actor) {
         throw new ForbiddenException(
           `${principal.id} is an application, and trying a transform runs code in this process against no stored record of who asked. Take this route as a signed-in person, or save the transform and run it through a graph, which leaves one.`,
+        );
+      }
+    }
+
+    /**
+     * Is there a person behind this request?
+     *
+     * The handler-side half of {@link RequireHuman} on the two expectation
+     * writes, and it is the half that actually runs: the decorator is metadata
+     * for a guard the host wrote, and `catalog.route-auth.ts` is explicit that
+     * reading it is the host's job. `transforms/try` makes the same check for
+     * the same reason and says so at length.
+     *
+     * What is being protected here is not permission — a machine key holding
+     * `catalog:curate` is perfectly authorised — it is authorship. The row
+     * records `setBy`, the reason field is a sentence, and "the nightly
+     * publisher decided this dataset may accumulate deleted rows" is not an
+     * answer to who decided it. `actor` is what says a person was behind the
+     * principal; see `catalog.principal.ts`.
+     */
+    private assertIsPerson(principal: CatalogPrincipal, typeName: string): void {
+      if (!principal.actor) {
+        throw new ForbiddenException(
+          `${principal.id} is an application, and a load expectation is a decision with a reason attached and a name against it — "${typeName} may accumulate rows deleted upstream, because…" is somebody's sentence. Take this route as a signed-in person, or declare it under CATALOG_LOAD_EXPECTATIONS in this deployment's configuration, which is reviewed.`,
         );
       }
     }

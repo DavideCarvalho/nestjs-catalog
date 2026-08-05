@@ -1,9 +1,6 @@
-import type { SnapshotRef } from '@dudousxd/nestjs-catalog';
-import { BadRequestException } from '@nestjs/common';
-
 /**
  * What a load has to be true of before it is allowed to become the data
- * everybody reads.
+ * everybody reads, and the functions that decide it.
  *
  * Two failures live here, and they are the same failure seen from two ends: a
  * load that is *fresh and wrong*. Every signal this catalog publishes about a
@@ -17,14 +14,23 @@ import { BadRequestException } from '@nestjs/common';
  *   since a watermark. A row physically removed from the source never changes
  *   again, so it is never returned again, so `carryForward` copies it into
  *   every subsequent snapshot forever. The catalog does not go wrong at any
- *   point; it simply never finds out. See {@link DeleteReconciliation}.
+ *   point; it simply never finds out. See `DeleteReconciliation`.
  * - **Collapse.** A source-side filter change, a broken `WHERE`, a partial
  *   outage: the connector returns 12 rows where it returned 40,000, the
  *   snapshot commits, and the freshness signals all say healthy — correctly,
- *   because it IS fresh. See {@link RowCountBound}.
+ *   because it IS fresh. See `RowCountBound`.
  *
- * **Why a policy object and not a column on the connector.** Both facts are
- * statements about a *type*, not about the reader of a source. "It is
+ * **The shapes are in `@dudousxd/nestjs-catalog` and the decisions are here.**
+ * `CatalogLoadExpectations`, `LoadExpectation`, `DeleteReconciliation` and
+ * `RowCountBound` are declared in `catalog.pipeline.ts` beside
+ * `CatalogConnector`, for the reason `CatalogConnector` itself is: a store
+ * package depends on the catalog and must not depend on this one, and
+ * `StoredLoadExpectation` is a row a store now holds. They are re-exported
+ * below, so an import that named this file still names it. The functions did
+ * not move — a store has no business deciding whether a load commits.
+ *
+ * **Why a policy about a type and not a column on the connector.** Both facts
+ * are statements about a *type*, not about the reader of a source. "It is
  * acceptable that `Employee` accumulates rows deleted upstream" and "`Employee`
  * must never lose half its rows in one load" stay true whether the rows arrive
  * from a connector, from a workflow sink, or from an application POSTing to the
@@ -35,43 +41,63 @@ import { BadRequestException } from '@nestjs/common';
  *
  * The second reason is who should be able to change it. Accepting that a
  * dataset silently accumulates deleted rows is not a checkbox decision; it is
- * the kind of thing that should appear in a diff with a reason attached, which
- * is why {@link DeleteReconciliation} makes the reason a required field.
+ * the kind of thing that should appear with a reason attached and a name against
+ * it — which is why `DeleteReconciliation` makes the reason a required field,
+ * and why the stored layer records who set it. See
+ * {@link resolveLoadExpectation} for how the layers combine.
  */
-export interface CatalogLoadExpectations {
-  /** Applied to every type that has no entry of its own. */
-  default?: LoadExpectation;
-  /**
-   * Keyed by object type name. Merged OVER {@link default} field by field, so a
-   * host can set one house-wide row-count bound and still say something about
-   * deletes for the three types that are loaded incrementally.
-   */
-  byType?: Record<string, LoadExpectation>;
-}
+import type {
+  CatalogLoadExpectations,
+  CatalogPipelineStore,
+  LoadExpectation,
+  RowCountBound,
+  SnapshotRef,
+  StoredLoadExpectation,
+} from '@dudousxd/nestjs-catalog';
+import { supportsLoadExpectations } from '@dudousxd/nestjs-catalog';
+import {
+  DELETE_RECONCILIATION_STRATEGIES,
+  type LoadExpectationInput,
+  type ResolvedLoadExpectation,
+  isDeleteReconciliationStrategy,
+} from '@dudousxd/nestjs-catalog/client';
+import { BadRequestException } from '@nestjs/common';
 
-export interface LoadExpectation {
-  /**
-   * How deletions at the source reach this type. **Absent means the load is
-   * refused**, which is the whole mechanism — see {@link
-   * refuseUndeclaredDeletes}.
-   */
-  deletes?: DeleteReconciliation;
-  /**
-   * How far one load may move this type's row count. Merged over
-   * {@link DEFAULT_ROW_COUNT_BOUND}, so a host that only wants to raise
-   * `maxShrink` writes exactly that one field.
-   */
-  rowCount?: Partial<RowCountBound>;
-}
+/*
+ * Re-exported rather than moved out of every importer's sight. Fourteen files
+ * across three packages name these from here, and a move that renames an import
+ * in all of them is a diff nobody can read for the change it is actually making.
+ * The provenance shape comes from the client entry point for the same reason it
+ * is declared there: the Model screen renders it, and a browser cannot import
+ * this package.
+ */
+export type {
+  CatalogLoadExpectations,
+  DeleteReconciliation,
+  LoadExpectation,
+  RowCountBound,
+  StoredLoadExpectation,
+} from '@dudousxd/nestjs-catalog';
+export type {
+  LoadExpectationInput,
+  ResolvedLoadExpectation,
+} from '@dudousxd/nestjs-catalog/client';
 
 /**
  * The token a host binds to say all of the above.
  *
  * `@Optional()` everywhere it is injected, so a host that binds nothing still
- * boots — and then finds that its incremental loads are refused, which is the
+ * boots — and then finds that its incremental loads are refused unless an
+ * operator has stored an expectation for the type through the API, which is the
  * intended and documented outcome rather than an oversight. It is said out loud
  * at boot too, once: a host that bound nothing hears which token is missing and
  * what it costs, rather than meeting it as a refused load weeks later.
+ *
+ * **This layer is the strongest one and that is what it is for.** A type named
+ * in {@link CatalogLoadExpectations.byType} cannot be overridden from the API:
+ * an operator sees the value and is told this deployment fixed it in code. What
+ * a host declares here it therefore owns, and what it leaves out an operator may
+ * decide — see {@link resolveLoadExpectation}.
  *
  * Two ways to bind it, both supported and neither preferred. Pass a `Provider`
  * as `CatalogPipelineModule.forRoot({ expectations })` — the docblock on that
@@ -81,106 +107,6 @@ export interface LoadExpectation {
  * which is Nest's ordinary precedence and not a rule this package invented.
  */
 export const CATALOG_LOAD_EXPECTATIONS = Symbol('CATALOG_LOAD_EXPECTATIONS');
-
-/**
- * How a type that is loaded incrementally learns about rows that were deleted.
- *
- * Three answers, and the honest thing to say about them up front is that only
- * one is *policed*. What this file enforces is that somebody chose one and
- * wrote down why — because the state being prevented is nobody having thought
- * about it at all, and that state is invisible by construction.
- *
- * The fourth answer, tombstones off a change feed, is the correct one and is
- * deliberately not here. It needs the source to publish a delete stream, the
- * catalog to hold a delete log per type, and the merge to apply it — which is
- * a larger machine than the problem justifies today, and adding a strategy name
- * that nothing implements would be exactly the dropdown-with-a-lie this
- * codebase refuses everywhere else.
- */
-export type DeleteReconciliation =
-  /**
-   * Nothing reconciles them, and that is a decision somebody made.
-   *
-   * The legitimate cases are real and common: an append-only ledger where rows
-   * are never removed, a source that only ever soft-retires records by changing
-   * a status the transform can see, or a dataset where a handful of stale rows
-   * is genuinely cheaper than a nightly full read. What is not legitimate is
-   * arriving here by default, which is why {@link because} cannot be omitted.
-   */
-  | { strategy: 'accepted'; because: string }
-  /**
-   * The source marks a deletion instead of performing one, and the watermark
-   * therefore sees it — a `deleted_at` that moves, a status column that flips —
-   * so the deleted row arrives as an ordinary change and the transform drops it
-   * or the type keeps it flagged.
-   *
-   * The strongest of the three, and the one that pushes a requirement onto a
-   * source that may refuse it. Not verifiable from here: the catalog cannot
-   * tell a source that soft-deletes from one that claims to, so this is a
-   * declaration like the one above. It is a separate value anyway because the
-   * two say completely different things to the next person who reads the
-   * config, and collapsing them would lose that.
-   */
-  | { strategy: 'soft-deleted-at-source'; because: string; column?: string }
-  /**
-   * Full reads reconcile, incremental reads fill the gaps between them.
-   *
-   * The interval is the trade-off, and it is stated in time rather than in runs
-   * because "reconciled daily" is what anybody actually means and because the
-   * only thing the catalog can count is the snapshots a store chooses to
-   * report, which is a window of unknown depth. {@link refuseStaleReconciliation}
-   * makes the interval real: once the newest full load of the type is older
-   * than `withinMs`, incremental loads of it stop committing.
-   */
-  | { strategy: 'periodic-full-reload'; because: string; withinMs: number };
-
-/**
- * How far a single load may move a type's row count before it is refused.
- *
- * **Asymmetric on purpose.** A type that doubles has usually had a good day —
- * a backfill landed, a new base was onboarded, a source finished catching up.
- * A type that loses 90% has almost never had a good day. Bounding both sides by
- * the same number would mean picking a growth bound loose enough to be useless
- * as a shrink bound, or a shrink bound tight enough to refuse every backfill.
- *
- * **Conditional on the store, and a host configuring this should know which
- * condition.** {@link refuseRowCountDrift} is pure and decides on two numbers;
- * somebody has to fetch them, and both come from members that are optional on
- * the store interface. Without `currentSnapshot` there is no served baseline;
- * without `listSnapshots`, or from a `listSnapshots` whose window does not
- * reach the snapshot about to be committed, there is no count for the pending
- * one. Either way the bound is not applied to that commit. That is the same
- * permissive-rather-than-punishing stance {@link CARRIED_FROM_LABEL} takes for
- * the same reason — an adapter that records less than the bundled one is not
- * the failure this file exists for — but it means a number written here is a
- * bound the store has to be able to measure, not one it is guaranteed to have.
- * `PublishService.assertRowCountIsPlausible` is where that is decided; a skip
- * that is not said out loud there is a bound believed to be on and off, which
- * is the one outcome neither this file nor that one may produce.
- */
-export interface RowCountBound {
-  /**
-   * The largest fraction of the previously served snapshot a load may lose.
-   * `0.5` refuses a load that comes back with less than half of what is live.
-   */
-  maxShrink: number;
-  /**
-   * The ratio above which growth is refused — `10` refuses a load ten times the
-   * size of the previous one. **Absent means growth is never refused**, which is
-   * the default, because the failure this file exists for is collapse and a
-   * growth bound that fires on a legitimate backfill teaches people to raise
-   * every bound in this object until none of them do anything.
-   */
-  maxGrowth?: number;
-  /**
-   * Below this many rows in the previously served snapshot, no ratio applies.
-   *
-   * A percentage of a small number is noise. A four-row lookup table dropping to
-   * one is a 75% collapse and is also a Tuesday, and a bound that fires on it is
-   * a bound somebody switches off — taking the forty-thousand-row types with it.
-   */
-  minRows: number;
-}
 
 /**
  * What applies when nobody has said otherwise.
@@ -258,17 +184,20 @@ export const EXPECT_SHRINK_LABEL = '_expectShrink';
  */
 export const CARRIED_FROM_LABEL = '_carriedFrom';
 
-/** The expectation for one type: its own entry over the default, field by field. */
+/**
+ * The expectation for one type from the host object alone.
+ *
+ * Kept, unchanged in signature and in answer, because it is what a caller with
+ * no store in hand asks — and because it is exactly {@link mergeLoadExpectation}
+ * with the middle layer empty, which is how it is now implemented rather than
+ * how it is merely described. Two copies of a precedence rule is two answers to
+ * one question the first time somebody edits one of them.
+ */
 export function expectationFor(
   policy: CatalogLoadExpectations | undefined,
   typeName: string,
 ): LoadExpectation {
-  const fallback = policy?.default ?? {};
-  const specific = policy?.byType?.[typeName] ?? {};
-  return {
-    deletes: specific.deletes ?? fallback.deletes,
-    rowCount: { ...fallback.rowCount, ...specific.rowCount },
-  };
+  return mergeLoadExpectation(policy, undefined, typeName).resolved;
 }
 
 /** The bound for one type, over the default, over {@link DEFAULT_ROW_COUNT_BOUND}. */
@@ -276,7 +205,231 @@ export function rowCountBoundFor(
   policy: CatalogLoadExpectations | undefined,
   typeName: string,
 ): RowCountBound {
-  return { ...DEFAULT_ROW_COUNT_BOUND, ...expectationFor(policy, typeName).rowCount };
+  return rowCountBoundOf(expectationFor(policy, typeName));
+}
+
+/** The bound an already-resolved expectation means, over {@link DEFAULT_ROW_COUNT_BOUND}. */
+export function rowCountBoundOf(expectation: LoadExpectation): RowCountBound {
+  return { ...DEFAULT_ROW_COUNT_BOUND, ...expectation.rowCount };
+}
+
+/**
+ * The three layers, merged field by field, strongest first:
+ *
+ * ```
+ * host.byType[typeName]   >   the stored row   >   host.default
+ * ```
+ *
+ * **Pure and synchronous, and it is the only thing that decides precedence.**
+ * The layer above it fetches the stored row; the layers below it — the four
+ * `refuse*` functions — take the answer and never look anything up. That split
+ * is deliberate and is what keeps the rules testable against three plain
+ * objects rather than against a store nobody wants to fake.
+ *
+ * **Why the host's own entry wins over an operator's.** That is what lets a
+ * deployment lock a type down: a type somebody put in code is a type somebody
+ * argued about, and an API that could quietly overrule it would make the code
+ * a suggestion. Where the host is silent the operator decides, which is the
+ * whole point of the stored layer — creating a connector and running it
+ * incrementally should not need an engineer and a deploy.
+ *
+ * **`host.default` is the weakest, deliberately.** It is a house-wide statement
+ * about types nobody has looked at, and a house-wide statement that beat a
+ * specific decision would mean the more somebody knew about a type the less
+ * their answer counted.
+ *
+ * `rowCount` merges key by key across all three, which is the merge
+ * {@link expectationFor} already did between two: a host that sets one
+ * house-wide `minRows` and an operator who raises `maxShrink` for one type both
+ * get what they asked for. {@link ResolvedLoadExpectation.rowCountFrom} then
+ * names the strongest layer that set anything, because a per-key provenance is
+ * three more fields on a screen answering a question nobody asks.
+ */
+export function mergeLoadExpectation(
+  host: CatalogLoadExpectations | undefined,
+  stored: StoredLoadExpectation | undefined,
+  typeName: string,
+): ResolvedLoadExpectation {
+  const specific = host?.byType?.[typeName];
+  const fallback = host?.default;
+
+  const deletes = specific?.deletes ?? stored?.deletes ?? fallback?.deletes;
+  const rowCount = { ...fallback?.rowCount, ...stored?.rowCount, ...specific?.rowCount };
+
+  return {
+    typeName,
+    resolved: { deletes, rowCount },
+    deletesFrom: specific?.deletes
+      ? 'host'
+      : stored?.deletes
+        ? 'stored'
+        : fallback?.deletes
+          ? 'default'
+          : 'none',
+    rowCountFrom: statesRowCount(specific?.rowCount)
+      ? 'host'
+      : statesRowCount(stored?.rowCount)
+        ? 'stored'
+        : 'default',
+    stored,
+    hostLocked: hostLockedFields(host, typeName),
+  };
+}
+
+/**
+ * Which fields of a type this deployment has declared in code, per field.
+ *
+ * True means a stored value for that field can never apply. **Only `byType`
+ * counts**: `host.default` is the weakest layer and an operator's row beats it,
+ * so drawing a house-wide default as a lock would tell somebody an edit was
+ * impossible when it would have worked.
+ */
+export function hostLockedFields(
+  host: CatalogLoadExpectations | undefined,
+  typeName: string,
+): { deletes: boolean; rowCount: boolean } {
+  const specific = host?.byType?.[typeName];
+  return {
+    deletes: specific?.deletes !== undefined,
+    rowCount: statesRowCount(specific?.rowCount),
+  };
+}
+
+/**
+ * The expectation for one type across every layer, stored row included.
+ *
+ * The async half, and the only async thing in this file. A store that does not
+ * implement the optional load-expectation members has no stored layer, and that
+ * is not a degraded mode — it is exactly the behaviour of every deployment
+ * before this existed, host object only. `supportsLoadExpectations` is how that
+ * is asked, rather than a `try`/`catch` around a method that may not be there:
+ * a probe answers "this deployment cannot store these" once, and a screen can
+ * say it.
+ *
+ * A store that throws is left to throw. The alternative — swallowing it and
+ * resolving from the host alone — would silently drop the layer that makes an
+ * incremental load legal, so a database blip would show up as a refused load
+ * blaming a missing declaration that is sitting in the table.
+ */
+export async function resolveLoadExpectation(
+  host: CatalogLoadExpectations | undefined,
+  store: CatalogPipelineStore | undefined,
+  typeName: string,
+): Promise<ResolvedLoadExpectation> {
+  return mergeLoadExpectation(host, await storedExpectationFor(store, typeName), typeName);
+}
+
+/** The operator's row for a type, or nothing when this store does not keep them. */
+export async function storedExpectationFor(
+  store: CatalogPipelineStore | undefined,
+  typeName: string,
+): Promise<StoredLoadExpectation | undefined> {
+  if (!store || !supportsLoadExpectations(store)) return undefined;
+  return store.getLoadExpectation(typeName);
+}
+
+/** Whether a partial bound says anything at all. `{}` is not a statement. */
+function statesRowCount(bound: Partial<RowCountBound> | undefined): boolean {
+  if (!bound) return false;
+  return Object.values(bound).some((value) => value !== undefined);
+}
+
+/**
+ * Which fields of a write the host has already declared in code.
+ *
+ * Only `byType` counts. `host.default` is the weakest layer and an operator's
+ * row beats it, so refusing a write because a house-wide default exists would
+ * refuse every write on a host that set one — see {@link mergeLoadExpectation}.
+ *
+ * Returned as the list of field names rather than a boolean because the refusal
+ * has to say WHICH field is owned: a form that sent both and was told only
+ * "locked" cannot tell the operator which half of their edit would have taken.
+ */
+export function hostOwnedFields(
+  host: CatalogLoadExpectations | undefined,
+  typeName: string,
+  input: LoadExpectationInput,
+): Array<'deletes' | 'rowCount'> {
+  const locked = hostLockedFields(host, typeName);
+  const owned: Array<'deletes' | 'rowCount'> = [];
+  if (input.deletes !== undefined && locked.deletes) owned.push('deletes');
+  if (input.rowCount !== undefined && locked.rowCount) owned.push('rowCount');
+  return owned;
+}
+
+/**
+ * Refuse a stored expectation that could never be honoured, naming the field.
+ *
+ * Checked at the write rather than only at the load, and the two are not the
+ * same check even where they overlap. {@link refuseUndeclaredDeletes} answers
+ * "may this load proceed" for whatever is in force at 03:00; this answers "is
+ * what you are typing a thing at all", to somebody who is looking at a form and
+ * can fix it. A row that stored `withinMs: 0` would pass the write, sit on the
+ * screen looking like a policy, and refuse every incremental load of the type
+ * for a reason the editor never mentioned.
+ *
+ * `unknown` in, because this arrives off the wire: `strategy` is a string until
+ * something checks it, and the union in the type system binds only callers that
+ * compile. The empty `because` is refused as hard as an absent one, for the
+ * reason `refuseUndeclaredDeletes` gives — a reason field that may be blank is a
+ * reason field that is blank.
+ */
+export function refuseInvalidLoadExpectation(input: {
+  deletes?: unknown;
+  rowCount?: unknown;
+}): string | undefined {
+  if (input.deletes !== undefined) {
+    const refusal = refuseInvalidDeletes(input.deletes);
+    if (refusal) return refusal;
+  }
+  if (input.rowCount !== undefined) return refuseInvalidRowCount(input.rowCount);
+  return undefined;
+}
+
+/** The delete half of {@link refuseInvalidLoadExpectation}. */
+function refuseInvalidDeletes(deletes: unknown): string | undefined {
+  if (typeof deletes !== 'object' || deletes === null) {
+    return '`deletes` must be an object naming a strategy and the reason for it.';
+  }
+  const strategy = Reflect.get(deletes, 'strategy');
+  if (!isDeleteReconciliationStrategy(strategy)) {
+    return `"${String(strategy)}" is not a delete strategy. Accepted: ${DELETE_RECONCILIATION_STRATEGIES.join(', ')}. There is deliberately no fourth — a strategy nothing implements would be a dropdown with a lie in it.`;
+  }
+  const because = Reflect.get(deletes, 'because');
+  if (typeof because !== 'string' || because.trim().length === 0) {
+    return '`deletes.because` is required and may not be blank. It is the only part of this decision that is still legible in six months, when somebody is asking why the count does not match the source.';
+  }
+  if (strategy !== 'periodic-full-reload') return undefined;
+  const withinMs = Reflect.get(deletes, 'withinMs');
+  if (typeof withinMs !== 'number' || !(withinMs > 0)) {
+    return '`deletes.withinMs` must be a positive number of milliseconds. Reconciling by periodic full reload with no interval polices nothing: the last full read can never be too old.';
+  }
+  return undefined;
+}
+
+/** The row-count half of {@link refuseInvalidLoadExpectation}. */
+function refuseInvalidRowCount(rowCount: unknown): string | undefined {
+  if (typeof rowCount !== 'object' || rowCount === null) {
+    return '`rowCount` must be an object.';
+  }
+  const maxShrink = Reflect.get(rowCount, 'maxShrink');
+  if (maxShrink !== undefined && !isRatio(maxShrink, 0, 1)) {
+    return '`rowCount.maxShrink` is the fraction of the served snapshot a load may lose, so it must be above 0 and at most 1. Zero would refuse every load that lost a single row; above 1 is a bound no load can cross, which is the bound switched off wearing a number.';
+  }
+  const maxGrowth = Reflect.get(rowCount, 'maxGrowth');
+  if (maxGrowth !== undefined && !isRatio(maxGrowth, 1, Number.POSITIVE_INFINITY)) {
+    return '`rowCount.maxGrowth` is a ratio against the served snapshot, so it must be above 1. At 1 or below every load that grew at all — which is most of them — would be refused.';
+  }
+  const minRows = Reflect.get(rowCount, 'minRows');
+  if (minRows !== undefined && (typeof minRows !== 'number' || !(minRows >= 0))) {
+    return '`rowCount.minRows` is the size below which no ratio applies, so it cannot be negative.';
+  }
+  return undefined;
+}
+
+/** A number in `(above, orBelow]`. `NaN` fails every comparison, which is the intent. */
+function isRatio(value: unknown, above: number, orBelow: number): boolean {
+  return typeof value === 'number' && value > above && value <= orBelow;
 }
 
 /**

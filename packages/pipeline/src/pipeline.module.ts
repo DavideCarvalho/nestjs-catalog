@@ -81,10 +81,15 @@ export interface CatalogPipelineModuleOptions {
    * this is the seam for the far more common host that has no natural module to
    * hang it on and was otherwise writing one for a single `useValue`.
    *
-   * **A host running incremental connectors has to bind this, and it is the
-   * first thing to bind.** The refusals ship on: an incremental load of a type
-   * with no declared delete strategy does not commit, on any path — connector,
-   * workflow sink, or an application POSTing to the publish API. That is
+   * **A host running incremental connectors declares them here or an operator
+   * declares them through the API, and this is the layer that wins.** The
+   * refusals ship on: an incremental load of a type with no declared delete
+   * strategy does not commit, on any path — connector, workflow sink, or an
+   * application POSTing to the publish API. What satisfies that is a strategy
+   * from either layer; what this one buys is that a type named in `byType` can
+   * no longer be changed from the API at all, which is how a deployment pins a
+   * type it has argued about. See `PUT <path>/pipeline/expectations/:type` and
+   * `resolveLoadExpectation` for the precedence. That is
    * deliberate. An incremental read asks its source for what changed since a
    * watermark, a row deleted at the source never changes again, so it is never
    * returned again and the carry-forward copies it into every later snapshot
@@ -357,7 +362,7 @@ export function describeExpectationsBinding(expectations: CatalogLoadExpectation
   if (!expectations) {
     return {
       level: 'warn',
-      message: `Nothing binds CATALOG_LOAD_EXPECTATIONS, so no object type declares how rows deleted at its source reach it — and every incremental load will be refused at the merge until one does. Bind it as CatalogPipelineModule.forRoot({ expectations }), or export the token from a module in imports. Row counts are still bounded meanwhile, at the built-in maxShrink ${DEFAULT_ROW_COUNT_BOUND.maxShrink} above ${DEFAULT_ROW_COUNT_BOUND.minRows} rows. A host that has looked and decided nothing applies binds an empty object, which this line stops asking about.`,
+      message: `Nothing binds CATALOG_LOAD_EXPECTATIONS, so this deployment declares nothing in code about how rows deleted at a source reach a type — and every incremental load will be refused at the merge unless an operator has stored an expectation for that type through PUT <path>/pipeline/expectations/:type. Bind it as CatalogPipelineModule.forRoot({ expectations }), or export the token from a module in imports. Row counts are still bounded meanwhile, at the built-in maxShrink ${DEFAULT_ROW_COUNT_BOUND.maxShrink} above ${DEFAULT_ROW_COUNT_BOUND.minRows} rows. A host that has looked and decided nothing applies binds an empty object, which this line stops asking about.`,
     };
   }
 
@@ -366,7 +371,7 @@ export function describeExpectationsBinding(expectations: CatalogLoadExpectation
     return {
       level: 'log',
       message:
-        'Load expectations are bound and declare nothing: no default and no types. Taken as said rather than as missing — every incremental load stays refused, and the row-count bound stays at its built-in value.',
+        'Load expectations are bound and declare nothing: no default and no types. Taken as said rather than as missing — nothing is pinned in code, so every incremental load stays refused until an operator stores an expectation for its type, and the row-count bound stays at its built-in value.',
     };
   }
 
