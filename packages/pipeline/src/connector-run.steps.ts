@@ -30,6 +30,21 @@ import { CATALOG_PIPELINE_SCOPE, type CatalogPipelineScope } from './seams';
  */
 export const CONNECTOR_RUN_STEP = 'catalog.connector.run';
 
+/**
+ * What the engine hands this step.
+ *
+ * **There is no field here for acknowledging a shrink, and there must not be
+ * one.** `ConnectorRunnerService.run` takes an `expectShrink` reason that stands
+ * the row-count bound down for one snapshot; the caller that supplies it is a
+ * person who has just looked at what the source did. Every run that arrives
+ * here came from a cron window instead — `ConnectorScheduler` builds the input,
+ * attributed to a synthetic `scheduler` principal, at whatever hour the
+ * expression names. An acknowledgement carried on a schedule would be given
+ * once and honoured nightly, which is the bound disabled rather than
+ * acknowledged, and the run that eventually collapses for a real reason would
+ * be the one nobody hears about. A refused scheduled load is meant to fail,
+ * loudly, and be re-run by hand by somebody willing to say why.
+ */
 export interface ConnectorRunStepInput {
   connectorId: string;
   principalId: string;
@@ -103,6 +118,10 @@ export class ConnectorRunSteps {
 
     let run: ConnectorRun;
     try {
+      // Three arguments, and the fourth is left off on purpose rather than
+      // passed as empty: `ConnectorRunOptions` is what a run says for itself,
+      // and an unattended one has nobody to say it. See the note on
+      // `ConnectorRunStepInput`.
       run = await this.scope.run(() =>
         this.runner.run(input.connectorId, input.principalId, input.snapshotId),
       );

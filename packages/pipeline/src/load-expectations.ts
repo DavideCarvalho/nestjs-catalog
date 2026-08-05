@@ -69,9 +69,16 @@ export interface LoadExpectation {
  *
  * `@Optional()` everywhere it is injected, so a host that binds nothing still
  * boots — and then finds that its incremental loads are refused, which is the
- * intended and documented outcome rather than an oversight. Bind it from a
- * module passed in `CatalogPipelineModule.forRoot({ imports })`, exporting the
- * token, the same way the store and the registry arrive.
+ * intended and documented outcome rather than an oversight. It is said out loud
+ * at boot too, once: a host that bound nothing hears which token is missing and
+ * what it costs, rather than meeting it as a refused load weeks later.
+ *
+ * Two ways to bind it, both supported and neither preferred. Pass a `Provider`
+ * as `CatalogPipelineModule.forRoot({ expectations })` — the docblock on that
+ * option is where the policy object itself is explained — or export the token
+ * from a module passed in `forRoot({ imports })`, the way the store and the
+ * registry arrive. A host that does both gets the one passed to `forRoot`,
+ * which is Nest's ordinary precedence and not a rule this package invented.
  */
 export const CATALOG_LOAD_EXPECTATIONS = Symbol('CATALOG_LOAD_EXPECTATIONS');
 
@@ -197,12 +204,23 @@ export const DEFAULT_ROW_COUNT_BOUND: RowCountBound = {
  * the policy would stand it down for every load of that type until somebody
  * remembers to put it back.
  *
- * **A connector run cannot set this today.** The runner labels its snapshots
- * `{ source, connector }` and takes no input for the rest, so a connector whose
- * load is legitimately refused is fixed by raising `maxShrink` for that type in
- * the policy, running it, and lowering it again. Stated rather than glossed:
- * that is a worse workflow than the HTTP path has, and it is the next thing to
- * fix here.
+ * **A connector run reaches it through `ConnectorRunOptions.expectShrink`**,
+ * which is a reason rather than a flag and is written here as the label's value,
+ * so the snapshot itself answers why it was allowed to collapse. It is an
+ * argument to one call and is stored nowhere, which is the only reliable way to
+ * keep a one-time acknowledgement from becoming a standing one.
+ *
+ * **A scheduled run has no way to set it, deliberately.** `ConnectorRunSteps`
+ * passes no options and `ConnectorRunStepInput` carries no field for them: the
+ * run comes from a cron window with nobody watching, and an acknowledgement
+ * that fires every night is the bound switched off in a costume. The route for
+ * a refused scheduled load is to look at the source and re-run it by hand.
+ *
+ * What the value is checked for is only presence — `!== undefined` — so a load
+ * arriving over the publish API with `"_expectShrink": ""` is still
+ * acknowledged. That is the publish surface's business and it is where the
+ * caller is another program; the connector path asks for a sentence because a
+ * person is typing it.
  */
 export const EXPECT_SHRINK_LABEL = '_expectShrink';
 

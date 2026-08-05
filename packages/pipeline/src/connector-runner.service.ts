@@ -7,6 +7,7 @@ import {
   emitCatalog,
 } from '@dudousxd/nestjs-catalog';
 import { BadRequestException, Inject, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { EXPECT_SHRINK_LABEL } from './load-expectations';
 import { PublishService } from './publish.service';
 import {
   type FetchResult,
@@ -17,6 +18,48 @@ import {
 } from './sources';
 
 const BATCH_SIZE = 500;
+
+/**
+ * What a caller may say about ONE run, beyond which connector it is.
+ *
+ * Everything here is a property of the load, never of the connector. Nothing in
+ * it is read from the store, written to the store, or carried between runs, and
+ * that is the whole design rather than an implementation note — see
+ * {@link ConnectorRunOptions.expectShrink}.
+ */
+export interface ConnectorRunOptions {
+  /**
+   * Why this load is expected to come back smaller — a deliberate truncation, a
+   * source cut back to one base for a migration, a first load after the tables
+   * were emptied.
+   *
+   * Sets {@link EXPECT_SHRINK_LABEL} on the snapshot this run writes, which
+   * stands the row-count bound down **for that snapshot and nothing else**. The
+   * alternative an operator had before this existed was to raise
+   * `rowCount.maxShrink` for the type, run the connector, and lower it again —
+   * three steps, of which the third is the one that gets forgotten, and between
+   * the first and the third the type has no bound at all.
+   *
+   * **A reason, not a boolean, and an empty one is refused.** It is the same
+   * requirement `DeleteReconciliation.because` makes and it is made for the same
+   * reason: the sentence ends up in the snapshot's labels, so the answer to "why
+   * was this collapse allowed?" is readable off the snapshot forever, by
+   * somebody who was not there. A flag would answer only "somebody clicked".
+   *
+   * **It cannot become permanent, because there is nowhere to keep it.** It is
+   * an argument to one call. It is not a column on the connector, not a key in
+   * `connector.state` — which is the runner's watermark and is documented as
+   * never written by a person — and not a field on `ConnectorRunStepInput`, so
+   * the scheduled path cannot supply one at all. That last exclusion is
+   * deliberate and is the point: a cron-fired run is unattended, and an
+   * acknowledgement that fires every night at 03:00 with nobody watching is not
+   * an acknowledgement, it is the bound switched off with extra steps. The
+   * operator's route when a scheduled load is refused is to look at what the
+   * source did and then re-run it by hand, saying why — which is the shape the
+   * refusal was asking for.
+   */
+  expectShrink?: string;
+}
 
 /**
  * Fetch, transform, publish.
@@ -48,8 +91,17 @@ export class ConnectorRunnerService {
    * `snapshotId` comes from the caller — the durable run id when durable
    * scheduled it — so a retried run appends to the same snapshot and replaces
    * its own batches instead of opening a second one.
+   *
+   * `options` is what this particular run is allowed to say for itself, and it
+   * is empty for every caller that does not have somebody watching. See
+   * {@link ConnectorRunOptions}.
    */
-  async run(connectorId: string, principalId: string, snapshotId: string): Promise<ConnectorRun> {
+  async run(
+    connectorId: string,
+    principalId: string,
+    snapshotId: string,
+    options: ConnectorRunOptions = {},
+  ): Promise<ConnectorRun> {
     const connector = await this.pipeline.getConnector(connectorId);
     if (!connector) {
       throw new NotFoundException(`No connector ${connectorId}`);
@@ -57,6 +109,13 @@ export class ConnectorRunnerService {
     if (!connector.enabled) {
       throw new BadRequestException(`"${connector.name}" is disabled. Enable it before running.`);
     }
+
+    // Before `startRun`, so a run row is never opened for a call that was never
+    // going to be honoured. A blank reason is refused rather than dropped: a
+    // caller that sent one believes the shrink is acknowledged, and silently
+    // ignoring it would surface as a refusal at the commit — after the source
+    // has been read — naming the row count and never the empty string.
+    const labels = labelsFor(connector.name, options);
 
     const run = await this.pipeline.startRun({
       connectorId,
@@ -72,7 +131,13 @@ export class ConnectorRunnerService {
       principalId,
     });
 
-    const logs: string[] = [];
+    // The run starts with whatever it was allowed to say for itself, so the
+    // acknowledgement is on the run row and not only in the snapshot's labels.
+    // The runs list is where somebody scanning last night's loads sees that one
+    // of them was permitted to collapse, and a run that carried an
+    // acknowledgement silently would be the one entry there that reads exactly
+    // like the others.
+    const logs: string[] = openingLogs(labels, snapshotId, connector.name);
     let fetched = 0;
     let written = 0;
     let transformVersion: number | undefined;
@@ -114,7 +179,7 @@ export class ConnectorRunnerService {
           connector.targetType,
           snapshotId,
           slice,
-          { source: 'connector', connector: connector.name },
+          labels,
           batch,
         );
         written += result.written;
@@ -135,11 +200,16 @@ export class ConnectorRunnerService {
       // serving it, which is what makes the ordering enforced rather than
       // merely documented.
       if (connector.mode === 'incremental') {
+        // The same labels the batches carried, and it has to be the same object
+        // of facts rather than a second literal: the store creates the snapshot
+        // row from whichever of the two writes reaches it first, so an
+        // acknowledgement attached to only one of them would land or not
+        // depending on whether this run happened to fetch any rows.
         const merged = await this.publish.carryForwardAsSystem(
           principalId,
           connector.targetType,
           snapshotId,
-          { source: 'connector', connector: connector.name },
+          labels,
         );
         logs.push(
           merged.from
@@ -160,6 +230,13 @@ export class ConnectorRunnerService {
       // Only now. A watermark advanced before the commit is a promise never to
       // read those records again, made by a run that had not yet succeeded —
       // and the next run would start after data nobody stored.
+      //
+      // `options` is deliberately not part of what gets written here. This is
+      // the one place a connector run persists anything about itself, so it is
+      // the one place a per-run acknowledgement could turn into a standing one
+      // — and a `_expectShrink` that survived into `connector.state` would be
+      // read back by every run after it and would have switched the bound off
+      // for good, silently, from a call that meant it once.
       if (fetchResult.state) {
         await this.pipeline.saveConnectorState(connector.id, {
           ...connector.state,
@@ -251,4 +328,61 @@ export class ConnectorRunnerService {
       }),
     );
   }
+}
+
+/**
+ * The labels this run's snapshot carries — provenance, plus whatever this one
+ * run was allowed to say for itself.
+ *
+ * Built once per run and used by every write in it, which is what makes the
+ * acknowledgement a property of the snapshot rather than of a code path. A
+ * function rather than two literals inline because the previous shape — the
+ * same object spelled out at the batch write and again at the merge — is
+ * exactly how a label ends up on one of the two.
+ *
+ * Refusing a blank reason here rather than at some validating edge is
+ * deliberate: this service is called by the bundled controller, by a host's own
+ * controller, and by the durable step, and a rule that lived in one of them
+ * would be a rule the other two do not have. `BadRequestException` because that
+ * is what an operator sending `{"expectShrink": ""}` should get back — the same
+ * 400 the publish surface answers a malformed load with — rather than a 500 or
+ * a run that opens and then refuses itself.
+ */
+function labelsFor(connectorName: string, options: ConnectorRunOptions): Record<string, string> {
+  const labels: Record<string, string> = { source: 'connector', connector: connectorName };
+  if (options.expectShrink === undefined) return labels;
+
+  const because = options.expectShrink.trim();
+  if (because.length === 0) {
+    throw new BadRequestException(
+      `This run of "${connectorName}" was told to expect a shrink and given no reason for it. The reason is what makes the acknowledgement worth anything: it is stored in the snapshot's labels and is the only answer anybody will have in six months to "why was this load allowed to lose most of the data?". Say what happened at the source — a truncation, a migration, a base being cut — or drop the acknowledgement and let the bound decide.`,
+    );
+  }
+  labels[EXPECT_SHRINK_LABEL] = because;
+  return labels;
+}
+
+/**
+ * What the run's log says before it has done anything.
+ *
+ * Read back off the labels rather than off the options, so that the line and the
+ * snapshot cannot disagree: the label is what the bound will actually read, and
+ * a log built from the caller's argument would keep saying "acknowledged" if
+ * anything ever stopped that argument from reaching the write.
+ *
+ * Empty for an ordinary run, which is why this returns the array rather than
+ * appending to one — nothing about a load that acknowledges nothing needs
+ * saying, and a "no acknowledgement" line on every run of every connector is
+ * how the ones that matter become invisible.
+ */
+function openingLogs(
+  labels: Record<string, string>,
+  snapshotId: string,
+  connectorName: string,
+): string[] {
+  const because = labels[EXPECT_SHRINK_LABEL];
+  if (because === undefined) return [];
+  return [
+    `This run acknowledges a shrink: ${because} The row-count bound stands down for snapshot ${snapshotId} only; the next run of "${connectorName}" is measured against the full bound again.`,
+  ];
 }
