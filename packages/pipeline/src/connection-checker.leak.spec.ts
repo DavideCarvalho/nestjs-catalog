@@ -53,9 +53,7 @@ function unreachable(url: string): CatalogConnection {
 describe('a failed connection check', () => {
   it('does not hand the password back in the error', async () => {
     // THE case. The route is `catalog:read`; the password is not.
-    const result = await checker.check(
-      unreachable('http://user:S3cr3t@127.0.0.1:1/nowhere'),
-    );
+    const result = await checker.check(unreachable('http://user:S3cr3t@127.0.0.1:1/nowhere'));
 
     expect(result.ok).toBe(false);
     expect(result.error ?? '').not.toContain('S3cr3t');
@@ -77,9 +75,7 @@ describe('a failed connection check', () => {
     // "Could not reach it." with no address cannot tell a typo from an outage,
     // and would go looking in the process log — which is exactly the trip this
     // route exists to save them.
-    const result = await checker.check(
-      unreachable('http://reader:S3cr3t@127.0.0.1:1/nowhere'),
-    );
+    const result = await checker.check(unreachable('http://reader:S3cr3t@127.0.0.1:1/nowhere'));
 
     expect(result.error ?? '').toContain('127.0.0.1');
     expect(result.error ?? '').toContain('reader');
