@@ -1,5 +1,141 @@
 # @dudousxd/nestjs-catalog-store-mikro-orm
 
+## 0.9.0
+
+### Minor Changes
+
+- 4afbedd: A second replica stops serving last week's model
+
+  `StoredCatalogRegistry` held the catalog in memory and rebuilt it only when
+  something in **its own process** wrote. With one replica that is invisible. With
+  two, `PUT publish/:type/schema` answered 200 from the pod that handled it and the
+  connector run that followed was told by the other pod that the type had never
+  been published — for as long as that pod lived, or until it happened to serve a
+  publish itself. Which answer a caller got was load-balancer luck.
+
+  Each process now re-reads a **watermark** over the two model tables — their row
+  counts and their newest `updated_at` — and rebuilds when it has moved.
+  Deliberately no writer takes part in this. An invalidation that every write path
+  has to remember is correct until somebody adds one that forgets, and the symptom
+  of forgetting is a model quietly a day out of date on half the traffic. Reading
+  the rows themselves means a replica that never writes anything converges anyway,
+  and so does one whose sibling was updated through a code path this package has
+  never heard of.
+
+  **The read path costs nothing.** `getSnapshot()` and `getType()` stay synchronous
+  field reads; what they gained is one integer comparison, and when it says the
+  window has elapsed they start the check _without waiting for it_. No request is
+  ever slower for this. What the database sees is at most one statement per
+  `staleAfterMs` per process — two counts and two maxima over a few hundred types
+  and their columns — however much traffic arrives.
+
+  New `forRoot` option **`staleAfterMs`**, default 1000. `0` turns the check off
+  entirely, which is what a deployment that genuinely runs one process sets to keep
+  its query count exactly as it was.
+
+  Handled along the way: two replicas checking at once need no coordination and get
+  none, since both are reads; a check that fails leaves the previous model serving
+  rather than emptying the registry, and retries on the next window; and a
+  watermark read inside the second of its own newest write is treated as
+  provisional, because `updated_at` is a `DATETIME` and two writes in one second
+  otherwise share a maximum that would hide the second one forever.
+
+  **Schema note.** `catalog_property` gains a nullable `updated_at`. Half the model
+  lives in that table and there are writes that touch nothing else — a curation
+  rename, or a re-publish whose only change is a column's type — so a watermark
+  over `catalog_object_type` alone would call those invisible. Adding a scalar
+  column moves the fingerprint `autoSchema` gates on, so an already-running
+  deployment does get it; what it does not get is a backfill, so rows written
+  before this holds `NULL` until something next writes them. That is harmless by
+  construction — `MAX()` ignores nulls and the row counts in the same watermark
+  still move — and is covered against MySQL 8 in
+  `stored-registry.staleness.db.spec.ts`. No index is declared, because
+  `fingerprintOf` does not hash indexes and one would therefore never reach an
+  existing database at all.
+
+- 800a61b: A delete strategy can be declared by an operator, not only by a deployment
+
+  `CATALOG_LOAD_EXPECTATIONS` was the only way to say how a type reconciles rows
+  deleted at its source, and it is a provider bound at boot. So the path was:
+  build a connector in the console, run it in `full`, and the moment you wanted
+  `incremental` you needed an engineer, a commit and a deploy. For a console whose
+  whole premise is that you assemble a pipeline on screen, that is the wrong shape.
+
+  The control was never about compilation. Read its own docblock: what it wants is
+  that **somebody chose a strategy and wrote down why**. That needs attribution and
+  visibility, which a row can carry as well as a provider can.
+
+  So the policy now resolves through three layers, field by field:
+
+      host.byType[type]   >   stored row   >   host.default
+
+  A deployment that declared something about a type still wins — that is what lets
+  one pin a type down and keep it pinned. Where the host is silent, an operator's
+  stored decision applies. `host.default` stays weakest, so a house-wide bound
+  never beats a specific one. `expectationFor` is now literally the same merge with
+  no stored layer, so there is one precedence rule in the codebase rather than two.
+
+  The enforcement functions did not move and did not become async.
+  `refuseUndeclaredDeletes`, `refuseStaleReconciliation` and `refuseRowCountDrift`
+  are still pure and synchronous; only the _sourcing_ of the policy reaches a
+  store, and it reaches it through `supportsLoadExpectations`, so a store that
+  implements none of the four new optional members behaves exactly as it does
+  today. The four members are optional for that reason: this package is not the
+  only implementation of `CatalogPipelineStore`, and widening a required interface
+  silently disqualifies every other one.
+
+  `PUT`/`DELETE pipeline/expectations/:type` ask for `catalog:curate` — the scope
+  that already governs what the catalog says about a type — and for a person.
+  `@RequireHuman()` is not decoration here: `because` is a sentence somebody is
+  accountable for, and an application key has no author. The writes merge over the
+  stored row, so an absent field means "leave it alone" rather than "clear it", and
+  a write to a field the host owns is a 409 naming that field rather than a silent
+  no-op. Both writes emit `type.curated`, the same event `patchType` emits, so the
+  recorder that already lifts `principalId` into the audit table needs no change.
+
+  The connector's cheap pre-flight gate resolves through the same three layers.
+  Without that the feature would work everywhere except where it is used: a
+  scheduled incremental run would still be refused by the early check after an
+  operator had stored a strategy.
+
+  `deletes` and `rowCount` are stored as JSON rather than as columns, and that is
+  load-bearing rather than lazy. MikroORM infers `int` for a `number`, which would
+  round `maxShrink: 0.5` to `0` — a bound that refuses a load for losing a single
+  row — and would overflow a thirty-day `withinMs` past a signed INT.
+
+### Patch Changes
+
+- 800a61b: One rule about what may be a SQL identifier, rather than two that agreed
+
+  `store-mikro-orm` and `store-clickhouse` each carried the pattern
+  `/^[A-Za-z_][A-Za-z0-9_]{0,62}$/`, an `UnsafeIdentifierError`, and the sentence
+  `Refusing to use "…" as a SQL identifier: letters, digits and underscore only,
+starting with a letter or underscore, 63 characters max.` — byte for byte
+  identical, in two files, with nothing anywhere comparing them.
+
+  That mattered because the publish-time refusal added alongside this reuses a
+  store's rule on purpose, so that a name refused at publish and the same name
+  refused at DDL cannot be described differently. It reused the MySQL copy. Which
+  bought the guarantee for a MySQL deployment and left a ClickHouse-only one
+  trusting two files to have been edited in step.
+
+  The rule now lives in `@dudousxd/nestjs-catalog` beside
+  `CATALOG_RESERVED_COLUMNS`, which is already shared for exactly this reason:
+  both are part of what the catalog promises a _publisher_, and a publisher should
+  be able to read the answer out of the contract rather than out of whichever
+  adapter happens to be mounted. New exports: `isSafeIdentifier`,
+  `assertSafeIdentifier`, `UnsafeIdentifierError`.
+
+  Each store keeps its own `ident`, because _quoting_ is engine syntax and not the
+  catalog's business — what may be quoted at all is. Both now call
+  `assertSafeIdentifier` and re-export the core's `UnsafeIdentifierError` rather
+  than declaring one, which also makes `error instanceof UnsafeIdentifierError` a
+  question worth asking across packages: it used to be false whenever the mounted
+  store was not the one the catching code imported from.
+
+  No behaviour changes. The character set, the 63-character limit, the wording and
+  the quoting are all what they were; there is one copy of them instead of two.
+
 ## 0.8.0
 
 ### Minor Changes
