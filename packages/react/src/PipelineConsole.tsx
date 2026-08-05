@@ -21,7 +21,7 @@ import {
   Trash2,
   TriangleAlert,
 } from 'lucide-react';
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { ConnectionPanel, connectionOptionsFor } from './ConnectionPanel';
 import { TransformEditor } from './TransformEditor';
 import { cn } from './cn';
@@ -143,6 +143,31 @@ export interface ConnectorSchemaDiscovery {
   drift: SchemaDrift | null;
 }
 
+/**
+ * The discovery response, checked rather than assumed.
+ *
+ * The client returns `unknown` because this package must not import
+ * `@dudousxd/nestjs-catalog-pipeline` — it would drag database drivers behind
+ * optional imports into a browser bundle — so the shape above is a mirror of a
+ * contract held somewhere else. A mirror can fall behind: a console talking to
+ * an older server gets a body with no `columns`, and rendering it would throw
+ * somewhere deep in the table with a message about `undefined.map`.
+ *
+ * Checked at the seam, once, so the failure names itself. Only the fields this
+ * screen would crash without — validating every column here would be
+ * re-implementing the server's own shape in a place that cannot be kept honest.
+ */
+function narrowDiscovery(answer: unknown): ConnectorSchemaDiscovery {
+  if (!answer || typeof answer !== 'object' || !Array.isArray(Reflect.get(answer, 'columns'))) {
+    throw new Error(
+      'The server answered the discovery request with something this console does not recognise. ' +
+        'It is most likely running a version of @dudousxd/nestjs-catalog-pipeline older than this ' +
+        'console expects.',
+    );
+  }
+  return Object.assign(Object.create(null), answer);
+}
+
 /** The subset of a published type this screen is able to state. */
 export interface DiscoveredTypeDraft {
   name: string;
@@ -171,6 +196,40 @@ export function PipelineConsole({
 }: PipelineConsoleProps) {
   const client = useCatalogClient();
   const [tab, setTab] = useState('connectors');
+
+  /**
+   * The bridge, from the client, unless the host supplied its own.
+   *
+   * Until this existed the panel took `schemaDiscovery` as a prop and nothing
+   * supplied one, so the feature was reachable only by a host that had read the
+   * source and written the two calls itself. The prop stays — a host embedding
+   * this screen may route discovery through its own gateway — but it is an
+   * override now rather than the only way in.
+   */
+  const bridge = useMemo<SchemaDiscoveryBridge>(
+    () => ({
+      discover: async (connectorId) =>
+        narrowDiscovery(await client.discoverConnectorSchema(connectorId)),
+      // `async` on purpose: `publishType` THROWS rather than rejecting when the
+      // transport cannot PUT, and a bridge whose method throws synchronously
+      // would escape the panel's error handling and take the screen with it.
+      createType: async (draft) =>
+        client.publishType(draft.name, {
+          // Only what a person confirmed on screen. Everything else about a type
+          // — its label, its description, its units — is curation, and inventing
+          // any of it here would put words nobody chose into a catalog whose
+          // whole claim is that its names were chosen.
+          properties: draft.properties.map((property) => ({
+            name: property.name,
+            columnName: property.columnName,
+            type: property.type,
+            nullable: property.nullable,
+          })),
+        }),
+    }),
+    [client],
+  );
+  const discovery = schemaDiscovery ?? bridge;
 
   const { data: capabilities } = useQuery({
     queryKey: catalogQueryKeys.capabilities,
@@ -224,7 +283,7 @@ export function PipelineConsole({
               <ConnectionPanel canEdit={canEdit} />
             </TabsPanel>
             <TabsPanel value="connectors">
-              <ConnectorList canEdit={canEdit} schemaDiscovery={schemaDiscovery} />
+              <ConnectorList canEdit={canEdit} schemaDiscovery={discovery} />
             </TabsPanel>
             <TabsPanel value="transforms">
               <TransformList

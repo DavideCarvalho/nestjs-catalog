@@ -102,7 +102,7 @@ function discovery(overrides: Partial<ConnectorSchemaDiscovery> = {}): Connector
 }
 
 /** A transport that answers the four reads the connectors tab makes, and nothing else. */
-function fakeTransport(): CatalogTransport {
+function fakeTransport(extra: Record<string, unknown> = {}): CatalogTransport {
   // The transport is generic on its response and a fixture map cannot be. Same seam, and same
   // reason, as `screens.spec.tsx`.
   // biome-ignore lint/suspicious/noExplicitAny: see above
@@ -112,6 +112,7 @@ function fakeTransport(): CatalogTransport {
     '/pipeline/transforms': [TRANSFORM],
     '/pipeline/connections': [],
     '/pipeline/runs': [],
+    ...extra,
   };
   const answer = (path: string) =>
     path in answers
@@ -126,11 +127,14 @@ function fakeTransport(): CatalogTransport {
   };
 }
 
-function renderConsole(schemaDiscovery?: SchemaDiscoveryBridge) {
+function renderConsole(
+  schemaDiscovery?: SchemaDiscoveryBridge,
+  transportAnswers: Record<string, unknown> = {},
+) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={queryClient}>
-      <CatalogProvider transport={fakeTransport()}>
+      <CatalogProvider transport={fakeTransport(transportAnswers)}>
         <PipelineConsole schemaDiscovery={schemaDiscovery} />
       </CatalogProvider>
     </QueryClientProvider>,
@@ -143,8 +147,11 @@ function renderConsole(schemaDiscovery?: SchemaDiscoveryBridge) {
  * The card's route into the editor is its transform button, which is why the fixture carries a
  * transform — this is the existing shape of the screen, not something these tests arrange.
  */
-async function openEditor(schemaDiscovery?: SchemaDiscoveryBridge) {
-  renderConsole(schemaDiscovery);
+async function openEditor(
+  schemaDiscovery?: SchemaDiscoveryBridge,
+  transportAnswers: Record<string, unknown> = {},
+) {
+  renderConsole(schemaDiscovery, transportAnswers);
   fireEvent.click(await screen.findByRole('button', { name: /Fleet mapper/ }));
   return screen.findByPlaceholderText('Nightly fleet load');
 }
@@ -229,14 +236,24 @@ describe('the proposal a set of choices makes', () => {
 });
 
 describe('the connector editor', () => {
-  it('offers no discovery at all when the host wired none', async () => {
+  it('offers discovery without the host wiring anything', async () => {
+    // This used to assert the opposite, and the opposite used to be true: the
+    // panel took a bridge as a prop and nothing supplied one, so the feature
+    // was reachable only by a host that had read the source and written the two
+    // calls itself. The console builds the bridge from its own client now, and
+    // the prop is an override for a host routing discovery through a gateway of
+    // its own.
     await openEditor();
-    expect(screen.queryByRole('button', { name: 'Discover schema' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Discover schema' })).toBeTruthy();
   });
 
-  it('offers it when the host did', async () => {
-    await openEditor(bridgeFor(discovery()));
-    expect(screen.getByRole('button', { name: 'Discover schema' })).toBeTruthy();
+  it('prefers the bridge the host supplied over its own', async () => {
+    // The override has to actually override. A default that quietly won would
+    // send a host's gateway-routed discovery straight at the API it was wired
+    // to avoid.
+    const discover = vi.fn(() => Promise.resolve(discovery()));
+    await discoverIn({ discover });
+    expect(discover).toHaveBeenCalledTimes(1);
   });
 
   it('asks about the connector being edited, not about some other one', async () => {
@@ -262,6 +279,24 @@ describe('the connector editor', () => {
   it('says what the server said the report can prove', async () => {
     await discoverIn(bridgeFor(discovery()));
     expect(screen.getByText(/Read from the driver/)).toBeTruthy();
+  });
+
+  it('names a server answer it does not recognise, instead of crashing on it', async () => {
+    // The console mirrors a shape held in `@dudousxd/nestjs-catalog-pipeline`,
+    // which it cannot import — the package carries database drivers and must
+    // never enter a browser bundle. So a console talking to an older server
+    // gets a body it half understands, and without the guard the first thing
+    // that happens is `undefined.map` somewhere inside the column table: a
+    // stack trace naming a component, for a problem that is a version mismatch.
+    //
+    // Through the CLIENT path deliberately, with no bridge prop, because the
+    // guard only exists on the bridge the console builds for itself.
+    await openEditor(undefined, {
+      '/pipeline/connectors/c1/discover': { connectorId: 'c1', caveat: 'sure' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Discover schema' }));
+
+    expect(await screen.findByText(/does not recognise/)).toBeTruthy();
   });
 
   it('reports a source that could not be read, rather than an empty table', async () => {
