@@ -214,6 +214,40 @@ describe('a connector run that acknowledges a deliberate shrink', () => {
     expect(written.merges[0]?.[EXPECT_SHRINK_LABEL]).toBe(REASON);
   });
 
+  it('writes an empty batch when a FULL source returned nothing', async () => {
+    // A batch is the only thing that creates the snapshot row, and a full run
+    // has no carry-forward to create one instead. Without this the load left no
+    // snapshot at all and the commit refused with "no snapshot has been
+    // written" — an error naming the wrong event entirely, for a source that
+    // answered perfectly and had nothing to say.
+    //
+    // The labels ride on it, which is the other half: they are how an
+    // operator's acknowledgement reaches the snapshot, so the one case
+    // `expectShrink` exists for was the one case it could not arrive.
+    store = memoryStore({ mode: 'full', config: { records: [] } });
+    const { service, written } = runner(store);
+
+    await service.run('c1', 'ana', 'snap-1', { expectShrink: REASON });
+
+    expect(written.batches).toHaveLength(1);
+    expect(written.batches[0]?.[EXPECT_SHRINK_LABEL]).toBe(REASON);
+  });
+
+  it('does not add a batch to an incremental run that fetched nothing', async () => {
+    // The asymmetry is deliberate rather than an oversight. An incremental run
+    // that fetched nothing is already covered — the carry-forward writes the
+    // snapshot and carries the same labels — so a batch here would be a second
+    // write on a path that already has one, and a snapshot whose row count
+    // arrived twice is a snapshot nobody can reason about.
+    store = memoryStore({ mode: 'incremental', config: { records: [] } });
+    const { service, written } = runner(store);
+
+    await service.run('c1', 'ana', 'snap-1', { expectShrink: REASON });
+
+    expect(written.batches).toHaveLength(0);
+    expect(written.merges).toHaveLength(1);
+  });
+
   it('says so on the run row, where somebody scanning last night reads it', async () => {
     const { service } = runner(store);
 

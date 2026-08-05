@@ -171,20 +171,28 @@ export class ConnectorRunnerService {
 
       // Batches of the same size the publish protocol expects, numbered so a
       // retry replaces rather than appends.
-      let batch = 1;
-      for (let index = 0; index < rows.length; index += BATCH_SIZE) {
-        const slice = rows.slice(index, index + BATCH_SIZE);
-        const result = await this.publish.appendRowsAsSystem(
-          principalId,
-          connector.targetType,
-          snapshotId,
-          slice,
-          labels,
-          batch,
-        );
-        written += result.written;
-        batch += 1;
-      }
+      //
+      // A FULL source that returned nothing still writes one — an empty batch,
+      // where the loop below writes none. A batch is the only thing that
+      // creates the snapshot, so without this a full load of zero rows left no
+      // snapshot at all and the commit a few lines down refused with "no
+      // snapshot has been written": an error naming the wrong event entirely,
+      // for a source that answered perfectly and had nothing to say.
+      //
+      // It also carries the labels, which is where an operator's
+      // acknowledgement that this collapse was deliberate travels — so the one
+      // case `expectShrink` exists for, a source that really was emptied, was
+      // the one case where it could not arrive.
+      //
+      // FULL only, and the asymmetry is not an oversight. An incremental run
+      // that fetched nothing is already covered: the carry-forward below writes
+      // the snapshot and carries the same labels, deliberately, and adding a
+      // batch here would put a second write on a path that already has one.
+      //
+      // An empty batch is a statement — the load ran and produced nothing.
+      // Writing no batch at all is silence, and the store cannot tell silence
+      // from a crash.
+      written += await this.appendBatches(connector, principalId, snapshotId, rows, labels);
 
       // An incremental run has only fetched what changed, so what sits in the
       // snapshot right now is not the dataset — it is a diff. This turns it
@@ -299,6 +307,67 @@ export class ConnectorRunnerService {
   }
 
   /** Pull the raw records. Shaping is the transform's job, not this one's. */
+  /**
+   * Every batch this load writes, and — for a full load that read nothing — the
+   * one empty batch that would otherwise not exist.
+   *
+   * Extracted from `run` because `run` had grown past the point where a reader
+   * could hold it, not to hide anything: the two calls below are the same call
+   * with different rows, and the interesting part is which of them happens.
+   *
+   * A batch is the only thing that creates the snapshot row. A FULL load of
+   * zero rows therefore used to leave no snapshot at all, and the commit
+   * refused with "no snapshot has been written" — an error naming the wrong
+   * event entirely, for a source that answered perfectly and had nothing to
+   * say. It also carries the labels, which is where an operator's
+   * acknowledgement that this collapse was deliberate travels, so the one case
+   * that acknowledgement exists for was the one case it could not arrive.
+   *
+   * INCREMENTAL is excluded, and the asymmetry is deliberate: a carry-forward
+   * follows, it writes the snapshot, and it carries the same labels. A batch
+   * here would be a second write on a path that already has one.
+   *
+   * An empty batch is a statement — the load ran and produced nothing. Writing
+   * no batch at all is silence, and the store cannot tell silence from a crash.
+   */
+  private async appendBatches(
+    connector: CatalogConnector,
+    principalId: string,
+    snapshotId: string,
+    rows: Array<Record<string, unknown>>,
+    labels: Record<string, string>,
+  ): Promise<number> {
+    // Numbered so a retry replaces rather than appends.
+    let batch = 1;
+    let written = 0;
+
+    if (rows.length === 0 && connector.mode !== 'incremental') {
+      await this.publish.appendRowsAsSystem(
+        principalId,
+        connector.targetType,
+        snapshotId,
+        [],
+        labels,
+        batch,
+      );
+      return 0;
+    }
+
+    for (let index = 0; index < rows.length; index += BATCH_SIZE) {
+      const result = await this.publish.appendRowsAsSystem(
+        principalId,
+        connector.targetType,
+        snapshotId,
+        rows.slice(index, index + BATCH_SIZE),
+        labels,
+        batch,
+      );
+      written += result.written;
+      batch += 1;
+    }
+    return written;
+  }
+
   private async fetch(rawConnector: CatalogConnector): Promise<FetchResult> {
     // Resolved here rather than at save time: a connection edited after a
     // connector was saved must take effect on the next run, which is the whole
