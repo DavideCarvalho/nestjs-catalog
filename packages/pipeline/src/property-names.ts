@@ -19,13 +19,16 @@
  * the publish payload, so it is answered there, for nothing, before a single row
  * exists.
  *
- * **The rule is not restated here.** {@link identifierRefusal} runs the store's
- * own `ident` and hands back the error it raises, so the publish-time refusal
- * and the DDL-time one cannot disagree about the character set, the length or
- * the wording — the wording especially, because the two refusals are now two
- * things somebody may see for one payload and reading them as one rule is the
- * whole point. The two bundled adapters ship that rule character for character
- * identically; this shares the copy the package already depends on.
+ * **The rule is not restated here.** {@link identifierRefusal} runs
+ * `assertSafeIdentifier` from `@dudousxd/nestjs-catalog` and hands back the
+ * error it raises — the same call every store's `ident` makes before it quotes
+ * anything — so the publish-time refusal and the DDL-time one cannot disagree
+ * about the character set, the length or the wording. The wording especially,
+ * because the two refusals are two things somebody may see for one payload and
+ * reading them as one rule is the whole point. This used to import the MySQL
+ * adapter's copy of the rule, which bought that guarantee for a MySQL
+ * deployment and left a ClickHouse-only one relying on two files having been
+ * edited together; there is now one definition and both adapters call it.
  *
  * **Nothing here sanitises on the caller's behalf.** {@link toPhysicalName} is
  * used to *suggest* a name, never to store one. A property name is how the
@@ -35,11 +38,15 @@
  * that column. A refusal costs a round trip; that costs a dataset that looks
  * loaded.
  */
-import {
-  UnsafeIdentifierError,
-  ident,
-  toPhysicalName,
-} from '@dudousxd/nestjs-catalog-store-mikro-orm';
+import { UnsafeIdentifierError, assertSafeIdentifier } from '@dudousxd/nestjs-catalog';
+// `toPhysicalName` — the *repair*, not the rule — stays the adapter's. It is
+// the cleaning one store applies to reach a physical column, so a name it
+// produces is only a promise where that store is mounted; the suggestion in a
+// refusal is allowed to be that, and the refusal itself is not. Still from
+// here, rather than moved beside the rule, because the only caller is
+// `publish.service.ts`, which reaches for `ObjectTypeRow` and an
+// `@mikro-orm/mysql` EntityManager two lines further down.
+import { toPhysicalName } from '@dudousxd/nestjs-catalog-store-mikro-orm';
 
 /** As much of a published property as this file has an opinion about. */
 export interface NamedProperty {
@@ -48,22 +55,23 @@ export interface NamedProperty {
 }
 
 /**
- * The store's own words for why a value cannot be an identifier, or nothing.
+ * The catalog's own words for why a value cannot be an identifier, or nothing.
  *
- * `ident` is called for its refusal and its result thrown away, which is the
- * point: the character set, the length limit and the sentence describing them
- * all stay in one place, and this cannot drift from what the DDL will do because
- * it IS what the DDL does.
+ * `assertSafeIdentifier` is called for its refusal and nothing else, which is
+ * the point: the character set, the length limit and the sentence describing
+ * them all live in one place, and this cannot drift from what the DDL will do
+ * because it IS what the DDL does — `ident`, in whichever store is mounted,
+ * begins with this same call.
  *
  * A `string | undefined` rather than a thrown error because the callers below
  * collect several before deciding what kind of failure the batch of them is.
  * Anything that is not an {@link UnsafeIdentifierError} is re-thrown rather than
- * read as a refusal — a different failure out of `ident` is a bug, not a verdict
- * about the name.
+ * read as a refusal — a different failure out of the rule is a bug, not a
+ * verdict about the name.
  */
 export function identifierRefusal(value: string): string | undefined {
   try {
-    ident(value);
+    assertSafeIdentifier(value);
   } catch (error) {
     if (error instanceof UnsafeIdentifierError) return error.message;
     throw error;

@@ -1,5 +1,9 @@
-import type { CatalogObjectTypeDef, CatalogPrincipal } from '@dudousxd/nestjs-catalog';
-import { ObjectTypeRow, UnsafeIdentifierError } from '@dudousxd/nestjs-catalog-store-mikro-orm';
+import {
+  type CatalogObjectTypeDef,
+  type CatalogPrincipal,
+  UnsafeIdentifierError,
+} from '@dudousxd/nestjs-catalog';
+import { ObjectTypeRow, ident as mysqlIdent } from '@dudousxd/nestjs-catalog-store-mikro-orm';
 import { BadRequestException, Logger } from '@nestjs/common';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -153,7 +157,7 @@ describe('a property named something that cannot be a column', () => {
     expect(created()).toEqual([]);
   });
 
-  it('says which property, in the store’s own words for the rule', async () => {
+  it('says which property, in the catalog’s own words for the rule', async () => {
     const { service } = rig();
 
     await expect(
@@ -162,9 +166,9 @@ describe('a property named something that cannot be a column', () => {
         properties: [ID_COLUMN, { name: 'Asset Id', type: 'string' }],
       }),
     ).rejects.toThrow(
-      // Character for character what `ident` raises at DDL time, because it IS
-      // what `ident` raises: `identifierRefusal` runs it and hands back the
-      // message. Two wordings for one rule is how they come to disagree.
+      // Character for character what `ident` raises at DDL time, because both
+      // come from `assertSafeIdentifier` in the core package — whichever store
+      // is mounted. Two wordings for one rule is how they come to disagree.
       new UnsafeIdentifierError('Asset Id').message,
     );
   });
@@ -325,6 +329,18 @@ describe('the rule itself', () => {
     for (const bad of ['Asset Id', '9lives', 'a'.repeat(64), '', 'Asset-Id']) {
       expect(identifierRefusal(bad)).toBe(new UnsafeIdentifierError(bad).message);
     }
+  });
+
+  it('reaches the rule the mounted store reaches, not one adapter’s copy of it', () => {
+    // The whole point of the move. This used to import `ident` and
+    // `UnsafeIdentifierError` from the MySQL adapter, so a deployment running
+    // only the ClickHouse store had a publish-time refusal and a DDL-time
+    // refusal that were two files agreeing by hand. Asserting on the class the
+    // core exports — which is the one both adapters now throw — is what makes
+    // the assertion above true of every store rather than of one.
+    expect(identifierRefusal('Asset Id')).toBe(new UnsafeIdentifierError('Asset Id').message);
+    expect(mysqlIdent('Asset_Id')).toBe('`Asset_Id`');
+    expect(() => mysqlIdent('Asset Id')).toThrow(UnsafeIdentifierError);
   });
 
   it('reports a repeated bad name once', () => {

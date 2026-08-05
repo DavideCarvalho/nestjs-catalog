@@ -14,10 +14,11 @@ have worked. Real column headers look like this: `Asset Id`, `Work Order Id`,
 
 Everything needed to answer the question is in the publish payload, so
 `upsertType` now answers it there: before the row is created, before the flush,
-before `ensureType`. The rule is not restated — `identifierRefusal` runs the
-store's own `ident` and hands back the error it raises, so the publish-time
-refusal and the DDL-time one cannot come to disagree about the character set,
-the length or the wording.
+before `ensureType`. The rule is not restated — `identifierRefusal` runs
+`assertSafeIdentifier` from `@dudousxd/nestjs-catalog`, the same call every
+store's `ident` makes before it quotes anything, and hands back the error it
+raises. So the publish-time refusal and the DDL-time one cannot come to disagree
+about the character set, the length or the wording, whichever store is mounted.
 
 The refusal names every offending property, not the first, and offers the
 payload that would have worked: `{ "name": "Asset_Id", "columnName": "Asset Id"

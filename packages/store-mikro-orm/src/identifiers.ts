@@ -1,25 +1,37 @@
-import { CATALOG_RESERVED_COLUMNS } from '@dudousxd/nestjs-catalog';
+import { CATALOG_RESERVED_COLUMNS, assertSafeIdentifier } from '@dudousxd/nestjs-catalog';
 
 /**
  * Every table and column name in this service comes from another application
  * over HTTP, and all of it ends up in DDL and in SELECT lists where no
  * placeholder can stand in for it. So identifiers are not escaped, they are
  * *rejected*: anything outside a narrow character set never becomes SQL.
+ *
+ * Which character set, and how long, is not decided here. It is
+ * `assertSafeIdentifier` in the core package, next to
+ * `CATALOG_RESERVED_COLUMNS`, and taken from there for the same reason that
+ * list is: a publisher is told the rule once, in one sentence, whichever
+ * adapter is mounted. This file used to state it, and so did the ClickHouse
+ * adapter, in identical words that nothing kept identical.
  */
 
-const SAFE = /^[A-Za-z_][A-Za-z0-9_]{0,62}$/;
+/**
+ * The refusal, re-exported rather than declared.
+ *
+ * A store's caller catches this to tell a name it may fix from a fault it
+ * cannot, so it has to be the same class the other adapters throw — an
+ * `instanceof` against a per-adapter copy is a check that quietly stops
+ * matching the moment somebody mounts a different store.
+ */
+export { UnsafeIdentifierError } from '@dudousxd/nestjs-catalog';
 
-export class UnsafeIdentifierError extends Error {
-  constructor(value: string) {
-    super(
-      `Refusing to use "${value}" as a SQL identifier: letters, digits and underscore only, starting with a letter or underscore, 63 characters max.`,
-    );
-  }
-}
-
-/** Quote a value already known to be safe. Throws rather than sanitising. */
+/**
+ * Quote a value already known to be safe. Throws rather than sanitising.
+ *
+ * Backticks are this adapter's own business — MySQL's quoting is not the
+ * catalog's to know — but what may be quoted at all is the shared rule's.
+ */
 export function ident(value: string): string {
-  if (!SAFE.test(value)) throw new UnsafeIdentifierError(value);
+  assertSafeIdentifier(value);
   return `\`${value}\``;
 }
 
