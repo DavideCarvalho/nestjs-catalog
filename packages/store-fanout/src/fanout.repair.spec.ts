@@ -359,10 +359,13 @@ describe('a follower that refused a schema change', () => {
     follower.refusesSchemaFor.delete(type.name);
     const replayed = await migration.replay(type, 's1', 'follower');
 
-    // One debt, and it is the schema one: the writes never failed, so there was
-    // nothing else outstanding to clear. Before the fix this was zero — the
-    // count was honest and the repair did nothing.
-    expect(replayed.cleared).toBe(1);
+    // Two debts: the schema one, and the commit this follower was held back
+    // from because of it. Before the schema fix this was zero — the count was
+    // honest and the repair did nothing. It then read one for a while, which was
+    // the schema debt counted and the held-back commit not, because the count
+    // was a sum of what two of the repair's steps reported and the commit is a
+    // third step that reported nothing. See `fanout.replay-count.spec.ts`.
+    expect(replayed.cleared).toBe(2);
     expect(replayed.committed).toBe(true);
     expect(replayed.comparison.matches).toBe(true);
     expect(await journal.outstanding()).toEqual([]);
@@ -434,7 +437,11 @@ describe('a follower that refused a schema change', () => {
     follower.refusesWritesFor.delete(type.name);
     const replayed = await migration.replay(type, 's1', 'follower');
 
-    expect(replayed.cleared).toBe(1);
+    // Two, and neither of them the schema: the failed write, and the commit the
+    // follower was held back from because of it — which are exactly the two
+    // entries asserted on above. The schema call this replay makes on the way
+    // past still has nothing to report, which is what this case is about.
+    expect(replayed.cleared).toBe(2);
     expect(replayed.notes.join(' ')).not.toContain('failed schema change');
     expect(await journal.outstanding()).toEqual([]);
   });

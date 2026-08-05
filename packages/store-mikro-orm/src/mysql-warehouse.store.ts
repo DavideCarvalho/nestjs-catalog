@@ -245,6 +245,38 @@ export class MySqlWarehouseStore implements CatalogMergeStore, CatalogQueryStore
    * that landed short. The snapshot's own count is on the `SnapshotRef` that
    * `commit` returns, and it is deliberately counted from the table rather than
    * accumulated here.
+   *
+   * ## A batch of zero rows is a batch
+   *
+   * `rows: []` writes no rows and still does everything else: it replaces
+   * whatever that batch held, it creates the snapshot, and it counts. This used
+   * to return immediately, and the cost of that was paid two steps later and
+   * under the wrong name — no rows meant no snapshot row, so `commit` refused
+   * with "no snapshot has been written", which sends somebody looking for a lost
+   * batch when what actually happened is that a source returned nothing.
+   *
+   * A source CAN legitimately become empty: a base decommissioned, a filter
+   * narrowed on purpose, a dataset retired. A store that cannot hold an empty
+   * snapshot is a catalog that can never show an empty type, and the only way
+   * left to express it is to delete the type — which throws away its history and
+   * its curation to say something about one day's data.
+   *
+   * **Whether that emptiness is acceptable is not decided here.** The row-count
+   * bound decides it (`refuseRowCountDrift` in the pipeline package): zero rows
+   * never replaces a non-empty dataset, at any size, unless the snapshot's labels
+   * carry the operator's acknowledgement. Both halves of that need this snapshot
+   * to exist — the count to measure and the labels to read — so the store's job
+   * is to make the load representable and the bound's job is to refuse it. A
+   * refusal here instead would be the same rule enforced with no way to
+   * acknowledge it, which is the acknowledgement made inert in a second place:
+   * the very case most likely to need it is a source that really was emptied.
+   *
+   * **Silence is still not a declaration.** A caller that writes no batch at all
+   * — a run whose source was unreachable rather than empty — leaves no snapshot,
+   * and `commit` refuses. This store cannot tell those two apart from the rows,
+   * because there are none either way, so it makes the caller say which one it
+   * means: an empty batch says "the load ran and produced nothing", and writing
+   * nothing says nothing at all.
    */
   async write(
     type: CatalogObjectTypeDef,
@@ -264,8 +296,6 @@ export class MySqlWarehouseStore implements CatalogMergeStore, CatalogQueryStore
       labels?: Record<string, string>;
     },
   ): Promise<{ written: number }> {
-    if (rows.length === 0) return { written: 0 };
-
     const em = this.em.fork();
     const table = tableFor(type.name);
 
@@ -287,19 +317,27 @@ export class MySqlWarehouseStore implements CatalogMergeStore, CatalogQueryStore
     // that says nothing. Losing sight of a real dataset because a CSV had
     // different headers is the failure this refuses. One matching property is
     // enough: a partial load is a judgement call, no matching property is not.
-    const matched = properties.filter((property) =>
-      rows.some((row) => row[property.name] !== undefined),
-    );
-    if (matched.length === 0) {
-      const incoming = Object.keys(rows[0] ?? {});
-      throw new BadRequestException(
-        `None of the incoming fields match ${type.name}. Got ${
-          incoming.length > 0 ? incoming.slice(0, 8).join(', ') : 'no fields'
-        }; expected any of ${properties
-          .slice(0, 8)
-          .map((p) => p.name)
-          .join(', ')}. A transform is where a source's names become the type's.`,
+    //
+    // Asked only of a batch that has rows. Zero rows carry no field names to
+    // disagree with the type, and reading that silence as "nothing matched"
+    // would refuse the empty load in the one voice guaranteed to send the reader
+    // to the wrong place: a message about mismatched headers, for a batch that
+    // has no headers.
+    if (rows.length > 0) {
+      const matched = properties.filter((property) =>
+        rows.some((row) => row[property.name] !== undefined),
       );
+      if (matched.length === 0) {
+        const incoming = Object.keys(rows[0] ?? {});
+        throw new BadRequestException(
+          `None of the incoming fields match ${type.name}. Got ${
+            incoming.length > 0 ? incoming.slice(0, 8).join(', ') : 'no fields'
+          }; expected any of ${properties
+            .slice(0, 8)
+            .map((p) => p.name)
+            .join(', ')}. A transform is where a source's names become the type's.`,
+        );
+      }
     }
     const batch = Number.isFinite(options.batch) ? Number(options.batch) : 0;
     // Negative batch numbers belong to the store. Carry-forward writes under
@@ -331,18 +369,31 @@ export class MySqlWarehouseStore implements CatalogMergeStore, CatalogQueryStore
     });
 
     // Replace, not append. This is what makes a retried batch idempotent.
+    //
+    // Unconditional, including for a batch of zero rows, and that is the whole
+    // of the special-casing an empty batch gets: "this batch is now what I last
+    // said it was" is one rule, and a caller re-sending a batch that has since
+    // emptied means it. Exempting the empty case would leave the previous
+    // attempt's rows in a snapshot the caller has retracted them from — and it
+    // would need its own answer to the merge question below, because rows
+    // vanishing from a batch changes what the carry-forward should have copied
+    // in exactly the way rows arriving does.
     await em
       .getConnection()
       .execute(
         `DELETE FROM ${ident(table)} WHERE ${ident(SNAPSHOT_COLUMN)} = ? AND ${ident(BATCH_COLUMN)} = ?`,
         [options.snapshotId, batch],
       );
-    await em
-      .getConnection()
-      .execute(
-        `INSERT INTO ${ident(table)} (${columns.map(ident).join(',')}) VALUES ${placeholders.join(',')}`,
-        values,
-      );
+    // Skipped only because MySQL has no syntax for inserting no tuples. Nothing
+    // downstream of here treats the two cases differently.
+    if (placeholders.length > 0) {
+      await em
+        .getConnection()
+        .execute(
+          `INSERT INTO ${ident(table)} (${columns.map(ident).join(',')}) VALUES ${placeholders.join(',')}`,
+          values,
+        );
+    }
 
     // The snapshot row is upserted rather than inserted so a retried batch does
     // not create a second one. rowCount accumulates across batches of the same
@@ -607,12 +658,34 @@ export class MySqlWarehouseStore implements CatalogMergeStore, CatalogQueryStore
     };
   }
 
+  /**
+   * Publish a snapshot: flip its flag, move the pointer, move the view.
+   *
+   * **What a missing snapshot means, and why it is still refused.** Nothing
+   * creates a snapshot row here. A load that wrote no batch at all — the source
+   * was unreachable, the run died before its first batch, the caller sent a
+   * snapshot id it never wrote to — reaches this method with nothing to commit,
+   * and those are different facts that look identical from inside the store.
+   * Inventing an empty snapshot to commit would pick the most destructive of
+   * them: it would repoint every reader at no rows on the strength of a typo.
+   * So it refuses, and the message names the possibility that is easy to miss,
+   * because the other two announce themselves in the caller's own logs and "the
+   * source returned nothing" does not.
+   *
+   * A load that genuinely produced nothing says so by writing an empty batch,
+   * which creates the snapshot like any other write. From there it is an
+   * ordinary snapshot holding zero rows, and whether it may replace what is
+   * being served is the row-count bound's decision rather than this method's —
+   * see the note on {@link write}.
+   */
   async commit(type: CatalogObjectTypeDef, snapshotId: string): Promise<SnapshotRef> {
     const em = this.em.fork();
     const id = `${type.name}:${snapshotId}`;
     const snapshot = await em.findOne(SnapshotRow, { id });
     if (!snapshot) {
-      throw new BadRequestException(`No snapshot ${snapshotId} has been written for ${type.name}.`);
+      throw new BadRequestException(
+        `No snapshot ${snapshotId} has been written for ${type.name}, so there is nothing to commit. A snapshot is created by the first batch written under its id, and a load that produced no rows writes no batch — so a source that returned nothing, a run that died before its first batch, and a snapshot id that was never written to all arrive here looking the same. If ${type.name} really is empty at the source, write an empty batch under ${snapshotId}: that creates the snapshot, and committing it over a non-empty dataset is then refused by the row-count expectation rather than by this message, which is where the acknowledgement for a deliberate collapse belongs.`,
+      );
     }
 
     // Refused, not repaired. The carry-forward could be re-run from here, but
@@ -630,10 +703,38 @@ export class MySqlWarehouseStore implements CatalogMergeStore, CatalogQueryStore
       );
     }
 
+    const typeRow = await em.findOne(ObjectTypeRow, { name: type.name });
+
+    // An empty snapshot is committed, not refused — and said out loud when it
+    // replaces something.
+    //
+    // Refused is the tempting answer and it is the wrong one here. The rule
+    // "zero rows never replaces a non-empty dataset" already exists, one layer
+    // up, together with the one thing that makes it liveable: a label on the
+    // snapshot by which an operator acknowledges a collapse they meant. This
+    // store cannot read that acknowledgement — the label and its meaning belong
+    // to the pipeline package, which depends on this one and not the other way
+    // round — so a refusal here would be that rule re-enforced by the component
+    // that has no way to hear the answer, and a deliberate truncation would
+    // become impossible to express at all.
+    //
+    // What is left is to say it. A host running this adapter without that bound
+    // has nothing else standing between an empty load and the live view, and one
+    // line naming both snapshots is the difference between noticing today and
+    // noticing when somebody asks why a screen is blank.
+    if (snapshot.rowCount === 0 && typeRow?.currentSnapshotId) {
+      const served = await em.findOne(SnapshotRow, {
+        id: `${type.name}:${typeRow.currentSnapshotId}`,
+      });
+      if (served && served.snapshotId !== snapshotId && served.rowCount > 0) {
+        this.logger.warn(
+          `Committing snapshot ${snapshotId} of ${type.name}, which holds no rows, over ${served.snapshotId}, which holds ${served.rowCount}. Every reader of ${type.name} now sees an empty dataset. That is what a source that really emptied looks like, and it is also what a filter matching nothing and a transform returning [] look like — this store cannot tell them apart. Nothing here refuses it; a row-count expectation on ${type.name} is what does.`,
+        );
+      }
+    }
+
     snapshot.committed = true;
     snapshot.committedAt = new Date();
-
-    const typeRow = await em.findOne(ObjectTypeRow, { name: type.name });
     if (typeRow) typeRow.currentSnapshotId = snapshotId;
     await em.flush();
 

@@ -705,6 +705,16 @@ export class FanoutCatalogStore implements CatalogWriteStore {
    * been copied from the primary the follower is holding the snapshot, and
    * publishing it there has to go through the same announce-before-attempt path
    * as an ordinary commit or a crash during the repair would go unrecorded.
+   *
+   * **This discharges journal entries, and says so only to the journal.** A
+   * follower held back from a load owes a `commit` entry, which the attempt below
+   * resolves; committing also supersedes every entry about a snapshot this
+   * follower has now moved past. Neither shows up in the return value, which is
+   * the `SnapshotRef` a caller asked for and nothing else — so a repair reporting
+   * how much it fixed cannot assemble that number out of what its steps hand
+   * back, and {@link import('./migration').CatalogFanoutMigration.replay} reads
+   * the ledger before and after instead. Widening this signature would fix one caller's arithmetic and
+   * leave the next step somebody adds to the repair with the same trap.
    */
   async commitFollower(
     type: CatalogObjectTypeDef,

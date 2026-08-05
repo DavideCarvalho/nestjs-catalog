@@ -11,7 +11,12 @@ import {
 } from './compare';
 import { emitFanout } from './events';
 import { CatalogFanoutError, FanoutCatalogStore, type FanoutFollower } from './fanout.store';
-import type { FanoutCommitMark, FanoutJournalEntry, FanoutStage } from './journal';
+import {
+  FANOUT_SCHEMA_SCOPE,
+  type FanoutCommitMark,
+  type FanoutJournalEntry,
+  type FanoutStage,
+} from './journal';
 import type { FollowerStrictness } from './options';
 
 /**
@@ -65,7 +70,32 @@ export interface FanoutReplayResult {
   batches: number;
   rows: number;
   committed: boolean;
-  /** Journal entries the replay discharged. */
+  /**
+   * Journal entries this follower owed when the replay started and no longer
+   * owes now.
+   *
+   * **Observed, not accumulated**, and that is the whole of it. This used to be
+   * a sum of what each step of the repair reported — the schema call, then
+   * `clearDebt` — which meant it could only ever count the debts those two calls
+   * knew about. The commit at the end of a replay discharges an entry too: a
+   * follower held back from a load owes a `commit` entry, and `commitFollower`
+   * resolves it and said nothing. So an operator who read "2 outstanding" on the
+   * status screen, ran the repair, was told it cleared 1, and then found the
+   * ledger empty had been handed two numbers that could not both be right, with
+   * nothing to say which.
+   *
+   * Undercounting is the safer direction and it is still the wrong number. A
+   * repair whose total cannot be reconciled with what the ledger does next is a
+   * repair somebody stops reading, and the reason to report a count at all is
+   * that somebody reads it before deciding the follower is fixed. Taking the
+   * ledger before and after is the only version of this that stays true when a
+   * step is added to the repair, because it measures the ledger rather than the
+   * steps.
+   *
+   * It counts entries **closed** as well as entries **repaired** — see the note
+   * a replay pushes when the two differ. Both are entries that were on the
+   * screen and are not now, which is the question this number answers.
+   */
   cleared: number;
   /** Anything the operator should know that is not a failure. */
   notes: string[];
@@ -296,8 +326,11 @@ export class CatalogFanoutMigration {
    * 5. Discharge the journal entries the copy supplied.
    * 6. Commit on the follower, but only when this snapshot is the one the
    *    primary is currently serving. Backfilling an older snapshot must not
-   *    repoint the follower at last week.
-   * 7. Compare, and return the comparison. A replay that did not end in a match
+   *    repoint the follower at last week. This discharges entries too — the
+   *    commit's own, and every entry about a snapshot the follower has now moved
+   *    past — which is why the count in step 7 comes after it.
+   * 7. Read the ledger again and report what left it. See `cleared`.
+   * 8. Compare, and return the comparison. A replay that did not end in a match
    *    is not a finished replay.
    *
    * **If it fails partway** the follower holds less than it did when it started,
@@ -315,6 +348,16 @@ export class CatalogFanoutMigration {
     const follower = this.fanout.followerNamed(followerName);
     const primary = this.fanout.primary;
     const notes: string[] = [];
+
+    // Read before anything is touched, because it is the baseline the returned
+    // count is measured against. Scoped to this type and this follower, which is
+    // exactly as wide as a replay can reach: `ensureTypeOn` writes under the
+    // schema scope, `clearDebt` under this snapshot, and the commit's
+    // `supersede` under any other snapshot of the same type.
+    const owedBefore = await this.fanout.journal.outstanding({
+      typeName: resolved.name,
+      follower: followerName,
+    });
 
     const current = await this.fanout.journal.lastCommitted(resolved.name);
     if (!primary.store.capabilities.timeTravel && snapshotId !== current?.snapshotId) {
@@ -361,13 +404,10 @@ export class CatalogFanoutMigration {
       principalId,
     });
 
-    // The schema entry counts towards this only when `ensureTypeOn` reported it
-    // actually discharged one. A repair that adds to its own total on the
-    // strength of having run is a repair whose total cannot be checked, and this
-    // number is what an operator reads before believing the follower is fixed.
-    const cleared =
-      (schema.recovered ? 1 : 0) +
-      (await this.fanout.clearDebt(resolved.name, snapshotId, followerName, REPLAYED_STAGES));
+    // The rows are in, so the entries that were waiting for them are paid. The
+    // number this returns is not taken from here — see `cleared` — but this call
+    // is what actually discharges them, and what announces one event per debt.
+    await this.fanout.clearDebt(resolved.name, snapshotId, followerName, REPLAYED_STAGES);
 
     const shouldCommit = await this.commitReplayIfCurrent(
       resolved,
@@ -375,6 +415,18 @@ export class CatalogFanoutMigration {
       followerName,
       current,
       options.commit,
+      notes,
+    );
+
+    // After the commit, deliberately: the commit is a step that discharges
+    // entries — its own, and every entry about a snapshot this follower has now
+    // moved past — and a count taken before it would miss exactly the ones the
+    // old arithmetic missed.
+    const cleared = await this.dischargedByReplay(
+      resolved,
+      snapshotId,
+      followerName,
+      owedBefore,
       notes,
     );
 
@@ -486,6 +538,69 @@ export class CatalogFanoutMigration {
     }
 
     return shouldCommit;
+  }
+
+  /**
+   * What this replay took off the ledger: the entries this follower owed when it
+   * started and does not owe now.
+   *
+   * **Measured against the journal rather than assembled from the steps.** Every
+   * step of a repair that discharges something has to remember to say so, and the
+   * commit did not — which is how the reported total came to be smaller than the
+   * number of lines that disappeared from the operator's screen. Adding a third
+   * addend would have fixed today's arithmetic and left the next step to be added
+   * with the same trap set. Two reads of the ledger cannot fall behind the steps,
+   * because they do not know what the steps are.
+   *
+   * **What it cannot see** is anybody else. The default journal is documented as
+   * single-process, and this is a repair somebody runs deliberately rather than
+   * something on a timer, so an entry that vanished during the replay vanished
+   * because of the replay. On a shared journal with two loaders running, this
+   * would over-count by whatever the other one happened to fix in the same
+   * seconds — which is the same caveat the status screen already carries, since
+   * it is a snapshot of a ledger somebody else can be writing to.
+   *
+   * The note is where the two kinds of discharge are kept apart. An entry about
+   * *this* snapshot was repaired: the rows arrived, or the schema was taken, or
+   * the follower committed. An entry about *another* snapshot was closed by
+   * `supersede` — nothing was supplied for it, it simply stopped describing
+   * anything a reader of that follower can encounter. Both belong in the count,
+   * because both are lines that were on the screen and are not now; only one of
+   * them means data moved, and an operator reading a total of four should not
+   * have to guess which.
+   */
+  private async dischargedByReplay(
+    type: CatalogObjectTypeDef,
+    snapshotId: string,
+    followerName: string,
+    owedBefore: FanoutJournalEntry[],
+    notes: string[],
+  ): Promise<number> {
+    if (owedBefore.length === 0) return 0;
+
+    const stillOwed = new Set(
+      (
+        await this.fanout.journal.outstanding({
+          typeName: type.name,
+          follower: followerName,
+        })
+      ).map((entry) => entry.key),
+    );
+    const gone = owedBefore.filter((entry) => !stillOwed.has(entry.key));
+
+    const elsewhere = gone.filter(
+      (entry) => entry.snapshotId !== snapshotId && entry.snapshotId !== FANOUT_SCHEMA_SCOPE,
+    );
+    if (elsewhere.length > 0) {
+      const snapshots = Array.from(new Set(elsewhere.map((entry) => entry.snapshotId)));
+      notes.push(
+        `${elsewhere.length} of the ${gone.length} entries this replay cleared were not about ${snapshotId} — they were about ${snapshots.join(
+          ', ',
+        )}, and they were closed rather than repaired: ${followerName} now serves ${snapshotId}, which is the complete state of ${type.name}, so an entry saying it once missed an earlier snapshot no longer describes anything a reader of it can encounter. Those snapshots are missing from its history; its current state is complete.`,
+      );
+    }
+
+    return gone.length;
   }
 
   /**
