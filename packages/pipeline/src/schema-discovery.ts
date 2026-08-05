@@ -6,7 +6,7 @@ import {
   type ScalarType,
   isReservedColumn,
 } from '@dudousxd/nestjs-catalog';
-import { SOURCES, type SqlDescription, describeSql, toFetchResult } from './sources';
+import { SOURCES, type SqlDescription, describeSql, toBufferedFetchResult } from './sources';
 
 /**
  * Asking a connector what its source actually looks like.
@@ -289,7 +289,12 @@ async function describeFromSample(
     );
   }
 
-  const fetched = toFetchResult(
+  // The limit goes to the buffer rather than to a `.slice` afterwards, so a
+  // source that hands rows over one at a time is asked for `limit` of them and
+  // then stopped. On a source that returns an array this is the same slice it
+  // always was; on a streamed one it is the difference between describing a
+  // table and reading it.
+  const fetched = await toBufferedFetchResult(
     await fetcher({
       connector,
       secret,
@@ -300,8 +305,9 @@ async function describeFromSample(
       state: {},
       mode: 'full',
     }),
+    limit,
   );
-  const records = fetched.records.slice(0, limit);
+  const records = fetched.records;
 
   return {
     basis: 'sample',

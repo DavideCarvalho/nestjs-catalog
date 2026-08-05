@@ -113,6 +113,30 @@ failure this split exists to avoid.
 load: rows arrive under a snapshot id in numbered batches, a retried batch replaces itself, and a
 separate commit makes it visible. Three attempts load the data once.
 
+**An attempt that never came back is closed by the next one.** A step whose lease expires is
+re-dispatched while the attempt holding it is still running, so that attempt never reaches
+`finishRun` and its run row sits at `running` with `fetched = 0` and no error for good. On the way
+in, a run closes any earlier run *at the same snapshot id* that is still marked running, recording
+what that state means and pointing at `durable_step_checkpoints`, where a rising `attempts` against
+an empty error is the engine's side of the same fact. Keyed on the snapshot rather than on age,
+because the loads this is about are the slow ones — the last attempt of a series is still never
+closed by anything, since nothing runs after it.
+
+**A MySQL connector reads a batch at a time; a Postgres one does not, and neither does a connector
+with a transform.** The write side has always been bounded — 500 rows per batch — and the read side
+was not: the driver materialised the whole result set first, which on a large table is a step that
+holds a table in the heap until its lease expires with nothing recorded anywhere. `fetchSql` now
+reads MySQL through mysql2's row stream, and back-pressure reaches the socket, so the pipeline holds
+a batch. Two exceptions, both deliberate:
+
+- **Postgres.** Plain `pg` buffers the result set inside the driver; streaming needs an explicit
+  portal, which lives in `pg-cursor`/`pg-query-stream` — a dependency this package does not require.
+  Narrow a large Postgres connector with `watermarkColumn` or a `LIMIT`.
+- **Any connector with a transform.** A transform is a function over a batch — that is the contract,
+  and it is what lets one deduplicate, aggregate or join — so it is given the whole read in one call
+  and the whole read is therefore in memory. Chunking the calls would silently change what an
+  aggregating transform computes. The run log says when this is what happened.
+
 **`scheduler` is per process.** Starting a run from a process that "should not" would still be
 correct — the run id is derived from the cron fire time and `engine.start` is idempotent, so a
 duplicate start is a no-op. The option exists so that every replica does not poll the store on a

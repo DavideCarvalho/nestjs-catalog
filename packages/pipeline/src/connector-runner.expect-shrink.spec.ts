@@ -112,6 +112,18 @@ function memoryStore(over: Record<string, unknown> = {}) {
       if (run) Object.assign(run, outcome);
       return Promise.resolve(run);
     },
+    // Newest first, the way a real store orders it. Implemented rather than
+    // omitted because the runner asks it on the way in — see
+    // `closeAbandonedAttempts` — and a fake that threw would have that call
+    // swallowed by its own guard, which is a test passing for want of a method.
+    listRuns: (connectorId?: string, limit?: number) =>
+      Promise.resolve(
+        state.runs
+          .filter((run) => connectorId === undefined || run.connectorId === connectorId)
+          .slice()
+          .reverse()
+          .slice(0, limit ?? 50),
+      ),
     getTransform: () => Promise.resolve(undefined),
   };
 

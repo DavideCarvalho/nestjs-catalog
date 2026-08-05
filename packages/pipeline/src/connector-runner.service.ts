@@ -11,14 +11,40 @@ import { EXPECT_SHRINK_LABEL } from './load-expectations';
 import { PublishService } from './publish.service';
 import { capLines, redactLines, redactSecrets } from './run-logs';
 import {
-  type FetchResult,
+  type RecordStream,
   SOURCES,
   applyConnection,
   resolveSecret,
-  toFetchResult,
+  toRecordStream,
 } from './sources';
 
 const BATCH_SIZE = 500;
+
+/**
+ * How often a long read says something on the process log.
+ *
+ * Twenty batches is ten thousand rows. The number is a compromise between two
+ * bad outcomes and neither is subtle: a line per batch makes a million-row load
+ * two thousand lines of noise, and no line at all is what a running load used to
+ * look like from outside — the run row is written at `startRun` and not again
+ * until `finishRun`, so `fetched` reads 0 for the whole of it and nothing
+ * anywhere distinguished "reading" from "wedged". This is the cheapest thing
+ * that tells them apart, and it goes to the process log rather than the run row
+ * because `finishRun` stamps `finishedAt`: there is no way to update a run row
+ * mid-run without closing it.
+ */
+const PROGRESS_EVERY_BATCHES = 20;
+
+/**
+ * How many recent runs of a connector are examined for one left open.
+ *
+ * A durable retry reuses the snapshot id, so the runs that can be orphans of
+ * *this* load are the handful of attempts that came before it — three, at the
+ * step's current retry count. Twenty is room for other runs of the same
+ * connector to have interleaved without the scan missing them, and it is a
+ * bounded query rather than a scan of the table.
+ */
+const ORPHAN_SCAN_LIMIT = 20;
 
 /**
  * How many lines of a transform's own logging survive into the run record.
@@ -86,6 +112,34 @@ export interface ConnectorRunOptions {
  * Nothing here schedules. The durable engine does that, or a human presses the
  * button. Two systems believing they decide when a load runs is the failure
  * mode this design exists to avoid.
+ *
+ * **A connector without a transform reads a batch at a time. One with a
+ * transform reads the lot.** That split is not a performance decision that
+ * happened to land there; it is the transform contract, and it is written down
+ * in two places already. `CatalogTransform.code` says the code is "the body of a
+ * function over one batch ... a transform that needs to look up, deduplicate or
+ * aggregate cannot do it one row at a time", and `WorkflowRunnerService`
+ * repeats it where it holds a node's whole input for the same reason. So the
+ * *whole fetch* is what a transform is promised, and chunking the calls would
+ * silently redefine that promise as "five hundred rows": a transform that counts
+ * would return one number per chunk, one that deduplicates would stop catching
+ * duplicates that fell either side of a boundary, and one that sorts would
+ * return the data in pieces. None of that fails. It commits, and the numbers are
+ * wrong.
+ *
+ * A per-connector opt-in was the alternative and is rejected. The flag would
+ * live on the connector and the assumption it encodes would live in the
+ * transform — two rows, versioned independently, edited by different people. The
+ * day somebody adds a `dedupe` to a transform that six connectors read through,
+ * a checkbox one of them ticked months earlier makes their load quietly wrong,
+ * and nothing in the diff they wrote says so. If a transform is genuinely
+ * row-wise, that is a fact about the transform and belongs beside it — a change
+ * to the transform contract, made once, not a promise a connector makes on its
+ * behalf.
+ *
+ * What a transformed connector gets instead is a run log that says why it is
+ * holding everything, which is the part that was missing: the previous
+ * behaviour was the same, and unexplained.
  */
 @Injectable()
 export class ConnectorRunnerService {
@@ -130,6 +184,10 @@ export class ConnectorRunnerService {
     // has been read — naming the row count and never the empty string.
     const labels = labelsFor(connector.name, options);
 
+    // Before `startRun`, so this run's own row is not among the ones scanned and
+    // no ordering has to be reasoned about. See {@link closeAbandonedAttempts}.
+    const abandoned = await this.closeAbandonedAttempts(connector, snapshotId);
+
     const run = await this.pipeline.startRun({
       connectorId,
       snapshotId,
@@ -150,62 +208,32 @@ export class ConnectorRunnerService {
     // of them was permitted to collapse, and a run that carried an
     // acknowledgement silently would be the one entry there that reads exactly
     // like the others.
-    const logs: string[] = openingLogs(labels, snapshotId, connector.name);
+    const logs: string[] = [...openingLogs(labels, snapshotId, connector.name), ...abandoned];
     let fetched = 0;
     let written = 0;
     let transformVersion: number | undefined;
 
     try {
-      const fetchResult = await this.fetch(connector);
-      const records = fetchResult.records;
-      fetched = records.length;
-      logs.push(`Fetched ${fetched} records from ${connector.kind}.`);
+      const source = await this.fetch(connector);
+      const load = await this.readIntoSnapshot(connector, principalId, snapshotId, source, {
+        labels,
+        logs,
+        noteTransformVersion: (version) => {
+          transformVersion = version;
+        },
+      });
+      fetched = load.fetched;
+      written += load.written;
 
-      let rows: Array<Record<string, unknown>> = records.filter(
-        (record): record is Record<string, unknown> =>
-          typeof record === 'object' && record !== null && !Array.isArray(record),
-      );
-
-      if (connector.transformId) {
-        const transform = await this.pipeline.getTransform(connector.transformId);
-        if (!transform) {
-          throw new Error(
-            `Transform ${connector.transformId} is gone. A connector pointing at code that no longer exists must fail rather than load raw records under a shape nobody chose.`,
-          );
-        }
-        transformVersion = transform.version;
-        const result = await this.transforms.run(transform, records);
-        rows = result.rows;
-        logs.push(
-          `Transform "${transform.name}" v${transform.version} produced ${rows.length} rows in ${result.elapsedMs}ms.`,
-          ...capLines(result.logs, TRANSFORM_LOG_LINES),
-        );
-      }
-
-      // Batches of the same size the publish protocol expects, numbered so a
-      // retry replaces rather than appends.
-      //
-      // A FULL source that returned nothing still writes one — an empty batch,
-      // where the loop below writes none. A batch is the only thing that
-      // creates the snapshot, so without this a full load of zero rows left no
-      // snapshot at all and the commit a few lines down refused with "no
-      // snapshot has been written": an error naming the wrong event entirely,
-      // for a source that answered perfectly and had nothing to say.
-      //
-      // It also carries the labels, which is where an operator's
-      // acknowledgement that this collapse was deliberate travels — so the one
-      // case `expectShrink` exists for, a source that really was emptied, was
-      // the one case where it could not arrive.
-      //
-      // FULL only, and the asymmetry is not an oversight. An incremental run
-      // that fetched nothing is already covered: the carry-forward below writes
-      // the snapshot and carries the same labels, deliberately, and adding a
-      // batch here would put a second write on a path that already has one.
-      //
-      // An empty batch is a statement — the load ran and produced nothing.
-      // Writing no batch at all is silence, and the store cannot tell silence
-      // from a crash.
-      written += await this.appendBatches(connector, principalId, snapshotId, rows, labels);
+      // Asked here — after the last row and before the merge and the commit —
+      // rather than where it is used forty lines down. A streamed watermark is a
+      // running maximum, so it is not final until the read is, and it can still
+      // refuse: a bounded query whose rows never carried the watermark column
+      // has nothing to advance to. That refusal used to arrive before any write
+      // because the whole result set was in hand; now some batches have already
+      // been appended when it fires, and they are left in an uncommitted
+      // snapshot exactly as every other mid-run failure's are.
+      const advanced = source.state();
 
       // An incremental run has only fetched what changed, so what sits in the
       // snapshot right now is not the dataset — it is a diff. This turns it
@@ -258,12 +286,12 @@ export class ConnectorRunnerService {
       // — and a `_expectShrink` that survived into `connector.state` would be
       // read back by every run after it and would have switched the bound off
       // for good, silently, from a call that meant it once.
-      if (fetchResult.state) {
+      if (advanced) {
         await this.pipeline.saveConnectorState(connector.id, {
           ...connector.state,
-          ...fetchResult.state,
+          ...advanced,
         });
-        logs.push(`Advanced state: ${Object.keys(fetchResult.state).join(', ')}.`);
+        logs.push(`Advanced state: ${Object.keys(advanced).join(', ')}.`);
       }
 
       emitCatalog('connector.run.finished', {
@@ -341,14 +369,111 @@ export class ConnectorRunnerService {
     }
   }
 
-  /** Pull the raw records. Shaping is the transform's job, not this one's. */
+  /**
+   * The read and the writes, and the one decision that separates them.
+   *
+   * **A connector with no transform streams; one with a transform does not**, and
+   * which happens is decided here by the transform contract rather than by what
+   * the source was capable of. The reasoning is on {@link ConnectorRunnerService}
+   * and it is not a performance argument — a transform is promised the whole
+   * batch, and chunking the calls would change what an aggregating one computes
+   * without failing.
+   *
+   * `logs` is appended to rather than returned, because the caller has already
+   * started the run's log with what this run was allowed to say for itself and
+   * the ordering of those lines is what somebody reads a failed run in.
+   *
+   * `noteTransformVersion` is reported the moment the transform is in hand
+   * rather than carried out on the return value, and that is not tidiness: a
+   * transform that *throws* never reaches a return, and the version is exactly
+   * what somebody investigating the failure wants on the run row. Returning it
+   * would have recorded it only for the runs that did not need it.
+   */
+  private async readIntoSnapshot(
+    connector: CatalogConnector,
+    principalId: string,
+    snapshotId: string,
+    source: RecordStream,
+    into: {
+      labels: Record<string, string>;
+      logs: string[];
+      noteTransformVersion: (version: number) => void;
+    },
+  ): Promise<{ fetched: number; written: number }> {
+    const { labels, logs } = into;
+
+    if (!connector.transformId) {
+      const counts = await this.appendBatches(
+        connector,
+        principalId,
+        snapshotId,
+        source.records,
+        labels,
+      );
+      // After the writes, because with a streamed source the count is not known
+      // until the last row has gone past. The line reads the same and sits in
+      // the same place in the log as it always did.
+      logs.push(`Fetched ${counts.seen} records from ${connector.kind}.`);
+      return { fetched: counts.seen, written: counts.written };
+    }
+
+    const transform = await this.pipeline.getTransform(connector.transformId);
+    if (!transform) {
+      throw new Error(
+        `Transform ${connector.transformId} is gone. A connector pointing at code that no longer exists must fail rather than load raw records under a shape nobody chose.`,
+      );
+    }
+    into.noteTransformVersion(transform.version);
+
+    const records = await collect(source.records);
+    logs.push(`Fetched ${records.length} records from ${connector.kind}.`);
+    // Only when the source could have streamed and was not allowed to. An
+    // operator looking at a connector that exhausted its heap should be able to
+    // read why off the run, rather than working it out from the fact that the
+    // connector happens to have a transform on it.
+    if (source.streamed) {
+      logs.push(
+        `Held all ${records.length} records in memory: "${transform.name}" is a function over the whole batch, so this read could not be streamed. Drop the transform to have it read a batch at a time.`,
+      );
+    }
+
+    const result = await this.transforms.run(transform, records);
+    logs.push(
+      `Transform "${transform.name}" v${transform.version} produced ${result.rows.length} rows in ${result.elapsedMs}ms.`,
+      ...capLines(result.logs, TRANSFORM_LOG_LINES),
+    );
+
+    const counts = await this.appendBatches(
+      connector,
+      principalId,
+      snapshotId,
+      toRecordStream(result.rows).records,
+      labels,
+    );
+    return { fetched: records.length, written: counts.written };
+  }
+
   /**
    * Every batch this load writes, and — for a full load that read nothing — the
    * one empty batch that would otherwise not exist.
    *
-   * Extracted from `run` because `run` had grown past the point where a reader
-   * could hold it, not to hide anything: the two calls below are the same call
-   * with different rows, and the interesting part is which of them happens.
+   * **It pulls, and that is what bounds the memory.** The records arrive as an
+   * async iterable, and the next one is not asked for until the batch before it
+   * has been written, so what this holds is at most `BATCH_SIZE` rows however
+   * many the source has. When the source is a real stream — see
+   * {@link fetchSql} — that back-pressure reaches the driver's socket and the
+   * whole read is bounded end to end. When it is an array the fetcher already
+   * had, this walks it and nothing is copied.
+   *
+   * One implementation for both paths on purpose. The transform path hands its
+   * *output* through here as an array; the streamed path hands the source's rows
+   * through directly. Two loops would be two answers to where a batch boundary
+   * falls, and the empty-batch rule below is exactly the kind of thing that would
+   * end up on one of them.
+   *
+   * `seen` counts everything the iterable yielded, before the filter — which is
+   * what `fetched` on the run row has always meant. Records that are not plain
+   * objects cannot be written as rows and are dropped, as they always were.
    *
    * A batch is the only thing that creates the snapshot row. A FULL load of
    * zero rows therefore used to leave no snapshot at all, and the commit
@@ -369,41 +494,119 @@ export class ConnectorRunnerService {
     connector: CatalogConnector,
     principalId: string,
     snapshotId: string,
-    rows: Array<Record<string, unknown>>,
+    records: AsyncIterable<unknown>,
     labels: Record<string, string>,
-  ): Promise<number> {
+  ): Promise<{ seen: number; written: number }> {
     // Numbered so a retry replaces rather than appends.
     let batch = 1;
+    let seen = 0;
     let written = 0;
+    let pending: Array<Record<string, unknown>> = [];
 
-    if (rows.length === 0 && connector.mode !== 'incremental') {
-      await this.publish.appendRowsAsSystem(
-        principalId,
-        connector.targetType,
-        snapshotId,
-        [],
-        labels,
-        batch,
-      );
-      return 0;
-    }
-
-    for (let index = 0; index < rows.length; index += BATCH_SIZE) {
+    const flush = async (): Promise<void> => {
       const result = await this.publish.appendRowsAsSystem(
         principalId,
         connector.targetType,
         snapshotId,
-        rows.slice(index, index + BATCH_SIZE),
+        pending,
         labels,
         batch,
       );
       written += result.written;
       batch += 1;
+      pending = [];
+      if (batch % PROGRESS_EVERY_BATCHES === 1 && batch > 1) {
+        this.logger.log(
+          `${connector.name}: ${seen} records read, ${written} written into ${snapshotId} so far.`,
+        );
+      }
+    };
+
+    for await (const record of records) {
+      seen += 1;
+      if (isRowRecord(record)) pending.push(record);
+      if (pending.length >= BATCH_SIZE) await flush();
     }
-    return written;
+
+    // `batch === 1` is "nothing was ever written", which is the condition the
+    // array version spelled as `rows.length === 0`. It is not the same as "the
+    // source read nothing": a full load of a thousand records that were all
+    // strings writes an empty batch too, and did before.
+    if (pending.length > 0 || (batch === 1 && connector.mode !== 'incremental')) await flush();
+
+    return { seen, written };
   }
 
-  private async fetch(rawConnector: CatalogConnector): Promise<FetchResult> {
+  /**
+   * Close any run of this connector left open by an earlier attempt at the same
+   * snapshot.
+   *
+   * The failure this exists for leaves no trace at all. A step whose lease
+   * expires is re-dispatched by the durable engine while the attempt holding it
+   * is still inside `run` — so that attempt never reaches `finishRun`, and its
+   * row sits at `running` with `fetched = 0` and an empty `error` for good. The
+   * only place the truth was written down was `durable_step_checkpoints`, where
+   * a rising `attempts` against an empty error means a lease and not a failure,
+   * and reading that is not something an operator should have to know to do.
+   *
+   * **Keyed on the snapshot id, which makes it exact rather than a heuristic.** A
+   * durable retry reuses the snapshot id and nothing else does, so the rows this
+   * closes are attempts at *this* load and cannot be a different run of the same
+   * connector happening at the same time. An age threshold was the alternative
+   * and is unusable here: the loads this is about are the slow ones, so "open for
+   * a long time" is indistinguishable from working.
+   *
+   * Two things it cannot do, both worth knowing before trusting it:
+   *
+   * - **The last attempt is never closed by anything.** Nothing runs after it.
+   *   Three abandoned attempts leave two rows saying so and one still `running`,
+   *   which is two more than there were and is enough to recognise the pattern.
+   * - **An attempt still alive in another process may write over this.** The
+   *   lease expired; the work did not stop. If it finishes it calls `finishRun`
+   *   and its own outcome wins, which is the right answer — it is the one that
+   *   actually knows.
+   *
+   * Never fatal. This is bookkeeping about a previous run, and a store that
+   * cannot answer must not take out the load in front of it.
+   */
+  private async closeAbandonedAttempts(
+    connector: CatalogConnector,
+    snapshotId: string,
+  ): Promise<string[]> {
+    try {
+      const recent = await this.pipeline.listRuns(connector.id, ORPHAN_SCAN_LIMIT);
+      const lines: string[] = [];
+
+      for (const stale of recent) {
+        if (stale.status !== 'running' || stale.snapshotId !== snapshotId) continue;
+
+        const reason = abandonedRunMessage(connector.name, stale);
+        await this.pipeline.finishRun(stale.id, {
+          status: 'failed',
+          error: reason,
+          logs: [...stale.logs, reason],
+        });
+        lines.push(
+          `Closed run ${stale.id}, an earlier attempt at snapshot ${snapshotId} that was still marked running and had recorded no outcome of its own.`,
+        );
+        this.logger.warn(`${connector.name}: ${reason}`);
+      }
+
+      return lines;
+    } catch (error) {
+      // Warned rather than swallowed, and warned rather than thrown. See the
+      // docblock: this is a note about a run that is already over.
+      this.logger.warn(
+        `Could not check "${connector.name}" for attempts left open at snapshot ${snapshotId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return [];
+    }
+  }
+
+  /** Pull the raw records. Shaping is the transform's job, not this one's. */
+  private async fetch(rawConnector: CatalogConnector): Promise<RecordStream> {
     // Resolved here rather than at save time: a connection edited after a
     // connector was saved must take effect on the next run, which is the whole
     // point of naming it once.
@@ -423,7 +626,7 @@ export class ConnectorRunnerService {
         `Connector kind "${connector.kind}" has no fetcher. This should be unreachable — the kind list and this map are meant to move together.`,
       );
     }
-    return toFetchResult(
+    return toRecordStream(
       await source({
         connector,
         secret: resolveSecret(connector),
@@ -432,6 +635,48 @@ export class ConnectorRunnerService {
       }),
     );
   }
+}
+
+/**
+ * Everything an iterable yields, as an array.
+ *
+ * Named for what it costs. The one caller is the transform path, and the reason
+ * it is a separate function with this docblock rather than three lines inline is
+ * so that the next person to reach for it has to read why the transform path is
+ * allowed to do this and nothing else is.
+ */
+/**
+ * Whether a record can be written as a row at all.
+ *
+ * A string, a number or an array cannot be, and dropping one silently is how a
+ * load comes out short with nothing to explain it — which is why `fetched`
+ * counts what arrived and `written` counts what survived this, and the two being
+ * different is visible on the run. `WorkflowRunnerService` applies the identical
+ * filter to a source node's output, and says so.
+ */
+function isRowRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+async function collect(records: AsyncIterable<unknown>): Promise<unknown[]> {
+  const collected: unknown[] = [];
+  for await (const record of records) collected.push(record);
+  return collected;
+}
+
+/**
+ * What a run that vanished should have said, in the one place it can still be
+ * written down.
+ *
+ * It names the three things that produce this row and refuses to pick between
+ * them, because from inside the runner they are the same fact: nothing wrote an
+ * outcome. Naming only the lease would be a guess with a plausible-sounding
+ * cause attached, which is worse than the silence it replaces. What it can do is
+ * say where the difference is recorded, so the next person does not have to
+ * discover `durable_step_checkpoints` for themselves the way the first one did.
+ */
+function abandonedRunMessage(connectorName: string, run: ConnectorRun): string {
+  return `This run of "${connectorName}" was still marked running when another attempt at snapshot ${run.snapshotId} started, and it recorded no outcome of its own — it had fetched ${run.fetched} and written ${run.written}. A step whose lease expired, a pod that was killed, and a process that died between starting and finishing all look like this from here: nothing failed, so nothing was written down. The engine's side of it is in durable_step_checkpoints for ${run.snapshotId}, where a rising "attempts" against an empty error is a lease expiring rather than a source refusing.`;
 }
 
 /**
