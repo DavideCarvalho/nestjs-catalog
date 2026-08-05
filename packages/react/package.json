@@ -1,6 +1,6 @@
 {
   "name": "@dudousxd/nestjs-catalog-react",
-  "version": "0.13.0",
+  "version": "0.14.0",
   "description": "Ready-made React screens for @dudousxd/nestjs-catalog — a model manager and a generic object explorer you can drop into your own app shell.",
   "license": "MIT",
   "author": "Davide Carvalho",

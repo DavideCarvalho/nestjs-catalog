@@ -1,6 +1,6 @@
 {
   "name": "@dudousxd/nestjs-catalog-secrets-vault",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "HashiCorp Vault Transit secret vault for @dudousxd/nestjs-catalog: connection credentials encrypted by Vault, so the key never reaches the application and rotation never reaches the database.",
   "license": "MIT",
   "author": "Davide Carvalho",

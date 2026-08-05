@@ -1,5 +1,219 @@
 # @dudousxd/nestjs-catalog
 
+## 0.11.0
+
+### Minor Changes
+
+- 4d28056: A workflow can be saved unfinished, and publishing is what validates it
+
+  Validation used to be the gate on _saving_. `MySqlPipelineStore.saveWorkflow` ran
+  `validateWorkflow` and refused anything with an issue — `"<name>" cannot run as
+drawn.` — so a graph you had not finished could not be written down at all, and
+  closing the tab lost it. A saved workflow was, by definition, one that runs.
+
+  That also made the canvas lie about ordinary work. Clicking **+ Sink** produced a
+  node that "is not reachable from any source" and "does not say which object type
+  it writes": both true, both useless one second after the click, because a
+  just-added node is unwired by construction.
+
+  So the gate moved rather than loosened. `CatalogWorkflow` gains
+  `status: 'draft' | 'ready'`. A draft saves without validating; only a `ready`
+  graph runs, is schedulable, or is promoted. The same `validateWorkflow` still
+  decides — a draft is not a graph that skipped the rules, it is a graph nobody has
+  claimed is finished yet.
+
+  ## What a host does on upgrade
+
+  **The schema gains one column, and its default is the decision.**
+  `catalog_workflow.status` is `varchar(16) NOT NULL DEFAULT 'ready'`, applied by
+  `ensureCatalogSchema` like every other change in this package — there is nothing
+  to run by hand. It backfills every existing row to `ready`, deliberately: each
+  one got there through a save that refused anything invalid, so each is a graph
+  that was valid when it was written, which is exactly what `ready` asserts.
+  Defaulting to `draft` would have been the conservative-looking choice and would
+  have silently stopped every scheduled connector on the deployment the moment the
+  migration ran, because a connector may only run a ready graph. A default that
+  turns an upgrade into an outage is the wrong default.
+
+  **New graphs now arrive as drafts.** Anything automating `POST workflows` and
+  expecting the result to be immediately runnable must now call
+  `POST workflows/:id/publish`. This is the one behavioural break: a script that
+  created a workflow and attached a connector to it in the same breath will now be
+  refused at the connector save until it publishes.
+
+  **Two new routes**, both `catalog:write`: `POST workflows/:id/publish` and
+  `POST workflows/:id/unpublish`. Publishing is a transition rather than a field on
+  save because "ready" is a claim that has to be checked, and a check that fails
+  owes an explanation naming the nodes — a boolean on a save request has nowhere to
+  put that which is not an error on an operation the author thought was about
+  something else.
+
+  **Two new store methods.** `CatalogWorkflowStore` gains `publishWorkflow` and
+  `unpublishWorkflow`, and `supportsWorkflows` now asks for `publishWorkflow` by
+  name. A custom store implementing the interface must add both; one that has the
+  save and not the transition would narrow cleanly and then fail one call into a
+  promotion that had already written types and transforms into the target.
+
+  ## The three refusals worth knowing about
+
+  **A connector may only point at a `ready` workflow, refused at save.** The check
+  could equally have lived in the runner, and that is the version worth arguing
+  against: it would move the error from the person wiring the connector — who is
+  looking at the screen and can fix it in one edit — to a scheduled window at 3am.
+
+  **A published workflow edited into an invalid state is refused, not demoted.**
+  Silently dropping it back to `draft` was the alternative, and it is the one that
+  loses a running pipeline without saying so: connectors may only run ready graphs,
+  so the demotion would disable a scheduled load with nothing reported. Unpublish
+  it explicitly to park a broken idea on a live graph.
+
+  **Unpublishing is refused while any connector still runs the graph**, naming
+  them, exactly as `deleteWorkflow` already did. Cascading — disabling those
+  connectors here — was rejected on principle: turning off somebody's loads as a
+  side effect of an edit to something else is the silent action this status exists
+  to prevent.
+
+  ## Promotion
+
+  Drafts are not in the promotable set at all, which is stronger than refusing a
+  draft promotion and is the statement worth making: a draft may have no sink, so
+  there is not even a well-formed thing to describe to a reviewer. Nothing can be
+  hidden by the omission, because no connector can reference one. `promoteWorkflows`
+  now saves _and publishes_, since a save drafts and the connector phase that
+  follows cannot attach to a draft — and the publish re-validates the graph against
+  the transforms that actually arrived in the target rather than trusting that it
+  was ready in the source.
+
+- 67741ab: Two security fixes on the pipeline surface: who may execute a transform, and what a graph serves.
+
+  **`POST pipeline/transforms/try` is code execution and is now authorised as such.** It was the only
+  route on the controller that never called `requirePrincipal`, and it did not check that
+  `body.language` was a language the way `saveTransform` does. It reached `SubprocessTransformRunner`
+  on `catalog:write` alone — and that runner is honest in its own docblock about not being a security
+  boundary, because the child reads the parent's whole environment back out of `/proc/<ppid>/environ`
+  whatever the `env` allowlist withholds, and reads the filesystem as the service's own user. So the
+  softest thing on that route was the only thing holding the door.
+
+  It now requires a principal, at least one `writeTypes` grant, and a signed-in person
+  (`@RequireHuman()` — this is the decorator's first use anywhere; declare `REQUIRES_HUMAN` in your
+  guard). **Breaking for hosts** whose console calls this route with a machine principal, or with a
+  principal holding `catalog:write` and no per-type write grant: both now get 403.
+
+  The bar is deliberately the same one the graph path already charges rather than a higher one — a
+  principal that may write some type can already run the same code by saving a transform, saving a
+  graph and pressing Run. That residual is the trust model, and it is now written down in the pipeline
+  README under "Running a transform is running code" instead of only in a JSDoc, along with the
+  supported way to change it (bind your own `TransformRunner`).
+
+  **`GET pipeline/workflows` served source-node credentials verbatim.** A `WorkflowSourceNode` carries
+  the same `config` vocabulary a connector does, so a URL with a password in a graph was readable by
+  anyone holding `catalog:read` — the audience `redactConnector`/`redactConnection` were written for,
+  through the one route nobody had counted as a connector route. Source configs are now redacted on the
+  way out, and restored per node id on the way back in, so a console that reads a graph and posts it
+  back does not overwrite the credential with the placeholder. The save responses of `POST workflows`,
+  `POST connectors` and `POST connections` are redacted too: each returns the row it just restored, so
+  an unredacted response undid the read redaction in a single request.
+
+  `SubprocessTransformRunner` also gets three fixes worth having regardless of the above: `stderr` is
+  bounded at 64 KiB (it accumulated without any cap for the whole timeout window, growing the _parent's_
+  heap until the pod died), the timeout kills the child's process group rather than one pid (so a
+  transform that spawned anything no longer outlives it), and the child runs in a temporary directory
+  rather than inheriting the service's, where `readFileSync(".env")` reached the host application's
+  configuration.
+
+- f2f5d7c: Credentials can be encrypted before they rest in the catalog's own tables
+
+  The redaction stopped a connection password travelling in an HTTP response. The
+  refusal stopped a new one being written. Neither does anything for the reader
+  this is about: a database dump, a read replica, a nightly backup, or anybody
+  holding `SELECT` on the instance. For them `catalog_connection.config` was a
+  list of every password the catalog knew — and `allowInlineCredentials` enlarges
+  that population on purpose, which is why this is worth building now.
+
+  **`CatalogSecretVault`, a seam and not a cipher.** There is no encryption in
+  this library and there must not be: shipping AES with a key from an environment
+  variable moves the problem from one column to one variable, and leaves this
+  package answering for key rotation and per-environment separation that the
+  host's KMS or Vault already answers for. Bind `CATALOG_SECRET_VAULT` — to one
+  vault, or to an array of them, which is what lets a key rotation happen without
+  an outage: the first seals, and any of them may open, matched on the `vault`
+  name every row carries.
+
+  **The default refuses.** Unbound, `RefusingSecretVault` throws on `seal` naming
+  the token. A default that quietly stored plaintext would make
+  `encryptCredentials: true` a no-op with a reassuring name — saves would succeed
+  and the column would be exactly as it was.
+
+  **`encryptCredentials`, and how it composes with `allowInlineCredentials`.**
+  Four combinations, three meanings, and no fourth: sealing runs _before_ the
+  refusal is asked, so a sealed credential is an object by the time anything looks
+  for a password-bearing string. `false/false` refuses (unchanged, and the
+  default). `false/true` and `true/true` seal. `true/false` is the deliberate
+  dev-environment plaintext trade the flag already documented. The combination
+  worth naming is `allowInlineCredentials: false, encryptCredentials: true` — it
+  reads like a contradiction and is the one a production deployment wants.
+
+  **The store opens on every read**, whatever the flag currently says, so turning
+  encryption off keeps existing rows readable rather than being a data-loss
+  button. It also means nothing downstream learns that a vault exists: `fetchSql`
+  still gets a URL, and — the sharper reason — `restoreRedactedSecrets` still
+  gets a string to compare against. Had reads handed out ciphertext, the console
+  round trip would have written the literal `REDACTED` over the credential, which
+  is the classic way a fix of this shape corrupts what it protects. **The
+  redaction is unchanged and stays**: it defends against `catalog:read` over HTTP,
+  sealing defends against `SELECT` on the database, and dropping either because
+  the other exists gives that attacker the password back.
+
+  **What is sealed** is what the refusal already recognises — a top-level string
+  that parses as a URL carrying a password — and not the whole `config` object.
+  One predicate, two consumers: seal something the redaction does not hide and a
+  console renders a ciphertext blob; hide something this does not seal and the
+  column still holds the password. Sealing everything would also blind the
+  refusal, which needs a string to inspect.
+
+  **Rows already holding plaintext** are sealed on their next save and not before.
+  No read-through-reseal — a read that writes can fail a connector run for a
+  bookkeeping reason, and these rows are read on the runner's hot path — and no
+  one-shot migration in this release. The column takes both forms indefinitely,
+  `isSealedSecret` tells them apart, and a migration written later needs no schema
+  change.
+
+  **A vault that is down fails a save, and fails a read _retryably_.** A save that
+  cannot seal writes nothing; there is deliberately no catch that logs and stores
+  the plaintext, because a deployment that did that during an outage would have no
+  way afterwards to find out which credentials went in clear. A read that cannot
+  open throws `SecretOpenFailedError`, which is pointedly **not** a
+  `BadRequestException` — `ConnectorRunSteps` catches that class and converts it
+  to a non-retryable `connector_unavailable`, so a five-second vault blip would
+  have become a load that never ran and an operator hunting for a connector nobody
+  deleted. It is fatal only when waiting provably cannot help: nothing bound,
+  nothing bound under the row's vault name, or the vault's own error saying so.
+
+  **`saveWorkflow` refuses and seals a source node's credential too.**
+  `WorkflowSourceNode` promised "credentials stay out of the catalog here exactly
+  as they do everywhere else" and nothing enforced it: the graph was written
+  verbatim, and the workflow runner spreads `node.config` into a synthesised
+  connector, so `fetchSql` read `config.url` from there exactly as it does from a
+  connector's. Same predicate, applied per node; grandfathering compares per node
+  id, so renaming a graph does not refuse over a credential nobody touched. The
+  graph fingerprint is taken before sealing, so a non-deterministic ciphertext
+  never registers as a new version.
+
+### Patch Changes
+
+- 7e8d541: The canvas can see what a draft is, and stops promising a refusal that no longer happens
+
+  `WORKFLOW_STATUSES`, `WorkflowStatus` and `isWorkflowStatus` are exported from
+  the client entry point, alongside the node kinds and issue codes already there
+  and for the same stated reason: an editor that cannot see the vocabulary
+  restates it, and the copy is what drifts.
+
+  The Save tooltip said "the server will refuse the graph". That was true before
+  drafts and is now wrong in the case it fires most often: saving an unfinished
+  graph **succeeds** — it is stored as a draft, which is the whole point. The
+  refusal moved to publishing. A hint that still promised one would be
+  confidently wrong, which is worse than saying nothing.
+
 ## 0.10.0
 
 ### Minor Changes
