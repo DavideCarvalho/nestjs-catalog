@@ -118,6 +118,7 @@ import {
 import { WORKFLOW_NAME } from './workflow/name';
 import { WorkflowNodeProvider, workflowNodeTypes } from './workflow/nodes';
 import { RunsAsPanel } from './workflow/runs';
+import type { ShapeKnowledge, SourceShape } from './workflow/shape';
 import {
   type WorkflowProblem,
   type WorkflowProblemCode,
@@ -1391,6 +1392,31 @@ function discoveryTarget(
   return { workflowId: draft.id };
 }
 
+/**
+ * Whether an edit changed where this node reads from, or only what it is
+ * called.
+ *
+ * The question a discovered shape's shelf life turns on. Everything compared
+ * here is part of the address the server would dial — the kind of system, the
+ * connection it borrows, whether it reads the lot or from a watermark, and the
+ * config that holds the URL or the statement. A name, a position and a
+ * selection are none of those, and dropping the columns for one of them would
+ * make the check disappear for the most ordinary edit there is.
+ *
+ * `config` is compared as JSON because it is an open record — both sides are
+ * built by `sourceConfigFrom`, so the key order is stable, and the failure mode
+ * of a false difference is silence rather than a wrong answer.
+ */
+function readsDifferently(before: WorkflowNode | undefined, after: WorkflowNode): boolean {
+  if (before?.kind !== 'source' || after.kind !== 'source') return false;
+  return (
+    before.sourceKind !== after.sourceKind ||
+    before.connectionId !== after.connectionId ||
+    before.mode !== after.mode ||
+    JSON.stringify(before.config ?? {}) !== JSON.stringify(after.config ?? {})
+  );
+}
+
 function Canvas({
   title = WORKFLOW_NAME.titlePlural,
   eyebrow = 'Ingestion',
@@ -1455,6 +1481,24 @@ function Canvas({
    * somebody finished with.
    */
   const [unstarted, setUnstarted] = useState<ReadonlySet<string>>(() => new Set<string>());
+  /**
+   * What discovery said each source node reads, for the source nodes somebody
+   * has actually asked about in this session.
+   *
+   * Component state for the same reason `unstarted` is, and kept HERE rather
+   * than inside `SchemaDiscoveryPanel` because that panel is unmounted with the
+   * inspector: the columns somebody just read would be gone by the time they
+   * looked at the Problems rail, which is where the comparison in
+   * `workflow/shape.ts` is drawn. The panel tells this through `onDiscovered`.
+   *
+   * Empty is the state every graph starts in, and it means "nobody asked" — not
+   * "nothing to report". That distinction is the whole basis of the column
+   * checks, and it survives here because the map is only ever written by a
+   * discovery somebody ran.
+   */
+  const [shapesByNode, setShapesByNode] = useState<ReadonlyMap<string, SourceShape>>(
+    () => new Map(),
+  );
 
   /**
    * The last thing the canvas refused, and the last thing it did.
@@ -1491,6 +1535,10 @@ function Canvas({
     // Everything in a freshly loaded draft came off the server, so nothing in it
     // is "not finished yet" — see `partitionProblems`.
     setUnstarted(new Set<string>());
+    // A discovered shape belongs to the node it was read for, and node ids do
+    // not cross graphs. Keeping the map would be this screen holding one graph's
+    // columns while drawing another's — silence is the right state on arrival.
+    setShapesByNode(new Map());
     menu.reset();
   }, [workflows.data, selected, menu.reset]);
 
@@ -1516,9 +1564,34 @@ function Canvas({
     [transforms],
   );
 
+  /**
+   * The two halves of the column check, or nothing at all.
+   *
+   * `undefined` until a discovery has actually been run on this graph, and that
+   * is the load-bearing part rather than an optimisation: an implementation
+   * whose `sourceShape` always answered `undefined` would look like an answer
+   * and report the same silence, and `shape.ts` is written on the assumption
+   * that being handed a {@link ShapeKnowledge} means somebody can answer with
+   * it. An empty map is "nobody asked", and it says so by being absent.
+   *
+   * The types come from the snapshot this screen already holds, so the catalog
+   * half costs no request. A snapshot that has not arrived yet answers nothing,
+   * which reads as "this console cannot see that type" for the one render
+   * before it does — a warning, never an error, which is exactly the outcome a
+   * momentarily-unknown type deserves.
+   */
+  const shapes = useMemo<ShapeKnowledge | undefined>(() => {
+    if (shapesByNode.size === 0) return undefined;
+    const types = new Map((snapshot?.types ?? []).map((type) => [type.name, type]));
+    return {
+      sourceShape: (nodeId) => shapesByNode.get(nodeId),
+      targetShape: (typeName) => types.get(typeName),
+    };
+  }, [shapesByNode, snapshot]);
+
   const problems = useMemo(
-    () => validateWorkflow({ nodes: draft.nodes, edges: draft.edges }, { transformIds }),
-    [draft.nodes, draft.edges, transformIds],
+    () => validateWorkflow({ nodes: draft.nodes, edges: draft.edges }, { transformIds, shapes }),
+    [draft.nodes, draft.edges, transformIds, shapes],
   );
   /**
    * The same checks, split by whether the node they name is finished.
@@ -1633,6 +1706,31 @@ function Canvas({
    */
   const markStarted = useCallback((...ids: string[]) => {
     setUnstarted((current) => without(current, ids));
+  }, []);
+
+  /**
+   * A discovery landed, so the column check has something to say about this
+   * node.
+   *
+   * The response is stored as-is: `ConnectorSchemaDiscovery` already IS a
+   * {@link SourceShape} — same `columns`, same `basis`, same `sampled` — and
+   * that is not a coincidence worth papering over with a conversion. The two
+   * were written against the same route. A mapping function here would be a
+   * place for the two to quietly drift, and would have to invent an answer for
+   * every field it did not copy.
+   */
+  const rememberShape = useCallback((nodeId: string, shape: SourceShape) => {
+    setShapesByNode((current) => new Map(current).set(nodeId, shape));
+  }, []);
+
+  /** The columns on file stop describing this node. See the caller. */
+  const forgetShape = useCallback((nodeId: string) => {
+    setShapesByNode((current) => {
+      if (!current.has(nodeId)) return current;
+      const next = new Map(current);
+      next.delete(nodeId);
+      return next;
+    });
   }, []);
 
   const disconnect = useCallback(
@@ -2224,11 +2322,32 @@ function Canvas({
         pending={problemsOf(pendingFor, inspectingNode)}
         discovery={discovery}
         discoverable={discoveryTarget(draft)}
+        onDiscovered={rememberShape}
         onClose={() => setInspecting(null)}
         onChange={(next) => {
           // Editing any field is the clearest statement there is that somebody
           // is working on this node rather than looking at one they just made.
           markStarted(next.id);
+          // A discovered shape describes the source as it was addressed when it
+          // was read. Change where or what this node reads and the columns on
+          // file stop being about this node, so they are dropped rather than
+          // compared — reporting a missing column against a query somebody has
+          // since rewritten would be the validator inventing a fact, which is
+          // the one thing `shape.ts` refuses to do. Renaming the node keeps
+          // them: a name is not an address.
+          //
+          // Asked out here, against the rendered draft, rather than inside the
+          // updater below: an updater is called again on every re-render React
+          // decides to replay, and a `setState` in one is a side effect that
+          // would fire with it.
+          if (
+            readsDifferently(
+              draft.nodes.find((node) => node.id === next.id),
+              next,
+            )
+          ) {
+            forgetShape(next.id);
+          }
           edit((current) => ({
             ...current,
             nodes: current.nodes.map((node) => (node.id === next.id ? next : node)),
@@ -3094,6 +3213,7 @@ function KindInspector({
   canEdit,
   discovery,
   discoverable,
+  onDiscovered,
   onChange,
   onEditCode,
   onCreateTransform,
@@ -3112,6 +3232,8 @@ function KindInspector({
    */
   discovery: SchemaDiscoveryBridge;
   discoverable: { workflowId: string } | { workflowId?: undefined; because: string };
+  /** And what it answered, passed back out for the same reason. */
+  onDiscovered: (nodeId: string, shape: SourceShape) => void;
   onChange: (node: WorkflowNode) => void;
   onEditCode: (nodeId: string) => void;
   onCreateTransform: (nodeId: string) => void;
@@ -3144,6 +3266,7 @@ function KindInspector({
         canEdit={canEdit}
         discovery={discovery}
         discoverable={discoverable}
+        onDiscovered={onDiscovered}
         onChange={onChange}
       />
     );
@@ -3170,6 +3293,7 @@ function NodeInspector({
   pending,
   discovery,
   discoverable,
+  onDiscovered,
   onClose,
   onChange,
   onConnect,
@@ -3189,6 +3313,8 @@ function NodeInspector({
   canEdit: boolean;
   discovery: SchemaDiscoveryBridge;
   discoverable: { workflowId: string } | { workflowId?: undefined; because: string };
+  /** What a discovery said, passed up so it outlives this sheet. */
+  onDiscovered: (nodeId: string, shape: SourceShape) => void;
   problems: WorkflowProblem[];
   pending: WorkflowProblem[];
   onClose: () => void;
@@ -3308,6 +3434,7 @@ function NodeInspector({
             canEdit={canEdit}
             discovery={discovery}
             discoverable={discoverable}
+            onDiscovered={onDiscovered}
             onChange={onChange}
             onEditCode={onEditCode}
             onCreateTransform={onCreateTransform}
@@ -3439,6 +3566,7 @@ function SourceInspector({
   canEdit,
   discovery,
   discoverable,
+  onDiscovered,
   onChange,
 }: {
   node: WorkflowSourceNode;
@@ -3454,6 +3582,15 @@ function SourceInspector({
    * for. `undefined` means press it.
    */
   discoverable: { workflowId: string } | { workflowId?: undefined; because: string };
+  /**
+   * What discovery said about this node, handed up rather than kept here.
+   *
+   * This sheet closes; the Problems rail beside the canvas does not. So the one
+   * screen that can compare these columns against the type a sink writes is the
+   * one that outlives the panel that read them — see the canvas's
+   * `shapesByNode`.
+   */
+  onDiscovered: (nodeId: string, shape: SourceShape) => void;
   onChange: (node: WorkflowNode) => void;
 }) {
   const [source, setSource] = useState<SourceDraft>(() => sourceDraftFrom(node.config));
@@ -3581,6 +3718,7 @@ function SourceInspector({
         workflowId={discoverable.workflowId ?? ''}
         nodeId={node.id}
         bridge={discovery}
+        onDiscovered={onDiscovered}
         {...(discoverable.workflowId === undefined ? { disabledReason: discoverable.because } : {})}
       />
     </div>
