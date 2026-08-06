@@ -382,9 +382,8 @@ export class WorkflowRow {
    * is still written, but as a copy for evidence — this is what
    * `ConnectorScheduler` parses. Keeping both and being explicit about which is
    * the authority is the point: the alternative, dropping the connector's copy,
-   * would have thrown away the record of what each of the adopted connectors was
-   * doing before the move, at exactly the upgrade where somebody might need to
-   * check.
+   * would have thrown away the only record of when a connector belonging to no
+   * graph fires, and those are exactly the rows no screen can show.
    */
   @Property({ length: 128, nullable: true })
   schedule?: string;

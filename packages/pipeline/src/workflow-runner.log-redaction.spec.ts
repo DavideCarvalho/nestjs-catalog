@@ -77,7 +77,6 @@ function harness() {
     // by name, so a double missing one reads as a store that cannot hold a
     // workflow at all.
     saveWorkflowSchedule: () => Promise.resolve(undefined),
-    adoptConnector: () => Promise.resolve(undefined),
     writeStage: () => Promise.resolve(),
     readStage: () => Promise.resolve([]),
     dropStages: () => Promise.resolve(0),

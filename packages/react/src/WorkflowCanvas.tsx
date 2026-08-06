@@ -91,7 +91,6 @@ import {
   toFlowNodes,
 } from './workflow/graph';
 import {
-  AdoptionNote,
   PublishControls,
   RunControls,
   SchedulePanel,
@@ -2156,7 +2155,7 @@ function Canvas({
         <p className="mt-0.5 max-w-3xl text-xs text-zinc-500 dark:text-zinc-400">{intro}</p>
 
         <DurabilityBanner durability={durability} />
-        {stored && <AdoptionNote workflow={stored} />}
+        {workflows.isSuccess && workflows.data.length === 0 && <NothingDrawnYet />}
 
         <div className="mt-2.5 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
           <SelectField
@@ -2510,6 +2509,47 @@ function CanvasSkeleton() {
         <ArrowRight size={14} className={MUTED} />
         <div className="h-16 w-48 animate-pulse rounded-lg bg-zinc-200 dark:bg-zinc-800" />
       </div>
+    </div>
+  );
+}
+
+/**
+ * That there are none, said rather than drawn as a blank canvas.
+ *
+ * The zero case used to be nearly unreachable: a deployment that had connectors
+ * got them wrapped into graphs at boot, so `#workflows` opened onto thirteen of
+ * them. Nothing wraps anything now — a graph exists because somebody drew one —
+ * so a deployment that has never drawn one opens onto an empty canvas, which is
+ * pixel-identical to a workflow whose nodes have all been deleted and to a list
+ * that failed to load in a way the query did not notice.
+ *
+ * So it says which of the three it is, and what to do about it. The distinction
+ * this file already draws between {@link CanvasSkeleton} and
+ * {@link CanvasFailure} is the same one, for the same reason: three states that
+ * render identically and mean different things need one of them to speak.
+ *
+ * It carries no button. The control that creates a workflow is the `New
+ * workflow` option already selected in the picker three lines below this note,
+ * and a second affordance pointing at the same act is how somebody ends up
+ * wondering whether the two do different things.
+ */
+function NothingDrawnYet() {
+  return (
+    <div
+      className={cn(
+        'mt-2.5 flex flex-wrap items-baseline gap-x-2 rounded-md border border-dashed px-2.5 py-1.5',
+        RULE,
+      )}
+    >
+      <p className={cn('font-mono text-[10px] uppercase tracking-[0.14em]', MUTED)}>
+        No {WORKFLOW_NAME.plural} yet
+      </p>
+      <p className={cn('text-[11px] leading-relaxed', MUTED)}>
+        Nothing is missing — this deployment has never had one drawn. Add a source, wire it into a
+        sink and save, and it becomes the first. If this deployment has connectors already loading
+        data, they are not shown here and nothing turns them into {WORKFLOW_NAME.plural}
+        automatically.
+      </p>
     </div>
   );
 }

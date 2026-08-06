@@ -134,7 +134,6 @@ function storeOf(workflows: CatalogWorkflow[], connectors: CatalogConnector[]) {
     saveWorkflow: () => Promise.reject(new Error('the scheduler writes nothing')),
     publishWorkflow: () => Promise.reject(new Error('the scheduler writes nothing')),
     saveWorkflowSchedule: () => Promise.reject(new Error('the scheduler writes nothing')),
-    adoptConnector: () => Promise.reject(new Error('the scheduler writes nothing')),
     connectorsUsingWorkflow: (id: string) =>
       Promise.resolve(connectors.filter((c) => c.workflowId === id)),
     listConnectors: () => Promise.resolve(connectors),

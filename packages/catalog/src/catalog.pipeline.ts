@@ -2031,49 +2031,6 @@ export interface CatalogWorkflowStore {
     input: { schedule?: string; enabled?: boolean },
     changedBy: string,
   ): Promise<CatalogWorkflow>;
-  /**
-   * Wrap a connector that predates workflows into the graph it always was.
-   *
-   * **The upgrade path, and the reason removing `POST connectors` does not
-   * orphan anything.** A deployment upgrading into this change has connectors
-   * that were authored directly — a kind, a config, optionally one transform,
-   * and a target type — and no route can edit them any more. Three outcomes
-   * were possible: migrate them, leave them readable but frozen, or make
-   * somebody rebuild each by hand. This is the first, and it is chosen because
-   * the shape was already exactly representable: a connector *is* a
-   * single-source, single-sink graph with at most one transform in the middle,
-   * and it has been describable as one since `workflowId` existed.
-   *
-   * ## What is preserved, and why each matters
-   *
-   * - **The connector id.** It is the mutex key, the owner of every
-   *   `ConnectorRun` and the holder of the watermark. Minting a fresh connector
-   *   and leaving the old one would split one pipeline's history in two and
-   *   leave nothing serialising the halves against each other.
-   * - **The watermark, re-keyed.** A plain connector kept a flat `state`; a
-   *   graph keys it by source-node id. Carrying the blob over unchanged would
-   *   leave the new source node with no watermark at all, and the first run
-   *   after the upgrade would re-read an incremental source from the beginning —
-   *   which is not data loss, but is a surprise measured in hours on a large
-   *   source.
-   * - **The schedule**, moved to the graph, which is where it is authored now.
-   *
-   * ## What changes, stated plainly
-   *
-   * The graph is published as `ready` without a person having declared it
-   * finished, because refusing to publish would leave the pipeline not running —
-   * an upgrade that silently stops twelve loads is a worse outcome than one that
-   * carries a decision forward on the operator's behalf. It is validated first
-   * and the adoption is **refused** if the wrap does not validate, so nothing is
-   * published that could not have been drawn.
-   *
-   * Idempotent: a connector that already has a `workflowId` is left alone and
-   * answered `undefined`. That is what makes it safe to run at every boot.
-   */
-  adoptConnector(
-    connectorId: string,
-    adoptedBy: string,
-  ): Promise<{ workflow: CatalogWorkflow; connector: CatalogConnector } | undefined>;
 }
 
 /**

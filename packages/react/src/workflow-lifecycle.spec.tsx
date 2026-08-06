@@ -26,10 +26,11 @@
  * nothing on this console can produce one at all, and every graph would be a draft that never
  * fires.
  *
- * **3. Adoption.** Thirteen connectors on the dev deployment were wrapped into graphs at boot and
- * published as `ready` without a person declaring them finished. An operator opening a pipeline
- * they never drew, marked ready, deserves to be told where it came from — so `createdBy` is read
- * and said out loud rather than left to be inferred from a description that is often absent.
+ * **3. The empty list.** A boot hook used to wrap every pre-workflow connector into a graph, so
+ * this screen opened onto thirteen of them on the dev deployment and zero was a state almost
+ * nobody reached. Nothing wraps anything now — a graph exists because somebody drew one — so the
+ * empty list is an ordinary first-run state, and an empty canvas is pixel-identical to a graph
+ * whose nodes were all deleted. The tests below assert it says which it is.
  *
  * WHAT IS NOT ASSERTED
  * --------------------
@@ -251,29 +252,28 @@ function panel(heading: string) {
   return within(section);
 }
 
-describe('a graph nobody drew', () => {
-  it('says an adopted pipeline was adopted, rather than letting "ready" imply somebody agreed', async () => {
-    // Adoption publishes a wrapped connector as `ready` at boot. "Ready" then means "it
-    // validated", not "a person looked at it and said it was finished", and the difference is
-    // invisible unless the screen says it.
-    const { transport } = fakeTransport(
-      answersFor([workflow({ createdBy: 'connector-adoption' })]),
-    );
-    await openCanvas(transport);
+describe('a deployment with nothing drawn yet', () => {
+  it('says the list is empty rather than opening onto a blank canvas that looks broken', async () => {
+    // The zero case used to be nearly unreachable, because a boot hook wrapped every existing
+    // connector into a graph and this screen opened onto thirteen. Nothing does that now, so a
+    // deployment that has never drawn one lands here — and an empty canvas is pixel-identical to
+    // a graph whose nodes were all deleted.
+    const { transport } = fakeTransport(answersFor([]));
+    render(withCatalog(transport, <WorkflowCanvas />));
 
-    expect(screen.getByText('adopted')).toBeTruthy();
-    expect(screen.getByText(/was not drawn by anybody/)).toBeTruthy();
-    expect(screen.getByText(/run history and incremental watermark carried over/)).toBeTruthy();
+    expect(await screen.findByText(/never had one drawn/)).toBeTruthy();
+    // The half somebody with connectors still loading data needs, because the screen showing
+    // none of them is exactly what would otherwise read as data loss.
+    expect(screen.getByText(/nothing turns them into workflows/)).toBeTruthy();
   });
 
-  it('says nothing of the sort about a graph a person authored', async () => {
-    // The badge has to be a signal, not decoration. Rendering it for everything would make the
-    // one case it exists for unreadable.
+  it('says nothing of the sort once a graph exists', async () => {
+    // It has to be a signal, not furniture. Left on screen beside a workflow it would be a
+    // sentence contradicted by the thing next to it.
     const { transport } = fakeTransport(answersFor([workflow()]));
     await openCanvas(transport);
 
-    expect(screen.queryByText('adopted')).toBeNull();
-    expect(screen.queryByText(/was not drawn by anybody/)).toBeNull();
+    expect(screen.queryByText(/never had one drawn/)).toBeNull();
   });
 });
 

@@ -150,7 +150,7 @@ actually alive, and closes it when the engine has no record of it or reports it 
   `ORDER BY started_at DESC LIMIT CATALOG_RUN_RECONCILE_SCAN` over the run table, one
   `listConnectors` for the names, and one `engine.getRun` per row *currently* open — nought or one on
   a healthy deployment. Nothing in it grows with the data a load moves. Loaded on the same axis as the
-  scheduler and connector adoption (`reconcileRuns`, defaulting to `scheduler`), because it writes.
+  scheduler (`reconcileRuns`, defaulting to `scheduler`), because it writes.
 - **Three answers, and only two are writes.** No record of the run, or a terminal status, are closes.
   A non-terminal status — including one a later engine release adds — is left exactly alone: a row
   wrongly left `running` is visible and is the status quo, a row wrongly closed is a false outcome in

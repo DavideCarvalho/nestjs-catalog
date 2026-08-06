@@ -163,9 +163,6 @@ class MemoryPipelineStore implements CatalogPipelineStore {
     if (!workflow) throw new Error(`No workflow ${id}`);
     return Promise.resolve(workflow);
   }
-  adoptConnector(): Promise<undefined> {
-    return Promise.resolve(undefined);
-  }
   saveWorkflow(
     input: Pick<CatalogWorkflow, 'name' | 'nodes' | 'edges'> & { id?: string },
     createdBy: string,

@@ -110,7 +110,6 @@ function harness(options: Options = {}) {
     saveWorkflow: () => Promise.resolve(workflow),
     publishWorkflow: () => Promise.resolve(workflow),
     saveWorkflowSchedule: () => Promise.resolve(workflow),
-    adoptConnector: () => Promise.resolve(undefined),
     connectorsUsingWorkflow: () => Promise.resolve([]),
     getConnector: () => Promise.resolve(undefined),
     getConnection: () => Promise.resolve(undefined),

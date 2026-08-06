@@ -74,11 +74,11 @@ const connections = new Map<string, CatalogConnection>();
 const workflows = new Map<string, CatalogWorkflow>();
 
 /**
- * A one-source, one-sink graph — the shape a connector adopts into.
+ * A one-source, one-sink graph — the smallest thing anybody draws.
  *
- * `source` is a fixed node id rather than a UUID for the reason adoption uses
- * one: a node id is a durable step name, so a stable id is what makes two
- * readings of the same pipeline name the same thing.
+ * `source` is a fixed node id rather than a UUID, because a node id is a durable
+ * step name: a stable id is what makes two readings of the same pipeline name
+ * the same thing.
  */
 function workflow(
   source: Partial<WorkflowSourceNode> = {},
@@ -171,7 +171,6 @@ const pipelineStore = {
   deleteWorkflow: () => Promise.reject(new Error('nothing here deletes')),
   connectorsUsingWorkflow: () => Promise.resolve([]),
   saveWorkflowSchedule: () => Promise.reject(new Error('nothing here schedules')),
-  adoptConnector: () => Promise.resolve(undefined),
   writeStage: () => Promise.reject(new Error('discovery stages nothing')),
   readStage: () => Promise.resolve([]),
   dropStages: () => Promise.resolve(0),

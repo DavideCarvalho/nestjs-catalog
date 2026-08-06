@@ -542,9 +542,10 @@ export function createPipelineController(
      * It stays served rather than being hidden, because it is the answer to
      * questions a graph cannot answer about itself: which id a run history and a
      * watermark are actually keyed on, and — on a deployment upgraded rather
-     * than built fresh — which rows have not been adopted into a workflow yet.
-     * An internal record that no route exposes is one an operator debugs by
-     * opening the database.
+     * than built fresh — which rows belong to no graph at all. Nothing turns
+     * those into workflows, so this is the only surface they appear on, and an
+     * internal record that no route exposes is one an operator debugs by opening
+     * the database.
      */
     @Get('connectors')
     @RequireScopes('catalog:read')

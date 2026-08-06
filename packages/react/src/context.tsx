@@ -556,9 +556,10 @@ export interface CatalogClient {
    *
    * This read stays because it answers what a graph cannot answer about itself:
    * which id the run history and the incremental watermark are keyed on, and —
-   * on a deployment upgraded rather than built fresh — which rows have not been
-   * adopted into a workflow yet. `CatalogConnector.workflowId` is what joins one
-   * to the graph that runs it.
+   * on a deployment upgraded rather than built fresh — which rows belong to no
+   * graph at all. Nothing turns those into workflows; they keep loading on the
+   * path they were already on, and this read is the only place they are visible.
+   * `CatalogConnector.workflowId` is what joins one to the graph that runs it.
    */
   listConnectors(): Promise<CatalogConnector[]>;
   /**
