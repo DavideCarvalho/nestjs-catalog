@@ -100,6 +100,19 @@ export interface CatalogDatabase {
 export async function openCatalogDatabase(
   container: StartedMySqlContainer,
   dbName: string,
+  /**
+   * Every statement this catalog issues, as MikroORM logs it.
+   *
+   * For the suites whose subject is *how many* statements a path emits rather
+   * than what it returns — a per-batch cost is invisible to an assertion about
+   * the answer, because the answer is right either way. Counting them from the
+   * driver's own log is the only version of that question that cannot drift
+   * from what actually reached the server.
+   *
+   * Passing it switches `debug` on, which is itself a cost, so it is off unless
+   * a spec asks and no timing is ever taken from a run that passed it.
+   */
+  onQuery?: (sql: string) => void,
 ): Promise<CatalogDatabase> {
   // Through the container's own client rather than a connection of ours: there
   // is no database to connect *to* yet, and asking the server to make one is
@@ -150,7 +163,14 @@ export async function openCatalogDatabase(
     // it — three hours here, none in a UTC container, which is precisely the
     // sort of difference that gets blamed on the data.
     timezone: '+00:00',
-    debug: false,
+    ...(onQuery === undefined
+      ? { debug: false }
+      : {
+          debug: ['query'],
+          logger: (message: string) => {
+            onQuery(message);
+          },
+        }),
   });
 
   await ensureCatalogSchema(orm);
