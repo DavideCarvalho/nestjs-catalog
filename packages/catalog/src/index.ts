@@ -117,6 +117,22 @@ export {
   type WorkflowTransformNode,
   type WorkflowValidationIssue,
 } from './catalog.pipeline';
+// How a staged batch is written down. Exported because `CatalogStageStore` is a
+// seam a host can implement — a stage kept in object storage or a columnar
+// warehouse rather than the catalog database is the case the interface exists
+// for — and such a host needs the codec, not a description of it. Two stores
+// encoding the same batch differently would be a run that cannot resume across
+// a deployment that changed its mind about where stages live.
+export {
+  type ColumnarStageBatch,
+  STAGE_ENCODING,
+  STAGE_ENCODING_VERSION,
+  type StagePayload,
+  classifyStagePayload,
+  decodeStageRows,
+  encodeStageRows,
+  isColumnarStageBatch,
+} from './catalog.stage-encoding';
 // The environment surface: which catalog database a call is served from, and
 // how a connector or a transform is promoted between them.
 export * from './catalog.environment';

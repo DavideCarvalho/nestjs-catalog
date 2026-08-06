@@ -447,9 +447,25 @@ export class WorkflowStageRow {
   @Property()
   batch!: number;
 
-  /** The rows themselves. The only place in this model where rows are stored. */
+  /**
+   * The rows themselves. The only place in this model where rows are stored.
+   *
+   * `unknown` rather than `unknown[]`, because the column now holds either of
+   * two encodings and one of them is not an array. Batches written before
+   * `catalog.stage-encoding.ts` existed are a JSON array of row objects;
+   * batches written since are a tagged object that names each key-set once
+   * instead of once per row, which is half the bytes and therefore roughly half
+   * the `INSERT`. Nothing reads this property directly — `encodeStageRows` and
+   * `decodeStageRows` are the only two things that touch it, and the widened
+   * type is what stops a caller from indexing it as an array and getting the
+   * old shape's answer for the new one.
+   *
+   * The column type does not change, so no migration: a MySQL `JSON` column
+   * takes an object as readily as an array, and the ~16,233 batches already in
+   * the deployment stay exactly as they are and still read.
+   */
   @Property({ type: 'json' })
-  rows: unknown[] = [];
+  rows: unknown = [];
 
   @Property()
   rowCount = 0;
