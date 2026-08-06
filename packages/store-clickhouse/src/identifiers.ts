@@ -1,4 +1,4 @@
-import { assertSafeIdentifier } from '@dudousxd/nestjs-catalog';
+import { CATALOG_RESERVED_COLUMNS, assertSafeIdentifier } from '@dudousxd/nestjs-catalog';
 
 /**
  * Every table and column name in this service comes from another application
@@ -146,13 +146,28 @@ export const BATCH_COLUMN = '_batch';
  * nothing at read time.
  */
 export const ROW_COLUMN = '_row';
-export const RESERVED_COLUMNS = [
-  SNAPSHOT_COLUMN,
-  PRINCIPAL_COLUMN,
-  LOADED_AT_COLUMN,
-  BATCH_COLUMN,
-  ROW_COLUMN,
-];
+/**
+ * Taken from the core package rather than assembled from the five above.
+ *
+ * The docblock at the top of this file has said for a while that the identifier
+ * rule lives in the core package "next to `CATALOG_RESERVED_COLUMNS`, and taken
+ * from there for the same reason that list is" — and the list was not taken from
+ * there. It was built here, out of this adapter's own constants, and agreed with
+ * the core's by coincidence. That sentence was the bug: a reader who checked
+ * whether the two copies matched would have found the file already claiming they
+ * were one.
+ *
+ * They belong to the core for the reason it gives: these names are part of what
+ * the catalog promises a *reader* — the SQL console lists them, ad-hoc queries
+ * filter on them — so a per-adapter copy is a copy that can quietly stop matching
+ * the one a publisher was told about. The five constants above stay, because the
+ * DDL and the SELECT lists need each name on its own; what they no longer do is
+ * *define* the set. That the two still agree is not left to reading either — the
+ * spec beside this file asserts it, since a constant renamed here without the
+ * core list moving would otherwise mean a column this store writes that its own
+ * collision check cannot see.
+ */
+export const RESERVED_COLUMNS: readonly string[] = CATALOG_RESERVED_COLUMNS;
 
 /**
  * The batch number carried rows are written under.

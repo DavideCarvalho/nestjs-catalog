@@ -8,6 +8,7 @@ import {
   describeCatalogStoreContract,
 } from '../../../test/catalog-store-contract';
 import { ClickHouseWarehouseStore } from './clickhouse-warehouse.store';
+import { RESERVED_COLUMNS } from './identifiers';
 import { ensureCatalogClickHouseSchema } from './snapshots';
 
 /**
@@ -164,5 +165,78 @@ describe('ClickHouseWarehouseStore', () => {
     });
     expect(served.total).toBe(2);
     expect(served.rows.map((row) => row.id)).toEqual(['a', 'b']);
+  });
+
+  it('reserves exactly the columns the core package names, in the tables it creates', async () => {
+    // The list is taken from the core package now rather than assembled from
+    // this file's own constants, and this is the half of that move a re-export
+    // cannot guarantee: that the columns actually in the DDL are the columns a
+    // publisher's property name is checked against. Read off `system.columns`
+    // rather than off the constants, because the failure being guarded is a
+    // bookkeeping column that exists in the table and not in the list — which is
+    // a property this store writes into its own metadata with no collision
+    // reported and no error raised.
+    const type = contractType('ClickHouseReservedLayout');
+    await store.ensureType(type);
+
+    const columns = await client.query({
+      query: `SELECT \`name\` FROM system.columns
+              WHERE \`database\` = currentDatabase() AND \`table\` = {t:String}`,
+      query_params: { t: 'obj_clickhousereservedlayout' },
+      format: 'JSONEachRow',
+    });
+    const names = (await columns.json<{ name: string }>()).map((row) => row.name);
+    const declared = type.properties.map((property) => property.name);
+
+    expect(names.filter((name) => !declared.includes(name)).sort()).toEqual(
+      [...RESERVED_COLUMNS].sort(),
+    );
+  });
+
+  it('filters case-insensitively on contains, the way the search box already does', async () => {
+    // The one place this adapter deliberately does not transliterate MySQL, and
+    // the one worth a real server. ClickHouse's `LIKE` is case-sensitive where
+    // MySQL's is case-insensitive under the usual collations, so `contains` is
+    // `ILIKE` here — the same choice `read()` makes for the search term, for the
+    // same reason: a control that behaved differently depending on which adapter
+    // was mounted would be read as a bug in the data.
+    //
+    // `eq` is asserted right beside it as the counter-case, because it is NOT
+    // given that treatment and a reader should be able to see that it was a
+    // decision. Matching MySQL there would mean lowering both sides of every
+    // comparison — forfeiting the sparse index that is the reason to be on this
+    // engine — and would still not match, MySQL's default collation being
+    // accent-insensitive as well.
+    const type = contractType('ClickHouseFilterCase');
+    await store.ensureType(type);
+    await store.write(type, [contractRow('a', 'Alpha', 1), contractRow('b', 'bravo', 2)], {
+      snapshotId: 'case',
+      principalId: 'contract',
+      batch: 0,
+    });
+    await store.commit(type, 'case');
+
+    const label = type.properties.find((property) => property.name === 'label');
+    if (!label) throw new Error('the contract fixture lost its label property');
+
+    const contains = await store.read(type, ['id', 'label'], {
+      page: 1,
+      size: 50,
+      sort: 'id',
+      dir: 'asc',
+      filters: [{ property: label, op: 'contains', value: 'alp' }],
+    });
+    expect(contains.rows.map((row) => row.id)).toEqual(['a']);
+    expect(contains.total).toBe(1);
+
+    const exact = await store.read(type, ['id', 'label'], {
+      page: 1,
+      size: 50,
+      sort: 'id',
+      dir: 'asc',
+      filters: [{ property: label, op: 'eq', value: 'alpha' }],
+    });
+    expect(exact.rows).toEqual([]);
+    expect(exact.total).toBe(0);
   });
 });

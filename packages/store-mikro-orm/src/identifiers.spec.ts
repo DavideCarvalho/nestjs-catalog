@@ -8,11 +8,21 @@
  * core's rather than merely to look like it.
  */
 import {
+  CATALOG_RESERVED_COLUMNS,
   UnsafeIdentifierError as CatalogUnsafeIdentifierError,
   isSafeIdentifier,
 } from '@dudousxd/nestjs-catalog';
 import { describe, expect, it } from 'vitest';
-import { UnsafeIdentifierError, ident } from './identifiers';
+import {
+  BATCH_COLUMN,
+  LOADED_AT_COLUMN,
+  PRINCIPAL_COLUMN,
+  RESERVED_COLUMNS,
+  ROW_COLUMN,
+  SNAPSHOT_COLUMN,
+  UnsafeIdentifierError,
+  ident,
+} from './identifiers';
 
 /** Names a publisher has actually sent, plus the boundary the rule turns on. */
 const NAMES = [
@@ -59,5 +69,22 @@ describe('UnsafeIdentifierError', () => {
     // every assertion above and still break `error instanceof UnsafeIdentifierError` in the
     // pipeline package, turning a 400 that names the property into a 500 that names nothing.
     expect(UnsafeIdentifierError).toBe(CatalogUnsafeIdentifierError);
+  });
+});
+
+describe('RESERVED_COLUMNS', () => {
+  it("is the core package's list, not a copy of it that happens to agree", () => {
+    expect(RESERVED_COLUMNS).toBe(CATALOG_RESERVED_COLUMNS);
+  });
+
+  it('covers every bookkeeping column this adapter actually writes', () => {
+    // The half a re-export cannot give you. Taking the list from the core package stops it drifting
+    // from the *contract*; it does nothing about the five constants below drifting from the list,
+    // and those are what reach the DDL and the SELECT lists. A column this store writes and its own
+    // collision check cannot see is exactly what `_row` was before somebody named it — the same
+    // assertion is in the ClickHouse adapter's spec, so the two cannot come apart either.
+    expect([...RESERVED_COLUMNS].sort()).toEqual(
+      [SNAPSHOT_COLUMN, PRINCIPAL_COLUMN, LOADED_AT_COLUMN, BATCH_COLUMN, ROW_COLUMN].sort(),
+    );
   });
 });

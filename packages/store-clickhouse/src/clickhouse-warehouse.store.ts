@@ -1,7 +1,8 @@
 import type { ClickHouseClient } from '@clickhouse/client';
-import { CatalogRegistry, emitCatalog } from '@dudousxd/nestjs-catalog';
+import { CATALOG_FILTER_OPERATORS, CatalogRegistry, emitCatalog } from '@dudousxd/nestjs-catalog';
 import type {
   CarryForwardResult,
+  CatalogFilteringReadStore,
   CatalogMergeStore,
   CatalogObjectTypeDef,
   CatalogPropertyDef,
@@ -11,7 +12,9 @@ import type {
   CatalogQueryStore,
   CatalogReadQuery,
   CatalogReadResult,
+  CatalogResolvedFilter,
   CatalogStoreCapabilities,
+  ScalarType,
   SnapshotRef,
 } from '@dudousxd/nestjs-catalog';
 import { BadRequestException, Inject, Injectable, Logger, Optional } from '@nestjs/common';
@@ -157,8 +160,29 @@ export interface ClickHouseStoreCapabilities extends CatalogStoreCapabilities {
 }
 
 @Injectable()
-export class ClickHouseWarehouseStore implements CatalogMergeStore, CatalogQueryStore {
+export class ClickHouseWarehouseStore
+  implements CatalogMergeStore, CatalogQueryStore, CatalogFilteringReadStore
+{
   private readonly logger = new Logger(ClickHouseWarehouseStore.name);
+
+  /**
+   * Every operator, because every one of them is a predicate this engine can
+   * take — see {@link predicateFor}.
+   *
+   * Declared rather than assumed, and the absence of this line was the bug it
+   * replaces. The core package offers a screen exactly the operators its store
+   * reports and refuses a filter naming anything else, so a store that reported
+   * nothing did not fall back to filtering badly — it offered no controls at all
+   * and turned a hand-built filter into a refusal. That is the *correct* failure
+   * for a store that cannot filter and simply the wrong answer for this one,
+   * which has had the whole of `read()`'s WHERE clause available the entire time.
+   *
+   * Kept as the core's own list rather than a subset written out here, so an
+   * operator added to the contract fails in {@link predicateFor}'s exhaustiveness
+   * check — a compile error naming the operator — instead of being quietly
+   * offered by this line and then thrown on at read time.
+   */
+  readonly objectFilterOperators = CATALOG_FILTER_OPERATORS;
 
   readonly capabilities: ClickHouseStoreCapabilities = {
     snapshots: 'emulated',
@@ -830,6 +854,17 @@ export class ClickHouseWarehouseStore implements CatalogMergeStore, CatalogQuery
       }
     }
 
+    // Conjoined, and conjoined into the same `where` the count below uses. Two
+    // statements answer one paged read here — a `count()` and the page — and a
+    // filter applied to only one of them is a screen showing three rows above
+    // the words "of 4,812", which is a worse outcome than not filtering at all
+    // because it is not visibly wrong.
+    (query.filters ?? []).forEach((filter, index) => {
+      const predicate = filterPredicate(selected, filter, index);
+      where += ` AND ${predicate.sql}`;
+      Object.assign(params, predicate.params);
+    });
+
     const totals = await this.client.query({
       query: `SELECT count() AS total FROM ${ident(table)} WHERE ${where}`,
       query_params: params,
@@ -1136,4 +1171,146 @@ function primaryKeyProperties(type: CatalogObjectTypeDef): CatalogPropertyDef[] 
   }
 
   return resolved;
+}
+
+/**
+ * One filter, against a column this read is actually returning.
+ *
+ * The membership check is against `selected` rather than against the type, for
+ * the reason the MySQL adapter gives in the same place: the service already
+ * resolves a filter against the visible columns, so this can only fail for a
+ * caller building the query itself — and what it prevents is a predicate over a
+ * column the same request declined to return, which is how a hidden or
+ * classified value leaks out through row membership one `gte` at a time.
+ *
+ * `ident` is the guard on the column, the same one the SELECT list and the
+ * ORDER BY go through: a name outside a narrow character set is refused rather
+ * than escaped. Nothing a caller sent reaches it — the property came off the
+ * type — and no value reaches the statement text at all.
+ */
+function filterPredicate(
+  selected: CatalogPropertyDef[],
+  filter: CatalogResolvedFilter,
+  index: number,
+): { sql: string; params: Record<string, unknown> } {
+  const property = selected.find((p) => p.name === filter.property.name);
+  if (!property) {
+    throw new BadRequestException(
+      `${filter.property.name} is not among the columns this read returns, so it cannot be filtered on.`,
+    );
+  }
+  return predicateFor(ident(physicalColumn(property.name)), property.type, filter, `f${index}`);
+}
+
+/**
+ * One filter as a predicate and the parameters it binds.
+ *
+ * Every value is a named placeholder the driver binds, including the `%`
+ * wrapping for `contains`, which is built as a parameter rather than into the
+ * statement. The column is already quoted by `ident`.
+ *
+ * Four of these are not the naive translation, and the first two are wrong in
+ * exactly the ways the MySQL adapter documents:
+ *
+ * - `ne` matches rows whose column is NULL as well. `<>` is never true of NULL,
+ *   so "state is not FL" would drop every row with no state at all — and a
+ *   reader of that list would conclude those rows are in Florida.
+ * - `empty` counts the empty string as well as NULL on a text column. `coerce`
+ *   writes `''` as NULL on the way in, so today they are the same set here; a
+ *   column loaded by an older version of this store, or by hand, is where they
+ *   come apart, and "no value" has to mean no value on both.
+ *
+ * The other two are where this engine is genuinely not MySQL:
+ *
+ * - `empty` and `notEmpty` compare against `''` **only for the text types.**
+ *   MySQL will happily compare a `DOUBLE` to a string and coerce it; ClickHouse
+ *   refuses `Nullable(Float64) = String` outright, so the same predicate would
+ *   turn a filter on a number or a date column into an engine error. `IS NULL`
+ *   alone is the whole of the question on those columns anyway — a numeric
+ *   column has no empty string to hold.
+ * - `contains` is `ILIKE`, not `LIKE`, which is the same choice `read()` already
+ *   makes for the search box and for the same reason: ClickHouse's `LIKE` is
+ *   case-sensitive where MySQL's is case-insensitive under the usual collations,
+ *   and a control that behaved differently depending on which adapter was
+ *   mounted would look like a bug in the data rather than a difference between
+ *   engines.
+ *
+ * `eq` and `ne` are deliberately **not** given the same treatment, and the
+ * difference is worth stating rather than hiding: they compare exactly, so
+ * `label:eq:Alpha` matches on ClickHouse only what was stored as `Alpha`, where
+ * MySQL's default collation would also match `alpha`. Matching MySQL there would
+ * mean lowering both sides on every row, which forfeits the sparse index that is
+ * the reason to be on this engine — and it still would not match, because
+ * MySQL's default collation is accent-insensitive too and nothing here can
+ * reproduce that. `contains` is a free fix and gets one; `eq` is not, and is left
+ * as the engine's own answer.
+ */
+function predicateFor(
+  column: string,
+  type: ScalarType,
+  filter: CatalogResolvedFilter,
+  key: string,
+): { sql: string; params: Record<string, unknown> } {
+  const bound = { [key]: coerce(filter.value, type) };
+  const value = `{${key}:${placeholderType(type)}}`;
+  // A date is compared through the same best-effort parse the insert path uses,
+  // rather than left to an implicit cast. `coerce` hands over the ISO string it
+  // would have written, so the two sides of the comparison are produced by one
+  // function — the alternative is a filter that agrees with the stored value
+  // everywhere except the boundary where the server's own string-to-DateTime64
+  // rules differ from `date_time_input_format`.
+  const operand = type === 'date' ? `parseDateTime64BestEffort(${value}, 3, 'UTC')` : value;
+  const emptyable = type !== 'number' && type !== 'boolean' && type !== 'date';
+  const blank = emptyable ? ` OR ${column} = ''` : '';
+  const notBlank = emptyable ? ` AND ${column} != ''` : '';
+
+  switch (filter.op) {
+    case 'eq':
+      return { sql: `${column} = ${operand}`, params: bound };
+    case 'ne':
+      return { sql: `(${column} != ${operand} OR ${column} IS NULL)`, params: bound };
+    case 'contains':
+      return {
+        sql: `${column} ILIKE {${key}:String}`,
+        params: { [key]: `%${String(filter.value)}%` },
+      };
+    case 'gt':
+      return { sql: `${column} > ${operand}`, params: bound };
+    case 'gte':
+      return { sql: `${column} >= ${operand}`, params: bound };
+    case 'lt':
+      return { sql: `${column} < ${operand}`, params: bound };
+    case 'lte':
+      return { sql: `${column} <= ${operand}`, params: bound };
+    case 'empty':
+      return { sql: `(${column} IS NULL${blank})`, params: {} };
+    case 'notEmpty':
+      return { sql: `(${column} IS NOT NULL${notBlank})`, params: {} };
+    default:
+      // An operator added to the contract and not to this switch fails to
+      // compile here, which is what lets `objectFilterOperators` be the core's
+      // whole list rather than a subset restated above. The alternative to a
+      // `never` is a `default` that returns something true, which is a filter
+      // silently matching every row.
+      return unknownOperator(filter.op);
+  }
+}
+
+function unknownOperator(operator: never): never {
+  throw new BadRequestException(`This store cannot filter with ${String(operator)}.`);
+}
+
+/**
+ * The placeholder type a filter value is bound under.
+ *
+ * ClickHouse's parameters are typed at the call site — `{f0:String}` — so this
+ * has to agree with what {@link coerce} produces for the same scalar, which is
+ * why the two are read together: `boolean` becomes 0/1 and so binds as `UInt8`,
+ * `date` becomes an ISO string and so binds as `String` before being parsed back
+ * server-side.
+ */
+function placeholderType(type: ScalarType): string {
+  if (type === 'number') return 'Float64';
+  if (type === 'boolean') return 'UInt8';
+  return 'String';
 }
