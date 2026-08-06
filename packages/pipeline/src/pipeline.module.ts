@@ -10,6 +10,7 @@ import {
   type Provider,
   type Type,
 } from '@nestjs/common';
+import { CATALOG_PIPELINE_ENVIRONMENT, type CatalogEnvironmentNameResolver } from './code-context';
 import { ConnectionChecker } from './connection-checker.service';
 import { CATALOG_ADOPT_CONNECTORS, ConnectorAdoption } from './connector-adoption.service';
 import { ConnectorRunSteps } from './connector-run.steps';
@@ -254,6 +255,35 @@ export interface CatalogPipelineModuleOptions {
   reconcileRuns?: boolean;
   /** Passed to `SubprocessTransformRunner` for Python transforms. */
   pythonVenv?: string;
+  /**
+   * What this deployment calls the copy of the world it is serving — `dev`,
+   * `prod`, `staging`.
+   *
+   * Surfaced to transform code as `context.environment`, and to nothing else.
+   * Nothing in the catalog routes on it, nothing refuses on it; it exists
+   * because a transform that has to behave differently in production otherwise
+   * sniffs a variable, and `context.environment === 'prod'` is a line a reviewer
+   * can check while `process.env.NODE_ENV !== 'development'` is one they have to
+   * go and look up.
+   *
+   * A function when the answer is not fixed for the process. A host that routes
+   * several environments through one deployment resolves it per call from
+   * whatever scope is active, exactly as it does for the EntityManager, and a
+   * plain string there would stamp every run with whichever environment
+   * happened to be current at boot:
+   *
+   * ```ts
+   * CatalogPipelineModule.forRoot({
+   *   environmentName: () => currentEnvironment()?.id,
+   * })
+   * ```
+   *
+   * Omitting it leaves `context.environment` absent, which is a different
+   * statement from `'dev'` and the only honest one available: this package has
+   * no environment identity it can read — `WorkflowLauncher` sets out why — so
+   * a default derived from `NODE_ENV` would be a guess presented as a fact.
+   */
+  environmentName?: string | CatalogEnvironmentNameResolver;
 }
 
 /**
@@ -345,6 +375,22 @@ export class CatalogPipelineModule {
     // for first.
     if (options.expectations) providers.push(options.expectations);
 
+    // Only when the host named one, so that an absent binding stays absent
+    // rather than resolving to a provider that returns `undefined` — the two
+    // are the same at runtime and only one of them survives a host binding the
+    // token from a module in `imports`.
+    //
+    // Normalised to a function here rather than at the reader, because there is
+    // one reader today and there will be three by the time the conditional node
+    // lands, and a `string | (() => string | undefined)` at each of them is
+    // three chances to call a string.
+    if (options.environmentName !== undefined) {
+      const name = options.environmentName;
+      const resolve: CatalogEnvironmentNameResolver =
+        typeof name === 'function' ? name : () => name;
+      providers.push({ provide: CATALOG_PIPELINE_ENVIRONMENT, useValue: resolve });
+    }
+
     // No path, no controllers: a worker-only host runs the engine and the
     // scheduler and serves nothing.
     const controllers = options.path
@@ -386,6 +432,7 @@ export const CATALOG_PIPELINE_TOKENS = {
   adoptConnectors: CATALOG_ADOPT_CONNECTORS,
   reconcileRuns: CATALOG_RECONCILE_RUNS,
   expectations: CATALOG_LOAD_EXPECTATIONS,
+  environment: CATALOG_PIPELINE_ENVIRONMENT,
 } as const;
 
 /**

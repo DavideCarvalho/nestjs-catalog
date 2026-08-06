@@ -15,6 +15,14 @@ export {
   type ReconcileOutcome,
   type ReconcileScan,
 } from './abandoned-runs';
+export {
+  CATALOG_PIPELINE_ENVIRONMENT,
+  allowlistedCodeEnv,
+  codeContext,
+  namedEnvironment,
+  type CatalogEnvironmentNameResolver,
+  type CodeEnvResolution,
+} from './code-context';
 export { ConnectionChecker } from './connection-checker.service';
 export {
   REDACTED_SECRET,

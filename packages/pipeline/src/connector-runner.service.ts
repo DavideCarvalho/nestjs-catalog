@@ -6,8 +6,22 @@ import {
   SubprocessTransformRunner,
   emitCatalog,
 } from '@dudousxd/nestjs-catalog';
-import { BadRequestException, Inject, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  Inject,
+  Injectable,
+  Logger,
+  NotFoundException,
+  Optional,
+} from '@nestjs/common';
 import { closeAbandonedAttempts } from './abandoned-runs';
+import {
+  CATALOG_PIPELINE_ENVIRONMENT,
+  type CatalogEnvironmentNameResolver,
+  allowlistedCodeEnv,
+  codeContext,
+  namedEnvironment,
+} from './code-context';
 import { EXPECT_SHRINK_LABEL } from './load-expectations';
 import { PublishService } from './publish.service';
 import { capLines, redactLines, redactSecrets } from './run-logs';
@@ -140,6 +154,15 @@ export class ConnectorRunnerService {
     private readonly pipeline: CatalogPipelineStore,
     private readonly transforms: SubprocessTransformRunner,
     private readonly publish: PublishService,
+    /**
+     * Last, and optional, for the reason its twin on `WorkflowRunnerService`
+     * gives: every caller that constructs this by hand keeps compiling, and a
+     * host that has declared no environment name gets an absent
+     * `context.environment` rather than a guessed one.
+     */
+    @Optional()
+    @Inject(CATALOG_PIPELINE_ENVIRONMENT)
+    private readonly environmentName?: CatalogEnvironmentNameResolver,
   ) {}
 
   /**
@@ -433,7 +456,29 @@ export class ConnectorRunnerService {
       );
     }
 
-    const result = await this.transforms.run(transform, records);
+    const admitted = allowlistedCodeEnv();
+    logs.push(...admitted.notes);
+
+    const result = await this.transforms.run(transform, records, {
+      context: codeContext({
+        // The snapshot id, which is also the run id — the same string a
+        // workflow node's `runId` carries, so code that logs it correlates the
+        // same way whichever path ran it.
+        runId: snapshotId,
+        // The only identity a connector's transform has: there is no graph
+        // here, so no workflow name and no node.
+        connectorId: connector.id,
+        environment: namedEnvironment(this.environmentName),
+        rowCount: records.length,
+        // Empty, and not for want of a count. `inputs` is per inbound *edge*,
+        // and a connector has no edges — it has one source, whose total is
+        // `rowCount`. Synthesising a one-element array with a fabricated
+        // `nodeId` would make `inputs[0].nodeId` name a node that does not
+        // exist in any graph.
+        inputs: [],
+        env: admitted.env,
+      }),
+    });
     logs.push(
       `Transform "${transform.name}" v${transform.version} produced ${result.rows.length} rows in ${result.elapsedMs}ms.`,
       ...capLines(result.logs, TRANSFORM_LOG_LINES),

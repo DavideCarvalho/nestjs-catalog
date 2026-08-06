@@ -3,11 +3,13 @@ import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve as resolvePath } from 'node:path';
 import { Injectable, Logger } from '@nestjs/common';
-import type {
-  CatalogTransform,
-  TransformLanguage,
-  TransformResult,
-  TransformRunner,
+import {
+  CODE_CONTEXT_CONTRACT,
+  type CatalogCodeContext,
+  type CatalogTransform,
+  type TransformLanguage,
+  type TransformResult,
+  type TransformRunner,
 } from './catalog.pipeline';
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -158,6 +160,23 @@ export interface TransformRunnerOptions {
  *
  * `node:vm` was the other option and is worse on both counts: it is famously
  * not an isolation boundary either, and it cannot be killed mid-loop.
+ *
+ * ## The environment the code is *given*, as opposed to the one it can reach
+ *
+ * Everything above says the trimmed `env` is a guard rail and not a boundary.
+ * The corollary matters for {@link CatalogCodeContext}: since the child can
+ * reach every variable anyway through `/proc`, `context.env` is not a
+ * confinement mechanism and is not offered as one. It is the **supported**
+ * route — the one that works on Windows, the one that survives a `TransformRunner`
+ * swapped for a container, and the one whose contents a deployment declares on
+ * purpose through the credential allow-list rather than by whatever happened to
+ * be exported into the pod.
+ *
+ * That distinction is what makes the allow-list worth applying here at all. A
+ * host that genuinely needs code not to read `DATABASE_URL` needs a different
+ * runner; a host that needs its own operators to declare, once, which
+ * credentials the pipeline is *meant* to use gets exactly that, in the same
+ * list that already governs connectors.
  */
 @Injectable()
 export class SubprocessTransformRunner implements TransformRunner {
@@ -215,10 +234,18 @@ export class SubprocessTransformRunner implements TransformRunner {
   async run(
     transform: Pick<CatalogTransform, 'language' | 'code'>,
     records: unknown[],
-    options: { timeoutMs?: number } = {},
+    options: { timeoutMs?: number; context?: CatalogCodeContext } = {},
   ): Promise<TransformResult> {
     const started = Date.now();
     const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    // Never `undefined` past this line. A caller may legitimately have no
+    // context to give — a spec, a host driving the runner directly — and the
+    // one thing user code must not have to write is `context?.env?.X`, because
+    // the optional chain is the spelling that silently reads nothing when the
+    // caller *did* have a context and got the shape wrong. So the absence is
+    // resolved here, once, into a context that says plainly there is no run and
+    // no admitted credential.
+    const context = options.context ?? contextlessRun(records.length);
 
     const python = transform.language === 'python';
     const interpreter = python ? await this.resolvePython() : process.execPath;
@@ -242,10 +269,15 @@ export class SubprocessTransformRunner implements TransformRunner {
           script,
         ];
 
+    // An envelope rather than the bare array stdin used to carry. The context
+    // travels beside the records rather than in the child's `env`, and that is
+    // the deliberate half of it: the child's own environment stays
+    // `{PATH, NODE_ENV}`, so nothing about what a transform may read changes by
+    // accident when somebody edits the spawn options later.
     const { stdout, stderr } = await this.spawn(
       interpreter,
       args,
-      JSON.stringify(records),
+      JSON.stringify({ records, context }),
       timeoutMs,
     );
 
@@ -393,6 +425,20 @@ export class SubprocessTransformRunner implements TransformRunner {
 }
 
 /**
+ * The context for a run that has none: a spec, or a host driving the runner by
+ * hand.
+ *
+ * Empty rather than absent, so `context.env.ANYTHING` is `undefined` instead of
+ * a `TypeError` and code written for a real run degrades to reading nothing.
+ * `runId` is left off rather than filled with a placeholder — the field's whole
+ * documented meaning is "there is a run and this is it", and a fabricated id
+ * would be the one lie a reader could not detect.
+ */
+function contextlessRun(rowCount: number): CatalogCodeContext {
+  return { contract: CODE_CONTEXT_CONTRACT, rowCount, inputs: [], env: {} };
+}
+
+/**
  * Stop the transform, and everything the transform started.
  *
  * `child.kill()` signals one pid. A transform that double-forks — two lines of
@@ -498,9 +544,15 @@ process.stdin.setEncoding("utf8");
 for await (const chunk of process.stdin) input += chunk;
 
 try {
-  const records = JSON.parse(input || "[]");
-  const transform = async (records) => { ${code} };
-  const rows = await transform(records);
+  const payload = JSON.parse(input || "{}");
+  const records = Array.isArray(payload.records) ? payload.records : [];
+  // Frozen, and one level down as well, so that a transform assigning to
+  // \`context.env.TOKEN\` fails loudly here rather than appearing to work and
+  // then confusing whoever reads the next node's code. Nothing propagates out
+  // of this process either way; the freeze buys the honest error, not safety.
+  const context = Object.freeze({ ...payload.context, env: Object.freeze({ ...payload.context?.env }) });
+  const transform = async (records, context) => { ${code} };
+  const rows = await transform(records, context);
   process.stdout.write(JSON.stringify({ rows: rows ?? [], logs: captured() }));
 } catch (error) {
   process.stdout.write(JSON.stringify({
@@ -626,7 +678,7 @@ sink = Sink()
 def log(*args):
     print(*args)
 
-def transform(records):
+def transform(records, context):
 ${indented || '    return records'}
 
 def to_rows(result):
@@ -650,11 +702,17 @@ def captured():
 
 try:
     raw = sys.stdin.read()
-    records = json.loads(raw) if raw.strip() else []
+    payload = json.loads(raw) if raw.strip() else {}
+    records = payload.get("records") or []
+    # A plain dict, not an object with attributes. \`context["env"]["TOKEN"]\`
+    # is the same expression in every Python transform anybody has written
+    # against a JSON payload, and a bespoke wrapper would buy dotted access at
+    # the cost of a KeyError that reads like a bug in the catalog.
+    context = payload.get("context") or {}
     # \`to_rows\` is inside the redirect as well: a lazily-evaluated return value
     # does its printing here, not before.
     with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
-        rows = to_rows(transform(records))
+        rows = to_rows(transform(records, context))
     # Back on the real stdout by now — the context manager restores on the way
     # out, including out of an exception — so this is the only thing on it.
     out = captured()

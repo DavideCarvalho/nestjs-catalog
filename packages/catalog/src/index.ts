@@ -47,6 +47,8 @@ export { MikroOrmCatalogRegistry } from './catalog.registry';
 export { CatalogRegistry } from './catalog.registry.base';
 export {
   CATALOG_PIPELINE_STORE,
+  CODE_CONTEXT_CONTRACT,
+  type CatalogCodeContext,
   type CatalogConnection,
   type CatalogConnector,
   type ConnectionCheck,
