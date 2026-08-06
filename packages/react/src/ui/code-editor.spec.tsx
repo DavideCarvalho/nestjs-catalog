@@ -35,6 +35,26 @@
  * symptoms impossible — the code scrolls rather than wraps, and the lines are
  * numbered. Everything else here is the price of the dependency that provides
  * them, written down as assertions rather than as prose.
+ *
+ * THE SECOND BUG, AND WHY IT IS NOT REALLY TESTED HERE
+ * ---------------------------------------------------
+ * `overflow: 'scroll'` bought the horizontal axis and said nothing about the
+ * vertical one, so a body taller than its box was clipped by the wrapper with no
+ * way to reach it: a real wheel over the SQL box scrolled the PAGE and left the
+ * editor on line 1. The repair is in the wrapper's classes and is described in
+ * `code-editor.tsx`.
+ *
+ * It is worth being blunt about what the test below is: jsdom lays nothing out
+ * and no Tailwind runs in it, so `scrollHeight` and `clientHeight` are both zero
+ * and `getComputedStyle` knows nothing of `overflow-y-auto`. An assertion that
+ * the wrapper "can scroll" would compare 0 to 0 and pass against the broken
+ * component just as happily as against the fixed one. So the test pins the CLASS
+ * — which is the thing a future edit would delete — and the behaviour it stands
+ * for was verified in Chrome instead: with a 61-line body in an `h-56` box, a
+ * CDP-dispatched wheel moved the wrapper's `scrollTop` from 0 to 1013 and left
+ * `window.scrollY` at 0, a drag on the 15px scrollbar took it to 636, and
+ * `Shift+End` on the 1463px-wide first line still selected the whole logical
+ * line in a 657px box.
  */
 import { act, cleanup, fireEvent, render, renderHook } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -134,6 +154,29 @@ describe('CodeEditor', () => {
       // asserted too — otherwise `disableLineNumbers: true` leaves this test green and the gutter
       // blank, which is exactly the state it exists to prevent.
       expect(root.querySelector('pre')?.hasAttribute('data-disable-line-numbers')).toBe(false);
+    });
+  });
+
+  describe('the second bug', () => {
+    it('makes the wrapper the vertical viewport, because nothing inside the editor is one', async () => {
+      // `@pierre/diffs` scrolls the X axis and clips the Y one: its `[data-code]`
+      // sizes to the whole document, `File` owns no vertical viewport, and the
+      // only property it exposes substitutes into the X component. So the box a
+      // tall query scrolls in has to be the wrapper, and `overflow-hidden` — what
+      // used to be here — is defined as clipping WITHOUT offering a scrolling
+      // mechanism.
+      //
+      // The class, not the geometry: see this file's header. jsdom reports 0 for
+      // both heights and knows no Tailwind, so a geometric assertion would pass
+      // on the broken component too.
+      const { wrapper } = await editor();
+
+      expect(wrapper.className).toContain('overflow-y-auto');
+      // The other half, and not decoration: the horizontal scroller is inside
+      // the shadow root, and an `overflow-x` left `visible` beside a scrolling Y
+      // axis computes to `auto` — a second, permanently empty scrollbar stacked
+      // on the real one.
+      expect(wrapper.className).toContain('overflow-x-hidden');
     });
   });
 
