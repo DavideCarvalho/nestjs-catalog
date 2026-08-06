@@ -33,10 +33,50 @@ import { type CodeThemeType, useCodeThemeType } from './code-theme';
  * lines and a trailing newline; overlaid, their glyphs coincided to the pixel.
  * Aligning them harder would have fixed nothing.
  *
- * So the fix is {@link CODE_OPTIONS}'s `overflow: 'scroll'` — real horizontal
+ * So the fix is {@link codeOptions}'s `overflow: 'scroll'` — real horizontal
  * scrolling, one visual row per line — plus the line numbers a gutter-less box
  * could never draw. Scrolling code well needs a document model, and that is what
  * the dependency buys.
+ *
+ * THE HALF THAT FIX DID NOT COVER
+ * -------------------------------
+ * `overflow: 'scroll'` is an option about WRAPPING, and it buys exactly one
+ * axis. Inside the shadow root the dependency puts `overflow-x: scroll` on its
+ * `[data-code]` element and pairs it with `overflow-y: clip`, then lets that
+ * element size to the whole document — a sixty-line body makes it 1230px tall
+ * inside a 224px box. Nothing in `@pierre/diffs` scrolls vertically: `File` is
+ * the non-virtualised renderer and owns no vertical viewport, the only escape
+ * hatch it exposes is the `--diffs-overflow-override` custom property, and that
+ * substitutes into the X component alone. (Its `CodeView` is the virtualised
+ * scroller, but it is a multi-item viewer rather than a taller `File`.)
+ *
+ * So the vertical overflow lands on the FIRST ancestor with an opinion, and
+ * that was this component's own wrapper, wearing `overflow-hidden`. Measured in
+ * Chrome on a 61-line body in an `h-56` box: wrapper `clientHeight` 223,
+ * `scrollHeight` 1236, and walking every element from the last line up to
+ * `<html>` found not one with a user-scrollable Y axis. A real wheel event
+ * dispatched over the box through CDP moved `window.scrollY` from 0 to 270 and
+ * left the editor on line 1 — the page scrolled, the code did not, which is the
+ * report. `overflow: hidden` is defined as clipping WITHOUT offering a
+ * scrolling mechanism, so no wheel, trackpad, scrollbar or `PageDown` could
+ * reach line 61; only the browser's own caret-into-view scrolling could, which
+ * is why typing to the bottom appeared to work and dragging never did.
+ *
+ * The wrapper is ours and in the light DOM, so the repair is here rather than
+ * past a boundary host CSS cannot cross: `overflow-y-auto` makes it the
+ * vertical viewport the dependency declines to be, and `overflow-x-hidden`
+ * keeps it from becoming a SECOND horizontal scroller competing with the one
+ * `overflow: 'scroll'` created — `overflow-y: auto` beside an `overflow-x:
+ * visible` would compute that axis to `auto` too. Verified in Chrome after the
+ * change: a wheel down moves the box and leaves the page still, a horizontal
+ * wheel still scrolls the long first line, and lines stay unwrapped.
+ *
+ * One consequence worth knowing rather than discovering: the horizontal
+ * scrollbar belongs to `[data-code]`, which is document-height, so it is drawn
+ * at the bottom of the DOCUMENT and not at the bottom of the visible box. A
+ * horizontal wheel or trackpad swipe works from anywhere in the box; the
+ * scrollbar itself is only in view once you are scrolled to the end. Moving it
+ * would mean styling inside the shadow root, which nothing out here can do.
  *
  * WHAT CONTENTEDITABLE COSTS
  * --------------------------
@@ -133,7 +173,9 @@ export interface CodeEditorProps {
  * The options every code surface in this package shares.
  *
  * `overflow: 'scroll'` is the fix this file's header describes and must not
- * become `'wrap'` without re-reading it. Line numbers are the other half and are
+ * become `'wrap'` without re-reading it. It is an option about WRAPPING, so what
+ * it settles is the horizontal axis and the meaning of `End`; the vertical one
+ * is the wrapper's job and is not decided here. Line numbers are the other half and are
  * conspicuously ABSENT from this object: they are on unless `disableLineNumbers`
  * turns them off, so the way to keep them is to not write it. `code-editor.spec`
  * asserts both, because "an option nobody added" is not something a reader can
@@ -253,10 +295,16 @@ export function CodeEditor({
   return (
     // Capture, not bubble, and on the wrapper rather than on the editable
     // element, which is not ours to attach to. See `onKeyDown`.
+    //
+    // `overflow-y-auto` is the vertical viewport — see this file's header for
+    // why it has to live out here — and `overflow-x-hidden` is not decoration:
+    // the horizontal scroller is `[data-code]` inside the shadow root, and
+    // leaving this axis `visible` beside a scrolling one would compute it to
+    // `auto` and stack a second, empty scrollbar on top of it.
     <div
       ref={wrapperRef}
       tabIndex={-1}
-      className={cn('relative overflow-hidden outline-none', className)}
+      className={cn('relative overflow-x-hidden overflow-y-auto outline-none', className)}
       onKeyDownCapture={onWrapperKeyDown}
     >
       <EditProvider createEditor={(options) => new Editor(options)}>
