@@ -113,14 +113,37 @@ failure this split exists to avoid.
 load: rows arrive under a snapshot id in numbered batches, a retried batch replaces itself, and a
 separate commit makes it visible. Three attempts load the data once.
 
-**An attempt that never came back is closed by the next one.** A step whose lease expires is
-re-dispatched while the attempt holding it is still running, so that attempt never reaches
+**An attempt that never came back is closed by the next one, on both run paths.** A step whose lease
+expires is re-dispatched while the attempt holding it is still running, so that attempt never reaches
 `finishRun` and its run row sits at `running` with `fetched = 0` and no error for good. On the way
 in, a run closes any earlier run *at the same snapshot id* that is still marked running, recording
 what that state means and pointing at `durable_step_checkpoints`, where a rising `attempts` against
 an empty error is the engine's side of the same fact. Keyed on the snapshot rather than on age,
 because the loads this is about are the slow ones — the last attempt of a series is still never
 closed by anything, since nothing runs after it.
+
+One implementation (`closeAbandonedAttempts`), called by both `ConnectorRunnerService` and
+`WorkflowRunnerService`: they are two implementations of a load rather than one wrapping the other,
+and a rule this specific about what it keys on would not survive being written down twice. Two things
+follow from the graph path having a *planning step* rather than a per-attempt row:
+
+- A workflow run's row used to be **adopted** by whichever attempt found it — so the attempt that
+  replaced an abandoned one wrote its own outcome over the row and nothing said an earlier attempt
+  had vanished. It now opens its own row and closes the one before it, which means a snapshot can
+  carry more than one row and `findRun` answers with the one still being written.
+- The scan is not the stale-stage sweep beside it. That takes runs that **failed**, at **other**
+  snapshots, older than `CATALOG_STAGE_RETENTION_MS`, and drops their staged rows; this takes runs
+  still **running**, at **this** snapshot, at any age, and writes them an outcome. They compose:
+  staged rows are only collected from a failed run, so a row abandoned at `running` kept its stages
+  for good until something closed it.
+
+**The limit on the graph path is wider than on the single-connector one.** A durable workflow run
+plans once and its node retries reuse that row, so the attempt that closes an abandoned row is a
+planning step being retried or an operator re-driving the same `snapshotId`. A durable run that dies
+without ever reaching its finish step — an execution timeout, a cancellation, a worker that never
+resumes — leaves a row nothing will revisit, because the next run of that workflow mints a new
+snapshot. That row is still an open question, and the honest answer to it is the engine's own view of
+the run rather than a clock.
 
 **A MySQL connector reads a batch at a time; a Postgres one does not, and neither does a connector
 with a transform.** The write side has always been bounded — 500 rows per batch — and the read side

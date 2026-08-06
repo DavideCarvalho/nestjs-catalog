@@ -23,6 +23,7 @@ import {
   workflowRunOrder,
 } from '@dudousxd/nestjs-catalog';
 import { BadRequestException, Inject, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { closeAbandonedAttempts } from './abandoned-runs';
 import { EXPECT_SHRINK_LABEL } from './load-expectations';
 import { PublishService } from './publish.service';
 import { redactLines, redactSecrets, safeLogLines } from './run-logs';
@@ -101,6 +102,19 @@ const STALE_TAIL_LIMIT = 5_000;
 const STAGE_RETENTION_MS = positiveInt(process.env.CATALOG_STAGE_RETENTION_MS, 24 * 60 * 60 * 1000);
 
 /**
+ * How many of a connector's recent runs one run of it looks back over.
+ *
+ * One number and one read, feeding both of the housekeeping rules a run does on
+ * its way in — {@link WorkflowRunnerService.sweepAbandonedStages}, which drops
+ * the staged rows of runs nobody will resume, and `closeAbandonedAttempts`,
+ * which writes an outcome onto attempts at *this* snapshot that never recorded
+ * one. Two reads would be two answers to "which runs were there", taken
+ * milliseconds apart, and the two rules would then be reasoning about different
+ * sets of rows while sharing a docblock that says they are not.
+ */
+const RUN_SCAN_LIMIT = 50;
+
+/**
  * What the run has learned so far.
  *
  * Shared between the two executors rather than reimplemented in each, because
@@ -139,6 +153,24 @@ export interface WorkflowPlanResult {
   /** The type the sink commits, for the run's own events and logging. */
   targetType: string;
   order: WorkflowPlanEntry[];
+  /**
+   * What opening this run had to say about the ones before it — today, one line
+   * per attempt at this snapshot that was found still marked `running` and was
+   * closed. Empty for the overwhelming majority of runs.
+   *
+   * Carried on the plan rather than written to the run row directly, because the
+   * row this run reports into is opened by this very step and finished by a
+   * later one: a line written here would be overwritten by the finish step's
+   * `logs`. Going through the checkpoint also makes it survive a replay, which
+   * is the case that matters — the fact being recorded is precisely that a
+   * previous attempt did not survive.
+   *
+   * Bounded by the number of attempts at one snapshot, which the engine's retry
+   * count bounds, so this cannot grow with the data the way a node's logging
+   * can. Optional so that a run whose plan was checkpointed by an older build
+   * replays without a field it never wrote.
+   */
+  notes?: string[];
 }
 
 /** What finishing a run needs. Bounded by the node count, never by the data. */
@@ -250,11 +282,24 @@ export class WorkflowRunnerService {
   /**
    * Open the run row and work out the order.
    *
-   * Idempotent by `(connectorId, snapshotId)`, because this is the first thing
-   * a durable run does and a durable step that fails *after* its side effect
-   * is retried: without the check, a planning step that opened a row and then
-   * lost its result would leave one abandoned `running` row per attempt, and
-   * the run list would report a load that never happened.
+   * **One row per attempt, and an attempt that left one open is closed by the
+   * one that follows it.** This step used to adopt an existing `running` row at
+   * the same snapshot instead of opening its own, so that a planning step which
+   * committed `startRun` and then lost its result would not leave a row per
+   * attempt. That answered the multiplicity and left the silence: the adopting
+   * attempt wrote its own outcome over the row, and nothing anywhere said that
+   * an earlier attempt had vanished — which is the single failure
+   * `closeAbandonedAttempts` exists to end, arrived at from the other side. Now
+   * the earlier row is closed, with the message saying what that state means and
+   * where the engine's half of it is recorded, and this attempt opens its own.
+   * A run list that reports "a load that never happened" is exactly right when
+   * the row says which load and why it never happened.
+   *
+   * The two limits of the scan hold here unchanged and are worth reading on
+   * {@link closeAbandonedAttempts} before trusting this: the last attempt of a
+   * series is closed by nothing, and an attempt still alive elsewhere may write
+   * its own outcome over ours — which is correct, since it is the one that
+   * knows.
    */
   async plan(input: {
     workflowId: string;
@@ -267,7 +312,7 @@ export class WorkflowRunnerService {
     const workflow = await this.requireWorkflow(input.workflowId);
     this.assertSameGraph(workflow, input.workflowVersion);
 
-    const run = await this.beginRun({
+    const opened = await this.beginRun({
       workflow,
       connectorId: input.connectorId,
       principalId: input.principalId,
@@ -276,9 +321,10 @@ export class WorkflowRunnerService {
     });
 
     return {
-      runRowId: run.id,
+      runRowId: opened.run.id,
       workflowVersion: workflow.version,
       targetType: workflow.targetType,
+      notes: opened.notes,
       // `workflowRunOrder` rather than a second traversal here: it enforces the
       // same wiring rules `validateWorkflow` does, and two implementations of
       // one rule is how a graph that validated comes out executing differently.
@@ -350,21 +396,20 @@ export class WorkflowRunnerService {
   }): Promise<ConnectorRun> {
     const { workflow, connectorId, principalId, snapshotId } = input;
     const order = workflowRunOrder(workflow);
-    const run = await this.beginRun({
+    const opened = await this.beginRun({
       workflow,
       connectorId,
       principalId,
       snapshotId,
       mode: 'inline',
     });
+    const run = opened.run;
 
-    const progress: NodeProgress = {
-      outcomes: {},
-      stages: new Map(),
-      logs: [],
-      fetched: 0,
-      written: 0,
-    };
+    // Seeded with whatever opening the run had to say about the attempts before
+    // it, so the closing of an abandoned one is readable off the run that did
+    // the closing and not only off the row that was closed. The durable path
+    // seeds the same lines from the plan step's checkpoint.
+    const progress = this.emptyProgress(opened.notes);
 
     for (let index = 0; index < order.length; index += 1) {
       const entry = order[index];
@@ -462,11 +507,21 @@ export class WorkflowRunnerService {
     progress.outcomes[nodeId] = { status: 'failed', rows: 0, error };
   }
 
-  emptyProgress(): NodeProgress {
+  /**
+   * A run that has learned nothing yet — except, sometimes, what it had to say
+   * about the attempt before it.
+   *
+   * `logs` is a parameter rather than something the two callers append
+   * afterwards because both of them are the *start* of a run's log and the order
+   * of those lines is what somebody reads a failed run in: a note about a
+   * closed attempt belongs above the first node's output, not wherever the
+   * caller happened to remember to push it.
+   */
+  emptyProgress(logs: string[] = []): NodeProgress {
     return {
       outcomes: {},
       stages: new Map(),
-      logs: [],
+      logs: [...logs],
       fetched: 0,
       written: 0,
     };
@@ -552,10 +607,36 @@ export class WorkflowRunnerService {
     throw new NotFoundException(`Run ${input.runRowId} disappeared while it was being finished.`);
   }
 
-  /** The run row for a snapshot, if this connector already has one. */
+  /**
+   * The run row for a snapshot — the one that is still being written, or failing
+   * that the one that recorded an outcome most recently.
+   *
+   * **A snapshot can carry more than one row**, and that is why this is four
+   * lines rather than a `find`. An attempt that left its row at `running` is
+   * closed by the attempt that follows it — see {@link plan} — so a snapshot
+   * whose first attempt was abandoned holds a closed row *and* the row of the
+   * attempt that closed it. Both are honest history; only one of them is the
+   * answer to "how is this load going". `listRuns` orders by `startedAt`, whose
+   * stored precision is seconds, so two rows opened moments apart can tie and
+   * the first match would be whichever the database happened to return —
+   * meaning `awaitRun` could report the abandoned attempt's failure as the
+   * outcome of the run that had just replaced it.
+   *
+   * Preferring `running` answers the poll while a load is in flight; preferring
+   * the latest `finishedAt` answers it afterwards, and that is the one field
+   * that genuinely orders two attempts at the same snapshot — the closing of an
+   * abandoned row happens strictly before the run that closed it can finish.
+   */
   async findRun(connectorId: string, snapshotId: string): Promise<ConnectorRun | undefined> {
-    const runs = await this.requireStore().listRuns(connectorId, 50);
-    return runs.find((run) => run.snapshotId === snapshotId);
+    const runs = await this.requireStore().listRuns(connectorId, RUN_SCAN_LIMIT);
+    const matching = runs.filter((run) => run.snapshotId === snapshotId);
+    const live = matching.find((run) => run.status === 'running');
+    if (live) return live;
+    return matching.reduce<ConnectorRun | undefined>(
+      (latest, run) =>
+        latest === undefined || finishedOrder(run) > finishedOrder(latest) ? run : latest,
+      undefined,
+    );
   }
 
   /* --------------------------------------------------------------------- */
@@ -576,21 +657,52 @@ export class WorkflowRunnerService {
     );
   }
 
+  /**
+   * Open this attempt's run row, having first dealt with what earlier ones left.
+   *
+   * The two rules below are different rules and they stay different — one is
+   * about rows and the other about staged data — but they read **one** list.
+   * See {@link RUN_SCAN_LIMIT}: two reads are two answers to which runs there
+   * were, and rules that disagree about what they looked at are how the pair
+   * eventually contradict each other.
+   *
+   * They are also not redundant, which is worth stating because the names
+   * suggest it. `sweepAbandonedStages` takes runs that *failed*, at *other*
+   * snapshots, longer ago than the retention window, and drops the rows they
+   * staged. `closeAbandonedAttempts` takes runs still marked `running`, at *this*
+   * snapshot, whatever their age, and writes them an outcome. Disjoint on every
+   * clause. What they do share is a boundary: staged rows are only ever
+   * collected from a run that *failed*, so a row abandoned at `running` used to
+   * keep its stages for good. Closing it is what makes them collectable, one
+   * retention window later, by the sweep.
+   */
   private async beginRun(input: {
     workflow: CatalogWorkflow;
     connectorId: string;
     principalId: string;
     snapshotId: string;
     mode: WorkflowExecutionMode;
-  }): Promise<ConnectorRun> {
+  }): Promise<{ run: ConnectorRun; notes: string[] }> {
     const store = this.requireStore();
-    const existing = await this.findRun(input.connectorId, input.snapshotId);
-    if (existing) return existing;
 
-    // Best effort, and before the run rather than after: the sweep reads and
-    // writes the same store the run is about to use, and doing it at the end
+    // Both best effort, and before the run rather than after: they read and
+    // write the same store the run is about to use, and doing it at the end
     // would mean a run that crashed never cleaned anything up.
-    await this.sweepAbandonedStages(input.connectorId, input.snapshotId);
+    const recent = await this.recentRuns(input.connectorId);
+    const notes = await closeAbandonedAttempts(
+      store,
+      {
+        // The workflow's name, which is the name this path already puts on the
+        // run's events — a message naming a connector id nobody authored would
+        // send a reader looking for an object that is not there any more.
+        name: input.workflow.name,
+        connectorId: input.connectorId,
+        snapshotId: input.snapshotId,
+        runs: recent,
+      },
+      this.logger,
+    );
+    await this.sweepAbandonedStages(recent, input.snapshotId);
 
     const run = await store.startRun({
       connectorId: input.connectorId,
@@ -614,23 +726,46 @@ export class WorkflowRunnerService {
       principalId: input.principalId,
     });
 
-    return run;
+    return { run, notes };
+  }
+
+  /**
+   * This connector's recent runs, or nothing at all.
+   *
+   * The one read both housekeeping rules work from, and guarded here rather
+   * than inside each of them: a store that cannot answer must leave the load in
+   * front of it alone, and an empty list is what "there is nothing I can say
+   * about earlier runs" looks like to both rules without either needing a second
+   * code path for it.
+   */
+  private async recentRuns(connectorId: string): Promise<ConnectorRun[]> {
+    try {
+      return await this.requireStore().listRuns(connectorId, RUN_SCAN_LIMIT);
+    } catch (error) {
+      this.logger.warn(`Could not read the recent runs of ${connectorId}: ${say(error)}`);
+      return [];
+    }
   }
 
   /**
    * Collect the staged rows of runs nobody is going to resume.
    *
-   * Bounded on both axes — the last fifty runs of this connector, and only
-   * those that failed longer ago than the retention window — so it costs one
-   * query and cannot turn a load into a table scan. Failures inside it are
-   * swallowed deliberately: a housekeeping problem must never be the reason a
-   * load did not happen.
+   * Bounded on both axes — the last {@link RUN_SCAN_LIMIT} runs of this
+   * connector, and only those that failed longer ago than the retention window
+   * — so it costs no query of its own and cannot turn a load into a table scan.
+   * Failures inside it are swallowed deliberately: a housekeeping problem must
+   * never be the reason a load did not happen.
+   *
+   * **`failed`, and not `running`.** A run still marked `running` may be one; a
+   * run that is genuinely in flight and whose stages this dropped would lose its
+   * own inputs mid-graph. That is why the pair in {@link beginRun} is two rules
+   * — the other one is what turns an abandoned `running` row into a `failed`
+   * one, at which point this can collect it a retention window later.
    */
-  private async sweepAbandonedStages(connectorId: string, keepSnapshotId: string): Promise<void> {
+  private async sweepAbandonedStages(runs: ConnectorRun[], keepSnapshotId: string): Promise<void> {
     try {
       const store = this.requireStore();
       const cutoff = Date.now() - STAGE_RETENTION_MS;
-      const runs = await store.listRuns(connectorId, 50);
       for (const run of runs) {
         if (run.snapshotId === keepSnapshotId) continue;
         if (run.status !== 'failed') continue;
@@ -1183,6 +1318,23 @@ function sinkLabels(workflowName: string, expectShrink?: string): Record<string,
   }
   labels[EXPECT_SHRINK_LABEL] = because;
   return labels;
+}
+
+/**
+ * When a run recorded its outcome, as something two rows can be compared on.
+ *
+ * A run with no `finishedAt` has not recorded one, and falling back to
+ * `startedAt` would let an attempt that is merely *older* outrank the one that
+ * actually finished last. `-Infinity` says "this never finished" and loses to
+ * anything that did, which is what {@link WorkflowRunnerService.findRun} is
+ * asking. An unparseable timestamp goes the same way rather than becoming
+ * `NaN`, which loses every comparison it appears in and would make the answer
+ * depend on the order the rows arrived.
+ */
+function finishedOrder(run: ConnectorRun): number {
+  if (run.finishedAt === undefined) return Number.NEGATIVE_INFINITY;
+  const at = Date.parse(run.finishedAt);
+  return Number.isFinite(at) ? at : Number.NEGATIVE_INFINITY;
 }
 
 function positiveInt(raw: string | undefined, fallback: number): number {

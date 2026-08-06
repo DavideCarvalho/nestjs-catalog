@@ -7,6 +7,7 @@ import {
   emitCatalog,
 } from '@dudousxd/nestjs-catalog';
 import { BadRequestException, Inject, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { closeAbandonedAttempts } from './abandoned-runs';
 import { EXPECT_SHRINK_LABEL } from './load-expectations';
 import { PublishService } from './publish.service';
 import { capLines, redactLines, redactSecrets } from './run-logs';
@@ -34,17 +35,6 @@ const BATCH_SIZE = 500;
  * mid-run without closing it.
  */
 const PROGRESS_EVERY_BATCHES = 20;
-
-/**
- * How many recent runs of a connector are examined for one left open.
- *
- * A durable retry reuses the snapshot id, so the runs that can be orphans of
- * *this* load are the handful of attempts that came before it — three, at the
- * step's current retry count. Twenty is room for other runs of the same
- * connector to have interleaved without the scan missing them, and it is a
- * bounded query rather than a scan of the table.
- */
-const ORPHAN_SCAN_LIMIT = 20;
 
 /**
  * How many lines of a transform's own logging survive into the run record.
@@ -185,8 +175,14 @@ export class ConnectorRunnerService {
     const labels = labelsFor(connector.name, options);
 
     // Before `startRun`, so this run's own row is not among the ones scanned and
-    // no ordering has to be reasoned about. See {@link closeAbandonedAttempts}.
-    const abandoned = await this.closeAbandonedAttempts(connector, snapshotId);
+    // no ordering has to be reasoned about. See {@link closeAbandonedAttempts},
+    // which `WorkflowRunnerService` calls too — it is one rule and one message
+    // rather than the same subtle keying written down twice.
+    const abandoned = await closeAbandonedAttempts(
+      this.pipeline,
+      { name: connector.name, connectorId: connector.id, snapshotId },
+      this.logger,
+    );
 
     const run = await this.pipeline.startRun({
       connectorId,
@@ -537,74 +533,6 @@ export class ConnectorRunnerService {
     return { seen, written };
   }
 
-  /**
-   * Close any run of this connector left open by an earlier attempt at the same
-   * snapshot.
-   *
-   * The failure this exists for leaves no trace at all. A step whose lease
-   * expires is re-dispatched by the durable engine while the attempt holding it
-   * is still inside `run` — so that attempt never reaches `finishRun`, and its
-   * row sits at `running` with `fetched = 0` and an empty `error` for good. The
-   * only place the truth was written down was `durable_step_checkpoints`, where
-   * a rising `attempts` against an empty error means a lease and not a failure,
-   * and reading that is not something an operator should have to know to do.
-   *
-   * **Keyed on the snapshot id, which makes it exact rather than a heuristic.** A
-   * durable retry reuses the snapshot id and nothing else does, so the rows this
-   * closes are attempts at *this* load and cannot be a different run of the same
-   * connector happening at the same time. An age threshold was the alternative
-   * and is unusable here: the loads this is about are the slow ones, so "open for
-   * a long time" is indistinguishable from working.
-   *
-   * Two things it cannot do, both worth knowing before trusting it:
-   *
-   * - **The last attempt is never closed by anything.** Nothing runs after it.
-   *   Three abandoned attempts leave two rows saying so and one still `running`,
-   *   which is two more than there were and is enough to recognise the pattern.
-   * - **An attempt still alive in another process may write over this.** The
-   *   lease expired; the work did not stop. If it finishes it calls `finishRun`
-   *   and its own outcome wins, which is the right answer — it is the one that
-   *   actually knows.
-   *
-   * Never fatal. This is bookkeeping about a previous run, and a store that
-   * cannot answer must not take out the load in front of it.
-   */
-  private async closeAbandonedAttempts(
-    connector: CatalogConnector,
-    snapshotId: string,
-  ): Promise<string[]> {
-    try {
-      const recent = await this.pipeline.listRuns(connector.id, ORPHAN_SCAN_LIMIT);
-      const lines: string[] = [];
-
-      for (const stale of recent) {
-        if (stale.status !== 'running' || stale.snapshotId !== snapshotId) continue;
-
-        const reason = abandonedRunMessage(connector.name, stale);
-        await this.pipeline.finishRun(stale.id, {
-          status: 'failed',
-          error: reason,
-          logs: [...stale.logs, reason],
-        });
-        lines.push(
-          `Closed run ${stale.id}, an earlier attempt at snapshot ${snapshotId} that was still marked running and had recorded no outcome of its own.`,
-        );
-        this.logger.warn(`${connector.name}: ${reason}`);
-      }
-
-      return lines;
-    } catch (error) {
-      // Warned rather than swallowed, and warned rather than thrown. See the
-      // docblock: this is a note about a run that is already over.
-      this.logger.warn(
-        `Could not check "${connector.name}" for attempts left open at snapshot ${snapshotId}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-      return [];
-    }
-  }
-
   /** Pull the raw records. Shaping is the transform's job, not this one's. */
   private async fetch(rawConnector: CatalogConnector): Promise<RecordStream> {
     // Resolved here rather than at save time: a connection edited after a
@@ -662,21 +590,6 @@ async function collect(records: AsyncIterable<unknown>): Promise<unknown[]> {
   const collected: unknown[] = [];
   for await (const record of records) collected.push(record);
   return collected;
-}
-
-/**
- * What a run that vanished should have said, in the one place it can still be
- * written down.
- *
- * It names the three things that produce this row and refuses to pick between
- * them, because from inside the runner they are the same fact: nothing wrote an
- * outcome. Naming only the lease would be a guess with a plausible-sounding
- * cause attached, which is worse than the silence it replaces. What it can do is
- * say where the difference is recorded, so the next person does not have to
- * discover `durable_step_checkpoints` for themselves the way the first one did.
- */
-function abandonedRunMessage(connectorName: string, run: ConnectorRun): string {
-  return `This run of "${connectorName}" was still marked running when another attempt at snapshot ${run.snapshotId} started, and it recorded no outcome of its own — it had fetched ${run.fetched} and written ${run.written}. A step whose lease expired, a pod that was killed, and a process that died between starting and finishing all look like this from here: nothing failed, so nothing was written down. The engine's side of it is in durable_step_checkpoints for ${run.snapshotId}, where a rising "attempts" against an empty error is a lease expiring rather than a source refusing.`;
 }
 
 /**
