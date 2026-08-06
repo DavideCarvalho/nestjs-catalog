@@ -42,6 +42,13 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import {
+  CATALOG_PIPELINE_ENVIRONMENT,
+  type CatalogEnvironmentNameResolver,
+  allowlistedCodeEnv,
+  codeContext,
+  namedEnvironment,
+} from './code-context';
+import {
   redactConfigSecrets,
   redactConnection,
   redactConnector,
@@ -114,6 +121,14 @@ export function createPipelineController(
       @Optional()
       @Inject(CATALOG_LOAD_EXPECTATIONS)
       private readonly expectations?: CatalogLoadExpectations,
+      // The host's name for this copy of the world, read only by the try pane
+      // so that the context it hands sample code is the one a real run would
+      // hand it. Optional for the same reason it is optional on the two
+      // runners: nobody can work it out from here, and an absent name is a
+      // truthful answer.
+      @Optional()
+      @Inject(CATALOG_PIPELINE_ENVIRONMENT)
+      private readonly environmentName?: CatalogEnvironmentNameResolver,
     ) {}
 
     /** What this deployment can actually execute, and whether a run survives a crash. */
@@ -736,10 +751,34 @@ export function createPipelineController(
         `${principal.id} ran an unsaved ${language} transform against ${body.records?.length ?? 0} sample record(s).`,
       );
 
+      const records = body.records ?? [];
+      // The same admitted environment a real run gets, and deliberately so.
+      // The try pane's entire value is that it predicts what the load will do,
+      // and a pane where `context.env.VENDOR_TOKEN` is `undefined` and the
+      // scheduled run's is not would send its author looking for a bug in
+      // their code. The disclosure costs nothing that is not already spent:
+      // this route is reached only by a human principal holding a write grant,
+      // which is precisely the principal who could save the same code onto a
+      // graph and read the same values out of a run log.
+      //
+      // No `runId`, and no invented stand-in for one: nothing is stored here,
+      // so code deriving a key from the run is meant to see the absence.
+      const admitted = allowlistedCodeEnv();
+
       try {
-        return await this.transforms.run({ language, code: body.code }, body.records ?? [], {
+        const result = await this.transforms.run({ language, code: body.code }, records, {
           timeoutMs: 10_000,
+          context: codeContext({
+            environment: namedEnvironment(this.environmentName),
+            rowCount: records.length,
+            inputs: [],
+            env: admitted.env,
+          }),
         });
+        // In front of the transform's own lines, matching where the runners put
+        // them: the note is about the conditions the code ran under, and a
+        // reader works down from those to what it said.
+        return { ...result, logs: [...admitted.notes, ...result.logs] };
       } catch (error) {
         // A failing transform is the author's mistake, not the server's. Letting
         // it become a 500 hides the one thing they need — the timeout, the

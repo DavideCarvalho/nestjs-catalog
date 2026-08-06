@@ -449,12 +449,18 @@ export interface CatalogTransform {
   description?: string;
   language: TransformLanguage;
   /**
-   * The body of a function over one batch. It receives `records` and returns
-   * the rows to store.
+   * The body of a function over one batch. It receives `records` and
+   * `context`, and returns the rows to store.
    *
    * A batch rather than a record at a time: a transform that needs to look up,
    * deduplicate or aggregate cannot do it one row at a time, and paying one
    * process spawn per record would make any real load unusable.
+   *
+   * `context` is a {@link CatalogCodeContext} — the run, the node, the counts
+   * of what fed it, and the environment variables this deployment admits.
+   * Second rather than first, so that every transform written before it existed
+   * still runs: the harness supplies the parameter, and code that never names
+   * it is unaffected.
    */
   code: string;
   version: number;
@@ -506,7 +512,7 @@ export interface TransformRunner {
   run(
     transform: Pick<CatalogTransform, 'language' | 'code'>,
     records: unknown[],
-    options?: { timeoutMs?: number },
+    options?: { timeoutMs?: number; context?: CatalogCodeContext },
   ): Promise<TransformResult>;
   /** Languages this runner can actually execute in this environment. */
   available(): Promise<TransformLanguage[]>;
@@ -521,6 +527,118 @@ export interface TransformRunner {
 }
 
 export const TRANSFORM_RUNNER = Symbol('TRANSFORM_RUNNER');
+
+/**
+ * The number in {@link CatalogCodeContext.contract}.
+ *
+ * Its own version, separate from {@link WORKFLOW_CALL_CONTRACT}, because the
+ * two travel to different places for different reasons — a call envelope
+ * crosses to another SDK over the durable wire, a code context crosses to a
+ * child process this repository spawned — and a transform written against one
+ * has to be able to say which it read.
+ */
+export const CODE_CONTEXT_CONTRACT = 1;
+
+/**
+ * The second argument every code-bearing node's code is handed.
+ *
+ * ## Why this exists at all
+ *
+ * A transform is a function over a batch, and a batch is not the whole of what
+ * the code needs to know. It needs the credential for the API it enriches
+ * against; it needs to say which run it belongs to when it logs; and — the case
+ * that motivated this — a conditional node's predicate has no `records` at all
+ * and still has to answer "did the source return anything", which is the guard
+ * that stops an empty snapshot being committed over live data.
+ *
+ * ## Why it is not `process.env`
+ *
+ * The obvious answer to "code needs environment variables" is to stop trimming
+ * the child's environment. It is the wrong one, and this repository has already
+ * argued the case in `secret-env-allowlist.ts`: a `secretEnvVar` is chosen by
+ * whoever writes the connector, so `process.env[name]` with nothing in between
+ * let anyone holding `catalog:write` on one narrow object type read the host
+ * application's own `DATABASE_URL`. Transform code is *the same principal by a
+ * shorter route* — it is a string that principal saved, and it can print
+ * whatever it reads into `logs`, which land in the run record and are served at
+ * `catalog:read`.
+ *
+ * So {@link env} is the allow-listed environment and nothing else: the same
+ * policy, the same two levers, the same boot warning. One rule across the
+ * product rather than a second one that quietly undoes the first. What the
+ * child's *own* `process.env` holds is unchanged — still `{PATH, NODE_ENV}` —
+ * and the admitted values arrive as data on stdin instead.
+ *
+ * ## Replay
+ *
+ * Everything here is plain JSON, and everything except {@link env} and
+ * {@link environment} is derived from a durable step's checkpointed input: the
+ * run id, the node, the graph's version and the stage handles are byte-
+ * identical on every attempt and on every replay. Those two are reads of
+ * pod-local state, which for a transform is harmless — a transform runs inside
+ * a step whose *output* is checkpointed, so replay returns the answer rather
+ * than re-running the code — and for a predicate evaluated in a workflow body
+ * is not. A caller in that position must resolve the context inside a step and
+ * let the checkpoint carry it, so that a redeploy between the original run and
+ * the replay cannot move the branch. The shape is JSON precisely so that it can
+ * be.
+ */
+export interface CatalogCodeContext {
+  /** {@link CODE_CONTEXT_CONTRACT} at the time the code ran. */
+  contract: number;
+  /**
+   * The run this code belongs to, which is also the snapshot id.
+   *
+   * Absent means there is no run: the editor's try pane executes code against
+   * sample records and stores nothing. Anything derived from this — an
+   * idempotency key, a filename — should refuse rather than invent one, and the
+   * absence is the signal that lets it.
+   */
+  runId?: string;
+  /** The graph, when the code is a node in one. Absent for a connector's single transform. */
+  workflow?: { id: string; name: string; version: number };
+  /** The node, when the code is a node. Absent for a connector's single transform. */
+  node?: { id: string; name: string };
+  /** The connector, when the code runs as a connector's transform rather than in a graph. */
+  connectorId?: string;
+  /**
+   * The host's name for this copy of the world — `dev`, `prod` — when the host
+   * declared one.
+   *
+   * Nothing in the catalog can work this out for itself: a process may serve
+   * several environments and the choice arrives per request, so the only
+   * honest source is the host saying so. Present because branching on a named
+   * environment is legible in a way that sniffing a variable is not, and absent
+   * whenever the host stayed silent, which is a different thing from `dev`.
+   */
+  environment?: string;
+  /**
+   * How many records reached this code.
+   *
+   * Redundant with `records.length` for a transform and the whole payload for a
+   * predicate, which has no records. Stated as one number because the line a
+   * predicate is written to hold is "did anything arrive", and making that a
+   * sum over {@link inputs} invites `inputs[0].rowCount`, which is wrong the
+   * moment somebody draws a second edge.
+   */
+  rowCount: number;
+  /**
+   * Per inbound edge, in edge order — handles and counts, never the rows.
+   *
+   * The same {@link WorkflowStageRef} the call node hands a callee, deliberately
+   * rather than a second vocabulary for the same fact. Empty outside a graph.
+   */
+  inputs: WorkflowStageRef[];
+  /**
+   * The environment variables this deployment admits, and only those.
+   *
+   * Filtered by the credential allow-list — see `secret-env-allowlist.ts` — so
+   * a name nobody admitted is not here, and an empty object is the ordinary
+   * answer on a deployment that has declared no policy. The run's logs say
+   * which it was.
+   */
+  env: Record<string, string>;
+}
 
 export interface ConnectorRun {
   id: string;

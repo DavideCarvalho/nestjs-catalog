@@ -24,8 +24,22 @@ import {
   supportsWorkflows,
   workflowRunOrder,
 } from '@dudousxd/nestjs-catalog';
-import { BadRequestException, Inject, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  Inject,
+  Injectable,
+  Logger,
+  NotFoundException,
+  Optional,
+} from '@nestjs/common';
 import { closeAbandonedAttempts } from './abandoned-runs';
+import {
+  CATALOG_PIPELINE_ENVIRONMENT,
+  type CatalogEnvironmentNameResolver,
+  allowlistedCodeEnv,
+  codeContext,
+  namedEnvironment,
+} from './code-context';
 import { EXPECT_SHRINK_LABEL } from './load-expectations';
 import { PublishService } from './publish.service';
 import { redactLines, redactSecrets, safeLogLines } from './run-logs';
@@ -251,6 +265,15 @@ export class WorkflowRunnerService {
     private readonly pipeline: CatalogPipelineStore,
     private readonly transforms: SubprocessTransformRunner,
     private readonly publish: PublishService,
+    /**
+     * Last, and optional, so that every caller constructing this by hand — the
+     * specs, a host wiring it outside `forRoot` — keeps compiling. A host that
+     * has not declared an environment name has not got one, and
+     * `context.environment` is absent rather than guessed.
+     */
+    @Optional()
+    @Inject(CATALOG_PIPELINE_ENVIRONMENT)
+    private readonly environmentName?: CatalogEnvironmentNameResolver,
   ) {}
 
   /**
@@ -397,7 +420,7 @@ export class WorkflowRunnerService {
       return this.runSource(node, input, startedAt);
     }
     if (node.kind === 'transform') {
-      return this.runTransform(node, input, startedAt);
+      return this.runTransform(node, workflow, input, startedAt);
     }
     if (node.kind === 'call') {
       // Not executable from here, and refused rather than approximated.
@@ -992,6 +1015,7 @@ export class WorkflowRunnerService {
 
   private async runTransform(
     node: WorkflowTransformNode,
+    workflow: CatalogWorkflow,
     input: WorkflowNodeStepInput,
     startedAt: number,
   ): Promise<WorkflowNodeStepOutput> {
@@ -1009,7 +1033,30 @@ export class WorkflowRunnerService {
     // of a node's input is therefore in this process's heap while it runs —
     // the same property the single-transform runner has always had.
     const records = await this.readInputs(input.inputs);
-    const result = await this.transforms.run(transform, records);
+
+    // Resolved here, in the step, rather than anywhere the workflow body could
+    // reach. `env` and `environment` are the only two reads in the context that
+    // could answer differently after a redeploy, and inside a step they are
+    // covered by the step's own checkpoint: a replay returns the recorded
+    // output and never re-runs the code. See `code-context.ts` on why a
+    // predicate evaluated in a body does not get that for free.
+    const admitted = allowlistedCodeEnv();
+    logs.push(...admitted.notes);
+
+    const result = await this.transforms.run(transform, records, {
+      context: codeContext({
+        runId: input.runId,
+        workflow: { id: workflow.id, name: workflow.name, version: input.workflowVersion },
+        node: { id: node.id, name: node.name },
+        environment: namedEnvironment(this.environmentName),
+        rowCount: records.length,
+        // The step's own input, which is the graph's inbound edges in order —
+        // the same handles the call node hands a callee, and the same ones a
+        // conditional's predicate will read to ask whether anything arrived.
+        inputs: input.inputs,
+        env: admitted.env,
+      }),
+    });
     logs.push(
       `Transform "${transform.name}" v${transform.version} turned ${records.length} records into ${result.rows.length} rows in ${result.elapsedMs}ms.`,
       ...result.logs,
