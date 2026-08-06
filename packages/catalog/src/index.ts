@@ -75,6 +75,7 @@ export {
   type RowCountBound,
   type StoredLoadExpectation,
   readWorkflowCallOutput,
+  REDACTED_SECRET,
   supportsLoadExpectations,
   supportsTransformRevisions,
   isWorkflowEdge,

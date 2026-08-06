@@ -1,6 +1,7 @@
 import type { ConnectorKind } from '@dudousxd/nestjs-catalog/client';
 import { CONNECTOR_KINDS } from '@dudousxd/nestjs-catalog/client';
 import { cn } from './cn';
+import { CONNECTION_KINDS, type ConnectableKind } from './connection-form';
 import { FieldGroup, TextAreaField, TextField } from './ui/field';
 import { SelectField } from './ui/select';
 import { Switch } from './ui/switch';
@@ -34,9 +35,21 @@ export function readsIncrementally(kind: ConnectorKind): boolean {
   return kind === 'sql' || kind === 's3';
 }
 
-/** Which kinds can borrow an address from a named connection. */
-export function usesConnection(kind: ConnectorKind): boolean {
-  return kind === 'http' || kind === 'sql' || kind === 's3';
+/**
+ * Which kinds can borrow an address from a named connection.
+ *
+ * Asked of `connection-form.tsx` rather than answered here with a list of
+ * three, because that module now has to answer the same question to decide
+ * whether it can offer to CREATE one — and two lists is how a picker comes to be
+ * offered for a kind whose form has no fields, or withheld for one that does.
+ *
+ * A type predicate, and that is what it is for: the source inspector renders the
+ * picker behind this call, and the creator beside it takes a {@link
+ * ConnectableKind}. Narrowing here is what makes those two the same decision
+ * rather than two that happen to agree today.
+ */
+export function usesConnection(kind: ConnectorKind): kind is ConnectableKind {
+  return CONNECTION_KINDS[kind].connectable;
 }
 
 export const KIND_OPTIONS = [

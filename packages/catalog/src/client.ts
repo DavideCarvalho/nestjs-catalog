@@ -290,6 +290,11 @@ export {
   // drift this entry point exists to prevent.
   isWorkflowEdge,
   isWorkflowNode,
+  // What a redacted password reads as. A form that lets somebody paste an
+  // address has to recognise the string a read showed them, or it posts the
+  // placeholder back as the password on a connection that has no stored row to
+  // restore the real one from.
+  REDACTED_SECRET,
   TRANSFORM_LANGUAGES,
   // A screen that shows what a call node got back narrows it the same way the
   // runner does, so the two cannot disagree about what "no rows" looks like.

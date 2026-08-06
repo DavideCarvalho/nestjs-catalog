@@ -1,8 +1,4 @@
-import type {
-  CatalogConnection,
-  ConnectionCheck,
-  ConnectorKind,
-} from '@dudousxd/nestjs-catalog/client';
+import type { CatalogConnection, ConnectorKind } from '@dudousxd/nestjs-catalog/client';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   CircleCheck,
@@ -19,15 +15,27 @@ import type { ReactNode } from 'react';
 import { useState } from 'react';
 import { cn } from './cn';
 import {
+  CONNECTION_KIND_OPTIONS,
+  type ConnectableKind,
+  ConnectionCheckResult,
+  type ConnectionDraft,
+  ConnectionKindFields,
+  type UpdateDraft,
+  connectionConfigFor,
+  connectionDraftFrom,
+  connectionIsIncomplete,
+  configString as text,
+  toConnectableKind,
+} from './connection-form';
+import {
   type ConnectionInput,
   type ConnectionUse,
   catalogQueryKeys,
   useCatalogClient,
 } from './context';
 import { ConfirmDialog } from './ui/dialog';
-import { FieldGroup, TextField } from './ui/field';
+import { TextField } from './ui/field';
 import { SelectField } from './ui/select';
-import { Switch } from './ui/switch';
 import { Tooltip } from './ui/tooltip';
 import { type CatalogWorkflow, nodeName } from './workflow/model';
 import { WORKFLOW_NAME } from './workflow/name';
@@ -36,36 +44,18 @@ const MUTED = 'text-zinc-400 dark:text-zinc-500';
 const RULE = 'border-zinc-200 dark:border-zinc-800';
 const PANEL = 'bg-white dark:bg-zinc-900';
 
-/**
- * The kinds worth naming once and reusing.
+/*
+ * The kinds, the draft, the per-kind fields and the two rules about what a
+ * connection needs all moved to `connection-form.tsx`, and the move is the
+ * point rather than tidiness: the source node's inspector creates a connection
+ * without leaving the canvas now, so there are two screens asking what an S3
+ * connection needs. Two copies would mean the one updated second is quietly the
+ * one that is right — which is the argument `source-fields.tsx` already makes
+ * about the other half of the same question.
  *
- * Deliberately three of the five kinds a source node can be, and the two that are
- * missing are missing for the same reason the checker refuses to probe them: a
- * file's path and a set of pasted records belong to the load, not to a shared
- * address. A connection there would be a name with no address behind it, and a
- * "Test connection" that always passes is worse than no button — it teaches
- * people that a green tick means nothing.
+ * A plain comment rather than a docblock: there is no declaration left here for
+ * one to attach to, and a `/**` would describe the constant below it.
  */
-const CONNECTABLE_KINDS = ['http', 'sql', 's3'] as const;
-
-type ConnectableKind = (typeof CONNECTABLE_KINDS)[number];
-
-/** A select hands back a string. Narrow it rather than promise it is a kind. */
-function toConnectableKind(value: string): ConnectableKind {
-  return CONNECTABLE_KINDS.find((kind) => kind === value) ?? 'http';
-}
-
-const KIND_OPTIONS = [
-  { value: 'http', label: 'HTTP — a JSON endpoint' },
-  { value: 'sql', label: 'SQL — a database' },
-  { value: 's3', label: 'S3 — a bucket, or anything S3-compatible' },
-];
-
-/** Read a string out of a stored config without believing it is one. */
-function text(config: Record<string, unknown>, key: string): string {
-  const value = config[key];
-  return typeof value === 'string' ? value : '';
-}
 
 /**
  * One line saying what a connection actually points at.
@@ -335,47 +325,6 @@ function StoredCheckSummary({ connection }: { connection: CatalogConnection }) {
 }
 
 /**
- * What a check that just ran found, in the checker's own words.
- *
- * A server version, a bucket and whether anything is under the prefix, an HTTP
- * status. That sentence is the whole product of the button; "OK" would prove
- * only that something is listening on a port.
- */
-function LiveCheckResult({ result }: { result: ConnectionCheck }) {
-  return (
-    <div
-      className={cn(
-        'mt-3 rounded-md border px-3 py-2 text-[11px]',
-        result.ok
-          ? 'border-emerald-200 bg-emerald-50 text-emerald-800 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-300'
-          : 'border-red-200 bg-red-50 text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300',
-      )}
-    >
-      <div className="flex items-start gap-2">
-        {result.ok ? (
-          <CircleCheck size={13} aria-hidden className="mt-px shrink-0" />
-        ) : (
-          <CircleX size={13} aria-hidden className="mt-px shrink-0" />
-        )}
-        <div className="min-w-0">
-          <div className="font-medium">{result.ok ? 'Reached it.' : 'Could not reach it.'}</div>
-          <div className="mt-0.5 font-mono leading-relaxed">{result.detail}</div>
-          {/*
-           * The error beside the detail, not instead of it. "Reachable but
-           * refused" and "unreachable" send an operator to completely
-           * different places, and only the raw message distinguishes them.
-           */}
-          {result.error && (
-            <div className="mt-1 font-mono leading-relaxed opacity-80">{result.error}</div>
-          )}
-          <div className="mt-1 font-mono text-[10px] opacity-70">{result.elapsedMs} ms</div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-/**
  * Why a delete would be refused, said before it is attempted.
  *
  * `blockedBy` is the server's own answer to "who still reads through this",
@@ -558,7 +507,7 @@ function ConnectionCard({
       {/* The stored outcome only while this session has not run its own check. */}
       {!result && <StoredCheckSummary connection={connection} />}
 
-      {result && <LiveCheckResult result={result} />}
+      {result && <ConnectionCheckResult result={result} />}
 
       {check.error && !result && (
         <p className="mt-3 text-[11px] text-red-600">
@@ -583,170 +532,6 @@ function ConnectionCard({
   );
 }
 
-/** Everything the form edits, before it is split into a name and a config. */
-interface ConnectionDraft {
-  name: string;
-  description: string;
-  url: string;
-  bucket: string;
-  endpoint: string;
-  region: string;
-  forcePathStyle: boolean;
-  secretEnvVar: string;
-}
-
-/** A patch onto the draft, so each field can name only what it changes. */
-type UpdateDraft = (patch: Partial<ConnectionDraft>) => void;
-
-/**
- * Only the config fields the chosen kind actually reads.
- *
- * Carrying the rest would leave a stale bucket on an HTTP connection, which
- * reads as configuration somebody meant rather than as a leftover from a
- * dropdown they changed.
- */
-function connectionConfigFor(
-  kind: ConnectableKind,
-  draft: ConnectionDraft,
-): Record<string, unknown> {
-  if (kind === 's3') {
-    return {
-      bucket: draft.bucket,
-      ...(draft.endpoint ? { endpoint: draft.endpoint } : {}),
-      ...(draft.region ? { region: draft.region } : {}),
-      ...(draft.forcePathStyle ? { forcePathStyle: true } : {}),
-    };
-  }
-  return draft.url ? { url: draft.url } : {};
-}
-
-/**
- * Whether there is not yet enough here to save.
- *
- * A SQL connection needs one of its two addresses and neither is more correct:
- * the variable is the right answer in a deployment, the inline URL is the one
- * that gets somebody running locally in a minute.
- */
-function connectionIsIncomplete(kind: ConnectableKind, draft: ConnectionDraft): boolean {
-  if (draft.name.trim().length === 0) return true;
-  if (kind === 's3') return draft.bucket.trim().length === 0;
-  if (kind === 'http') return draft.url.trim().length === 0;
-  return draft.url.trim().length === 0 && draft.secretEnvVar.trim().length === 0;
-}
-
-/** A base URL, and the token sent against it. */
-function HttpFields({ draft, update }: { draft: ConnectionDraft; update: UpdateDraft }) {
-  return (
-    <>
-      <TextField
-        label="URL"
-        value={draft.url}
-        onChange={(url) => update({ url })}
-        placeholder="https://api.example.mil/v1"
-        hint="The base every source reading through this will hang its path off."
-      />
-      <TextField
-        label="Credential env var"
-        value={draft.secretEnvVar}
-        onChange={(secretEnvVar) => update({ secretEnvVar })}
-        placeholder="Optional — sent as a bearer token"
-      />
-    </>
-  );
-}
-
-/**
- * The connection string, and nothing beside it.
- *
- * This was two fields — an inline URL and the name of an environment variable
- * holding one — presented side by side with a paragraph explaining when each
- * applied. Two doors for one decision, and only one of them worked for a
- * database with a password, which is every database anybody connects to. The
- * question it produced was "what is this second field", which is the form
- * asking the reader to understand its implementation.
- *
- * One field now. Whether the URL may REST in the catalog's own table is the
- * store's decision (`allowInlineCredentials`) and not something to ask on a
- * form — and it is a decision about the deployment, not about this connection.
- * The server refuses and says why if the answer is no, which is a better place
- * to learn it than a hint nobody reads until afterwards.
- *
- * `secretEnvVar` still exists on the model and is still what a hardened
- * deployment should use; it is not on this screen. A host that wants it back
- * has the field on the record.
- */
-function SqlFields({ draft, update }: { draft: ConnectionDraft; update: UpdateDraft }) {
-  return (
-    <FieldGroup
-      title="Address"
-      hint="The connection string, as your database gives it to you. It is served back redacted, so the password never travels in a response — but it does rest in this catalog's own table, and a deployment can refuse that."
-    >
-      <TextField
-        label="Connection URL"
-        value={draft.url}
-        onChange={(url) => update({ url })}
-        placeholder="mysql://user:pass@host:3306/database"
-      />
-    </FieldGroup>
-  );
-}
-
-/** A bucket, plus everything needed to address a non-AWS one. */
-function S3Fields({ draft, update }: { draft: ConnectionDraft; update: UpdateDraft }) {
-  return (
-    <FieldGroup title="Bucket">
-      <div className="grid gap-3 sm:grid-cols-2">
-        <TextField
-          label="Bucket"
-          value={draft.bucket}
-          onChange={(bucket) => update({ bucket })}
-          placeholder="fleet-drops"
-        />
-        <TextField
-          label="Region"
-          value={draft.region}
-          onChange={(region) => update({ region })}
-          placeholder="Blank uses the environment's"
-        />
-        <TextField
-          label="Endpoint"
-          value={draft.endpoint}
-          onChange={(endpoint) => update({ endpoint })}
-          placeholder="MinIO, e.g. http://localhost:9000"
-        />
-        <TextField
-          label="Env var holding accessKeyId:secretAccessKey"
-          value={draft.secretEnvVar}
-          onChange={(secretEnvVar) => update({ secretEnvVar })}
-          placeholder="Optional"
-          hint="Leave blank anywhere the pod has its own role — those credentials rotate, and a static pair named here would not."
-        />
-      </div>
-      <Switch
-        checked={draft.forcePathStyle}
-        onCheckedChange={(forcePathStyle) => update({ forcePathStyle })}
-        label="Path-style addressing"
-        hint="MinIO needs it; AWS does not."
-      />
-    </FieldGroup>
-  );
-}
-
-/** The address fields for whichever kind is selected, and only those. */
-function ConnectionKindFields({
-  kind,
-  draft,
-  update,
-}: {
-  kind: ConnectableKind;
-  draft: ConnectionDraft;
-  update: UpdateDraft;
-}) {
-  if (kind === 'http') return <HttpFields draft={draft} update={update} />;
-  if (kind === 'sql') return <SqlFields draft={draft} update={update} />;
-  return <S3Fields draft={draft} update={update} />;
-}
-
 /**
  * Create or edit one.
  *
@@ -766,19 +551,9 @@ function ConnectionForm({
   onSaved: () => void;
 }) {
   const client = useCatalogClient();
-  const config = connection?.config ?? {};
 
   const [kind, setKind] = useState<ConnectableKind>(toConnectableKind(connection?.kind ?? 'http'));
-  const [draft, setDraft] = useState<ConnectionDraft>({
-    name: connection?.name ?? '',
-    description: connection?.description ?? '',
-    url: text(config, 'url'),
-    bucket: text(config, 'bucket'),
-    endpoint: text(config, 'endpoint'),
-    region: text(config, 'region'),
-    forcePathStyle: config.forcePathStyle === true,
-    secretEnvVar: connection?.secretEnvVar ?? '',
-  });
+  const [draft, setDraft] = useState<ConnectionDraft>(() => connectionDraftFrom(connection));
   const update: UpdateDraft = (patch) => setDraft({ ...draft, ...patch });
 
   const save = useMutation({
@@ -824,7 +599,7 @@ function ConnectionForm({
           ariaLabel="Connection kind"
           value={kind}
           onValueChange={(value) => setKind(toConnectableKind(value))}
-          options={KIND_OPTIONS}
+          options={CONNECTION_KIND_OPTIONS}
         />
       </div>
 

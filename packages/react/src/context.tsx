@@ -573,6 +573,29 @@ export interface CatalogClient {
    */
   checkConnection(id: string): Promise<ConnectionCheck>;
   /**
+   * Reach an address that has not been stored, and record nothing.
+   *
+   * The reason this exists rather than a form telling somebody to save first:
+   * the field most likely to be wrong is the one that cannot be verified by
+   * reading it, and the way you would otherwise find out is a load failing on a
+   * schedule hours later. A connection saved to discover a typo is a row
+   * somebody then has to remember to delete.
+   *
+   * Asks for `catalog:write` where {@link CatalogClient.checkConnection} asks
+   * only for `catalog:read`, and a host wiring its own transport should know
+   * why: this reaches an address supplied in the request, so under the softer
+   * scope it is the server connecting wherever a reader of the catalog points
+   * it. It grants no reach a `catalog:write` holder did not already have — they
+   * could save, check and delete — but it leaves no rows behind, so the server
+   * writes what it did to its log instead.
+   *
+   * `id` on the input is what makes an EDIT testable: the server puts the stored
+   * credential back where the caller was only ever shown a redaction of it. A
+   * create sends no id, and nothing is restored — the address reached is exactly
+   * the one that was typed.
+   */
+  checkUnsavedConnection(input: ConnectionInput): Promise<ConnectionCheck>;
+  /**
    * Which pipelines read through it. Named, so a refusal can say which.
    *
    * Workflows and not connectors, because that is the question somebody is
@@ -873,6 +896,8 @@ export function CatalogProvider({
       listConnections: () => transport.get(pipeline.connections()),
       saveConnection: (input) => transport.post<CatalogConnection>(pipeline.connections(), input),
       checkConnection: (id) => transport.post<ConnectionCheck>(pipeline.checkConnection(id), {}),
+      checkUnsavedConnection: (input) =>
+        transport.post<ConnectionCheck>(pipeline.checkUnsavedConnection(), input),
       connectionWorkflows: (id) => transport.get(pipeline.connectionWorkflows(id)),
       deleteConnection: (id) => transport.delete<{ deleted: boolean }>(pipeline.connection(id)),
 

@@ -89,6 +89,40 @@ export {
   connectionOptionsFor,
   describeConnection,
 } from './ConnectionPanel';
+// What a connection IS, as data: which kinds can be one, what each needs, and
+// the two rules — completeness, and the redaction placeholder — that decide
+// whether a form may send one.
+//
+// Exported because there are two forms now. The console's is here; the source
+// node's inspector on the canvas has its own, behind the `/workflow` subpath,
+// and a host assembling a third should be reading these rather than restating
+// what an S3 connection needs.
+export {
+  CONNECTABLE_KINDS,
+  CONNECTION_KIND_OPTIONS,
+  CONNECTION_KINDS,
+  type ConnectableKind,
+  type ConnectableKindSpec,
+  ConnectionCheckResult,
+  type ConnectionDraft,
+  ConnectionKindFields,
+  type ConnectionKindSpec,
+  type UnconnectableKindSpec,
+  type UpdateDraft,
+  connectableSpec,
+  connectionConfigFor,
+  connectionDraftFrom,
+  connectionIsIncomplete,
+  redactedCredentialIn,
+  toConnectableKind,
+} from './connection-form';
+// Creating a connection from wherever a source is being configured.
+//
+// On the root entry and not behind `/workflow`, for the reason
+// `SchemaDiscoveryPanel` is: it imports no React Flow, and it is the other half
+// of the same offer — the sink's panel makes the type, this makes the address. A
+// host assembling its own source inspector should be able to mount either.
+export { SourceConnectionCreator } from './source-connection';
 export {
   PipelineConsole,
   type PipelineConsoleProps,
