@@ -42,6 +42,7 @@
  * they throw rather than fail. `toHaveProperty('disabled', true)` is the equivalent that works.
  */
 import type {
+  CatalogPropertyDef,
   CatalogSnapshot,
   CatalogTransform,
   CatalogWorkflow,
@@ -213,11 +214,11 @@ function transform(overrides: Partial<CatalogTransform> = {}): CatalogTransform 
   };
 }
 
-function snapshot(): CatalogSnapshot {
+function snapshot(properties: CatalogPropertyDef[] = []): CatalogSnapshot {
   return {
     version: 1,
     generatedAt: '2026-01-01T00:00:00.000Z',
-    stats: { types: 1, properties: 0, relations: 0, enrichedTypes: 1 },
+    stats: { types: 1, properties: properties.length, relations: 0, enrichedTypes: 1 },
     types: [
       {
         name: 'Mvr',
@@ -227,10 +228,33 @@ function snapshot(): CatalogSnapshot {
         group: 'Fleet',
         primaryKey: ['id'],
         enriched: true,
-        properties: [],
+        properties,
         relations: [],
       },
     ],
+  };
+}
+
+/**
+ * One property of the type a sink writes.
+ *
+ * `columnName` defaults to the name because that is what an ORM-derived type
+ * looks like — the two only diverge on a *published* type whose source spelled a
+ * column in a way SQL cannot use, which is the case the shape tests below are
+ * about and the one place they pass it explicitly.
+ */
+function property(name: string, overrides: Partial<CatalogPropertyDef> = {}): CatalogPropertyDef {
+  return {
+    name,
+    displayName: name,
+    type: 'string',
+    columnName: name,
+    nullable: true,
+    primary: false,
+    hidden: false,
+    order: 0,
+    enriched: false,
+    ...overrides,
   };
 }
 
@@ -483,6 +507,207 @@ describe('names', () => {
 
     addNodeOfKind('sink');
     await waitFor(() => expect(panel('Still to do').getByText('Sink 3')).toBeDefined());
+  });
+});
+
+/**
+ * The column check, where a reader actually meets it.
+ *
+ * `workflow/shape.spec.ts` pins what the answer is. What these pin is where the question gets
+ * asked and where the answer comes out, which are two different screens: the button is on the
+ * source node's inspector, and the verdict is in the Problems rail beside the canvas. The fixture
+ * graph is `Feed → Out`, a source wired straight into a sink, which is the one shape the check has
+ * anything to say about.
+ *
+ * **Nothing is discovered on the canvas's behalf, and that is the point of driving these through
+ * the button.** Discovery is a read of a live source behind a `POST`; a canvas that fired it for
+ * every source node on load would open a database connection nobody asked for, four of them on a
+ * graph with four sources. So the check speaks about a node somebody asked about and stays silent
+ * about every other one, and the first test here is that silence.
+ *
+ * The Save button's colour is asserted rather than described because it is the only signal before
+ * the click, and it is driven by `hasBlockingProblem` over `level`. A refactor that reported an
+ * unproven column as an error would turn this button amber, which is the whole failure: a panel
+ * that shouts about what it could not prove is one people stop reading.
+ */
+describe('whether the source fits the sink', () => {
+  /** `Asset Id` in the source, `Asset_Id` on the type. The 6,905-row case, on screen. */
+  const respelled = [property('Asset_Id', { columnName: 'Asset Id' })];
+
+  /** Where `discoverSourceSchema` lands for the source node in `wholeWorkflow`. */
+  const DISCOVER = '/pipeline/workflows/wf1/nodes/src_1/discover';
+
+  /**
+   * A driver description of one column, exactly as the route answers.
+   *
+   * `basis: 'driver'` with `sampled: 0` is what a real deployment came back with, and it is what
+   * makes a type difference a question rather than a refusal — the driver described the result set
+   * and not one row was read.
+   */
+  function discovery(name: string, type: 'string' | 'number') {
+    return {
+      workflowId: 'wf1',
+      nodeId: 'src_1',
+      nodeName: 'Feed',
+      kind: 'http',
+      targetType: 'Mvr',
+      typeExists: true,
+      basis: 'driver',
+      sampled: 0,
+      caveat: 'The driver described the result set. No rows were read.',
+      columns: [{ name, type, confidence: 'reported', sourceType: 'VARCHAR', nullable: null }],
+      drift: null,
+    };
+  }
+
+  /** Open the source's inspector from the wiring list, and ask what it reads. */
+  async function discoverOnFeed() {
+    fireEvent.click(panel('Wiring').getByText('Feed'));
+    fireEvent.click(await screen.findByText('Discover schema'));
+  }
+
+  /** Close the inspector, which is what the answer has to outlive. */
+  function closeInspector() {
+    fireEvent.click(inspector().getByLabelText('Close'));
+  }
+
+  it('says nothing until somebody has asked what the source reads', async () => {
+    // The state every graph opens in, and the state a deployment that has never run discovery
+    // stays in. Silence here is "nobody asked", not "it fits" — the type on screen is the one
+    // whose columns do NOT line up, and the canvas has no business guessing at that unasked.
+    const { transport, calls } = fakeTransport(
+      answersFor([wholeWorkflow()], { '/catalog': snapshot(respelled) }),
+    );
+    await openCanvas(transport);
+
+    expect(panel('Problems').getByText(/Nothing to flag here/)).toBeDefined();
+    // …and not because the answer was fetched and ignored. Nothing asked the source anything.
+    expect(calls.some((call) => call.path === DISCOVER)).toBe(false);
+  });
+
+  it('reports the column the source spells its own way, and colours Save as refused', async () => {
+    const { transport } = fakeTransport(
+      answersFor([wholeWorkflow()], { '/catalog': snapshot(respelled) }),
+      { [DISCOVER]: discovery('Asset Id', 'string') },
+    );
+    await openCanvas(transport);
+
+    await discoverOnFeed();
+
+    await waitFor(() =>
+      expect(panel('Problems').getByText(/knows under a different name/)).toBeDefined(),
+    );
+    expect(saveButton().className).toContain('bg-amber-600');
+  });
+
+  it('keeps what it read after the inspector that read it has closed', async () => {
+    // The reason the canvas holds these and the panel does not. The panel is unmounted with the
+    // sheet, and the rail that has something to say about the columns is on the other side of it —
+    // a report that died with its own dialog would never be read by anybody.
+    const { transport } = fakeTransport(
+      answersFor([wholeWorkflow()], { '/catalog': snapshot(respelled) }),
+      { [DISCOVER]: discovery('Asset Id', 'string') },
+    );
+    await openCanvas(transport);
+
+    await discoverOnFeed();
+    await waitFor(() =>
+      expect(panel('Problems').getByText(/knows under a different name/)).toBeDefined(),
+    );
+
+    closeInspector();
+
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    expect(panel('Problems').getByText(/knows under a different name/)).toBeDefined();
+  });
+
+  it('forgets what it read once the node is pointed somewhere else', async () => {
+    // A discovered shape describes the source as it was addressed when it was read. Change the
+    // address and those columns stop being about this node — so the check goes quiet rather than
+    // reporting a missing column against a query somebody has since rewritten. Over-forgetting
+    // costs a second press of the button; under-forgetting is the validator inventing a fact.
+    const { transport } = fakeTransport(
+      answersFor([wholeWorkflow()], { '/catalog': snapshot(respelled) }),
+      { [DISCOVER]: discovery('Asset Id', 'string') },
+    );
+    await openCanvas(transport);
+
+    await discoverOnFeed();
+    await waitFor(() =>
+      expect(panel('Problems').getByText(/knows under a different name/)).toBeDefined(),
+    );
+
+    fireEvent.change(inspector().getByLabelText(/^URL/), {
+      target: { value: 'https://example.test/other' },
+    });
+
+    await waitFor(() =>
+      expect(panel('Problems').queryByText(/knows under a different name/)).toBeNull(),
+    );
+  });
+
+  it('keeps what it read when the node is only renamed', async () => {
+    // The other half of that rule. A name is not an address, and dropping the check for the most
+    // ordinary edit there is would make it disappear for reasons nobody could connect to it.
+    const { transport } = fakeTransport(
+      answersFor([wholeWorkflow()], { '/catalog': snapshot(respelled) }),
+      { [DISCOVER]: discovery('Asset Id', 'string') },
+    );
+    await openCanvas(transport);
+
+    await discoverOnFeed();
+    await waitFor(() =>
+      expect(panel('Problems').getByText(/knows under a different name/)).toBeDefined(),
+    );
+
+    fireEvent.change(inspector().getByLabelText(/^Name/), { target: { value: 'Vehicle feed' } });
+
+    await waitFor(() => expect(panel('Wiring').getByText('Vehicle feed')).toBeDefined());
+    expect(panel('Problems').getByText(/knows under a different name/)).toBeDefined();
+  });
+
+  it('lists a column it could not decide about without blocking the save', async () => {
+    // `string` from the driver into a `number` property. It loads perfectly when every value is
+    // numeric, and `sampled: 0` means not one was read — so the honest answer is a question.
+    const { transport } = fakeTransport(
+      answersFor([wholeWorkflow()], {
+        '/catalog': snapshot([property('miles', { type: 'number' })]),
+      }),
+      { [DISCOVER]: discovery('miles', 'string') },
+    );
+    await openCanvas(transport);
+
+    await discoverOnFeed();
+
+    await waitFor(() =>
+      expect(
+        panel('Problems').getByText(/could not be decided from the schemas alone/),
+      ).toBeDefined(),
+    );
+    expect(saveButton().className).not.toContain('bg-amber-600');
+  });
+
+  it('still says nothing alarming about a sink somebody just added', async () => {
+    // The tension the top of this file is about, with the column check switched on: a node
+    // created a second ago has no type yet, so there is nothing to compare, and a check that
+    // found something to say here would be the original report all over again.
+    const { transport } = fakeTransport(
+      answersFor([wholeWorkflow()], { '/catalog': snapshot(respelled) }),
+      { [DISCOVER]: discovery('Asset Id', 'string') },
+    );
+    await openCanvas(transport);
+
+    await discoverOnFeed();
+    await waitFor(() =>
+      expect(panel('Problems').getByText(/knows under a different name/)).toBeDefined(),
+    );
+    closeInspector();
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+
+    addNodeOfKind('sink');
+
+    await waitFor(() => expect(panel('Still to do')).toBeDefined());
+    expect(panel('Still to do').queryByText(/knows under a different name/)).toBeNull();
   });
 });
 

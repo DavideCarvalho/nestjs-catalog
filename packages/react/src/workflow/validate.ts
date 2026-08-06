@@ -6,6 +6,7 @@ import {
 } from '@dudousxd/nestjs-catalog/client';
 import { nodeName } from './model';
 import { WORKFLOW_NAME } from './name';
+import { type ShapeKnowledge, checkShapes } from './shape';
 
 /**
  * What is wrong with a graph, checked in the browser while it is being drawn.
@@ -30,6 +31,13 @@ import { WORKFLOW_NAME } from './name';
  * - **A sink with no object type.** Core's type requires `targetType` on a sink
  *   but its validator never checks that the string is non-empty, and the server
  *   refuses one that is. The check is additive, not contradictory.
+ * - **Whether a source's columns fit the type its sink writes.** Core validates
+ *   topology, and topology cannot see a column: a sink wired to a source that
+ *   supplies none of its fields is a perfectly well-formed graph. Answering it
+ *   needs two things core has no access to — what discovery said the source
+ *   reads, and what the catalog says the type is made of — so it lives in
+ *   `shape.ts` and runs only when a caller supplies both. See that file's
+ *   header for why the answer has three values and not two.
  *
  * Two sinks writing the same type is NOT in that list: core reports it itself,
  * as `duplicate-sink-type`, and is passed straight through.
@@ -52,7 +60,16 @@ export type WorkflowProblemCode =
   | WorkflowIssueCode
   | 'missing-transform'
   | 'sink-has-no-type'
-  | 'duplicate-sink-type';
+  | 'duplicate-sink-type'
+  // The shape checks. Two errors and two warnings, because the answer to "does
+  // this fit" has three values — see `shape.ts`. A caller keying off these gets
+  // no help from the server, which is the one difference from the codes above:
+  // there is no server refusal spelled `shape-unproven`, and there should not
+  // be, since a thing that could not be proven is not a thing to refuse.
+  | 'shape-source-spelling'
+  | 'shape-missing-column'
+  | 'shape-unproven'
+  | 'shape-not-checked';
 
 export interface WorkflowProblem {
   level: WorkflowProblemLevel;
@@ -76,6 +93,17 @@ export interface ValidateOptions {
    * the list is passed in rather than assumed complete.
    */
   transformIds: ReadonlySet<string>;
+  /**
+   * What each source reads and what each type is made of, when the caller can
+   * say. Absent means the column checks in `shape.ts` do not run at all.
+   *
+   * Optional rather than required, and absent rather than empty: a caller with
+   * no discovery to offer has not learned that every graph is fine, it has not
+   * asked. An empty implementation would report the same silence while looking
+   * like an answer, which is the distinction this whole pair of modules is
+   * about.
+   */
+  shapes?: ShapeKnowledge;
 }
 
 /**
@@ -105,11 +133,25 @@ export interface ValidateOptions {
  * promise a save the server refuses.
  */
 
-/** The wires an issue is really about, since core names nodes and not edges. */
+/**
+ * The wires an issue is really about, since core names nodes and not edges.
+ *
+ * The two shape errors are here as well as core's three, because "this source
+ * does not supply that sink's columns" is a statement about the wire between
+ * them and the canvas should draw it that way. The two shape *warnings* are
+ * deliberately absent: a red wire is error styling, and the whole point of the
+ * third outcome is that it does not wear it.
+ */
+const EDGE_CODES: ReadonlySet<WorkflowProblemCode> = new Set([
+  'cycle',
+  'self-edge',
+  'duplicate-edge',
+  'shape-source-spelling',
+  'shape-missing-column',
+]);
+
 function edgesFor(code: WorkflowProblemCode, nodeIds: string[], edges: WorkflowEdge[]): string[] {
-  if (code !== 'cycle' && code !== 'self-edge' && code !== 'duplicate-edge') {
-    return [];
-  }
+  if (!EDGE_CODES.has(code)) return [];
   const named = new Set(nodeIds);
   return edges
     .filter((edge) => named.has(edge.from) && named.has(edge.to))
@@ -193,7 +235,31 @@ export function validateWorkflow(
     }
   }
 
+  // Last, and only when a caller supplied the two halves it needs. The columns
+  // are a different question from the wiring — a graph can be structurally
+  // perfect and still write nulls into every row — so it is asked whatever the
+  // checks above said, for the same reason they are asked whatever core said.
+  problems.push(...shapeProblems(draft, options));
+
   return problems;
+}
+
+/**
+ * The column checks, with their wires filled in the same way everything else's
+ * are.
+ *
+ * `shape.ts` returns no edge ids of its own on purpose: `edgesFor` above is the
+ * one derivation of a wire from the nodes an issue names, and a second copy
+ * inside the shape module is exactly the drift this file's header is about. Which
+ * codes get a wire is therefore decided in one place, and the warnings are not
+ * among them.
+ */
+function shapeProblems(draft: WorkflowDraft, options: ValidateOptions): WorkflowProblem[] {
+  if (!options.shapes) return [];
+  return checkShapes(draft.nodes, draft.edges, options.shapes).map((problem) => ({
+    ...problem,
+    edgeIds: edgesFor(problem.code, problem.nodeIds, draft.edges),
+  }));
 }
 
 /**

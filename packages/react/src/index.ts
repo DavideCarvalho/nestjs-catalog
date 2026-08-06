@@ -189,10 +189,27 @@ export {
   type WorkflowTransformNode,
 } from './workflow/model';
 export { WORKFLOW_NAME } from './workflow/name';
-// Core's rules, run in the browser, plus the two questions core cannot answer:
-// whether a connection is legal mid-drag, and whether a node names a transform
-// that still exists. Exported so a host can run the same checks before it offers
-// a save — never so it can skip the server's, which is the authority.
+// Whether what a source reads fits the type its sink writes.
+//
+// The canvas answers this for itself now — it holds what `discoverSourceSchema`
+// returned for each source node and compares it against the snapshot it already
+// reads, so there is no prop and nothing for a host to wire. These are exported
+// because the comparison is pure and a host may well want it somewhere else: a
+// pre-flight before a scheduled run, say. `ConnectorSchemaDiscovery` above is
+// already a `SourceShape`, so that caller has one for free.
+export {
+  checkShapes,
+  type ShapeKnowledge,
+  type SourceColumn,
+  type SourceShape,
+  type TargetProperty,
+  type TargetShape,
+} from './workflow/shape';
+// Core's rules, run in the browser, plus the questions core cannot answer:
+// whether a connection is legal mid-drag, whether a node names a transform that
+// still exists, and whether a source supplies the columns its sink writes.
+// Exported so a host can run the same checks before it offers a save — never so
+// it can skip the server's, which is the authority.
 export {
   canConnect,
   type ConnectionVerdict,

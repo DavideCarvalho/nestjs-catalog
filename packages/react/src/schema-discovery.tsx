@@ -283,12 +283,30 @@ export function SchemaDiscoveryPanel({
   nodeId,
   bridge,
   disabledReason,
+  onDiscovered,
 }: {
   workflowId: string;
   nodeId: string;
   bridge: SchemaDiscoveryBridge;
   /** Why the button cannot be pressed, said out loud. Absent means it can. */
   disabledReason?: string;
+  /**
+   * Told to whoever mounted this, because the answer outlives the panel.
+   *
+   * This component holds the report in state, and the canvas unmounts it the
+   * moment the inspector closes — so the columns a person just read would be
+   * gone by the time they looked at the problems rail, which is the one place
+   * the same answer has anything else to say. The canvas keeps them per node
+   * and hands them to `validateWorkflow`; see `workflow/shape.ts`.
+   *
+   * A callback rather than a query the canvas fires itself, because discovery
+   * is a **read of a live source** behind a `POST`: opening a graph with four
+   * source nodes must not open four database connections nobody asked for. The
+   * shape check is therefore answered exactly where somebody asked the
+   * question, and stays silent everywhere else — which is what that module is
+   * written around.
+   */
+  onDiscovered?: (nodeId: string, discovery: ConnectorSchemaDiscovery) => void;
 }) {
   // Counted rather than timestamped so a second discovery always remounts the
   // table below, dropping the choices somebody made against a column list that
@@ -297,7 +315,10 @@ export function SchemaDiscoveryPanel({
 
   const discover = useMutation({
     mutationFn: () => bridge.discover(workflowId, nodeId),
-    onSuccess: (value) => setDiscovered((previous) => ({ run: (previous?.run ?? 0) + 1, value })),
+    onSuccess: (value) => {
+      setDiscovered((previous) => ({ run: (previous?.run ?? 0) + 1, value }));
+      onDiscovered?.(nodeId, value);
+    },
   });
 
   return (
