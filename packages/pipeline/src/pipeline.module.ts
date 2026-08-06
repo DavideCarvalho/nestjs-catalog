@@ -24,6 +24,7 @@ import {
 import { createPipelineController } from './pipeline.controller';
 import { createPublishController } from './publish.controller';
 import { PublishService } from './publish.service';
+import { AbandonedRunReconciler, CATALOG_RECONCILE_RUNS } from './run-reconciler.service';
 import {
   CATALOG_PIPELINE_EM,
   CATALOG_PIPELINE_REGISTRY,
@@ -234,6 +235,23 @@ export interface CatalogPipelineModuleOptions {
    * is, and no route can edit it. See {@link ConnectorAdoption}.
    */
   adoptConnectors?: boolean;
+  /**
+   * Whether THIS process closes run rows whose durable run the engine has
+   * finished with. Defaults to whatever {@link scheduler} is, and then to true.
+   *
+   * The third thing on that axis and defaulted the same way as
+   * {@link adoptConnectors}, for the same reason: it writes, and six replicas
+   * racing to close one row is six copies of the warning about it.
+   *
+   * Passing false everywhere is supported and its consequence is stated rather
+   * than hidden: a durable run that dies before reaching its finish step — an
+   * execution timeout, a cancellation, a worker that never resumed — leaves a
+   * row marked `running` with no error, and nothing will ever revisit it,
+   * because the next run of that pipeline mints a new snapshot. The
+   * next-attempt rule still covers a step being retried. See
+   * {@link AbandonedRunReconciler}.
+   */
+  reconcileRuns?: boolean;
   /** Passed to `SubprocessTransformRunner` for Python transforms. */
   pythonVenv?: string;
 }
@@ -291,6 +309,12 @@ export class CatalogPipelineModule {
         useValue: options.adoptConnectors ?? options.scheduler ?? true,
       },
       {
+        // Same axis, same default, and the same argument: one process does the
+        // background writing. See `CatalogPipelineModuleOptions.reconcileRuns`.
+        provide: CATALOG_RECONCILE_RUNS,
+        useValue: options.reconcileRuns ?? options.scheduler ?? true,
+      },
+      {
         // Constructed rather than auto-wired so the venv path is visible beside
         // the rest of this module's configuration.
         provide: SubprocessTransformRunner,
@@ -303,6 +327,7 @@ export class CatalogPipelineModule {
       ConnectionChecker,
       ConnectorScheduler,
       ConnectorAdoption,
+      AbandonedRunReconciler,
       LoadExpectationsAnnouncer,
       SecretEnvAllowlistAnnouncer,
       ConnectorRunSteps,
@@ -359,6 +384,7 @@ export const CATALOG_PIPELINE_TOKENS = {
   scope: CATALOG_PIPELINE_SCOPE,
   schedulerEnabled: CATALOG_SCHEDULER_ENABLED,
   adoptConnectors: CATALOG_ADOPT_CONNECTORS,
+  reconcileRuns: CATALOG_RECONCILE_RUNS,
   expectations: CATALOG_LOAD_EXPECTATIONS,
 } as const;
 

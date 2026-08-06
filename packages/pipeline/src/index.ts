@@ -1,10 +1,19 @@
 export {
   ORPHAN_SCAN_LIMIT,
+  RECONCILE_SCAN_LIMIT,
   abandonedRunMessage,
+  askEngineAboutRun,
   closeAbandonedAttempts,
+  closeRunsTheEngineHasFinished,
+  engineRunView,
+  lostRunMessage,
   type AbandonedRunLog,
   type AbandonedRunStore,
   type AbandonedScan,
+  type EngineRunView,
+  type EngineVerdict,
+  type ReconcileOutcome,
+  type ReconcileScan,
 } from './abandoned-runs';
 export { ConnectionChecker } from './connection-checker.service';
 export {
@@ -47,6 +56,7 @@ export {
 } from './property-names';
 export { createPublishController } from './publish.controller';
 export { PublishService, type PublishedType } from './publish.service';
+export { AbandonedRunReconciler, CATALOG_RECONCILE_RUNS } from './run-reconciler.service';
 export { WorkflowLauncher, type WorkflowDurability } from './workflow-launcher.service';
 export {
   toGraph,

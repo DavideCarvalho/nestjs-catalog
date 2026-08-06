@@ -61,4 +61,8 @@ workflow run plans once and its node retries reuse that row, so the attempt that
 a planning step being retried or an operator re-driving the same `snapshotId`. A durable run that
 dies without reaching its finish step — an execution timeout, a cancellation, a worker that never
 resumes — leaves a row nothing revisits, because the next run mints a new snapshot. Closing that one
-needs the engine's own view of the run, which is not a clock and is not this change.
+needs the engine's own view of the run, which is not a clock. `AbandonedRunReconciler` does it, in
+the changeset beside this one: the snapshot id *is* the durable run id, so `engine.getRun` answers
+whether a run this deployment still calls `running` is actually alive. The two rules are complements
+— this one needs no engine and closes the earlier attempts of a retry series as the next one opens;
+that one needs an engine and closes the row nothing will ever come back to.

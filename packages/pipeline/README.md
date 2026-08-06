@@ -119,8 +119,8 @@ expires is re-dispatched while the attempt holding it is still running, so that 
 in, a run closes any earlier run *at the same snapshot id* that is still marked running, recording
 what that state means and pointing at `durable_step_checkpoints`, where a rising `attempts` against
 an empty error is the engine's side of the same fact. Keyed on the snapshot rather than on age,
-because the loads this is about are the slow ones — the last attempt of a series is still never
-closed by anything, since nothing runs after it.
+because the loads this is about are the slow ones — the last attempt of a series is closed by nothing
+on this rule, since nothing runs after it, and is picked up by the engine-view pass below.
 
 One implementation (`closeAbandonedAttempts`), called by both `ConnectorRunnerService` and
 `WorkflowRunnerService`: they are two implementations of a load rather than one wrapping the other,
@@ -137,13 +137,33 @@ follow from the graph path having a *planning step* rather than a per-attempt ro
   staged rows are only collected from a failed run, so a row abandoned at `running` kept its stages
   for good until something closed it.
 
-**The limit on the graph path is wider than on the single-connector one.** A durable workflow run
-plans once and its node retries reuse that row, so the attempt that closes an abandoned row is a
-planning step being retried or an operator re-driving the same `snapshotId`. A durable run that dies
-without ever reaching its finish step — an execution timeout, a cancellation, a worker that never
-resumes — leaves a row nothing will revisit, because the next run of that workflow mints a new
-snapshot. That row is still an open question, and the honest answer to it is the engine's own view of
-the run rather than a clock.
+**The row nothing revisits is closed by asking the engine.** A durable workflow run plans once and
+its node retries reuse that row, so the attempt that closes an abandoned row is a planning step being
+retried or an operator re-driving the same `snapshotId`. A durable run that dies without ever
+reaching its finish step — an execution timeout, a cancellation, a worker that never resumes — leaves
+a row nothing will revisit, because the next run of that workflow mints a new snapshot. The answer to
+that row is not a clock but the engine: **the snapshot id *is* the durable run id**, so
+`AbandonedRunReconciler` asks `engine.getRun` whether the run this deployment still calls `running` is
+actually alive, and closes it when the engine has no record of it or reports it terminal.
+
+- **A pass every `CATALOG_RUN_RECONCILE_MS` (default 5 min), on one process.** One
+  `ORDER BY started_at DESC LIMIT CATALOG_RUN_RECONCILE_SCAN` over the run table, one
+  `listConnectors` for the names, and one `engine.getRun` per row *currently* open — nought or one on
+  a healthy deployment. Nothing in it grows with the data a load moves. Loaded on the same axis as the
+  scheduler and connector adoption (`reconcileRuns`, defaulting to `scheduler`), because it writes.
+- **Three answers, and only two are writes.** No record of the run, or a terminal status, are closes.
+  A non-terminal status — including one a later engine release adds — is left exactly alone: a row
+  wrongly left `running` is visible and is the status quo, a row wrongly closed is a false outcome in
+  the record a load is audited by.
+- **When the engine cannot be asked, nothing is written and the reason is said at boot.** No engine
+  at all means every run here is `inline` and there is nothing to reconcile. An engine that resolved
+  and cannot read a run is the thin-worker case — `DurableStartClient` is bound under the
+  `WorkflowEngine` token as a store-less, start-only facade — and warns, because durable rows exist
+  and this process cannot see them.
+- **Only rows that say `executionMode: 'durable'`.** An `inline` row has no durable run, so
+  `getRun` would answer "no record" for a load running perfectly. A row with no execution mode —
+  which is every `ConnectorRunnerService` row — is refused for the same reason rather than guessed at,
+  so the single-transform path keeps the next-attempt rule and gets no second one.
 
 **A MySQL connector reads a batch at a time; a Postgres one does not, and neither does a connector
 with a transform.** The write side has always been bounded — 500 rows per batch — and the read side
