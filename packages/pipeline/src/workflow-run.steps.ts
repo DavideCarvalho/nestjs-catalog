@@ -63,7 +63,10 @@ export class WorkflowRunSteps {
    * Open the run row and work out the order.
    *
    * Retried quickly rather than in minutes: nothing here reaches a source, so
-   * the only failures it can have are the store being briefly unavailable.
+   * the only failures it can have are the store being briefly unavailable. A
+   * retry that follows an attempt which committed `startRun` and then lost its
+   * result is exactly the case `WorkflowRunnerService.plan` closes the earlier
+   * row for, which is why it is *this* step that has anything to report below.
    */
   @Step({
     name: WORKFLOW_PLAN_STEP,
@@ -72,8 +75,8 @@ export class WorkflowRunSteps {
     backoffMs: 5_000,
     jitter: true,
   })
-  async plan(input: WorkflowPlanStepInput): Promise<WorkflowPlanResult> {
-    return this.guard(() =>
+  async plan(input: WorkflowPlanStepInput, log?: StepLogger): Promise<WorkflowPlanResult> {
+    const plan = await this.guard(() =>
       this.scope.run(() =>
         this.runner.plan({
           workflowId: input.workflowId,
@@ -87,6 +90,13 @@ export class WorkflowRunSteps {
         }),
       ),
     );
+    // On the step as well as on the run row, the way `runNode` puts a node's
+    // own lines on both. Whoever is looking at a durable run whose earlier
+    // attempt vanished is looking at the engine's tables already — telling them
+    // there that a row was closed, and why, saves the hop to a second table to
+    // find out what the engine's own `attempts` column meant.
+    for (const line of plan.notes ?? []) log?.warn(line);
+    return plan;
   }
 
   /**

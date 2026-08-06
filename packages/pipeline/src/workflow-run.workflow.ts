@@ -133,7 +133,13 @@ export class CatalogWorkflowRunWorkflow {
       principalId: input.principalId,
     });
 
-    const progress = this.runner.emptyProgress();
+    // Seeded from the plan's checkpoint, so a note about an attempt that was
+    // found abandoned at this snapshot survives into this run's log — and
+    // survives a replay, which is the case that matters: what is being recorded
+    // is precisely that a previous attempt did not survive. `?? []` because a
+    // run whose plan was checkpointed by a build before the field existed
+    // replays through here.
+    const progress = this.runner.emptyProgress(plan.notes ?? []);
 
     for (let index = 0; index < plan.order.length; index += 1) {
       const entry = plan.order[index];

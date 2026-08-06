@@ -1,3 +1,11 @@
+export {
+  ORPHAN_SCAN_LIMIT,
+  abandonedRunMessage,
+  closeAbandonedAttempts,
+  type AbandonedRunLog,
+  type AbandonedRunStore,
+  type AbandonedScan,
+} from './abandoned-runs';
 export { ConnectionChecker } from './connection-checker.service';
 export {
   REDACTED_SECRET,
