@@ -107,13 +107,20 @@ function harness(options: Options = {}) {
   return { store, engine, runs, asked, warnings, logs, logger, reads: () => reads };
 }
 
-/** The rule, run over the harness, with the store narrowed the way Nest does. */
+/**
+ * The rule, run over the harness, with the store narrowed the way Nest does.
+ *
+ * `names` is handed over as the thunk the interface now takes, and {@link asked}
+ * counts the calls: the whole reason it became a function is that a pass which
+ * closes nothing must not pay for it, and a spec that resolved the map itself
+ * would not be able to see the difference.
+ */
 function reconcile(kit: ReturnType<typeof harness>, names?: ReadonlyMap<string, string>) {
   return closeRunsTheEngineHasFinished(
     Object.assign(Object.create(null), kit.store),
     kit.engine,
     kit.logger,
-    names ? { names } : {},
+    names ? { names: () => Promise.resolve(names) } : {},
   );
 }
 
@@ -193,6 +200,62 @@ describe('a durable run that died before reaching its finish step', () => {
     const unnamed = harness({ runs: [openRun()] });
     await reconcile(unnamed);
     expect(unnamed.runs[0].error).toContain('"conn-1"');
+  });
+
+  /**
+   * The reason `names` is a function rather than a map.
+   *
+   * This library mounts inside somebody else's application and this pass runs
+   * every five minutes whether or not anybody is using it. Reading the connector
+   * table to decorate a warning is defensible; reading it on the pass that has
+   * no warning to write — which is every pass on a deployment where nothing is
+   * wrong — is a tax on an idle host, and it was being paid twelve times an hour
+   * forever.
+   */
+  it('does not read the connector names on a pass that closes nothing', async () => {
+    // A run the engine says is alive: examined, and left exactly as it was.
+    const kit = harness({
+      runs: [openRun()],
+      engineRuns: { [SNAPSHOT]: { status: 'running' } },
+    });
+    let asked = 0;
+
+    const outcome = await closeRunsTheEngineHasFinished(
+      Object.assign(Object.create(null), kit.store),
+      kit.engine,
+      kit.logger,
+      {
+        names: () => {
+          asked += 1;
+          return Promise.resolve(new Map());
+        },
+      },
+    );
+
+    expect(outcome).toMatchObject({ closed: 0, alive: 1 });
+    expect(asked).toBe(0);
+  });
+
+  it('reads them once, however many rows one pass closes', async () => {
+    const kit = harness({
+      runs: [openRun({ id: 'run-a', snapshotId: 'wf-a' }), openRun({ id: 'run-b' })],
+    });
+    let asked = 0;
+
+    await closeRunsTheEngineHasFinished(
+      Object.assign(Object.create(null), kit.store),
+      kit.engine,
+      kit.logger,
+      {
+        names: () => {
+          asked += 1;
+          return Promise.resolve(new Map([['conn-1', 'Nightly fleet']]));
+        },
+      },
+    );
+
+    expect(kit.runs.map((run) => run.status)).toEqual(['failed', 'failed']);
+    expect(asked).toBe(1);
   });
 });
 

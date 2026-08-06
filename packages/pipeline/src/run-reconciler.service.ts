@@ -76,12 +76,15 @@ const DEFAULT_RECONCILE_MS = 5 * 60_000;
  *   row on every page render, which is exactly the kind of tax this package must
  *   not levy on the app embedding it.
  * - **A loop** costs, per pass: one `ORDER BY started_at DESC LIMIT n` over the
- *   run table, one `listConnectors` for the names, and one `engine.getRun` per
- *   row that is *currently* `running` and durable — which on a healthy
- *   deployment is nought or one. Nothing in that grows with the data a load
- *   moves, and every part of it is bounded before it is issued. A pass that finds
- *   something to close pays one further read of the run list, for the race
- *   described on {@link closeRunsTheEngineHasFinished}.
+ *   run table, and one `engine.getRun` per row that is *currently* `running` and
+ *   durable — which on a healthy deployment is nought or one. So on a deployment
+ *   where nothing is wrong, **one statement every five minutes**. Nothing in it
+ *   grows with the data a load moves, and every part is bounded before it is
+ *   issued. A pass that finds something to close pays two further reads — the
+ *   run list again, for the race described on
+ *   {@link closeRunsTheEngineHasFinished}, and one `listConnectors` for the
+ *   names — and neither is paid by a pass that found nothing, which is all of
+ *   them.
  *
  * On one pod, at {@link DEFAULT_RECONCILE_MS}. `CATALOG_RUN_RECONCILE_MS`
  * moves the interval and `CATALOG_RUN_RECONCILE_SCAN` the window.
@@ -205,7 +208,10 @@ export class AbandonedRunReconciler implements OnApplicationBootstrap, OnApplica
     this.working = true;
     try {
       const outcome = await closeRunsTheEngineHasFinished(this.pipeline, view, this.logger, {
-        names: await this.connectorNames(),
+        // Passed unresolved. See `ReconcileScan.names`: a healthy pass closes
+        // nothing, so a map built up front is a whole table read to decorate a
+        // warning that is not going to be written.
+        names: () => this.connectorNames(),
       });
       // Only when something happened. A line every five minutes saying nothing
       // was wrong is how the line that says something *is* wrong stops being

@@ -128,16 +128,34 @@ function connector(overrides: Partial<CatalogConnector> = {}): CatalogConnector 
 
 /** Only the members the loop reaches; anything else is a call it must not make. */
 function storeOf(workflows: CatalogWorkflow[], connectors: CatalogConnector[]) {
-  return {
-    listWorkflows: () => Promise.resolve(workflows),
+  return countingStoreOf(workflows, connectors).store;
+}
+
+/**
+ * The same store, with the two reads the loop issues counted.
+ *
+ * How many of them a tick makes is a property this package is on the hook for:
+ * it mounts inside somebody else's process, and the tick that finds nothing due
+ * is the one that runs 2,879 times out of 2,880.
+ */
+function countingStoreOf(workflows: CatalogWorkflow[], connectors: CatalogConnector[]) {
+  const reads = { listWorkflows: 0, connectorsUsingWorkflow: 0 };
+  const store = {
+    listWorkflows: () => {
+      reads.listWorkflows += 1;
+      return Promise.resolve(workflows);
+    },
     getWorkflow: (id: string) => Promise.resolve(workflows.find((w) => w.id === id)),
     saveWorkflow: () => Promise.reject(new Error('the scheduler writes nothing')),
     publishWorkflow: () => Promise.reject(new Error('the scheduler writes nothing')),
     saveWorkflowSchedule: () => Promise.reject(new Error('the scheduler writes nothing')),
-    connectorsUsingWorkflow: (id: string) =>
-      Promise.resolve(connectors.filter((c) => c.workflowId === id)),
+    connectorsUsingWorkflow: (id: string) => {
+      reads.connectorsUsingWorkflow += 1;
+      return Promise.resolve(connectors.filter((c) => c.workflowId === id));
+    },
     listConnectors: () => Promise.resolve(connectors),
   } as unknown as CatalogPipelineStore;
+  return { store, reads };
 }
 
 async function tick(store: CatalogPipelineStore, engine?: SpyEngine): Promise<void> {
@@ -279,6 +297,110 @@ describe('the scheduler reads the schedule off the workflow', () => {
 
     expect(engine.started).toHaveLength(0);
     expect(warnings.join(' ')).toMatch(/cannot hold workflows/);
+  });
+
+  /* ------------------------------------------------------------------------
+   * What a tick costs the application this is mounted inside.
+   * ---------------------------------------------------------------------- */
+
+  describe('a tick on a host where nothing is due', () => {
+    /** Ticked directly, so several ticks of ONE scheduler can be observed. */
+    function loopOver(store: CatalogPipelineStore, engine: SpyEngine): ConnectorScheduler {
+      return new ConnectorScheduler(
+        store,
+        engine as unknown as ConstructorParameters<typeof ConnectorScheduler>[1],
+      );
+    }
+
+    /**
+     * The connector lookup is per *window*, not per tick.
+     *
+     * A nightly graph opens one window a day and this loop looks at it 2,880
+     * times. Asking the store which connector runs it on every one of those
+     * looks is a query per scheduled pipeline every thirty seconds, forever, on
+     * a deployment where nothing is running — which is precisely the tax an
+     * embedded library must not levy on an idle host.
+     */
+    it('asks which connector runs a graph once per window, not once per tick', async () => {
+      const engine = new SpyEngine();
+      const { store, reads } = countingStoreOf([workflow()], [connector()]);
+      const loop = loopOver(store, engine);
+
+      await loop.tick();
+      await loop.tick();
+      await loop.tick();
+
+      // The schedule list is still rebuilt from the store every single tick —
+      // that is what makes an edit take effect within one poll interval, and it
+      // is not what this saves.
+      expect(reads.listWorkflows).toBe(3);
+      expect(reads.connectorsUsingWorkflow).toBe(1);
+      // And the window still ran exactly once, which it did before as well:
+      // `engine.start` is idempotent by run id, so the ticks this removes were
+      // buying nothing.
+      expect(engine.started).toHaveLength(1);
+    });
+
+    it('asks again the moment the graph is edited under it', async () => {
+      const engine = new SpyEngine();
+      const graph = workflow();
+      const { store, reads } = countingStoreOf([graph], [connector()]);
+      const loop = loopOver(store, engine);
+
+      await loop.tick();
+      await loop.tick();
+      expect(reads.connectorsUsingWorkflow).toBe(1);
+
+      // A save — `saveWorkflow` bumps `updatedAt` on every write, whether or not
+      // the version moves. The settled window has to expire on it, or an edit
+      // would be invisible until the next window opened.
+      graph.updatedAt = '2026-06-01T00:00:00.000Z';
+      await loop.tick();
+
+      expect(reads.connectorsUsingWorkflow).toBe(2);
+    });
+
+    /**
+     * The window that already passed, which is the ordinary steady state: the
+     * connector's `updatedAt` is bumped by the run itself, so from the moment a
+     * nightly load finishes every remaining tick of the day is a "not due".
+     */
+    it('settles a window that is not due, and stops re-reading it', async () => {
+      const engine = new SpyEngine();
+      const { store, reads } = countingStoreOf(
+        [workflow()],
+        // Bumped past the window, exactly as finishing a run would bump it.
+        [connector({ updatedAt: '2026-06-01T00:00:00.000Z' })],
+      );
+      const loop = loopOver(store, engine);
+
+      await loop.tick();
+      await loop.tick();
+      await loop.tick();
+
+      expect(engine.started).toHaveLength(0);
+      expect(reads.connectorsUsingWorkflow).toBe(1);
+    });
+
+    /**
+     * The one case that keeps paying, on purpose.
+     *
+     * A `ready` scheduled graph with no enabled connector is a state that should
+     * not exist, and the repair — publishing it again — mints a connector
+     * without necessarily touching anything a settled window is keyed on. So
+     * this one is asked every tick until somebody fixes it, which is the right
+     * way round.
+     */
+    it('keeps looking when a ready graph has no connector, so a re-publish is seen', async () => {
+      const engine = new SpyEngine();
+      const { store, reads } = countingStoreOf([workflow()], []);
+      const loop = loopOver(store, engine);
+
+      await loop.tick();
+      await loop.tick();
+
+      expect(reads.connectorsUsingWorkflow).toBe(2);
+    });
   });
 
   it('does not read the copy of the schedule left on the connector', async () => {

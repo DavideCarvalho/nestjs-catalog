@@ -290,8 +290,20 @@ export interface ReconcileOutcome {
 }
 
 export interface ReconcileScan {
-  /** Connector id → the name to put in the message. Falls back to the id. */
-  names?: ReadonlyMap<string, string>;
+  /**
+   * Connector id → the name to put in the message. Falls back to the id.
+   *
+   * **A function, and called only when there is a message to write.** It reads a
+   * whole table to decorate a warning, and on a healthy deployment there is no
+   * warning: every pass but the rare one would have paid for names nothing was
+   * going to say. A `ReadonlyMap` here — which is what this was — cannot express
+   * that, because building it is the cost.
+   *
+   * Called at most once per pass. A throw is the caller's to handle; the one in
+   * this package answers with an empty map, so a failure costs the names and not
+   * the pass.
+   */
+  names?: () => Promise<ReadonlyMap<string, string>>;
   /** How many recent runs to examine. Defaults to {@link RECONCILE_SCAN_LIMIT}. */
   limit?: number;
 }
@@ -403,10 +415,15 @@ export async function closeRunsTheEngineHasFinished(
         .map((run) => [run.id, run] as const),
     );
 
+    // Here rather than at the top of the pass, which is the whole point of
+    // `names` being a function: this line is reached by the pass that found
+    // something to close, and by no other.
+    const names = await scan.names?.();
+
     for (const { run, verdict } of closable) {
       const current = stillOpen.get(run.id);
       if (!current) continue;
-      const name = scan.names?.get(current.connectorId) ?? current.connectorId;
+      const name = names?.get(current.connectorId) ?? current.connectorId;
       const reason = lostRunMessage(name, current, verdict);
       await store.finishRun(current.id, {
         status: 'failed',

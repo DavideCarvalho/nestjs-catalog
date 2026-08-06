@@ -98,6 +98,13 @@ function warehouse(
     statements.push(sql.replace(/\s+/g, ' ').trim());
 
     if (sql.includes('information_schema.COLUMNS')) return Promise.resolve(columns());
+    // The index the write path needs. Answered as already present, because what
+    // these cases are about is an empty batch and not schema evolution — see
+    // `ensureSnapshotBatchIndex`, whose own behaviour is held by
+    // `write-path.db.spec.ts` against a real engine.
+    if (sql.includes('information_schema.STATISTICS')) {
+      return Promise.resolve([{ INDEX_NAME: 'ix_snapshot_batch' }]);
+    }
     if (sql.startsWith('DELETE FROM')) {
       deleteBatch(params);
       return Promise.resolve({ affectedRows: 0 });

@@ -76,6 +76,23 @@ export const CATALOG_SCHEDULER_ENABLED = Symbol('CATALOG_SCHEDULER_ENABLED');
  * of a database column, and the two would disagree the first time somebody
  * edited one.
  *
+ * ## What it costs a host that is not loading anything
+ *
+ * This mounts inside somebody else's application, so the interesting number is
+ * not what a tick costs when a window opens — it is what a tick costs when none
+ * does, because that is 2,879 ticks out of every 2,880 for a nightly schedule.
+ * The answer is **one statement**: the `listWorkflows` above, and nothing else.
+ *
+ * Getting there took the one piece of per-graph state this class keeps, and it
+ * is worth being precise that it is not a copy of a schedule. `fire` records the
+ * window it last carried a graph to a decision for, fingerprinted with that
+ * graph's cron, version and `updatedAt` — see {@link settlementOf} — and returns
+ * immediately when the next tick brings the same one. Nothing is cached across a
+ * window, an edit, or a restart. Before it, every runnable scheduled graph cost
+ * a `connectorsUsingWorkflow` on every tick to re-confirm a "not due" that could
+ * not have changed: twelve pipelines meant thirteen statements every thirty
+ * seconds, forever, on a deployment where nothing was running.
+ *
  * ## What it takes to be scheduled, and why each part is said out loud
  *
  * Three things: a graph that is `ready`, `enabled`, and carrying a cron. Each is
@@ -123,6 +140,16 @@ export class ConnectorScheduler implements OnApplicationBootstrap, OnApplication
   private readonly complaints = new Map<string, string>();
   /** Last window started per connector, so an idempotent re-start stays quiet. */
   private readonly started = new Map<string, string>();
+  /**
+   * The window each graph has already been carried to a decision for.
+   *
+   * The one piece of state this loop keeps about a *graph*, and it is kept for
+   * cost rather than for correctness — see {@link settlementOf}, which says what
+   * it is a fingerprint of and what it deliberately gives up. Bounded by the
+   * number of graphs this process has seen, exactly like {@link complaints} and
+   * {@link started} beside it.
+   */
+  private readonly settled = new Map<string, string>();
   /** Fingerprint of the scheduled set, so a boot log is not repeated forever. */
   private announced?: string;
 
@@ -187,8 +214,14 @@ export class ConnectorScheduler implements OnApplicationBootstrap, OnApplication
    * Guarded against re-entry rather than against slowness: a tick that outlives
    * its interval means the store is struggling, and stacking a second read on
    * top of the first is the wrong way to find that out.
+   *
+   * Public for the same reason {@link AbandonedRunReconciler.pass} is: a host
+   * that would rather drive this from its own scheduler can call it, and a
+   * measurement that would rather not own a timer can too. It resolves the
+   * engine itself, so a caller reaching past `onApplicationBootstrap` is not
+   * skipping a check — it simply does nothing when there is no engine.
    */
-  private async tick(): Promise<void> {
+  async tick(): Promise<void> {
     const engine = this.engine;
     if (!engine || this.ticking) return;
     this.ticking = true;
@@ -277,12 +310,28 @@ export class ConnectorScheduler implements OnApplicationBootstrap, OnApplication
     // deduplicated warning back into one per tick.
     this.forgive(`${workflow.id}:cron`);
 
+    // The window this tick is looking at has already been decided, so there is
+    // nothing to ask the store. This is the branch that makes a mounted catalog
+    // free when nobody is loading anything: a nightly graph opens one window a
+    // day and this loop looks at it 2,880 times, and without this every one of
+    // those looks costs a query. See {@link settlementOf} for what it is keyed
+    // on and what it gives up.
+    const settlement = settlementOf(workflow, fireMs);
+    if (this.settled.get(workflow.id) === settlement) return;
+
     // The connector this graph runs as, which is what the run is keyed and
-    // serialised on. Resolved per window rather than cached, for the reason this
-    // whole loop holds no state: a graph unpublished and re-published between
-    // two windows is a connector that was disabled and re-enabled, and a cached
-    // answer would keep firing into the disabled one.
+    // serialised on. Resolved per window rather than held, for the reason this
+    // loop holds no schedule state: a graph unpublished and re-published between
+    // two windows is a connector that was disabled and re-enabled, and a stale
+    // answer would keep firing into the disabled one. The settlement above is
+    // per *window* and carries the graph's own version and timestamp, so it
+    // expires on exactly the edits that could change this answer.
     const connector = await this.connectorFor(workflow);
+    // Deliberately not settled. A `ready` graph with no connector is the state
+    // `connectorFor` calls repairable by publishing again, and publishing mints
+    // a connector without necessarily moving anything this settlement is keyed
+    // on — so this one case keeps paying a query per tick until it is fixed,
+    // which is the right way round for a state that should not exist.
     if (!connector) return;
 
     // The current cron window is whatever fired most recently, which for a
@@ -302,7 +351,15 @@ export class ConnectorScheduler implements OnApplicationBootstrap, OnApplication
     // This is a filter, not the guarantee — the guarantee is the deterministic
     // run id below, which is what makes a redundant start a no-op.
     const changedAt = Date.parse(connector.updatedAt);
-    if (Number.isFinite(changedAt) && fireMs <= changedAt) return;
+    if (Number.isFinite(changedAt) && fireMs <= changedAt) {
+      // Settled, and safe to settle because `updatedAt` only moves forward: the
+      // column carries `onUpdate`, and every edit and every run's start and
+      // finish bumps it. A later tick asking the same question about the same
+      // window therefore gets the same answer, so asking is a query spent to
+      // confirm something that cannot have changed.
+      this.settled.set(workflow.id, settlement);
+      return;
+    }
 
     const schedule: ScheduledWorkflow = {
       // The key is half the run id, so it must identify the pipeline and
@@ -333,6 +390,10 @@ export class ConnectorScheduler implements OnApplicationBootstrap, OnApplication
       // fire time to build the run id, and a clock that moved between the two
       // would key the run on a window this tick never checked.
       const runId = (await runSchedules(engine, [schedule], now))[0];
+      // Settled only once the start came back. A throw below leaves this window
+      // unsettled on purpose, so the next tick tries it again — which is the
+      // whole retry this loop has ever had.
+      this.settled.set(workflow.id, settlement);
       // A start is idempotent, so this call is a no-op for every tick between
       // the window opening and the run reaching the store — which would
       // otherwise print the same line two or three times. Log the run id once,
@@ -501,6 +562,45 @@ function hasCron(workflow: CatalogWorkflow): boolean {
 /** Published, and switched on. Both, or its cron is a row nothing acts on. */
 function isRunnable(workflow: CatalogWorkflow): boolean {
   return workflow.status === 'ready' && workflow.enabled;
+}
+
+/**
+ * "This graph, as it currently stands, for this window."
+ *
+ * The key of the one thing this loop remembers, and the reason it is a
+ * *fingerprint* rather than a fire time is that it has to expire on every edit
+ * that could change the decision it stands for. The window alone would not: a
+ * cron edited from `0 3 * * *` to `0 3 * * 1` keeps yesterday's window and is a
+ * different question about it.
+ *
+ * So it carries the window and the three fields a decision about that window
+ * turns on — the cron itself, the graph's version, and its `updatedAt`, which
+ * `saveWorkflow` bumps on every write including the ones that do not change the
+ * version. Anything a person can do to a graph moves at least one of them.
+ *
+ * ## What this deliberately does not cover, and why that is acceptable
+ *
+ * The connector's `updatedAt`, which is the field the not-due test actually
+ * compares against — it cannot be here, because reading it is the query this
+ * exists to avoid. That is safe in the direction that matters: `updatedAt`
+ * carries `onUpdate` and is bumped by every edit and by every run's start and
+ * finish, so it only ever moves forward, and a settled "not due" cannot become
+ * "due" while the window stays the same.
+ *
+ * What it gives up is a connector row whose timestamp moves *backwards* — which
+ * a promotion importing an older environment's rows could do. The cost of being
+ * wrong there is one catch-up window not fired, on a pipeline somebody is in the
+ * middle of migrating, recoverable by re-driving it by hand. The alternative is
+ * a query per scheduled graph every thirty seconds on every deployment forever,
+ * which is what this is for.
+ *
+ * Nothing about the *guarantee* rests on this. Windows are started exactly once
+ * because the run id is derived from the schedule key and the fire time and
+ * `engine.start` is idempotent by run id — see the class docblock. This decides
+ * how many times a tick asks the store, not how many times a window runs.
+ */
+function settlementOf(workflow: CatalogWorkflow, fireMs: number): string {
+  return `${fireMs}|${workflow.schedule ?? ''}|${workflow.version}|${workflow.updatedAt}`;
 }
 
 function positiveInt(raw: string | undefined, fallback: number): number {

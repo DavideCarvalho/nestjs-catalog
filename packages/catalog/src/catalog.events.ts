@@ -150,6 +150,20 @@ export interface CatalogEventPayloads {
     typeName: string;
     table: string;
     addedColumns: string[];
+    /**
+     * Indexes this DDL added, when it added any.
+     *
+     * Optional and separate from {@link addedColumns} rather than folded into
+     * it, because the two are different facts about a table and only one of them
+     * changes what can be stored in it. An operator reading the trail for "when
+     * did this column appear" must not have an index name come back.
+     *
+     * A store that evolves an index on an existing table emits this with no
+     * columns added, which is a real event and not an empty one — see
+     * `ensureSnapshotBatchIndex` in the MikroORM store, where a table that
+     * predates the index acquires it on the next load.
+     */
+    addedIndexes?: string[];
     created: boolean;
   };
   /** A batch landed. Fires per batch, so a large load emits many. */

@@ -33,6 +33,7 @@ import {
   LOADED_AT_COLUMN,
   PRINCIPAL_COLUMN,
   ROW_COLUMN,
+  SNAPSHOT_BATCH_INDEX,
   SNAPSHOT_COLUMN,
   ident,
   outputAlias,
@@ -203,7 +204,7 @@ export class MySqlWarehouseStore
            ${ident(LOADED_AT_COLUMN)} DATETIME NOT NULL,
            ${ident(BATCH_COLUMN)} INT NOT NULL DEFAULT 0,
            ${columns.join(',\n           ')},
-           KEY \`ix_snapshot\` (${ident(SNAPSHOT_COLUMN)})
+           KEY ${ident(SNAPSHOT_BATCH_INDEX)} (${ident(SNAPSHOT_COLUMN)}, ${ident(BATCH_COLUMN)})
          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
       );
       this.logger.log(`Created ${table} with ${type.properties.length} columns`);
@@ -228,6 +229,11 @@ export class MySqlWarehouseStore
       );
       this.logger.log(`Added reserved column ${column} to ${table}`);
     }
+
+    // And so do the indexes — which had no path at all, and that was the
+    // expensive half. See {@link ensureSnapshotBatchIndex}. Strictly after the
+    // reserved columns above, because the index it adds names one of them.
+    await this.ensureSnapshotBatchIndex(type.name, table);
 
     const missing = type.properties.filter(
       (p) => !existing.has(physicalColumn(p.name).toLowerCase()),
@@ -835,8 +841,8 @@ export class MySqlWarehouseStore
    * Rows of one type, as of one snapshot.
    *
    * **Reading history is the same read with a different id.** The snapshot is a
-   * column on this table, so `WHERE _snapshot_id = ?` against `ix_snapshot` is
-   * the whole of time travel — an old load costs exactly what the current one
+   * column on this table, so `WHERE _snapshot_id = ?` against the leading column
+   * of `ix_snapshot_batch` is the whole of time travel — an old load costs exactly what the current one
    * costs, and nothing here touches the SQL view. That matters: the view is what
    * the query console selects from and it names the *committed* snapshot, so
    * reading last Tuesday by pointing the view at last Tuesday would have every
@@ -1010,6 +1016,109 @@ export class MySqlWarehouseStore
       [table],
     );
     return new Set(rows.map((r) => String(r.COLUMN_NAME).toLowerCase()));
+  }
+
+  private async existingIndexes(table: string): Promise<Set<string>> {
+    const rows = await this.em.getConnection().execute<Array<{ INDEX_NAME: string }>>(
+      `SELECT DISTINCT INDEX_NAME FROM information_schema.STATISTICS
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?`,
+      [table],
+    );
+    return new Set(rows.map((row) => String(row.INDEX_NAME).toLowerCase()));
+  }
+
+  /**
+   * Give an already-existing object table the index its writes need.
+   *
+   * ## What was wrong
+   *
+   * Every `obj_*` table was created with one secondary index,
+   * `ix_snapshot (_snapshot_id)`, and the statement that replaces a batch is
+   * `DELETE ... WHERE _snapshot_id = ? AND _batch = ?`. Every row of a snapshot
+   * carries the same `_snapshot_id`, so that index narrows nothing at all — and
+   * MySQL, correctly, declines to use it and scans the **whole table** instead,
+   * taking row locks the whole way. On a deployment's 313,833-row snapshot that
+   * is a full scan per batch, thirty batches per load, with the API on the same
+   * database waiting behind the locks. Its query log had that one statement at
+   * 821 seconds against 15 for the `SELECT COUNT(*)` beside it.
+   *
+   * Measured here at 300,000 rows in one snapshot (`write-path.db.spec.ts`):
+   * `EXPLAIN` went from **no index and ~296,000 rows examined** to the composite
+   * and ~19,000, and the statement from 214ms to 71ms on a warm local container.
+   * The remaining 71ms is the cost of actually removing 10,000 rows, which is
+   * the work the load asked for; the scan is what has gone.
+   *
+   * ## Why the composite replaces `ix_snapshot` on a new table
+   *
+   * A composite whose leading column is `_snapshot_id` answers every
+   * `_snapshot_id = ?` lookup as a prefix match, so the single-column index is
+   * redundant rather than complementary — confirmed rather than assumed: with
+   * `ix_snapshot` dropped, both the snapshot count and a page of snapshot rows
+   * still plan onto `ix_snapshot_batch`, at the same cost. And redundancy is not
+   * free here: the ingestion pattern is delete-and-reinsert, so every one of the
+   * 300,000 inserts a load makes would maintain a second index for nothing.
+   *
+   * ## Why it does NOT drop `ix_snapshot` on a table that already has one
+   *
+   * Adding an index is additive and recoverable; dropping one is neither, and
+   * the cost of being wrong is asymmetric — a redundant index costs write
+   * amplification, and an index dropped while something was planning onto it
+   * costs a scan on a production read path. This package also does not otherwise
+   * remove anything from a table it did not create in this process; the
+   * column path above is explicitly "additive only… dropping and retyping go
+   * through a human", and an index is the same kind of decision. So the
+   * composite is added, `ix_snapshot` is left, and the log says it can go.
+   *
+   * ## Why a failure here is a warning and not a throw
+   *
+   * The asymmetry that decides it: a missing *column* makes the next INSERT
+   * fail, so evolving it is a correctness repair and must be fatal if it cannot
+   * be done. A missing *index* makes the next INSERT slow. Refusing the load
+   * would convert a performance problem into an outage, on a deployment whose
+   * database user may simply not hold ALTER. So it is reported, with the
+   * statement to run by hand, and the load goes ahead.
+   *
+   * ## Where it runs, and why not at boot
+   *
+   * From `ensureType`, which is the first write to each table after boot and
+   * every publish — the same place the reserved column above is added, and one
+   * `information_schema` read per table per process. Deliberately not at boot:
+   * boot does not know which types exist, an `ALTER` per object table would put
+   * an unbounded amount of DDL in front of a pod becoming ready, and the pod
+   * that needs the index is the one about to write. InnoDB builds a secondary
+   * index in place without blocking DML, so the load that triggers it pays the
+   * build once — 906ms for 300,000 rows here — and every load after it is fast.
+   */
+  private async ensureSnapshotBatchIndex(typeName: string, table: string): Promise<void> {
+    const indexes = await this.existingIndexes(table);
+    if (indexes.has(SNAPSHOT_BATCH_INDEX.toLowerCase())) return;
+
+    const statement = `ALTER TABLE ${ident(table)} ADD INDEX ${ident(SNAPSHOT_BATCH_INDEX)} (${ident(SNAPSHOT_COLUMN)}, ${ident(BATCH_COLUMN)})`;
+    try {
+      await this.em.getConnection().execute(statement);
+    } catch (error) {
+      this.logger.warn(
+        `Could not add ${SNAPSHOT_BATCH_INDEX} to ${table}, so every batch this load replaces will scan the whole table: ${
+          error instanceof Error ? error.message : String(error)
+        }. Run it by hand when you can — "${statement}" — it is online and does not block writes. The load itself is unaffected and is going ahead.`,
+      );
+      return;
+    }
+
+    this.logger.log(
+      `Added ${SNAPSHOT_BATCH_INDEX} to ${table}, so replacing a batch reads that batch instead of scanning the table.${
+        indexes.has('ix_snapshot')
+          ? ` ${table} still carries ix_snapshot, which this index makes redundant — every _snapshot_id lookup matches its leading column. Dropping it is safe and saves maintaining a second index on every insert, and it is left for you to do because this package does not drop what it did not create here.`
+          : ''
+      }`,
+    );
+    emitCatalog('schema.changed', {
+      typeName,
+      table,
+      addedColumns: [],
+      addedIndexes: [SNAPSHOT_BATCH_INDEX],
+      created: false,
+    });
   }
 }
 
