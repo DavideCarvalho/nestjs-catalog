@@ -378,7 +378,24 @@ export function App() {
                 title="Model"
                 eyebrow="Published by your applications"
                 intro="Every object type published into this catalog. Structure follows the publisher; names, descriptions and units are yours, and survive its next deploy."
+                // The same agreement as `?type=` on the objects panel below, and
+                // the same parameter name on purpose: both screens answer "which
+                // type", so `#model?type=Mvr` and `#objects?type=Mvr` differ only
+                // in which of the two you land on. This is the half a workflow's
+                // sink links to.
+                type={params.get('type') ?? undefined}
                 explorerHref={(type) => `#objects?type=${type}`}
+                // Every loader links to the canvas ITSELF, and the id is
+                // deliberately dropped. `WorkflowCanvas` takes no workflow id —
+                // it picks its own — so a `#workflows?workflow=<id>` here would
+                // be an address naming a graph the screen then ignores, which is
+                // precisely the state `?savedQuery=` and `?dashboard=` shipped
+                // in for a release and what `App.deep-links.spec.tsx` exists to
+                // stop happening again. The day the canvas takes one, this line
+                // and a `params.get('workflow')` on the panel below are the
+                // change; until then the rows say the graph's name and the
+                // address says where you are going, and neither lies.
+                workflowHref={() => '#workflows'}
               />
             </TabsPanel>
             <TabsPanel value="objects" className="h-full">
@@ -409,7 +426,14 @@ export function App() {
               />
             </TabsPanel>
             <TabsPanel value="workflows" className="h-full">
-              <WorkflowCanvas />
+              {/* The other direction of the same link. A sink node knows which
+                  type it commits; this is what lets it say so out loud. The
+                  spelling MUST match the `params.get('type')` handed to
+                  `CatalogManager` above — that pair is the whole feature, and
+                  nothing in either file enforces it, which is why
+                  `App.load-links.spec.tsx` follows the link rather than reading
+                  it. */}
+              <WorkflowCanvas modelHref={(type) => `#model?type=${encodeURIComponent(type)}`} />
             </TabsPanel>
             <TabsPanel value="connections" className="h-full overflow-hidden">
               <PipelineConsole />

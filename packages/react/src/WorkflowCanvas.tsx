@@ -241,6 +241,22 @@ export interface WorkflowCanvasProps {
    * regardless; this only stops the canvas offering controls that always 403.
    */
   canEdit?: boolean;
+  /**
+   * Where the model screen lives, if the host mounts one. Receives the object
+   * type name.
+   *
+   * The mirror of `CatalogManager`'s `explorerHref`, and it exists for the
+   * question a sink node could always answer and never act on: a sink says
+   * exactly which type it commits, and there was nothing on this screen that
+   * would take you to it. Omit it and the sink inspector shows the type and no
+   * link, which is what a host that mounts no model screen should get.
+   *
+   * Given to the **sink inspector only**. A source reads a system this catalog
+   * knows nothing about, a transform is code, and a call node hands its step to
+   * a workflow that owns its own outputs — the sink is the one node whose
+   * configuration names a type in this catalog.
+   */
+  modelHref?: (typeName: string) => string;
 }
 
 /**
@@ -1425,6 +1441,7 @@ function Canvas({
   eyebrow = 'Ingestion',
   intro = 'Wire sources through transforms into sinks. Each sink commits its own object type independently, so one expensive read can feed several outputs.',
   canEdit = true,
+  modelHref,
 }: WorkflowCanvasProps) {
   const client = useCatalogClient();
   const queryClient = useQueryClient();
@@ -2321,6 +2338,7 @@ function Canvas({
         connections={connections}
         typeOptions={typeOptions}
         canEdit={canEdit}
+        modelHref={modelHref}
         problems={problemsOf(problemsFor, inspectingNode)}
         pending={problemsOf(pendingFor, inspectingNode)}
         discovery={discovery}
@@ -3062,18 +3080,35 @@ function TransformInspector({
  *
  * The type is set here, on the node that commits it, rather than once for the
  * whole graph — several sinks may write several types.
+ *
+ * ## The way out to the type
+ *
+ * This inspector is the one place in the whole canvas that names an object type,
+ * so it is the only honest place for a link to the model screen. It sits under
+ * the picker rather than in the header, and it names the type rather than saying
+ * "Open the model": the destination is that type's page, and a link whose label
+ * describes a screen rather than a thing gives no clue what pressing it shows.
+ *
+ * Rendered only when a type is actually chosen. A fresh sink's `targetType` is
+ * the empty string, and `#model?type=` names nothing — it would land on the
+ * model screen's first type and look, exactly, like a link that worked.
  */
 function SinkInspector({
   node,
   typeOptions,
   canEdit,
+  modelHref,
   onChange,
 }: {
   node: WorkflowSinkNode;
   typeOptions: SelectOption[];
   canEdit: boolean;
+  modelHref?: (typeName: string) => string;
   onChange: (node: WorkflowNode) => void;
 }) {
+  const target = node.targetType.trim();
+  const href = target.length > 0 ? modelHref?.(target) : undefined;
+
   return (
     <div className="space-y-3">
       <SelectField
@@ -3086,6 +3121,23 @@ function SinkInspector({
         disabled={!canEdit}
         hint="The type is set here, on the node that commits it, rather than once for the whole graph — several sinks may write several types."
       />
+      {href && (
+        <a
+          href={href}
+          // The type's own name in the label, so the accessible name says what
+          // is on the other side. `Database` is decorative beside it.
+          aria-label={`Open ${target} on the model screen`}
+          className={cn(
+            'inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs outline-none',
+            RULE,
+            'hover:bg-zinc-50 focus-visible:ring-2 focus-visible:ring-sky-500/40 dark:hover:bg-zinc-800',
+          )}
+        >
+          <Database size={12} aria-hidden />
+          Open {target}
+          <ExternalLink size={12} aria-hidden className={MUTED} />
+        </a>
+      )}
       <SelectField
         label="Commit mode"
         ariaLabel="Whether this sink replaces the dataset or merges into it"
@@ -3664,6 +3716,7 @@ function KindInspector({
   connections,
   typeOptions,
   canEdit,
+  modelHref,
   discovery,
   discoverable,
   onDiscovered,
@@ -3678,6 +3731,8 @@ function KindInspector({
   connections: CatalogConnection[];
   typeOptions: SelectOption[];
   canEdit: boolean;
+  /** The way out to the type, for the one kind of node that names one. */
+  modelHref?: (typeName: string) => string;
   /**
    * Asking a source what its columns are. Passed straight through to the one
    * branch that has a source in it — a `call` node has no schema to discover,
@@ -3731,7 +3786,13 @@ function KindInspector({
     return <CallInspector key={node.id} node={node} canEdit={canEdit} onChange={onChange} />;
   }
   return (
-    <SinkInspector node={node} typeOptions={typeOptions} canEdit={canEdit} onChange={onChange} />
+    <SinkInspector
+      node={node}
+      typeOptions={typeOptions}
+      canEdit={canEdit}
+      modelHref={modelHref}
+      onChange={onChange}
+    />
   );
 }
 
@@ -3742,6 +3803,7 @@ function NodeInspector({
   connections,
   typeOptions,
   canEdit,
+  modelHref,
   problems,
   pending,
   discovery,
@@ -3764,6 +3826,8 @@ function NodeInspector({
   connections: CatalogConnection[];
   typeOptions: SelectOption[];
   canEdit: boolean;
+  /** Passed through to the sink inspector, the one node that names a type. */
+  modelHref?: (typeName: string) => string;
   discovery: SchemaDiscoveryBridge;
   discoverable: { workflowId: string } | { workflowId?: undefined; because: string };
   /** What a discovery said, passed up so it outlives this sheet. */
@@ -3885,6 +3949,7 @@ function NodeInspector({
             connections={connections}
             typeOptions={typeOptions}
             canEdit={canEdit}
+            modelHref={modelHref}
             discovery={discovery}
             discoverable={discoverable}
             onDiscovered={onDiscovered}

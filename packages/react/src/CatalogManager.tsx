@@ -16,10 +16,12 @@ import {
   Search,
   Unlink,
 } from 'lucide-react';
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { CoverageLedger } from './CoverageLedger';
 import { EditableField } from './EditableField';
 import { LoadExpectationSection } from './LoadExpectationSection';
+import { LoadedBySection } from './LoadedBySection';
+import { paramFromLocation } from './ObjectExplorer';
 import { cn } from './cn';
 import { catalogQueryKeys, useCatalogClient } from './context';
 import { type Freshness, freshnessOf, isWorthFlagging } from './freshness';
@@ -66,10 +68,32 @@ function ScalarBadge({ type }: { type: ScalarType }) {
 
 export interface CatalogManagerProps {
   /**
+   * Which type to open. Omit to fall back to `?type=` then the first type.
+   *
+   * The same shape — and the same three-step fallback — as
+   * {@link ObjectExplorerProps.type}, deliberately: this screen became a
+   * destination the day a workflow's sink could link to the type it commits, and
+   * a second convention for "which one" would be a second thing to get wrong.
+   * See {@link useSelectedType} in `ObjectExplorer.tsx` for the argument the
+   * hook below mirrors.
+   *
+   * A name this catalog does not hold is **not** silently replaced by the first
+   * type. That is what makes a stale or premature link readable as one: a sink
+   * may name a type nothing has published yet, and showing an unrelated type
+   * under an address promising that one is the failure a deep link is supposed
+   * to be immune to.
+   */
+  type?: string;
+  /**
    * Where the object explorer lives, if the host mounts one. Receives the type
    * name. Omit to hide the "Open …" button entirely.
    */
   explorerHref?: (typeName: string) => string;
+  /**
+   * Where one workflow lives, if the host mounts a screen for graphs. Receives
+   * the workflow's id; omit and the "Loaded by" rows render as plain rows.
+   */
+  workflowHref?: (workflowId: string) => string;
   /** Heading copy, so the host can call this whatever its users call it. */
   title?: string;
   eyebrow?: string;
@@ -77,7 +101,9 @@ export interface CatalogManagerProps {
 }
 
 export function CatalogManager({
+  type: typeProp,
   explorerHref,
+  workflowHref,
   title = 'Catalog',
   eyebrow = 'Semantic layer',
   intro = 'Every object type the system already holds, derived from the ORM. Names, descriptions and units are yours to change — none of it touches the database.',
@@ -90,7 +116,7 @@ export function CatalogManager({
     staleTime: 30_000,
   });
 
-  const [selectedName, setSelectedName] = useState<string | null>(null);
+  const [selectedName, setSelectedName] = useSelectedType(typeProp);
   const [filter, setFilter] = useState('');
   const [onlyUnnamed, setOnlyUnnamed] = useState(false);
 
@@ -139,10 +165,22 @@ export function CatalogManager({
   });
 
   const types = useMemo(() => data?.types ?? [], [data]);
+  /**
+   * The type on screen, and — separately — a name that named nothing.
+   *
+   * The two are split because they used to be one `?? types[0]`, which answers
+   * both "nobody has chosen yet" and "the chosen one does not exist" with the
+   * same unrelated type. That is harmless while the only way to choose is the
+   * list on the left, where every entry exists by construction, and it stops
+   * being harmless the moment an address can name one: a sink may commit into a
+   * type nothing has published yet, so `#model?type=Fleet` is a link somebody
+   * can hold before the type behind it does.
+   */
   const selected = useMemo(
-    () => types.find((t) => t.name === selectedName) ?? types[0],
+    () => (selectedName === null ? types[0] : types.find((t) => t.name === selectedName)),
     [types, selectedName],
   );
+  const missing = selectedName !== null && types.length > 0 && !selected ? selectedName : null;
 
   const grouped = useMemo(() => {
     const term = filter.trim().toLowerCase();
@@ -325,10 +363,12 @@ export function CatalogManager({
           </aside>
 
           <main className="min-w-0 flex-1 overflow-y-auto">
+            {missing && <NoSuchType name={missing} />}
             {selected && (
               <TypeDetail
                 key={selected.name}
                 type={selected}
+                workflowHref={workflowHref}
                 // The whole catalog, so the detail pane can answer what points
                 // AT this type. Nothing on a type records its inbound links —
                 // one row per declaration, and the declaration lives on the
@@ -350,6 +390,70 @@ export function CatalogManager({
   );
 }
 
+/**
+ * Which type this screen is showing, and how it gets chosen.
+ *
+ * The same rules {@link useSelectedType} in `ObjectExplorer.tsx` argues for, and
+ * a deliberate second copy of them rather than a shared hook: that one owns a
+ * *found* type name (it resolves the prop against the catalog before storing it,
+ * because its query is `enabled` on a non-empty string), and this one must be
+ * able to hold a name the catalog does NOT have so that `missing` above can say
+ * so. Merging them would mean one hook with a flag deciding whether a bad name
+ * is remembered or discarded, which is two behaviours in one name.
+ *
+ * - **The prop wins whenever it changes**, not only on the first render. A host
+ *   that links from one type to another — the ordinary way to arrive here — sets
+ *   the prop, and a guard on "nothing chosen yet" would show the previous type
+ *   under an address naming the new one.
+ * - Failing a prop, the hash's own query string, once. `paramFromLocation` is
+ *   imported from `ObjectExplorer` rather than rewritten: it reads the real
+ *   query string *and* the hash's, and a hash-routed console leaves
+ *   `location.search` empty.
+ * - Failing both, `null` — which is what makes the first type the default, and
+ *   which is a different state from a name that matched nothing.
+ */
+function useSelectedType(typeProp: string | undefined): [string | null, (name: string) => void] {
+  const [typeName, setTypeName] = useState<string | null>(typeProp ?? null);
+
+  useEffect(() => {
+    if (typeProp) setTypeName(typeProp);
+  }, [typeProp]);
+
+  useEffect(() => {
+    if (typeName !== null || typeProp) return;
+    const requested = paramFromLocation('type');
+    if (requested) setTypeName(requested);
+  }, [typeName, typeProp]);
+
+  return [typeName, setTypeName];
+}
+
+/**
+ * A link that named a type this catalog does not hold.
+ *
+ * Said rather than swallowed, and the second paragraph is the reason this state
+ * is worth a panel: the likeliest way to arrive here is a sink node committing
+ * into a type that has not been published yet, which is legal — a sink may name
+ * a type before anything creates it — and reads as a broken console unless
+ * somebody says otherwise.
+ */
+function NoSuchType({ name }: { name: string }) {
+  return (
+    <div className="mx-auto max-w-5xl px-8 py-8">
+      <div className={cn('rounded-lg border border-dashed px-4 py-6', RULE)}>
+        <p className="text-sm">
+          Nothing in this catalog is called <span className="font-mono">{name}</span>.
+        </p>
+        <p className={cn('mt-1 text-sm', SECONDARY)}>
+          A type comes into existence when something publishes its schema, so a workflow sink can
+          name one before it exists — the link is not wrong, the type has simply not arrived. Pick
+          one on the left, or run the load that creates it.
+        </p>
+      </div>
+    </div>
+  );
+}
+
 function Stat({ label, value }: { label: string; value: number }) {
   return (
     <div className="text-right">
@@ -365,6 +469,7 @@ interface TypeDetailProps {
   type: CatalogObjectTypeDef;
   types: CatalogObjectTypeDef[];
   explorerHref?: (typeName: string) => string;
+  workflowHref?: (workflowId: string) => string;
   onPatchType: (patch: TypePatch) => void;
   onPatchProperty: (property: string, patch: PropertyPatch) => void;
   onNavigate: (name: string) => void;
@@ -374,6 +479,7 @@ function TypeDetail({
   type,
   types,
   explorerHref,
+  workflowHref,
   onPatchType,
   onPatchProperty,
   onNavigate,
@@ -455,6 +561,31 @@ function TypeDetail({
           <PropertyTable properties={type.properties} onPatchProperty={onPatchProperty} />
         </div>
       </section>
+
+      {/*
+        Immediately before the load expectation, and that ordering is the
+        argument for putting it on this screen at all rather than beside the
+        canvas or on Lineage.
+
+        The section under it states what must be true when this type is loaded.
+        It has always been the second half of a question whose first half was
+        unanswerable from here: WHO loads it. Reading them the other way round —
+        the bounds first, the loaders after — is reading the rule before knowing
+        who it binds, and reading either of them on a different screen from the
+        type's own properties is how "af_fleet" and "Mvr" stayed two unrelated
+        words in the same deployment.
+
+        Lineage was the other candidate and is the wrong one: it derives who fed
+        what from what publishers actually DID, and this is the declared half —
+        graphs somebody authored, including ones that have never run. Putting a
+        declaration on the screen whose whole claim is that it infers would be
+        the two making opposite promises in one place. See `FlowView`.
+      */}
+      <LoadedBySection
+        typeName={type.name}
+        displayName={type.displayName}
+        workflowHref={workflowHref}
+      />
 
       {/*
         Between the properties and the links, and on this screen rather than in
