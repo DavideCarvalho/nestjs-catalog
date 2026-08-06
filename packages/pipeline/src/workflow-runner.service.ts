@@ -297,9 +297,13 @@ export class WorkflowRunnerService {
    *
    * The two limits of the scan hold here unchanged and are worth reading on
    * {@link closeAbandonedAttempts} before trusting this: the last attempt of a
-   * series is closed by nothing, and an attempt still alive elsewhere may write
-   * its own outcome over ours — which is correct, since it is the one that
-   * knows.
+   * series is closed by nothing *on this rule*, and an attempt still alive
+   * elsewhere may write its own outcome over ours — which is correct, since it
+   * is the one that knows. The first of those is what `AbandonedRunReconciler`
+   * answers, from the other direction: a durable run that dies without ever
+   * reaching its finish step is never followed by another attempt at its
+   * snapshot, so its row is closed by asking the engine whether the run is
+   * alive rather than by waiting for a `plan` that will not come.
    */
   async plan(input: {
     workflowId: string;
