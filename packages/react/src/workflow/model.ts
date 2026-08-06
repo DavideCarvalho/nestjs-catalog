@@ -20,6 +20,8 @@
  */
 
 export type {
+  CallableWorkflowBlock,
+  CallableWorkflowDisagreement,
   CallableWorkflowRef,
   CatalogWorkflow,
   WorkflowEdge,
@@ -33,6 +35,11 @@ export type {
 } from '@dudousxd/nestjs-catalog/client';
 
 export {
+  // Whether an announced workflow may be committed onto a call node. Core's,
+  // not a copy: the picker greys an entry out and the server reasons about the
+  // same list, and two copies of that rule is a picker that eventually offers
+  // something the rest of the system will not accept.
+  callableWorkflowBlock,
   isWorkflowNodeKind,
   WORKFLOW_NODE_ID_PATTERN,
   WORKFLOW_NODE_KINDS,

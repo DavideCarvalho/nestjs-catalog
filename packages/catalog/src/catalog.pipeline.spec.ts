@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   CONNECTOR_KINDS,
+  type CallableWorkflowRef,
   type CatalogPipelineStore,
   TRANSFORM_LANGUAGES,
   WORKFLOW_EXECUTION_MODES,
@@ -13,6 +14,7 @@ import {
   type WorkflowSinkNode,
   type WorkflowSourceNode,
   type WorkflowTransformNode,
+  callableWorkflowBlock,
   isConnectorKind,
   isPipelineStore,
   isTransformLanguage,
@@ -865,5 +867,90 @@ describe('store capability checks', () => {
 
   it('accepts anything that can actually list connectors', () => {
     expect(isPipelineStore({ listConnectors: async () => [] })).toBe(true);
+  });
+});
+
+/**
+ * The rule that decides whether an announced workflow may be committed onto a
+ * call node.
+ *
+ * Here rather than in the canvas because the picker and anything server-side
+ * reasoning about the same list have to apply the SAME rule — a picker with its
+ * own copy is one that eventually offers an entry the rest of the system will
+ * not accept, which is the drift `validateWorkflow` living here already
+ * prevents for graphs.
+ *
+ * Both refusals exist because committing the entry would write a node whose
+ * meaning nobody can state, and neither is a style preference: a name with no
+ * version follows whatever gets deployed next, and a name claimed from two
+ * groups could be two different bodies on two different queues.
+ */
+describe('whether an announced workflow can be pinned onto a call node', () => {
+  function ref(overrides: Partial<CallableWorkflowRef> = {}): CallableWorkflowRef {
+    return { name: 'billing.reconcile', version: '2', group: 'billing', ...overrides };
+  }
+
+  it('accepts an entry the fleet agrees on', () => {
+    expect(callableWorkflowBlock(ref())).toBeUndefined();
+  });
+
+  it('refuses a bare name, because a name with no version cannot be pinned', () => {
+    const block = callableWorkflowBlock(ref({ version: undefined, group: undefined }));
+
+    expect(block?.code).toBe('no-version');
+    expect(block?.message).toContain('billing.reconcile');
+    // It says what to do instead, because the workflow is real and callable —
+    // what cannot be done is choosing it in one click.
+    expect(block?.message).toContain('type the name and the version you mean');
+  });
+
+  it('refuses a version that is present but blank, which is the same non-answer', () => {
+    expect(callableWorkflowBlock(ref({ version: '   ' }))?.code).toBe('no-version');
+  });
+
+  it('refuses an entry two groups claim, rather than choosing one of them', () => {
+    const block = callableWorkflowBlock(
+      ref({
+        group: undefined,
+        disagreements: [{ axis: 'group', values: ['billing', 'billing-legacy'] }],
+      }),
+    );
+
+    expect(block?.code).toBe('ambiguous-group');
+    // Both named. A refusal that says "the groups disagree" without saying which
+    // leaves somebody to go and read the descriptors themselves.
+    expect(block?.message).toContain('billing');
+    expect(block?.message).toContain('billing-legacy');
+  });
+
+  it('does not refuse a disagreement about origin or requires', () => {
+    // Worth showing — two packages declaring one name is a mess — but it does
+    // not change which queue the run goes to, and refusing on it would block a
+    // pin that is otherwise exactly determined.
+    expect(
+      callableWorkflowBlock(
+        ref({ disagreements: [{ axis: 'origin', values: ['@acme/a', '@acme/b'] }] }),
+      ),
+    ).toBeUndefined();
+    expect(
+      callableWorkflowBlock(
+        ref({ disagreements: [{ axis: 'requires', values: ['gpu', 'large-memory'] }] }),
+      ),
+    ).toBeUndefined();
+  });
+
+  it('reports the missing version first when an entry has both problems', () => {
+    // Ordered deliberately: no version is the more fundamental refusal, and a
+    // message about groups on an entry that could never be pinned anyway would
+    // send somebody to fix the wrong thing.
+    const block = callableWorkflowBlock(
+      ref({
+        version: undefined,
+        group: undefined,
+        disagreements: [{ axis: 'group', values: ['a', 'b'] }],
+      }),
+    );
+
+    expect(block?.code).toBe('no-version');
   });
 });

@@ -98,6 +98,8 @@ import {
   WorkflowStatusBadge,
 } from './workflow/lifecycle';
 import {
+  type CallableWorkflowBlock,
+  type CallableWorkflowRef,
   type CatalogWorkflow,
   WORKFLOW_NODE_KINDS,
   type WorkflowCallNode,
@@ -108,6 +110,7 @@ import {
   type WorkflowSinkNode,
   type WorkflowSourceNode,
   type WorkflowTransformNode,
+  callableWorkflowBlock,
   describeDurability,
   isWorkflowNodeKind,
   newLocalId,
@@ -3110,32 +3113,68 @@ function SinkInspector({
 /**
  * Which workflow this node hands its step to, and what it hands it.
  *
- * ## Two fields, typed, and no picker
+ * ## There is a picker now, and there was not before
  *
- * The obvious design is a dropdown of the workflows this deployment has, and it
- * cannot be built honestly today: nothing can enumerate them. The durable
- * engine answers `workflowBody(name, version)` for the process asking and
- * nothing else, and a missing body means *either* "not registered" *or* "its
- * body is in another SDK" *or* "it is a group resolved against a live worker" —
- * so a list inferred from it would omit precisely the cross-SDK workflows this
- * node exists to call, and would omit them silently. A picker that quietly
- * hides the thing you are looking for is worse than a text box.
+ * This used to be two text fields and a docblock explaining why a dropdown
+ * could not be built honestly, and that explanation is worth keeping because it
+ * is still what the picker has to be careful about. Nothing could enumerate a
+ * deployment's registrations: the durable engine answered
+ * `workflowBody(name, version)` for the process asking and nothing else, and a
+ * missing body meant *either* "not registered" *or* "its body is in another SDK
+ * behind `registerRemote`" *or* "it is a group resolved by convention against a
+ * live worker". A list inferred from that would have omitted precisely the
+ * cross-SDK workflows this node exists to call, and omitted them silently — a
+ * picker that quietly hides the thing you are looking for is worse than a text
+ * box.
  *
- * So: text, and `CallableWorkflowRef` in core is the shape to hand this
- * component the day a deployment can announce its registrations. One entry per
- * name **and version**, never per name — a picker that chose the version for
- * you would undo the pin below.
+ * `@dudousxd/nestjs-durable-core` **0.65.0** added
+ * `WorkflowEngine.announcedWorkflows()`, which is not an inference: live workers
+ * publish what they can execute on the descriptor keyspace and every pod folds
+ * the same statements. `GET pipeline/callable-workflows` serves it as
+ * `CallableWorkflowRef`s, and the select below offers them. Three properties of
+ * that aggregate are load-bearing here and none of them may be flattened:
+ *
+ * - **It lists what is runnable now, not what is known about.** The announcer is
+ *   always the queue's consumer, so it is neither a superset nor a subset of any
+ *   registry. A workflow missing from it may be perfectly real.
+ * - **It is a snapshot about one heartbeat wide.** Liveness is a TTL on the
+ *   descriptor key, so a worker that dies takes its entries with it within about
+ *   half a minute. Hence the ten-second `staleTime` below, the refetch on mount,
+ *   and the time printed under the field. It is never cached like
+ *   `capabilities`, which is stale-forever and correctly so.
+ * - **Disagreements are surfaced, never resolved.** Two workers claiming one
+ *   `name@version` from two groups mean nobody can say which queue a run would
+ *   land on, so `callableWorkflowBlock` — core's rule, shared with the server —
+ *   refuses the entry. It is still SHOWN, greyed, with the reason: an entry
+ *   silently dropped from a picker is the failure the old docblock was about.
+ *
+ * The same rule refuses a bare, unversioned announcement, which is what an
+ * un-upgraded worker of any SDK publishes. A name with no version cannot satisfy
+ * the pin, and offering it as though it could would be a lie the node then
+ * carries.
+ *
+ * ## The text fields stay, and are not a fallback
+ *
+ * A deployment whose workers have not been upgraded announces little or nothing,
+ * and a picker that became the only path would make this node unusable there.
+ * Both fields remain typeable at all times, including when the list is empty,
+ * unavailable, or simply does not contain what somebody is pointing at.
  *
  * ## Why the version is a required field and not a convenience
  *
  * Without it the load would run whichever version is registered on the day it
  * runs, so the person who owns that workflow could change what this pipeline
  * does by deploying theirs. With it, a mismatch stops the load and says so.
- * What it cannot do is *prevent* the wrong version starting: the engine starts
- * the newest registered version and takes no version argument, so the check
- * happens immediately after the start and cancels. The note below says that in
- * the room where somebody is typing the version, rather than only in a
- * docblock they will never open.
+ * What it still cannot do is *prevent* the wrong version starting. `engine.start`
+ * takes a pinned `version` as of durable 0.65.0, but the catalog does not pass
+ * one, and that is a decision rather than an oversight: a pinned start is
+ * refused outright on the two SYNTHESIZED registration paths — a child
+ * inheriting a remote ancestor's routing, and convention routing to a live
+ * worker group — which are exactly how a cross-SDK workflow is reached. Pinning
+ * at the start would therefore break the calls this node exists for. So the
+ * check still happens immediately after the start, and cancels. The note under
+ * the fields says that in the room where somebody is typing the version, rather
+ * than only in a docblock they will never open.
  */
 function CallInspector({
   node,
@@ -3153,6 +3192,23 @@ function CallInspector({
   const [text, setText] = useState(() => configText(node.config));
   const [invalid, setInvalid] = useState(false);
 
+  const client = useCatalogClient();
+  // Asked here rather than by the canvas and threaded down, because this is the
+  // only component that wants it and a call node is a small minority of the
+  // nodes anybody draws — a canvas-level query would ask every deployment for
+  // its fleet on every page load to serve a field most graphs never open.
+  const announced = useQuery({
+    queryKey: catalogQueryKeys.callableWorkflows,
+    queryFn: () => client.listCallableWorkflows(),
+    // Ten seconds, against the descriptor TTL of about thirty-five. Long enough
+    // that opening and closing the sheet does not re-ask, short enough that a
+    // worker which died while somebody was reading is gone before they choose.
+    // Emphatically NOT `Infinity`, which is right for `capabilities` and would
+    // here pin the list to whatever the fleet looked like when the tab opened.
+    staleTime: 10_000,
+    retry: false,
+  });
+
   const pushConfig = (next: string) => {
     setText(next);
     const parsed = parseConfigText(next);
@@ -3160,15 +3216,98 @@ function CallInspector({
     if (parsed !== undefined) onChange({ ...node, config: parsed });
   };
 
+  const refs = announced.data?.workflows ?? [];
+  const options = refs.map(callableOption);
+  // What the select should show as chosen: the announced entry the node already
+  // names, and nothing otherwise. A node pointing at something the fleet is not
+  // announcing shows the placeholder rather than a nearest match — the fields
+  // below say what it is pinned to, and a select inventing a selection would be
+  // claiming the fleet confirms it.
+  //
+  // An entry with no version can never be the answer, however empty the version
+  // field happens to be. A half-filled node beside a bare announcement of the
+  // same name would otherwise render as though the fleet had confirmed a pin
+  // that does not exist — which is the same lie as offering the entry, arriving
+  // by a different door.
+  const chosen = refs.find(
+    (ref) =>
+      ref.version !== undefined &&
+      ref.name === node.callName.trim() &&
+      ref.version === node.callVersion.trim(),
+  );
+  const blocked = refs
+    .map((ref) => ({ ref, block: callableWorkflowBlock(ref) }))
+    .filter((entry): entry is { ref: CallableWorkflowRef; block: CallableWorkflowBlock } =>
+      Boolean(entry.block),
+    );
+
+  /**
+   * Commit both halves, or neither.
+   *
+   * The version is written in the SAME update as the name, from the same entry.
+   * Committing a name and leaving the version to be filled in later is the exact
+   * failure the pin exists to prevent: the node would run whatever is newest on
+   * the day it runs, and it would look configured while doing it.
+   *
+   * `callableWorkflowBlock` is consulted again here even though a blocked entry
+   * renders as a disabled option. A disabled option is a rendering decision, and
+   * the rule about what may be pinned is not one — a Base UI item that stopped
+   * honouring `disabled`, or a keyboard path that got there anyway, must not be
+   * able to write an unpinnable entry onto the graph.
+   */
+  const choose = (key: string) => {
+    const ref = refs.find((candidate) => callableKey(candidate) === key);
+    if (!ref || ref.version === undefined || callableWorkflowBlock(ref)) return;
+    onChange({ ...node, callName: ref.name, callVersion: ref.version });
+  };
+
   return (
     <div className="space-y-3">
+      {options.length > 0 ? (
+        <SelectField
+          label="Announced by a live worker"
+          ariaLabel="Choose a workflow a live worker announces"
+          value={chosen ? callableKey(chosen) : ''}
+          onValueChange={choose}
+          options={options}
+          placeholder="Pick one, or type it below…"
+          disabled={!canEdit}
+          hint={
+            <>
+              Every workflow a live worker says it can execute right now, read at{' '}
+              {readTime(announced.data?.observedAt)}. Choosing one fills in both fields below. This
+              is a snapshot, not a registry — a worker that stops beating drops off it within about
+              half a minute, and one too old to announce its registrations was never on it.
+            </>
+          }
+        />
+      ) : (
+        <p className={cn('text-[11px] leading-relaxed', MUTED)}>
+          {announced.isPending
+            ? 'Asking the live workers what they can execute…'
+            : (announced.data?.detail ??
+              'Nothing here could be asked what this deployment can execute, so there is no list to choose from. Type the workflow name and the version to pin.')}
+        </p>
+      )}
+      {blocked.length > 0 && (
+        <div className={cn('space-y-1 text-[11px] leading-relaxed', MUTED)}>
+          {/* Listed in full rather than left to the greyed rows, whose hint line
+              is one truncated line inside a popup. An entry that cannot be
+              chosen owes a reason somebody can read, and the alternative —
+              dropping it from the list — is how a picker comes to hide the
+              thing you were looking for. */}
+          {blocked.map(({ ref, block }) => (
+            <p key={callableKey(ref)}>{block.message}</p>
+          ))}
+        </div>
+      )}
       <TextField
         label="Workflow"
         value={node.callName}
         onChange={(callName) => onChange({ ...node, callName })}
         placeholder="billing.reconcile"
         disabled={!canEdit}
-        hint="The name it is registered under in this deployment, exactly. Its body may be in another language — that is the point of calling it rather than writing it here."
+        hint="The name it is registered under in this deployment, exactly. Typed here it works whether or not anything announced it — a worker too old to publish its registrations still runs the workflow. Its body may be in another language, which is the point of calling it rather than writing it here."
       />
       <TextField
         label="Version"
@@ -3204,6 +3343,72 @@ function CallInspector({
       </p>
     </div>
   );
+}
+
+/**
+ * What identifies one announced entry among the others.
+ *
+ * `name@version`, and the bare name when nobody announced a version — the same
+ * key the durable aggregate sorts on, and the reason it can be used as a select
+ * value at all: the fleet reports one entry per `name@version`, so two rows can
+ * never collide. A key of the name alone would collapse the versions into one
+ * option, which is the picker undoing the pin.
+ */
+function callableKey(ref: CallableWorkflowRef): string {
+  return ref.version === undefined ? ref.name : `${ref.name}@${ref.version}`;
+}
+
+/**
+ * One announced workflow as a row in the select.
+ *
+ * The hint line is where the three facts that cannot be inferred from the name
+ * go, in the order somebody needs them:
+ *
+ * - **Why it cannot be chosen**, when it cannot. First, because a row that reads
+ *   like every other row and then refuses to be clicked is worse than a row that
+ *   says so. Short, because this line truncates inside the popup; the full
+ *   sentence is printed under the field.
+ * - **Its group**, which is the single most useful fact here — it is the only
+ *   signal distinguishing "this body lives in another process, in another
+ *   language" from "this one is local", which is precisely what a missing
+ *   `workflowBody` could never tell apart.
+ * - **How many workers announce it**, because one is a single point of failure
+ *   and a graph built on it should say so before the day it matters.
+ */
+function callableOption(ref: CallableWorkflowRef): SelectOption {
+  const block = callableWorkflowBlock(ref);
+  const groups = ref.disagreements?.find((entry) => entry.axis === 'group')?.values ?? [];
+  const facts: string[] = [];
+  if (block?.code === 'no-version') facts.push('no version announced — cannot be pinned');
+  if (block?.code === 'ambiguous-group')
+    facts.push(`two groups (${groups.join(', ')}) — ambiguous`);
+  if (ref.group) facts.push(`group ${ref.group}`);
+  if (ref.description) facts.push(ref.description);
+  if (ref.workers !== undefined) {
+    facts.push(ref.workers === 1 ? '1 worker' : `${ref.workers} workers`);
+  }
+  return {
+    value: callableKey(ref),
+    label: callableKey(ref),
+    hint: facts.join(' · '),
+    disabled: block !== undefined,
+  };
+}
+
+/**
+ * When the fleet was asked, as a clock time.
+ *
+ * Printed at all because this list is a snapshot roughly one heartbeat wide, and
+ * a screen that showed it with no time attached would be presenting a moment as
+ * a standing fact. Falls back to the plain string rather than to nothing when
+ * the server sends something unparseable — a server that answered is a server
+ * that answered, and hiding its timestamp because the format surprised us would
+ * remove the one caveat this field is here to carry.
+ */
+function readTime(observedAt: string | undefined): string {
+  if (!observedAt) return 'an unknown time';
+  const at = new Date(observedAt);
+  return Number.isNaN(at.getTime()) ? observedAt : at.toLocaleTimeString();
 }
 
 /**

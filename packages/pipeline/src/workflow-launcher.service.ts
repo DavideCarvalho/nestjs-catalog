@@ -1,5 +1,6 @@
-import type { CatalogWorkflow, ConnectorRun } from '@dudousxd/nestjs-catalog';
+import type { CallableWorkflowRef, CatalogWorkflow, ConnectorRun } from '@dudousxd/nestjs-catalog';
 import { WorkflowEngine } from '@dudousxd/nestjs-durable';
+import type { AnnouncedWorkflow } from '@dudousxd/nestjs-durable-core';
 import { BadRequestException, Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { CATALOG_PIPELINE_DURABILITY_DETAIL } from './seams';
 import { CATALOG_WORKFLOW_RUN, type CatalogWorkflowRunInput } from './workflow-run.workflow';
@@ -19,6 +20,65 @@ import { WorkflowRunnerService, newSnapshotId } from './workflow-runner.service'
  */
 const RUN_WAIT_MS = positiveInt(process.env.CATALOG_WORKFLOW_RUN_WAIT_MS, 120_000);
 const POLL_MS = 250;
+
+/**
+ * What a call node could be pointed at, and whether the question was answerable.
+ *
+ * `supported` first because it is the field that stops the list being misread.
+ * An empty `workflows` means "nothing is announced" when `supported` is true and
+ * "nobody could be asked" when it is false, and those are opposite facts about a
+ * deployment: the first says every callable workflow is unregistered or its
+ * workers are down, the second says this pod has no durable engine at all. A
+ * bare `[]` says neither, and a picker rendering "no workflows found" over it
+ * would be inventing the first.
+ */
+export interface CallableWorkflowList {
+  supported: boolean;
+  workflows: CallableWorkflowRef[];
+  /**
+   * When the fleet was asked, ISO-8601.
+   *
+   * On the answer rather than left to the reader's clock, because this is a
+   * snapshot with a resolution of about one worker heartbeat and a screen that
+   * showed it without a time would be presenting a moment as a standing fact.
+   */
+  observedAt: string;
+  /** Why, in a full sentence, addressed to whoever is looking at the picker. */
+  detail: string;
+}
+
+/**
+ * One announcement, as the shape a picker takes.
+ *
+ * Every narrowing here is a refusal to invent. `version` is copied only when an
+ * announcer stated one — never taken from a sibling entry, because a worker that
+ * said nothing did not agree with one that did. `group` is set only when the
+ * announcers named exactly one; more than one is left absent and reported as a
+ * disagreement instead, so nothing downstream can read a single group off an
+ * entry where the queue is genuinely undetermined.
+ *
+ * `origins` becomes a `description` only when the fleet agrees on exactly one:
+ * "declared by @acme/billing" is the most useful prose available about a
+ * workflow whose body is in another repository, and printing several of them as
+ * though they were one description would state a package as the owner when two
+ * claim to be. When they disagree, the axis is already in `disagreements` and
+ * the picker shows it there.
+ */
+function toCallableWorkflowRef(announced: AnnouncedWorkflow): CallableWorkflowRef {
+  const disagreements = announced.disagreements.map((entry) => ({
+    axis: entry.axis,
+    values: [...entry.values],
+  }));
+  const ref: CallableWorkflowRef = {
+    name: announced.name,
+    workers: announced.instances.length,
+  };
+  if (announced.version !== undefined) ref.version = announced.version;
+  if (announced.groups.length === 1) ref.group = announced.groups[0];
+  if (announced.origins.length === 1) ref.description = `declared by ${announced.origins[0]}`;
+  if (disagreements.length > 0) ref.disagreements = disagreements;
+  return ref;
+}
 
 /** What this pod can honestly promise about checkpointing a run. */
 export interface WorkflowDurability {
@@ -150,6 +210,98 @@ export class WorkflowLauncher {
    */
   private withHostDetail(observed: string): string {
     return this.detail ? `${observed} ${this.detail}` : observed;
+  }
+
+  /**
+   * What a call node could be pointed at: every workflow the LIVE fleet says it
+   * can execute right now.
+   *
+   * ## Why this can be answered at all, and could not before
+   *
+   * `CallInspector` on the canvas asked for a name and a version as typed text,
+   * and its docblock said why there was no picker: nothing could enumerate a
+   * deployment's registrations. {@link WorkflowEngine.workflowBody} answers for
+   * the process asking, and a missing body is ambiguous — "not registered here"
+   * reads identically to "registered through `registerRemote` against another
+   * SDK" and to "a group this pod resolves by convention against a live worker".
+   * A list inferred from it would have differed per replica and would have
+   * omitted exactly the cross-SDK workflows a call node exists to reach.
+   *
+   * `@dudousxd/nestjs-durable-core` **0.65.0** added
+   * {@link WorkflowEngine.announcedWorkflows}, which is not inferred: a worker
+   * publishes what it can execute on the descriptor keyspace, and every pod
+   * folds the same published statements. This method is the adapter onto
+   * {@link CallableWorkflowRef}, and it is deliberately thin — the aggregate
+   * already refuses to guess, and the job here is not to start guessing on its
+   * behalf.
+   *
+   * ## Three things this must not flatten
+   *
+   * - **Runnable now, not known about.** The announcer is always the queue's
+   *   CONSUMER, so nothing here is a list of what was declared: a `registerRemote`
+   *   entry is announced by the worker that serves it or not at all, and an
+   *   operator running bodies inline announces nothing. An empty list is
+   *   therefore a real and unremarkable answer on a deployment whose workers
+   *   have not been upgraded, which is why the manual fields on the node stay.
+   * - **A snapshot, roughly one heartbeat wide.** Announcements live on keys
+   *   with the worker-heartbeat TTL. Nothing is cached here — the read is on
+   *   demand, per request, and the answer carries {@link CallableWorkflowList.observedAt}
+   *   so a screen can say when it looked rather than implying it still holds.
+   * - **Disagreements survive.** Two workers claiming one `name@version` from
+   *   two groups produce a `group` entry in `disagreements`, and
+   *   {@link callableWorkflowBlock} is what refuses such an entry. Choosing one
+   *   here would be acting on a claim nobody made.
+   *
+   * ## What "no engine" answers
+   *
+   * `supported: false` and an empty list, never an empty list on its own. The
+   * distinction is the one `GET expectations` already draws and it is the whole
+   * value of this route: "this deployment cannot enumerate its workflows" and
+   * "this deployment has none to enumerate" would otherwise be the same `[]`,
+   * and a picker cannot tell an author which of those it is looking at. A
+   * screen that read silence as "there are none" would hide a workflow that is
+   * running perfectly well and offer no explanation.
+   */
+  async callableWorkflows(): Promise<CallableWorkflowList> {
+    const observedAt = new Date().toISOString();
+    if (!this.engine) {
+      return {
+        supported: false,
+        workflows: [],
+        observedAt,
+        detail: this.withHostDetail(
+          'No durable engine resolved in this process, so nothing here can read what the fleet announces. A call node still works — type the workflow name and the version to pin.',
+        ),
+      };
+    }
+    // `announcedWorkflows` is a live read over a transport, so it can fail in
+    // every way a network call can. Reported as "cannot enumerate" rather than
+    // rethrown: this route only ever feeds a convenience, and a picker whose
+    // backing read is down must not take the inspector down with it. The text
+    // fields behind it are the whole point of keeping them.
+    let announced: AnnouncedWorkflow[];
+    try {
+      announced = await this.engine.announcedWorkflows();
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      this.logger.warn(`Could not read what the fleet announces: ${reason}`);
+      return {
+        supported: false,
+        workflows: [],
+        observedAt,
+        detail: this.withHostDetail(
+          `The durable engine here could not be asked what the fleet announces (${reason}). A call node still works — type the workflow name and the version to pin.`,
+        ),
+      };
+    }
+    return {
+      supported: true,
+      workflows: announced.map(toCallableWorkflowRef),
+      observedAt,
+      detail: this.withHostDetail(
+        'Every workflow a live worker announces it can execute, read just now. A worker that stops beating drops off this list within about half a minute, and one that was never upgraded to announce its registrations is not on it at all — so a name that is missing here can still be typed.',
+      ),
+    };
   }
 
   /**

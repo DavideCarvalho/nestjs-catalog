@@ -332,8 +332,18 @@ export {
   isWorkflowExecutionMode,
   isWorkflowNodeKind,
   isWorkflowStatus,
+  // The rule that decides whether an announced workflow may be committed onto a
+  // call node, for the same reason `validateWorkflow` is here: the picker greys
+  // an option out and the server reasons about the same list, and a picker with
+  // its own copy of the rule is one that eventually offers an entry the rest of
+  // the system considers unusable.
+  callableWorkflowBlock,
 } from './catalog.pipeline';
-export type { WorkflowStatus } from './catalog.pipeline';
+export type {
+  CallableWorkflowBlock,
+  CallableWorkflowDisagreement,
+  WorkflowStatus,
+} from './catalog.pipeline';
 
 // Traces: the same grouping the shipped view renders, so a host writing its own
 // activity screen gets the shapes as well as the routes.

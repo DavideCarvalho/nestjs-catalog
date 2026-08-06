@@ -132,6 +132,17 @@ function normalise(basePath: string): string {
 
 export interface PipelineRoutes {
   capabilities(): string;
+  /**
+   * What a call node could be pointed at: every workflow the live fleet
+   * announces it can execute.
+   *
+   * Beside `capabilities` and NOT part of it, because the two have opposite
+   * lifetimes. Capabilities report what resolved in the server process and
+   * cannot change without a redeploy; this is a snapshot of live workers with a
+   * resolution of about one heartbeat. A screen caching the second the way it
+   * caches the first would show the fleet as it was when the tab opened.
+   */
+  callableWorkflows(): string;
   connections(): string;
   connection(id: string): string;
   checkConnection(id: string): string;
@@ -255,6 +266,7 @@ export function pipelineRoutes(basePath: string = DEFAULT_PIPELINE_BASE_PATH): P
   const expectations = pipelineExpectationRoutes(base);
   return {
     capabilities: () => `${base}/capabilities`,
+    callableWorkflows: () => `${base}/callable-workflows`,
     connections: () => `${base}/connections`,
     connection: (id) => `${base}/connections/${encodeURIComponent(id)}`,
     checkConnection: (id) => `${base}/connections/${encodeURIComponent(id)}/check`,

@@ -271,6 +271,15 @@ function answersFor(
       pythonPackages: [],
       durable: { available: true },
     },
+    // The shape a deployment whose workers announce nothing answers with, which
+    // is also the shape every test that is not about the picker wants: the call
+    // node's two typed fields, and a sentence saying why there is no list.
+    '/pipeline/callable-workflows': {
+      supported: false,
+      workflows: [],
+      observedAt: '2026-01-01T00:00:00.000Z',
+      detail: 'No durable engine resolved in this process.',
+    },
     '/catalog': snapshot(),
     ...extra,
   };
@@ -885,9 +894,14 @@ describe('a transform node on a catalog with no transforms', () => {
  *
  * What is worth testing here is the pair of fields and nothing about how they look: the version is
  * the half that decides which code runs, and a canvas that let it be left blank would store a node
- * that silently follows whatever gets deployed next. There is deliberately no picker to test — see
- * `CallInspector` — so the assertions are that both fields are typed, that both are demanded, and
- * that what is typed reaches the save.
+ * that silently follows whatever gets deployed next. So the assertions are that both fields are
+ * typed, that both are demanded, and that what is typed reaches the save.
+ *
+ * There USED to be no picker to test, because nothing could enumerate a deployment's
+ * registrations. `announcedWorkflows()` (durable 0.65.0) changed that, and the picker's own tests
+ * are in the describe below this one — with the manual fields still tested here, because a
+ * deployment whose workers have not been upgraded announces nothing and a picker that became the
+ * only path would make this node unusable there.
  */
 describe('a node that calls another workflow', () => {
   it('asks for the version as well as the name, and says why on the node', async () => {
@@ -1003,6 +1017,245 @@ describe('a node that calls another workflow', () => {
     expect(panel('Problems').getByText(/Nothing to flag here/)).toBeDefined();
   });
 });
+
+/**
+ * The picker over the two fields above.
+ *
+ * WHY THIS BLOCK EXISTS
+ * ---------------------
+ * The call node shipped without one on purpose, and the reason was written into it: nothing could
+ * enumerate a deployment's registrations, because `workflowBody(name, version)` answers only for
+ * the process asking and a missing body reads identically to "registered through `registerRemote`
+ * in another SDK" and to "a group resolved by convention against a live worker". Durable 0.65.0's
+ * `announcedWorkflows()` replaced that inference with a statement live workers publish about
+ * themselves, and `GET pipeline/callable-workflows` serves it.
+ *
+ * Every test here is about the picker NOT being tidier than the thing it renders:
+ *
+ * - Choosing an entry writes the version as well as the name, in one update. A selection that
+ *   dropped the version would leave a node that runs whatever is newest on the day it runs and
+ *   looks configured while doing it — the exact failure the pin exists to prevent.
+ * - An entry two live workers claim from two different groups is SHOWN and cannot be chosen.
+ *   Nobody can say which queue such a run would land on, so picking one would be acting on a claim
+ *   nobody made; dropping it from the list would be the "picker that hides what you are looking
+ *   for" the original docblock refused to build.
+ * - A bare, unversioned announcement — what an un-upgraded worker of any SDK publishes — is
+ *   likewise offered and refused, because a name with no version cannot satisfy the pin.
+ * - The typed fields survive all of it, including when there is no list at all.
+ */
+describe('choosing a workflow a live worker announces', () => {
+  /** The route's answer, with the fleet speaking with one voice unless told otherwise. */
+  function fleet(workflows: unknown[], supported = true) {
+    return {
+      supported,
+      workflows,
+      observedAt: '2026-01-01T00:00:00.000Z',
+      detail: 'Every workflow a live worker announces it can execute, read just now.',
+    };
+  }
+
+  async function openCallInspector(fleetAnswer: unknown) {
+    const fixture = fakeTransport(
+      answersFor([wholeWorkflow()], { '/pipeline/callable-workflows': fleetAnswer }),
+      { '/pipeline/workflows': wholeWorkflow() },
+    );
+    await openCanvas(fixture.transport);
+    addNodeOfKind('call');
+    await waitFor(() => expect(panel('Still to do')).toBeDefined());
+    // The fleet is asked over HTTP, so the inspector opens on "asking…" and the picker — or the
+    // sentence explaining why there is none — only exists once that settles. Without this wait
+    // every assertion below races the fetch and fails against the loading line.
+    await waitFor(() => expect(screen.queryByText(/Asking the live workers/)).toBeNull());
+    return fixture;
+  }
+
+  it('offers one option per version, never one per name', async () => {
+    // A picker that listed names and resolved the version would undo the pin, so `billing@1` and
+    // `billing@2` are two rows and not one row with a version somebody has to remember to set.
+    await openCallInspector(
+      fleet([
+        { name: 'billing.reconcile', version: '1', group: 'billing', workers: 2 },
+        { name: 'billing.reconcile', version: '2', group: 'billing', workers: 2 },
+      ]),
+    );
+
+    await openPicker();
+    const offered = screen.getAllByRole('option').map((option) => option.textContent ?? '');
+    expect(offered.filter((text) => text.startsWith('billing.reconcile@1')).length).toBe(1);
+    expect(offered.filter((text) => text.startsWith('billing.reconcile@2')).length).toBe(1);
+  });
+
+  it('writes the version as well as the name, and both reach the save', async () => {
+    // THE LOAD-BEARING ONE. `engine.start` resolves `latest.get(name)` unless a version is passed,
+    // so a selection that carried only the name would silently run whatever is newest.
+    const { lastPostTo } = await openCallInspector(
+      fleet([
+        { name: 'billing.reconcile', version: '1', group: 'billing', workers: 1 },
+        { name: 'billing.reconcile', version: '2', group: 'billing', workers: 1 },
+      ]),
+    );
+
+    await choose(/billing\.reconcile@2/);
+
+    // On the fields first, because that is what somebody sees before they save.
+    await waitFor(() =>
+      expect(inspector().getByLabelText(/^Version/)).toHaveProperty('value', '2'),
+    );
+    expect(inspector().getByLabelText(/^Workflow/)).toHaveProperty('value', 'billing.reconcile');
+
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(lastPostTo('/pipeline/workflows')).toBeDefined());
+    expect(readCallNodes(lastPostTo('/pipeline/workflows')?.body)).toEqual([
+      { callName: 'billing.reconcile', callVersion: '2', config: {} },
+    ]);
+  });
+
+  it('shows an entry two groups claim, and refuses to let it be chosen', async () => {
+    const { lastPostTo } = await openCallInspector(
+      fleet([
+        {
+          name: 'billing.reconcile',
+          version: '2',
+          workers: 2,
+          disagreements: [{ axis: 'group', values: ['billing', 'billing-legacy'] }],
+        },
+      ]),
+    );
+
+    // Shown, not hidden: an option silently dropped is the failure the old docblock was about.
+    // And both groups are named in full under the field, where nothing truncates them.
+    expect(screen.getByText(/2 different groups \(billing, billing-legacy\)/)).toBeDefined();
+
+    await openPicker();
+    const option = screen.getByRole('option', { name: /billing\.reconcile@2/ });
+    expect(option.getAttribute('aria-disabled')).toBe('true');
+
+    // And pressing it anyway commits nothing — the fields stay empty and the graph is still
+    // incomplete, rather than being pinned to a queue nobody can name.
+    fireEvent.keyDown(option, { key: 'Enter' });
+    await waitFor(() =>
+      expect(inspector().getByLabelText(/^Workflow/)).toHaveProperty('value', ''),
+    );
+    expect(inspector().getByLabelText(/^Version/)).toHaveProperty('value', '');
+    expect(lastPostTo('/pipeline/workflows')).toBeUndefined();
+  });
+
+  it('shows a bare, unversioned announcement and refuses that too', async () => {
+    // What an un-upgraded worker of any SDK publishes: a name, no version, no group. Offering it
+    // as though it could satisfy the pin would be a lie the node then carries.
+    await openCallInspector(fleet([{ name: 'legacy.sweep', workers: 1 }]));
+
+    expect(screen.getByText(/without saying which version it runs/)).toBeDefined();
+
+    await openPicker();
+    const option = screen.getByRole('option', { name: /legacy\.sweep/ });
+    expect(option.getAttribute('aria-disabled')).toBe('true');
+
+    fireEvent.keyDown(option, { key: 'Enter' });
+    await waitFor(() =>
+      expect(inspector().getByLabelText(/^Workflow/)).toHaveProperty('value', ''),
+    );
+  });
+
+  it('names the group, which is the one signal a missing body could never give', async () => {
+    await openCallInspector(
+      fleet([{ name: 'billing.reconcile', version: '2', group: 'python-billing', workers: 1 }]),
+    );
+
+    await openPicker();
+    expect(
+      within(screen.getByRole('option', { name: /billing\.reconcile@2/ })).getByText(
+        /group python-billing/,
+      ),
+    ).toBeDefined();
+  });
+
+  it('says when it looked, rather than presenting a snapshot as a standing fact', async () => {
+    await openCallInspector(
+      fleet([{ name: 'billing.reconcile', version: '2', group: 'billing', workers: 1 }]),
+    );
+
+    expect(inspector().getByText(/a worker that stops beating drops off it/)).toBeDefined();
+  });
+
+  it('does not show a bare announcement as the chosen entry of a half-filled node', async () => {
+    // The refusal arriving by a different door. A node with a name and no version yet, beside a
+    // bare announcement of that name, must not render as though the fleet had confirmed a pin —
+    // there is no version to have confirmed.
+    await openCallInspector(fleet([{ name: 'legacy.sweep', workers: 1 }]));
+
+    fireEvent.change(inspector().getByLabelText(/^Workflow/), {
+      target: { value: 'legacy.sweep' },
+    });
+
+    await waitFor(() =>
+      expect(
+        screen.getByLabelText('Choose a workflow a live worker announces').textContent,
+      ).toContain('Pick one, or type it below'),
+    );
+  });
+
+  it('keeps the typed fields when nobody could be asked, and says why', async () => {
+    // A deployment with no durable engine announces nothing. The node must still be usable, so
+    // there is no empty select promising a choice — just the server's sentence and the two fields.
+    const { lastPostTo } = await openCallInspector({
+      supported: false,
+      workflows: [],
+      observedAt: '2026-01-01T00:00:00.000Z',
+      detail: 'No durable engine resolved in this process, so nothing here can read the fleet.',
+    });
+
+    expect(inspector().getByText(/No durable engine resolved in this process/)).toBeDefined();
+    expect(inspector().queryByLabelText('Choose a workflow a live worker announces')).toBeNull();
+
+    fireEvent.change(inspector().getByLabelText(/^Workflow/), {
+      target: { value: 'legacy.sweep' },
+    });
+    fireEvent.change(inspector().getByLabelText(/^Version/), { target: { value: '7' } });
+    fireEvent.click(saveButton());
+
+    await waitFor(() => expect(lastPostTo('/pipeline/workflows')).toBeDefined());
+    expect(readCallNodes(lastPostTo('/pipeline/workflows')?.body)).toEqual([
+      { callName: 'legacy.sweep', callVersion: '7', config: {} },
+    ]);
+  });
+
+  it('lets a name the fleet is not announcing be typed over the picker', async () => {
+    // The picker is a convenience over a field that stays. A workflow served by a worker too old
+    // to announce its registrations is missing from the list and perfectly callable.
+    const { lastPostTo } = await openCallInspector(
+      fleet([{ name: 'billing.reconcile', version: '2', group: 'billing', workers: 1 }]),
+    );
+
+    fireEvent.change(inspector().getByLabelText(/^Workflow/), {
+      target: { value: 'legacy.sweep' },
+    });
+    fireEvent.change(inspector().getByLabelText(/^Version/), { target: { value: '7' } });
+    fireEvent.click(saveButton());
+
+    await waitFor(() => expect(lastPostTo('/pipeline/workflows')).toBeDefined());
+    expect(readCallNodes(lastPostTo('/pipeline/workflows')?.body)).toEqual([
+      { callName: 'legacy.sweep', callVersion: '7', config: {} },
+    ]);
+  });
+});
+
+/** Open the announced-workflow select. Base UI renders a button, not a `<select>`. */
+async function openPicker() {
+  fireEvent.click(screen.getByLabelText('Choose a workflow a live worker announces'));
+  await waitFor(() => expect(screen.queryAllByRole('option').length).toBeGreaterThan(0));
+}
+
+/**
+ * Open it and commit one option.
+ *
+ * Enter on the option rather than a click: Base UI's select does not commit on a bare
+ * `fireEvent.click`, which passes as "the test ran" and asserts nothing.
+ */
+async function choose(option: RegExp) {
+  await openPicker();
+  fireEvent.keyDown(screen.getByRole('option', { name: option }), { key: 'Enter' });
+}
 
 /* --- narrowing helpers, so nothing here needs an `as` --------------------- */
 

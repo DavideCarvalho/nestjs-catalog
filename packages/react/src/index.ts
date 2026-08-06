@@ -161,10 +161,11 @@ export { AccessConsole, type AccessConsoleProps } from './AccessConsole';
 // rather than declared here — a node, an edge and a graph have one definition,
 // and it belongs to the package that executes them. See `workflow/model.ts`.
 export {
-  // Declared with nothing producing it: the shape a workflow picker would be
-  // handed the day a deployment can announce its registrations. Named here
-  // rather than withheld because a host writing that picker is exactly who
-  // would need it, and this list has already been the thing that fell behind.
+  // What a call node's picker offers: one workflow the live fleet announces it
+  // can execute, one entry per version. Produced by `GET pipeline/callable-workflows`
+  // since durable 0.65.0 gave the engine `announcedWorkflows()`; before that it
+  // was a declaration with nothing behind it. Named here because a host writing
+  // its own inspector is exactly who needs it.
   type CallableWorkflowRef,
   type CatalogWorkflow,
   describeDurability,
@@ -308,6 +309,10 @@ export {
   type PersonInput,
   type PersonUpsertResult,
   type PipelineCapabilities,
+  // What `listCallableWorkflows` answers with. Mirrored for the same reason
+  // `PipelineCapabilities` is, and carrying the `supported` flag that separates
+  // "the fleet announces nothing" from "nobody could be asked".
+  type CallableWorkflowList,
   // What a stored schedule came back as, and what a manual run may say about
   // itself — including the acknowledgement that lets a deliberately collapsing
   // load past the row-count bound. Named here because they are arguments and

@@ -1234,32 +1234,143 @@ function describeCount(value: unknown): string {
 /**
  * One workflow a call node could name.
  *
- * Declared here with nothing producing it yet, and that is deliberate rather
- * than premature: a picker needs a list, and **no such list exists**. The
- * durable engine can answer `workflowBody(name, version)` for the process
- * asking and nothing more — and a missing body is ambiguous, since it equally
- * means a body registered in another SDK through `registerRemote` or a group
- * resolved by convention against a live worker. Inferring the list from what
- * one pod happens to know would produce a picker that omits exactly the
- * cross-SDK workflows this node exists to call.
+ * ## What this used to say, and what changed
  *
- * So the node takes a name and a version as authored text today, and this is
- * the shape a canvas should be handed the day a deployment can announce its
- * registrations. One entry per **version**, never per name: a picker that
- * listed names and resolved the version for you would undo the pin.
+ * This shape was declared with nothing producing it, because a picker needs a
+ * list and no list existed. The durable engine could answer
+ * `workflowBody(name, version)` for the process asking and nothing more, and a
+ * missing body is ambiguous by construction: it equally means "not registered",
+ * "registered through `registerRemote` against another SDK", or "a group
+ * resolved by convention against a live worker". A list inferred from that
+ * would have omitted precisely the cross-SDK workflows this node exists to
+ * call, and would have omitted them silently.
+ *
+ * `@dudousxd/nestjs-durable-core` **0.65.0** closed that with
+ * `WorkflowEngine.announcedWorkflows()`: live workers publish what they can
+ * execute on the worker-descriptor keyspace, and every pod folds the same
+ * published statements, so the answer no longer depends on which replica
+ * served the request. That is what fills this shape now — see
+ * `WorkflowLauncher.callableWorkflows` in `@dudousxd/nestjs-catalog-pipeline`
+ * for the adapter, and keep three properties of the aggregate in mind, because
+ * every field below exists to carry one of them:
+ *
+ * - **It is what is runnable, not what is known about.** The announcer is
+ *   always the process that CONSUMES the queue, so a `registerRemote` entry is
+ *   never announced by the engine that declared it. An operator running bodies
+ *   inline with no queue announces nothing at all — its workflows are real and
+ *   startable, and simply not in this list.
+ * - **It is a snapshot.** An announcement lives on a descriptor key with the
+ *   worker-heartbeat TTL, so a worker that dies takes its entries with it
+ *   within about one beat. Nothing built on this should be cached past that,
+ *   and nothing should present it as authoritative-forever.
+ * - **Disagreements are kept, not merged.** Two live workers may claim the same
+ *   `name@version` from different groups. The aggregate refuses to pick a
+ *   winner, and so does this shape: see {@link disagreements}.
+ *
+ * One entry per **version**, never per name — a picker that listed names and
+ * resolved the version for you would undo the pin the call node exists for.
  */
 export interface CallableWorkflowRef {
   name: string;
-  version: string;
+  /**
+   * The version to pin, and **absent is a real answer**.
+   *
+   * A worker that has not been upgraded announces a bare name with no version
+   * and no group. Silence is not a claim, so no version is invented for it from
+   * another announcer's — and an entry without one cannot satisfy the pin, which
+   * is why {@link callableWorkflowBlock} refuses it rather than letting a picker
+   * offer a name that would run whatever is newest on the day it runs.
+   */
+  version?: string;
   /** What it does, if the deployment publishes one. Shown beside the name. */
   description?: string;
   /**
-   * The worker group its turns are dispatched to, when it has one. The signal
-   * that says "this one's body is not in this process" — a Python workflow, or
-   * a separate TS worker — which is precisely what a caller cannot otherwise
-   * tell from a missing body.
+   * The worker group its turns are dispatched to, when the live announcers
+   * agree on exactly one. The signal that says "this one's body is not in this
+   * process" — a Python workflow, or a separate TS worker — which is precisely
+   * what a caller cannot otherwise tell from a missing body.
+   *
+   * Absent means either nobody stated one or the announcers disagree, and those
+   * two are not the same: the second puts a `group` entry in
+   * {@link disagreements} and the first does not.
    */
   group?: string;
+  /**
+   * How many live workers announce it. `1` is a single point of failure, and it
+   * is never `0` — an entry exists only because somebody announced it.
+   */
+  workers?: number;
+  /**
+   * The axes the live announcers do not agree on, empty or absent when they
+   * speak with one voice. Carried rather than resolved: the registry refuses to
+   * guess and so does everything downstream of it.
+   */
+  disagreements?: CallableWorkflowDisagreement[];
+}
+
+/**
+ * One axis on which the live announcers of a workflow differ.
+ *
+ * Mirrors the durable engine's own `Disagreement` rather than re-deriving it,
+ * and `values` holds every distinct **declared** value: an announcer that stated
+ * nothing on the axis contributes nothing, because silence is not a claim.
+ */
+export interface CallableWorkflowDisagreement {
+  axis: 'group' | 'origin' | 'requires';
+  values: string[];
+}
+
+/**
+ * Why an announced entry must not be committed onto a call node, or `undefined`
+ * when it can be.
+ *
+ * Pure and exported from the browser entry point as well as this one, for the
+ * reason {@link validateWorkflow} is: the canvas that greys the option out and
+ * anything server-side that reasons about the same list must apply *the same*
+ * rule. A picker with its own copy of it is a picker that eventually offers
+ * something the rest of the system considers unusable.
+ *
+ * Two refusals, and they are refusals rather than warnings because in both cases
+ * committing the entry would write a node whose meaning nobody can state:
+ *
+ * - `no-version` — an un-upgraded worker announced a bare name. The call node's
+ *   whole point is the pin; a node holding a name and no version follows
+ *   whatever gets deployed next, which is the failure the version field exists
+ *   to prevent. The name is still perfectly typeable by hand *with* a version
+ *   the author knows, so this refuses the one-click commit and not the workflow.
+ * - `ambiguous-group` — two live workers claim this exact `name@version` from
+ *   different groups. Two groups means two queues, and nothing here can know
+ *   which one a run would land on, so the two bodies may not even be the same
+ *   code. Picking one on the author's behalf would be acting on a claim nobody
+ *   made.
+ *
+ * A disagreement on `origin` or `requires` is deliberately **not** a refusal. It
+ * is worth showing — two packages declaring one name is a mess somebody should
+ * clean up — but it does not change which queue the run goes to, and refusing on
+ * it would block a pin that is otherwise exactly determined.
+ */
+export interface CallableWorkflowBlock {
+  code: 'no-version' | 'ambiguous-group';
+  /** A full sentence, addressed to whoever is looking at the picker. */
+  message: string;
+}
+
+export function callableWorkflowBlock(ref: CallableWorkflowRef): CallableWorkflowBlock | undefined {
+  const version = typeof ref.version === 'string' ? ref.version.trim() : '';
+  if (version.length === 0) {
+    return {
+      code: 'no-version',
+      message: `A live worker announces "${ref.name}" without saying which version it runs, which is what a worker announces before it has been upgraded to publish its registrations in full. A name with no version cannot be pinned, so this cannot be chosen — type the name and the version you mean.`,
+    };
+  }
+  const groups = ref.disagreements?.find((entry) => entry.axis === 'group')?.values ?? [];
+  if (groups.length > 1) {
+    return {
+      code: 'ambiguous-group',
+      message: `Live workers announce ${ref.name}@${version} from ${groups.length} different groups (${groups.join(', ')}), so nothing can say which queue a run would be dispatched to — or whether the two are even the same code. This cannot be chosen until the deployment stops claiming it twice.`,
+    };
+  }
+  return undefined;
 }
 
 /** Every way a graph can be refused. Exported so a canvas can key off the code. */
