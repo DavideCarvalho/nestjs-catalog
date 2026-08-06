@@ -18,6 +18,7 @@ export {
   ConnectorRunWorkflow,
   type ConnectorRunInput,
 } from './connector-run.workflow';
+export { CATALOG_ADOPT_CONNECTORS, ConnectorAdoption } from './connector-adoption.service';
 export { ConnectorRunnerService } from './connector-runner.service';
 export {
   CATALOG_SCHEDULER_ENABLED,
@@ -48,12 +49,13 @@ export {
 export {
   SAMPLE_LIMIT,
   columnsFromSqlDescription,
-  discoverConnectorSchema,
+  discoverSourceSchema,
   driftFrom,
   flagUnusableNames,
   type ColumnConfidence,
   type ConnectorSchemaDiscovery,
   type DiscoverSchemaInput,
+  type DiscoverySource,
   type DiscoveredColumn,
   type DiscoveryBasis,
   type SchemaDrift,

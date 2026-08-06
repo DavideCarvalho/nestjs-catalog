@@ -48,7 +48,6 @@ import {
   restoreRedactedSecrets,
 } from './config-secrets';
 import { ConnectionChecker } from './connection-checker.service';
-import { ConnectorRunnerService } from './connector-runner.service';
 import {
   CATALOG_LOAD_EXPECTATIONS,
   type CatalogLoadExpectations,
@@ -57,9 +56,9 @@ import {
   refuseInvalidLoadExpectation,
   resolveLoadExpectation,
 } from './load-expectations';
-import { discoverConnectorSchema } from './schema-discovery';
+import { discoverSourceSchema } from './schema-discovery';
 import { CATALOG_PIPELINE_REGISTRY, type CatalogPipelineRegistry } from './seams';
-import { applyConnection, resolveSecret } from './sources';
+import { resolveSecret } from './sources';
 import { WorkflowLauncher } from './workflow-launcher.service';
 import { WorkflowRunnerService } from './workflow-runner.service';
 import { type CanvasWorkflowInput, toGraph, toRunView } from './workflow-view';
@@ -97,7 +96,6 @@ export function createPipelineController(
       @Inject(CATALOG_PIPELINE_STORE)
       private readonly pipeline: CatalogPipelineStore,
       private readonly transforms: SubprocessTransformRunner,
-      private readonly runner: ConnectorRunnerService,
       private readonly checker: ConnectionChecker,
       private readonly workflows: WorkflowRunnerService,
       private readonly launcher: WorkflowLauncher,
@@ -488,10 +486,42 @@ export function createPipelineController(
       return result;
     }
 
-    @Get('connections/:id/connectors')
+    /**
+     * Which pipelines read through this connection.
+     *
+     * `connectors` before, and the rename is the question actually being asked
+     * rather than a tidy-up. An operator presses this before deleting a
+     * connection, and what they need is the list of things that would break —
+     * which is a list of workflows, because a workflow is the only thing anybody
+     * authors now and a connector's name is an implementation detail of one.
+     *
+     * Two places name a connection and both are searched. A source node may
+     * carry a `connectionId` of its own, and it may instead name a connector in
+     * `config.connectorId` and inherit that connector's — `resolveSourceNode`
+     * folds either in, so a list built from only the first would clear a
+     * connection for deletion that a running graph reaches through the second.
+     */
+    @Get('connections/:id/workflows')
     @RequireScopes('catalog:read')
     async connectionUsers(@Param('id') id: string) {
-      return (await this.pipeline.connectorsUsingConnection(id)).map(redactConnector);
+      const store = this.workflows.requireStore();
+      const viaConnector = new Set(
+        (await this.pipeline.connectorsUsingConnection(id)).map((connector) => connector.id),
+      );
+
+      const using = [];
+      for (const workflow of await store.listWorkflows()) {
+        const reached = reachesConnection(workflow, id, viaConnector);
+        if (reached) {
+          using.push({
+            id: workflow.id,
+            name: workflow.name,
+            status: workflow.status,
+            through: reached,
+          });
+        }
+      }
+      return using;
     }
 
     @Delete('connections/:id')
@@ -500,183 +530,26 @@ export function createPipelineController(
       return this.pipeline.deleteConnection(id).then((deleted: boolean) => ({ deleted }));
     }
 
-    /** Redacted for the same reason as `connections` — see that route. */
+    /**
+     * The internal records, read-only. Redacted as `connections` is.
+     *
+     * The one connector route left, and it is a read. There is no `POST` and no
+     * `DELETE` any more: a connector is what a published workflow runs as, minted
+     * by `POST workflows/:id/publish` and removed with the graph, so a route that
+     * created one would be the second way to author a pipeline that this whole
+     * change exists to remove.
+     *
+     * It stays served rather than being hidden, because it is the answer to
+     * questions a graph cannot answer about itself: which id a run history and a
+     * watermark are actually keyed on, and — on a deployment upgraded rather
+     * than built fresh — which rows have not been adopted into a workflow yet.
+     * An internal record that no route exposes is one an operator debugs by
+     * opening the database.
+     */
     @Get('connectors')
     @RequireScopes('catalog:read')
     async connectors() {
       return (await this.pipeline.listConnectors()).map(redactConnector);
-    }
-
-    @Post('connectors')
-    @RequireScopes('catalog:write')
-    async saveConnector(
-      @Req() request: { principal?: CatalogPrincipal },
-      @Body() body: Omit<CatalogConnector, 'id' | 'createdAt' | 'updatedAt' | 'createdBy'> & {
-        id?: string;
-      },
-    ) {
-      const principal = requirePrincipal(request);
-      // Validated here, at the edge, rather than narrowed on the way back out.
-      // The store can only be strict about what it reads if nothing invalid ever
-      // reached it, and a 400 naming the accepted kinds is a better answer than a
-      // connector that saves and then fails on its first run.
-      if (!isConnectorKind(body.kind)) {
-        throw new BadRequestException(
-          `"${body.kind}" is not a connector kind. Accepted: ${CONNECTOR_KINDS.join(', ')}.`,
-        );
-      }
-      await this.assertMayCommit(
-        principal,
-        body.targetType,
-        body.workflowId,
-        `saving connector "${body.name}"`,
-      );
-      const stored = body.id ? await this.pipeline.getConnector(body.id) : undefined;
-      // Redacted on the way out — see `saveConnection` for why a save response
-      // is a read.
-      return redactConnector(
-        await this.pipeline.saveConnector(
-          {
-            ...body,
-            kind: body.kind,
-            config: restoreRedactedSecrets(body.config ?? {}, stored?.config),
-          },
-          principal.id,
-        ),
-      );
-    }
-
-    @Delete('connectors/:id')
-    @RequireScopes('catalog:write')
-    deleteConnector(@Param('id') id: string) {
-      return this.pipeline.deleteConnector(id).then((deleted: boolean) => ({ deleted }));
-    }
-
-    /**
-     * Run one now.
-     *
-     * The snapshot id is minted here when the caller does not supply one. A
-     * durable-scheduled run passes its own run id instead, which is what makes a
-     * retry replace its batches rather than load twice.
-     */
-    @Post('connectors/:id/run')
-    @RequireScopes('catalog:write')
-    async run(
-      @Req() request: { principal?: CatalogPrincipal },
-      @Param('id') id: string,
-      @Body() body?: { snapshotId?: string; expectShrink?: string },
-    ) {
-      const principal = requirePrincipal(request);
-      // Checked at the run and not only at the save, because a connector
-      // authored by somebody who could write its type may be run by somebody
-      // who cannot, and the run is what commits. `commitAsSystem` at the end of
-      // it takes a `principalId` string and checks nothing by design — that id
-      // is attribution, not an authorisation — so this is the last point where
-      // there are grants to consult at all.
-      //
-      // A connector that is not there is left to the runner's own 404: there is
-      // nothing to authorise when there is nothing to write with.
-      const connector = await this.pipeline.getConnector(id);
-      if (connector) {
-        await this.assertMayCommit(
-          principal,
-          connector.targetType,
-          connector.workflowId,
-          `running connector "${connector.name}"`,
-        );
-      }
-      return this.runner.run(
-        id,
-        principal.id,
-        body?.snapshotId ?? `manual-${randomUUID().slice(0, 8)}`,
-        // The acknowledgement that this load is allowed to collapse, and it
-        // reaches the runner only from HERE. The scheduled path deliberately
-        // has no field for it: a cron run is unattended, and an acknowledgement
-        // given once and honoured every night is the bound switched off wearing
-        // a reason. So the operator's route is exactly this one — let the
-        // scheduled load be refused, then re-run it by hand saying why.
-        //
-        // Forwarded rather than defaulted. `undefined` means nobody said
-        // anything; an empty string means somebody sent the field with nothing
-        // behind it, which the runner refuses, and flattening the two here
-        // would turn that refusal into silence.
-        ...(body && 'expectShrink' in body ? [{ expectShrink: body.expectShrink }] : []),
-      );
-    }
-
-    /**
-     * Ask a connector what its source looks like. Creates nothing.
-     *
-     * The route that lets somebody point the catalog at a table nobody has
-     * written an entity for. It runs the connector's own read — the driver's
-     * column description for SQL, a bounded sample for everything else — and
-     * answers with the columns, the types it could conclude, the ones it could
-     * not, and how what it found differs from the type as it stands today. See
-     * `schema-discovery.ts` for why each of those is what it is.
-     *
-     * **It writes nothing, and it must stay that way.** Creating the type is a
-     * separate act by a person against `PUT /publish/:type/schema`, which does
-     * its own `mayWrite` check. A connector that created the type it loads into
-     * would grow the catalog by accident, and the names it invented would come
-     * from the shape of a query rather than from somebody who meant them.
-     *
-     * `POST` rather than `GET` for the same reason `connections/:id/check` is:
-     * this reaches out over the network, takes as long as the source takes, and
-     * is nobody's idea of a cacheable read.
-     *
-     * Authorised exactly as running it is, and that is not belt-and-braces.
-     * Saving a connector and running one both require a grant on its target
-     * type, so today a principal with `catalog:write` and no grants cannot cause
-     * the server to read any source at all. Discovery without the same check
-     * would be the first route that could: press it against somebody else's
-     * connector and the answer is the column names of a database this caller was
-     * never allowed near.
-     */
-    @Post('connectors/:id/discover')
-    @RequireScopes('catalog:write')
-    async discoverSchema(
-      @Req() request: { principal?: CatalogPrincipal },
-      @Param('id') id: string,
-    ) {
-      const principal = requirePrincipal(request);
-      const connector = await this.pipeline.getConnector(id);
-      if (!connector) throw new NotFoundException(`No connector ${id}`);
-      await this.assertMayCommit(
-        principal,
-        connector.targetType,
-        connector.workflowId,
-        `discovering the schema behind "${connector.name}"`,
-      );
-
-      // Resolved here rather than at save time, exactly as a run resolves it: an
-      // edited connection has to take effect on the next read, and a discovery
-      // that described the old address would describe a source the load no
-      // longer touches.
-      const connection = connector.connectionId
-        ? await this.pipeline.getConnection(connector.connectionId)
-        : undefined;
-      if (connector.connectionId && !connection) {
-        throw new BadRequestException(
-          `"${connector.name}" reads through a connection that no longer exists (${connector.connectionId}). Point it at one that does — there is nothing to describe until then.`,
-        );
-      }
-      const resolved = applyConnection(connector, connection);
-
-      try {
-        return await discoverConnectorSchema({
-          connector: resolved,
-          secret: resolveSecret(resolved),
-          // The registry, not the store: drift is measured against the type as
-          // the engine currently sees it, which is the same object a load would
-          // be written through.
-          existing: this.registry.getType(connector.targetType),
-        });
-      } catch (error) {
-        // A source that refuses, a query that does not parse, a missing
-        // credential: all of them are this connector's configuration, not the
-        // server's fault, and a 500 would hide the one sentence that says which.
-        throw new BadRequestException(error instanceof Error ? error.message : String(error));
-      }
     }
 
     @Get('runs')
@@ -1022,12 +895,24 @@ export function createPipelineController(
       const store = this.workflows.requireStore();
       return { deleted: await store.deleteWorkflow(id) };
     }
+    /**
+     * Run one now.
+     *
+     * **The only run route there is.** `POST connectors/:id/run` is gone with the
+     * rest of the connector surface, and what it carried that this did not is
+     * `expectShrink` — so that came here rather than being lost. See the note on
+     * {@link CatalogWorkflowRunInput.expectShrink}: without it, deleting the
+     * route would have deleted the only way an operator can re-drive a load the
+     * row-count bound refused, and left them raising the bound in policy
+     * instead — standing the guard down for every future load of the type rather
+     * than for one snapshot.
+     */
     @Post('workflows/:id/run')
     @RequireScopes('catalog:write')
     async runWorkflow(
       @Req() request: { principal?: CatalogPrincipal },
       @Param('id') id: string,
-      @Body() body?: { snapshotId?: string },
+      @Body() body?: { snapshotId?: string; expectShrink?: string },
     ) {
       const principal = requirePrincipal(request);
       const workflow = await this.workflows.requireWorkflow(id);
@@ -1044,33 +929,163 @@ export function createPipelineController(
         // Almost always absent — the console posts an empty body. Present when
         // somebody is re-driving a load they already own the identity of.
         snapshotId: body?.snapshotId,
+        // Forwarded, never defaulted, and the conditional spread is what keeps
+        // the two states apart: absent means nobody said anything, and a present
+        // empty string means somebody sent the field with nothing behind it,
+        // which the sink refuses with a 400 asking for a reason. Flattening them
+        // here would turn that refusal into silence.
+        ...(body && 'expectShrink' in body ? { expectShrink: body.expectShrink } : {}),
       });
       return toRunView(workflow, run);
     }
-    @Get('workflows/:id/connectors')
-    @RequireScopes('catalog:read')
-    async workflowUsers(@Param('id') id: string) {
-      const using = await this.workflows.requireStore().connectorsUsingWorkflow(id);
-      return using.map(redactConnector);
+
+    /**
+     * Set when this graph runs, and whether it runs.
+     *
+     * The schedule moved here from the connector, which is the half of this
+     * change with a live incident behind it: cron was silently broken for every
+     * scheduled connector, and the symptom was a scheduler logging that it was
+     * watching schedules while parsing nothing. So the route that writes one is
+     * deliberately loud about the two ways a cron can be stored and still never
+     * fire, and it answers with the workflow so a screen renders what was
+     * actually stored rather than what it sent.
+     *
+     * `PUT` and its own route rather than fields on `POST workflows`, for the
+     * reason {@link CatalogWorkflowStore.saveWorkflowSchedule} gives: a canvas
+     * autosaves, and a cron folded into the save every drag passes through is
+     * one a stale tab can silently revert.
+     *
+     * **Declared before `workflows/:id`**, as every literal under a `:param` on
+     * this controller has to be. The sweep in `pipeline.route-order.spec.ts` is
+     * what keeps that true for the next route added here.
+     */
+    @Put('workflows/:id/schedule')
+    @RequireScopes('catalog:write')
+    async scheduleWorkflow(
+      @Req() request: { principal?: CatalogPrincipal },
+      @Param('id') id: string,
+      @Body() body: { schedule?: string; enabled?: boolean },
+    ) {
+      const principal = requirePrincipal(request);
+      const store = this.workflows.requireStore();
+      const workflow = await this.workflows.requireWorkflow(id);
+      assertMayWriteTypes(
+        principal,
+        committedTypes(workflow.nodes),
+        `scheduling workflow "${workflow.name}"`,
+      );
+      if (body?.schedule === undefined && body?.enabled === undefined) {
+        throw new BadRequestException(
+          `Nothing to set for "${workflow.name}": send "schedule", "enabled", or both. An empty write would record a decision nobody made — to stop it running, send enabled:false, which is a decision with a verb on it.`,
+        );
+      }
+
+      const saved = await store.saveWorkflowSchedule(
+        id,
+        {
+          ...(body.schedule !== undefined ? { schedule: body.schedule } : {}),
+          ...(body.enabled !== undefined ? { enabled: body.enabled } : {}),
+        },
+        principal.id,
+      );
+
+      const warning = scheduleWarning(saved);
+      if (warning) this.logger.warn(warning);
+      return { ...saved, warning };
     }
 
     /**
-     * Every type this connector would cause to be committed, authorised at once.
+     * Ask one source node what its source looks like. Creates nothing.
      *
-     * Two sources, and both are needed. `targetType` is what a plain connector
-     * publishes on its own. A connector attached to a workflow publishes
-     * whatever that graph's **sinks** commit, which is not the same set: the
-     * store keeps `WorkflowRow.targetType` in step with the connector's, but
-     * that field records only the first sink found, while a graph may legally
-     * carry several as long as they commit different types. Authorising on the
-     * connector's field alone would clear a two-sink graph on the strength of
-     * its first sink.
+     * This was `POST connectors/:id/discover`, and it had to move rather than be
+     * dropped: discovery is how a type gets its shape, and a type has to exist
+     * before any sink can commit into it. The old route also could not have
+     * survived on its own terms — `discoverConnectorSchema` refused outright when
+     * a connector carried a `workflowId`, and every connector carries one now, so
+     * it would have refused every connector there is.
      *
-     * A workflow id that resolves to nothing is passed over rather than raised
-     * here: `saveConnector` in the store already refuses that, with a message
-     * that explains what a connector pointing at a missing graph does to a
-     * schedule, and answering 404 first would replace it with a worse one.
+     * **Answers on a draft, deliberately.** Requiring a published graph would
+     * require somebody to publish a graph whose target type they cannot create
+     * until they have published it. That is the ordering this route exists to
+     * break, so `requireWorkflow` and not `requireReadyWorkflow`.
+     *
+     * **It writes nothing, and it must stay that way.** Creating the type is a
+     * separate act by a person against `PUT /publish/:type/schema`, which does
+     * its own `mayWrite` check. A pipeline that created the type it loads into
+     * would grow the catalog by accident, and the names it invented would come
+     * from the shape of a query rather than from somebody who meant them.
+     *
+     * `POST` rather than `GET` for the same reason `connections/:id/check` is:
+     * this reaches out over the network, takes as long as the source takes, and
+     * is nobody's idea of a cacheable read.
+     *
+     * Authorised exactly as running the graph is, and that is not
+     * belt-and-braces. Saving and running both require a grant on what the graph
+     * commits, so a principal with `catalog:write` and no grants cannot cause the
+     * server to read any source at all. Discovery without the same check would be
+     * the first route that could: press it against somebody else's graph and the
+     * answer is the column names of a database this caller was never allowed
+     * near.
      */
+    @Post('workflows/:id/nodes/:nodeId/discover')
+    @RequireScopes('catalog:write')
+    async discoverSchema(
+      @Req() request: { principal?: CatalogPrincipal },
+      @Param('id') id: string,
+      @Param('nodeId') nodeId: string,
+    ) {
+      const principal = requirePrincipal(request);
+      const workflow = await this.workflows.requireWorkflow(id);
+      assertMayWriteTypes(
+        principal,
+        committedTypes(workflow.nodes),
+        `discovering the schema behind a source in "${workflow.name}"`,
+      );
+
+      const node = workflow.nodes.find((candidate) => candidate.id === nodeId);
+      if (!node) {
+        throw new NotFoundException(
+          `Workflow "${workflow.name}" has no node ${nodeId}, so there is nothing to describe.`,
+        );
+      }
+      if (node.kind !== 'source') {
+        throw new BadRequestException(
+          `Node "${node.name}" is a ${node.kind} node. Only a source reads from a system, so it is the only kind with a shape to discover — a transform's output shape is whatever its code returns, and the way to see that is to try it.`,
+        );
+      }
+
+      try {
+        // Resolved through the runner's own method, so a discovery cannot fold a
+        // connection in differently from the way the load will. See
+        // `resolveSourceNode`.
+        const { connector } = await this.workflows.resolveSourceNode(node);
+        return await discoverSourceSchema({
+          source: {
+            workflowId: workflow.id,
+            nodeId: node.id,
+            nodeName: node.name,
+            // The graph's sink type, not the node's — a source node has none.
+            // Empty on a draft that has not drawn a sink yet, which reads back
+            // as `typeExists: false` and is the honest answer: there is nothing
+            // for the columns to have drifted from.
+            targetType: workflow.targetType,
+            reader: connector,
+            transformed: workflow.nodes.some((other) => other.kind === 'transform'),
+          },
+          secret: resolveSecret(connector),
+          // The registry, not the store: drift is measured against the type as
+          // the engine currently sees it, which is the same object a load would
+          // be written through.
+          existing: workflow.targetType ? this.registry.getType(workflow.targetType) : undefined,
+        });
+      } catch (error) {
+        // A source that refuses, a query that does not parse, a missing
+        // credential: all of them are this graph's configuration, not the
+        // server's fault, and a 500 would hide the one sentence that says which.
+        throw new BadRequestException(error instanceof Error ? error.message : String(error));
+      }
+    }
+
     /**
      * May this principal cause code to run in this process, right now?
      *
@@ -1129,28 +1144,68 @@ export function createPipelineController(
         );
       }
     }
-
-    private async assertMayCommit(
-      principal: CatalogPrincipal,
-      targetType: string,
-      workflowId: string | undefined,
-      subject: string,
-    ): Promise<void> {
-      const types = [targetType];
-      if (workflowId) {
-        const workflow = await this.workflows.requireStore().getWorkflow(workflowId);
-        for (const type of committedTypes(workflow?.nodes ?? [])) {
-          if (!types.includes(type)) types.push(type);
-        }
-      }
-      assertMayWriteTypes(principal, types, subject);
-    }
   }
   if (guards.length > 0) {
     UseGuards(...guards)(PipelineController);
   }
 
   return PipelineController;
+}
+
+/**
+ * Why a stored schedule will not fire, when it will not.
+ *
+ * Said back to the caller rather than left to be inferred from a 200. A cron on
+ * a draft is exactly the silent no-op this whole change is written against: the
+ * row is written, the screen shows it, and the scheduler never touches it,
+ * because only a `ready` graph is scheduled. The scheduler says the same thing
+ * on its own tick — this is the half that reaches the person at the moment they
+ * typed it, rather than a log line nobody is watching.
+ *
+ * `undefined` for a schedule that will fire, and for one that was cleared: a
+ * warning about a graph carrying no cron would be a sentence about nothing.
+ */
+function scheduleWarning(workflow: CatalogWorkflow): string | undefined {
+  if (!workflow.schedule) return undefined;
+  if (workflow.status !== 'ready') {
+    return `"${workflow.name}" is still a draft, so this schedule will not fire. Publish it — only a ready graph is scheduled.`;
+  }
+  if (!workflow.enabled) {
+    return `"${workflow.name}" is disabled, so this schedule will not fire until it is enabled.`;
+  }
+  return undefined;
+}
+
+/**
+ * Which of a graph's source nodes reaches a given connection, described.
+ *
+ * Both ways a node can name one, because there are two and checking only the
+ * first would clear a connection for deletion that a running graph reaches
+ * through the second: a node carries its own `connectionId`, **or** it names a
+ * connector in `config.connectorId` and inherits that connector's.
+ * `resolveSourceNode` folds either in at run time, so either is a real
+ * dependency.
+ *
+ * Answers a sentence rather than a boolean, because "what breaks" is the
+ * question and "the node called Warehouse, through connector abc" is an answer
+ * somebody can act on. The first match wins: one graph appears once in the list
+ * however many of its nodes reach the connection, since deleting it breaks the
+ * graph exactly once.
+ */
+function reachesConnection(
+  workflow: CatalogWorkflow,
+  connectionId: string,
+  connectorIds: ReadonlySet<string>,
+): string | undefined {
+  for (const node of workflow.nodes) {
+    if (node.kind !== 'source') continue;
+    if (node.connectionId === connectionId) return `"${node.name}"`;
+    const named = node.config.connectorId;
+    if (typeof named === 'string' && connectorIds.has(named)) {
+      return `"${node.name}" via connector ${named}`;
+    }
+  }
+  return undefined;
 }
 
 /**

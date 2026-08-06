@@ -19,7 +19,6 @@ import {
   type OnApplicationShutdown,
   Optional,
 } from '@nestjs/common';
-import { CONNECTOR_RUN_WORKFLOW, type ConnectorRunInput } from './connector-run.workflow';
 import { CATALOG_PIPELINE_SCOPE, type CatalogPipelineScope, passthroughScope } from './seams';
 import { CATALOG_WORKFLOW_RUN, type CatalogWorkflowRunInput } from './workflow-run.workflow';
 
@@ -58,23 +57,50 @@ const DEFAULT_POLL_MS = 30_000;
 export const CATALOG_SCHEDULER_ENABLED = Symbol('CATALOG_SCHEDULER_ENABLED');
 
 /**
- * The thing that was missing: something that reads `connector.schedule`.
+ * The thing that reads `workflow.schedule` and starts a run for its window.
+ *
+ * **It used to read `connector.schedule`, and moving it is the point of this
+ * class's current shape.** A schedule is a statement about a pipeline, and a
+ * pipeline is a graph now — the connector is what a published graph runs as. Two
+ * copies of a cron, one on each row, is how the two come to disagree the first
+ * time somebody edits one, so there is one authority and this reads it. The
+ * connector still carries a copy, and this deliberately never looks at it; see
+ * `CatalogConnector.schedule`.
  *
  * The design decision worth stating is that this holds **no schedule state of
- * its own**. Every tick reloads every connector from the store and rebuilds the
+ * its own**. Every tick reloads every workflow from the store and rebuilds the
  * schedule list from scratch, so an edit in the console — a changed cron, a
- * cleared one, a connector disabled or deleted — takes effect within one poll
+ * cleared one, a graph unpublished or deleted — takes effect within one poll
  * interval, with no restart, no cache to invalidate and no registration to
- * withdraw. A scheduler that registered schedules at boot would be a second
- * copy of a database column, and the two would disagree the first time somebody
+ * withdraw. A scheduler that registered schedules at boot would be a second copy
+ * of a database column, and the two would disagree the first time somebody
  * edited one.
+ *
+ * ## What it takes to be scheduled, and why each part is said out loud
+ *
+ * Three things: a graph that is `ready`, `enabled`, and carrying a cron. Each is
+ * a way a schedule can be stored and never fire, and **every one of them is
+ * logged rather than skipped quietly**. That is not defensive style. Cron was
+ * silently broken for every scheduled connector on this deployment until
+ * recently, and the symptom was this loop announcing that it was watching
+ * schedules every 30000ms while parsing nothing at all — a log line that reads
+ * exactly like health. A skip with no sentence attached is the same failure
+ * wearing a different cause, so a graph that carries a cron and will not run
+ * says which of the three it is missing, once, until that changes.
  *
  * Starting a run is `runSchedules` from durable core, unchanged. It derives the
  * run id from the schedule key and the cron's fire time
  * (`sched:connector:<id>:<fireMs>`), and `engine.start` is idempotent by run id
  * — so every tick of every replica racing on the same window starts that window
  * **exactly once**. That is the guarantee that stops two workers double-loading
- * a connector, and it is a property of the store, not of this loop.
+ * a pipeline, and it is a property of the store, not of this loop.
+ *
+ * The key stays `connector:<connectorId>` rather than becoming
+ * `workflow:<workflowId>`, and that is deliberate: the key is half the run id
+ * and the run id is the snapshot id, so re-keying it would make every scheduled
+ * pipeline's next window look like a run it had never done before — and the
+ * connector id is also what the singleton mutex serialises on, so the two have
+ * to name the same thing.
  *
  * What it does *not* stop is window N+1 starting while window N is still
  * running. `runSchedules`' own `overlap: 'skip'` only applies to fixed-interval
@@ -82,7 +108,7 @@ export const CATALOG_SCHEDULER_ENABLED = Symbol('CATALOG_SCHEDULER_ENABLED');
  * the engine enforces in `own` mode and, because a control plane resolves a
  * foreign workflow by convention and a convention-resolved registration carries
  * no singleton config, does **not** enforce in `attach` mode. An `attach`
- * deployment whose connectors can outrun their own schedule needs a cron with
+ * deployment whose graphs can outrun their own schedule needs a cron with
  * enough headroom.
  */
 @Injectable()
@@ -168,95 +194,136 @@ export class ConnectorScheduler implements OnApplicationBootstrap, OnApplication
     this.ticking = true;
     try {
       const now = Date.now();
-      const connectors = await this.pipeline.listConnectors();
-      const scheduled = connectors.filter(isScheduled);
+      const store = this.pipeline;
+      if (!supportsWorkflows(store)) {
+        // Once, not per tick. A store that cannot hold a graph cannot hold a
+        // schedule either, so this is a deployment fault rather than a state
+        // that resolves itself — and it is exactly the case that must not be a
+        // silent no-op, because everything downstream of it looks idle.
+        this.complain(
+          'store',
+          "This deployment's pipeline store cannot hold workflows, so no schedule can be read and nothing will ever run on one. Nothing here will retry into working.",
+        );
+        return;
+      }
+
+      const workflows = await store.listWorkflows();
+      const scheduled = workflows.filter(hasCron);
       this.announce(scheduled);
-      // One `runSchedules` call per connector, not one for all of them: the
-      // library's loop is sequential and awaits each start, so a single
-      // connector whose start throws would silently swallow every connector
-      // after it — and `listConnectors` orders by name, so it would be the same
-      // ones every time.
-      for (const connector of scheduled) {
-        await this.fire(engine, connector, now);
+      this.reportUnrunnable(scheduled);
+      // One `runSchedules` call per graph, not one for all of them: the
+      // library's loop is sequential and awaits each start, so a single graph
+      // whose start throws would silently swallow every graph after it — and
+      // `listWorkflows` orders by name, so it would be the same ones every time.
+      for (const workflow of scheduled.filter(isRunnable)) {
+        await this.fire(engine, workflow, now);
       }
     } catch (error) {
-      this.logger.warn(`Could not read connectors this tick: ${say(error)}`);
+      this.logger.warn(`Could not read workflow schedules this tick: ${say(error)}`);
     } finally {
       this.ticking = false;
     }
   }
 
+  /**
+   * Name every graph that carries a cron and will not run on it.
+   *
+   * The half of this loop that the incident behind it argues for. A draft with a
+   * schedule, or a disabled one, is stored exactly like a working one and reads
+   * on every screen as scheduled — the only place the difference is observable
+   * is here, at the moment this loop decides not to fire it. Saying nothing is
+   * how "watching schedules" and "watching nothing" became the same log line.
+   *
+   * Deduplicated per graph through {@link complain}, so a graph parked as a
+   * draft for a month costs one line rather than one per tick.
+   */
+  private reportUnrunnable(scheduled: CatalogWorkflow[]): void {
+    for (const workflow of scheduled) {
+      if (isRunnable(workflow)) {
+        this.forgive(`${workflow.id}:unrunnable`);
+        continue;
+      }
+      this.complain(
+        `${workflow.id}:unrunnable`,
+        workflow.status !== 'ready'
+          ? `"${workflow.name}" has a schedule ("${workflow.schedule}") and is still a draft, so nothing will run it. Only a ready graph is scheduled — publish it, or clear the schedule so the row stops claiming something that is not happening.`
+          : `"${workflow.name}" has a schedule ("${workflow.schedule}") and is disabled, so nothing will run it.`,
+      );
+    }
+  }
+
   private async fire(
     engine: WorkflowEngine,
-    connector: CatalogConnector,
+    workflow: CatalogWorkflow,
     now: number,
   ): Promise<void> {
-    const cron = (connector.schedule ?? '').trim();
+    const cron = (workflow.schedule ?? '').trim();
 
     let fireMs: number;
     try {
       fireMs = prevCronFireMs(cron, now, this.timezone);
     } catch (error) {
       // A schedule nobody can parse is the author's to fix, and naming the
-      // connector and the expression is the only useful thing to say about it.
-      // It must not take the other connectors down with it.
+      // graph and the expression is the only useful thing to say about it. It
+      // must not take the other graphs down with it.
       this.complain(
-        `${connector.id}:cron`,
-        `"${connector.name}" has a schedule this service cannot read ("${cron}"): ${say(error)}`,
+        `${workflow.id}:cron`,
+        `"${workflow.name}" has a schedule this service cannot read ("${cron}"): ${say(error)}`,
       );
       return;
     }
     // Only the parse complaint. Clearing every complaint here would clear the
     // start-failure one below on the next tick and then log it again, turning a
     // deduplicated warning back into one per tick.
-    this.forgive(`${connector.id}:cron`);
+    this.forgive(`${workflow.id}:cron`);
+
+    // The connector this graph runs as, which is what the run is keyed and
+    // serialised on. Resolved per window rather than cached, for the reason this
+    // whole loop holds no state: a graph unpublished and re-published between
+    // two windows is a connector that was disabled and re-enabled, and a cached
+    // answer would keep firing into the disabled one.
+    const connector = await this.connectorFor(workflow);
+    if (!connector) return;
 
     // The current cron window is whatever fired most recently, which for a
     // daily schedule can be twenty hours ago. Firing it is right when a worker
     // was down through it — that is catch-up, and for a catalog catch-up is
-    // what you want. It is wrong when the schedule did not exist yet: a
-    // connector saved at 23:00 with `0 3 * * *` would load immediately, and so
-    // would one whose cron was just edited.
+    // what you want. It is wrong when the schedule did not exist yet: a graph
+    // published at 23:00 with `0 3 * * *` would load immediately, and so would
+    // one whose cron was just edited.
     //
-    // `updatedAt` separates the two, because the store bumps it on every edit
-    // *and* on every run's start and finish. So a window older than the last
-    // thing that happened to this connector has either already run or predates
-    // the schedule that names it; a window newer than that is genuinely due.
+    // `updatedAt` separates the two, and it is read off the **connector** rather
+    // than the workflow deliberately. The connector's is bumped by every edit
+    // *and* by every run's start and finish, which is what makes this test mean
+    // "newer than the last thing that happened to this pipeline"; a workflow's
+    // is bumped only by edits, so a graph nobody has touched since it was
+    // published would re-fire its most recent window on every boot forever.
+    //
     // This is a filter, not the guarantee — the guarantee is the deterministic
     // run id below, which is what makes a redundant start a no-op.
     const changedAt = Date.parse(connector.updatedAt);
     if (Number.isFinite(changedAt) && fireMs <= changedAt) return;
 
-    // Which durable workflow this connector's window runs, decided by what the
-    // connector delegates to and by nothing else. A connector with a
-    // `workflowId` gets the per-node workflow, so a scheduled graph is
-    // checkpointed node by node; one with a `transformId` gets the single step
-    // it has always had. The store refuses a connector that sets both, so this
-    // is a choice between two and never a guess.
-    const graph = connector.workflowId ? await this.resolveGraph(connector) : undefined;
-    if (connector.workflowId && !graph) return;
-
     const schedule: ScheduledWorkflow = {
-      // The key is half the run id, so it must identify the connector and
-      // nothing about it that can change. The id, therefore, not the name.
-      // Deliberately the same key for both workflows: the run id derived from
-      // it is the snapshot id, and a connector that was switched from a
-      // transform to a graph must not be able to start two runs for one window.
+      // The key is half the run id, so it must identify the pipeline and
+      // nothing about it that can change. The connector id, therefore — not the
+      // workflow's, because the run id derived from this is the snapshot id and
+      // the connector is what a snapshot's history and watermark hang off, and
+      // not the name.
       key: `connector:${connector.id}`,
-      workflow: graph ? CATALOG_WORKFLOW_RUN : CONNECTOR_RUN_WORKFLOW,
-      input: graph
-        ? ({
-            workflowId: graph.id,
-            workflowVersion: graph.version,
-            workflowName: graph.name,
-            connectorId: connector.id,
-            principalId: SCHEDULER_PRINCIPAL,
-          } satisfies CatalogWorkflowRunInput)
-        : ({
-            connectorId: connector.id,
-            connectorName: connector.name,
-            principalId: SCHEDULER_PRINCIPAL,
-          } satisfies ConnectorRunInput),
+      workflow: CATALOG_WORKFLOW_RUN,
+      input: {
+        workflowId: workflow.id,
+        workflowVersion: workflow.version,
+        workflowName: workflow.name,
+        connectorId: connector.id,
+        principalId: SCHEDULER_PRINCIPAL,
+        // No `expectShrink`, and its absence is the rule rather than an
+        // omission: this window is unattended, and an acknowledgement that
+        // fires every night is the row-count bound switched off in a costume.
+        // A refused scheduled load is re-driven by hand, with a reason. See
+        // `CatalogWorkflowRunInput.expectShrink`.
+      } satisfies CatalogWorkflowRunInput,
       cron,
       timezone: this.timezone,
     };
@@ -270,52 +337,60 @@ export class ConnectorScheduler implements OnApplicationBootstrap, OnApplication
       // the window opening and the run reaching the store — which would
       // otherwise print the same line two or three times. Log the run id once,
       // and let a repeat of the same id stay quiet.
-      if (runId && this.started.get(connector.id) !== runId) {
-        this.started.set(connector.id, runId);
+      if (runId && this.started.get(workflow.id) !== runId) {
+        this.started.set(workflow.id, runId);
         this.logger.log(
-          `${connector.name}: started ${runId} for the ${new Date(fireMs).toISOString()} window.`,
+          `${workflow.name}: started ${runId} for the ${new Date(fireMs).toISOString()} window.`,
         );
       }
     } catch (error) {
-      this.complain(`${connector.id}:start`, `Could not start "${connector.name}": ${say(error)}`);
+      this.complain(`${workflow.id}:start`, `Could not start "${workflow.name}": ${say(error)}`);
     }
   }
 
   /**
-   * The graph a connector delegates to, at the version it has right now.
+   * The connector a published graph runs as.
    *
-   * Read per window rather than cached, for the reason this whole loop holds no
-   * state of its own: an edited graph must take effect on the next run. The
-   * version travels with the start so that a graph edited between the start and
-   * the first node fails at the node rather than quietly executing half of one
-   * graph and half of another.
+   * There is exactly one, minted by `publishWorkflow`, and a graph that is
+   * `ready` with none is a state that should not exist — so it complains rather
+   * than starting anything. Starting a run with the workflow's own id standing
+   * in for a connector was the tempting shortcut and is the wrong one: that id
+   * would become the mutex key and the snapshot's owner, so the graph's history
+   * would silently split in two the moment its real connector appeared, and
+   * nothing would be serialising the two against each other in the meantime.
    *
-   * A connector pointing at a workflow that no longer exists complains once and
-   * starts nothing. Starting a run that cannot resolve its own graph would burn
-   * a window and record a failure whose cause is a missing row, which is the
-   * author's to fix and not the engine's to retry.
+   * More than one is reported and the first used, rather than refused. It can
+   * only happen on a deployment that had several connectors pointing at one
+   * graph before this change, which is exactly the deployment that must keep
+   * loading while somebody reconciles it.
    */
-  private async resolveGraph(connector: CatalogConnector): Promise<CatalogWorkflow | undefined> {
+  private async connectorFor(workflow: CatalogWorkflow): Promise<CatalogConnector | undefined> {
     const store = this.pipeline;
-    if (!supportsWorkflows(store)) {
+    if (!supportsWorkflows(store)) return undefined;
+
+    const using = (await store.connectorsUsingWorkflow(workflow.id)).filter(
+      (connector) => connector.enabled,
+    );
+    if (using.length === 0) {
       this.complain(
-        `${connector.id}:workflow`,
-        `"${connector.name}" runs a workflow and this deployment's pipeline store cannot hold one, so nothing will run it.`,
+        `${workflow.id}:connector`,
+        `"${workflow.name}" is ready and scheduled and there is no enabled connector running it, so its windows pass with nothing to key a run on. Publishing it again mints one; that is the supported repair.`,
       );
       return undefined;
     }
-    const workflow = connector.workflowId
-      ? await store.getWorkflow(connector.workflowId)
-      : undefined;
-    if (!workflow) {
+    if (using.length > 1) {
       this.complain(
-        `${connector.id}:workflow`,
-        `"${connector.name}" runs workflow ${connector.workflowId}, which does not exist. Point it at one that does, or its every window fails with nothing to execute.`,
+        `${workflow.id}:connector`,
+        `${using.length} connectors run "${workflow.name}": ${using
+          .map((connector) => connector.name)
+          .join(
+            ', ',
+          )}. Only ${using[0].name} is scheduled — the rest are rows from before a workflow minted its own connector, and each one is a separate run history nothing is writing to.`,
       );
-      return undefined;
+      return using[0];
     }
-    this.forgive(`${connector.id}:workflow`);
-    return workflow;
+    this.forgive(`${workflow.id}:connector`);
+    return using[0];
   }
 
   /**
@@ -324,22 +399,30 @@ export class ConnectorScheduler implements OnApplicationBootstrap, OnApplication
    * This is the observable that answers "did my edit take?" — it is logged the
    * tick after somebody saves a connector, and never again until the next edit.
    */
-  private announce(scheduled: CatalogConnector[]): void {
+  private announce(scheduled: CatalogWorkflow[]): void {
     const fingerprint = scheduled
-      .map((connector) => `${connector.id}@${connector.schedule}`)
+      .map(
+        (workflow) => `${workflow.id}@${workflow.schedule}@${workflow.status}@${workflow.enabled}`,
+      )
       .sort()
       .join('|');
     if (fingerprint === this.announced) return;
     this.announced = fingerprint;
 
+    const runnable = scheduled.filter(isRunnable);
     if (scheduled.length === 0) {
-      this.logger.log('No connector is enabled with a schedule.');
+      this.logger.log('No workflow carries a schedule.');
       return;
     }
+    // The count of what will actually fire, said separately from the count of
+    // what carries a cron. One number for both is what let "watching schedules"
+    // mean "watching nothing" — `reportUnrunnable` names each of the difference.
     this.logger.log(
-      `Scheduling ${scheduled.length} connector(s): ${scheduled
-        .map((connector) => `${connector.name} (${connector.schedule})`)
-        .join(', ')}.`,
+      `Scheduling ${runnable.length} of ${scheduled.length} workflow(s) carrying a cron: ${
+        runnable.length > 0
+          ? runnable.map((workflow) => `${workflow.name} (${workflow.schedule})`).join(', ')
+          : 'none of them are ready and enabled'
+      }.`,
     );
   }
 
@@ -352,16 +435,17 @@ export class ConnectorScheduler implements OnApplicationBootstrap, OnApplication
    */
   private async reportUnschedulable(): Promise<void> {
     try {
-      const waiting = (await this.pipeline.listConnectors()).filter(isScheduled);
+      const store = this.pipeline;
+      const waiting = supportsWorkflows(store) ? (await store.listWorkflows()).filter(hasCron) : [];
       if (waiting.length === 0) {
         this.logger.log(
-          'No durable engine here, and no connector has a schedule — nothing is going unrun.',
+          'No durable engine here, and no workflow has a schedule — nothing is going unrun.',
         );
         return;
       }
       this.logger.warn(
-        `${waiting.length} connector(s) have a schedule and nothing will run them: ${waiting
-          .map((connector) => connector.name)
+        `${waiting.length} workflow(s) have a schedule and nothing will run them: ${waiting
+          .map((workflow) => workflow.name)
           .join(
             ', ',
           )}. No WorkflowEngine resolved here. Either this host mounts no durable engine, or its durable module failed to bind — check the boot log before clearing the schedules.`,
@@ -401,9 +485,22 @@ export class ConnectorScheduler implements OnApplicationBootstrap, OnApplication
   }
 }
 
-/** Enabled, and carrying something to interpret. Both, or it is manual-only. */
-function isScheduled(connector: CatalogConnector): boolean {
-  return connector.enabled && (connector.schedule ?? '').trim().length > 0;
+/**
+ * Carrying something to interpret.
+ *
+ * Split from {@link isRunnable} on purpose, where the connector version had them
+ * as one test. A graph that has a cron and cannot run it is the case worth
+ * naming — it is the shape of the incident this loop exists to stop repeating —
+ * and one combined predicate makes it indistinguishable from a graph nobody ever
+ * scheduled.
+ */
+function hasCron(workflow: CatalogWorkflow): boolean {
+  return (workflow.schedule ?? '').trim().length > 0;
+}
+
+/** Published, and switched on. Both, or its cron is a row nothing acts on. */
+function isRunnable(workflow: CatalogWorkflow): boolean {
+  return workflow.status === 'ready' && workflow.enabled;
 }
 
 function positiveInt(raw: string | undefined, fallback: number): number {

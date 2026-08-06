@@ -375,6 +375,32 @@ export class WorkflowRow {
   @Property({ length: 128 })
   targetType!: string;
 
+  /**
+   * When this graph runs. Nullable, and null means manual only.
+   *
+   * The column the schedule moved *to*. `ConnectorRow.schedule` still exists and
+   * is still written, but as a copy for evidence — this is what
+   * `ConnectorScheduler` parses. Keeping both and being explicit about which is
+   * the authority is the point: the alternative, dropping the connector's copy,
+   * would have thrown away the record of what each of the adopted connectors was
+   * doing before the move, at exactly the upgrade where somebody might need to
+   * check.
+   */
+  @Property({ length: 128, nullable: true })
+  schedule?: string;
+
+  /**
+   * Whether this graph runs at all.
+   *
+   * **Defaulted to `true`, and that is the migration decision** — the same one
+   * `status` above makes and for the same reason. Every workflow already in a
+   * database was published by somebody who meant it to run; defaulting to
+   * `false` would be the conservative-looking choice that turns an upgrade into
+   * an outage, silently, on the deployment that has the most to lose.
+   */
+  @Property({ default: true })
+  enabled = true;
+
   @Property({ length: 128 })
   createdBy!: string;
 

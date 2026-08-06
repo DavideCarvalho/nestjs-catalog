@@ -80,8 +80,8 @@ function sink(id: string, targetType: string): WorkflowNode {
   return { id, name: id, kind: 'sink', targetType };
 }
 
-function source(id: string): WorkflowNode {
-  return { id, name: id, kind: 'source', sourceKind: 'inline', config: { records: [] } };
+function source(id: string, records: unknown[] = []): WorkflowNode {
+  return { id, name: id, kind: 'source', sourceKind: 'inline', config: { records } };
 }
 
 /**
@@ -190,6 +190,11 @@ class MemoryPipelineStore implements CatalogPipelineStore {
     const saved: CatalogWorkflow = {
       ...input,
       id: input.id ?? 'generated',
+      // Enabled, as a freshly saved graph is. `enabled` is half the test the
+      // scheduler applies now that a schedule lives on the workflow, so a
+      // double defaulting it false would model a store that quietly refuses to
+      // run anything.
+      enabled: true,
       // Drafted, as the real store drafts it. These tests are about write
       // grants, and every one of them asserts against the save itself, so the
       // status only has to be the one a save actually produces.
@@ -221,19 +226,66 @@ class MemoryPipelineStore implements CatalogPipelineStore {
   deleteWorkflow(): Promise<boolean> {
     return Promise.resolve(false);
   }
+  // Present because `supportsWorkflows` asks for it by name now: a schedule
+  // authored on a graph is worthless if the store cannot hold one, so a double
+  // that omitted it would make this whole fake read as "cannot hold workflows".
+  saveWorkflowSchedule(
+    id: string,
+    input: { schedule?: string; enabled?: boolean },
+  ): Promise<CatalogWorkflow> {
+    const stored = this.workflows.get(id);
+    if (!stored) throw new Error(`No workflow ${id} to schedule.`);
+    const saved: CatalogWorkflow = {
+      ...stored,
+      schedule: input.schedule ?? stored.schedule,
+      enabled: input.enabled ?? stored.enabled,
+    };
+    this.workflows.set(id, saved);
+    return Promise.resolve(saved);
+  }
+  adoptConnector(): Promise<undefined> {
+    return Promise.resolve(undefined);
+  }
   connectorsUsingWorkflow(id: string): Promise<CatalogConnector[]> {
     return Promise.resolve(
       [...this.connectors.values()].filter((connector) => connector.workflowId === id),
     );
   }
-  writeStage(): Promise<{ written: number }> {
-    return Promise.resolve({ written: 0 });
+  /**
+   * Real staging, keyed the way the store's is: `(runId, nodeId, batch)`.
+   *
+   * It used to answer `{ written: 0 }` and `[]`, which was enough while the only
+   * runs these tests made were refusals. It is not enough now that the positive
+   * case runs a graph end to end: a stage store that swallows rows makes every
+   * sink report "nothing reached the sink", so a test asserting a commit would
+   * fail for a reason that has nothing to do with the grant it is about.
+   */
+  readonly stages = new Map<string, Array<Record<string, unknown>>>();
+  writeStage(input: {
+    runId: string;
+    nodeId: string;
+    batch: number;
+    rows: Array<Record<string, unknown>>;
+  }): Promise<{ written: number }> {
+    this.stages.set(`${input.runId}:${input.nodeId}:${input.batch}`, input.rows);
+    return Promise.resolve({ written: input.rows.length });
   }
-  readStage(): Promise<Array<Record<string, unknown>>> {
-    return Promise.resolve([]);
+  readStage(ref: {
+    runId: string;
+    nodeId: string;
+    batch: number;
+  }): Promise<Array<Record<string, unknown>>> {
+    return Promise.resolve(this.stages.get(`${ref.runId}:${ref.nodeId}:${ref.batch}`) ?? []);
   }
-  dropStages(): Promise<number> {
-    return Promise.resolve(0);
+  dropStages(runId: string): Promise<number> {
+    let dropped = 0;
+    for (const key of [...this.stages.keys()]) {
+      if (key.startsWith(`${runId}:`)) {
+        this.stages.delete(key);
+        dropped += 1;
+      }
+    }
+    return Promise.resolve(dropped);
   }
   startRun(input: {
     connectorId: string;
@@ -290,8 +342,30 @@ class FakeWriteStore implements CatalogWriteStore {
   ensureType(): Promise<void> {
     return Promise.resolve();
   }
-  write(): Promise<{ written: number }> {
-    return Promise.resolve({ written: 0 });
+  /**
+   * Reports what it was handed, rather than a flat zero.
+   *
+   * Zero was harmless while every run in this file was a refusal. It is not
+   * harmless now: a workflow's sink refuses to commit when **nothing** reached
+   * it — a full load that produced no rows would otherwise repoint the live view
+   * at an empty snapshot — so a write store that always answers zero makes every
+   * successful graph look like an empty one, and a commit test would fail for a
+   * reason unrelated to the grant it is about.
+   *
+   * Worth noting that this is a real difference between the two run paths, not a
+   * fixture artefact: the single-transform connector runner writes an empty
+   * batch for a full load and commits it, while the workflow sink refuses. Only
+   * the second is reachable now.
+   */
+  /** Every label every batch carried, so a test can see what the snapshot got. */
+  labels: Array<Record<string, string> | undefined> = [];
+  write(
+    _def: CatalogObjectTypeDef,
+    rows: unknown[],
+    options?: { labels?: Record<string, string> },
+  ): Promise<{ written: number }> {
+    this.labels.push(options?.labels);
+    return Promise.resolve({ written: rows.length });
   }
   commit(def: CatalogObjectTypeDef, snapshotId: string): Promise<SnapshotRef> {
     this.committed.push(def.name);
@@ -340,6 +414,9 @@ describe('the pipeline surface enforces per-type write grants', () => {
     store.workflows.clear();
     store.runs = [];
     writeStore.committed = [];
+    // Reset alongside `committed`, or an assertion on the first write reads a
+    // label left by whichever test happened to run before this one.
+    writeStore.labels = [];
 
     const moduleRef = await Test.createTestingModule({
       imports: [
@@ -410,35 +487,30 @@ describe('the pipeline surface enforces per-type write grants', () => {
     });
   });
 
-  describe('saving a connector', () => {
-    const connector = {
-      name: 'Nightly',
-      kind: 'inline',
-      targetType: 'Subwo',
-      config: { records: [] },
-    };
-
-    it('refuses one that publishes a type this principal may not write', async () => {
-      await post('/connectors', 'mvr-only').send(connector).expect(403);
+  describe('authoring a connector', () => {
+    /**
+     * There is no longer a route that does it, and that is what is asserted.
+     *
+     * These tests used to check that saving a connector required a grant on its
+     * target type, and on the graph's sinks when it named one. Both checks are
+     * still made — on `POST workflows`, above, which is now the only way a
+     * pipeline comes into existence. What has to stay true is that no second way
+     * reappears: a `POST connectors` that came back would be a way to cause a
+     * load whose authorisation lives on a different object from the one that
+     * decides what gets written.
+     */
+    it('has no route that creates one', async () => {
+      await post('/connectors', 'both')
+        .send({ name: 'Nightly', kind: 'inline', targetType: 'Subwo', config: { records: [] } })
+        .expect(404);
       expect(store.connectors.size).toBe(0);
     });
 
-    it('accepts it from a principal that may', async () => {
-      await post('/connectors', 'both').send(connector).expect(201);
-      expect(store.connectors.size).toBe(1);
-    });
-
-    it('refuses one attached to a graph that commits out of reach', async () => {
-      // The connector's own `targetType` is fine. What it would actually cause
-      // to be committed is the graph's sinks, which are not.
-      await post('/workflows', 'both')
-        .send({ ...subwoGraph, id: 'wf-1' })
-        .expect(201);
-
-      await post('/connectors', 'mvr-only')
-        .send({ name: 'Attached', kind: 'inline', targetType: 'Mvr', workflowId: 'wf-1' })
-        .expect(403);
-      expect(store.connectors.size).toBe(0);
+    it('has no route that deletes one', async () => {
+      await request(app.getHttpServer())
+        .delete(`${BASE}/connectors/c1`)
+        .set('x-principal', 'both')
+        .expect(404);
     });
   });
 
@@ -454,33 +526,90 @@ describe('the pipeline surface enforces per-type write grants', () => {
       expect(writeStore.committed).toEqual([]);
     });
 
-    it('refuses a connector run for a type out of reach', async () => {
-      await post('/connectors', 'both')
-        .send({ id: 'c1', name: 'Nightly', kind: 'inline', targetType: 'Subwo', config: {} })
-        .expect(201);
-
-      await post('/connectors/c1/run', 'mvr-only').send({}).expect(403);
-      // `commitAsSystem` checks nothing by design, so reaching it at all is the
-      // whole breach.
-      expect(writeStore.committed).toEqual([]);
-    });
+    /**
+     * The source carries a record, unlike the graphs the refusal tests use, and
+     * it has to: a **full** load that produces nothing does not commit — the
+     * sink refuses rather than repointing the live view at an empty snapshot.
+     * A graph with an empty inline source would therefore pass this test's
+     * authorisation and still commit nothing, which would make it green for the
+     * wrong reason.
+     */
+    const loadingGraph = {
+      name: 'Load Subwo',
+      nodes: [source('in', [{ id: 1 }]), sink('out', 'Subwo')],
+      edges: [{ from: 'in', to: 'out' }],
+    };
 
     it('runs and commits for the principal that holds the grant', async () => {
-      await post('/connectors', 'both')
-        .send({ id: 'c1', name: 'Nightly', kind: 'inline', targetType: 'Subwo', config: {} })
+      await post('/workflows', 'both')
+        .send({ ...loadingGraph, id: 'wf-1' })
         .expect(201);
 
-      await post('/connectors/c1/run', 'both').send({}).expect(201);
+      await post('/workflows/wf-1/run', 'both').send({}).expect(201);
       expect(writeStore.committed).toEqual(['Subwo']);
     });
 
     it('attributes the run to the principal, not to a hardcoded name', async () => {
-      await post('/connectors', 'both')
-        .send({ id: 'c1', name: 'Nightly', kind: 'inline', targetType: 'Subwo', config: {} })
+      await post('/workflows', 'both')
+        .send({ ...loadingGraph, id: 'wf-1' })
         .expect(201);
-      await post('/connectors/c1/run', 'both').send({}).expect(201);
+      await post('/workflows/wf-1/run', 'both').send({}).expect(201);
 
       expect(store.runs[0]?.principalId).toBe('app-b');
+    });
+
+    /**
+     * The acknowledgement has to reach the **snapshot's labels**, not merely the
+     * launcher, because that is where the row-count bound reads it from.
+     *
+     * Asserted end to end for that reason: `EXPECT_SHRINK_LABEL` stands the
+     * bound down for one snapshot, and a reason that stopped at any hop between
+     * the route and the write would leave an operator unable to re-drive a
+     * refused load at all — which pushes them to raise the bound in policy and
+     * switch the guard off for every future load of the type.
+     */
+    it('carries the operator reason all the way onto the snapshot labels', async () => {
+      await post('/workflows', 'both')
+        .send({ ...loadingGraph, id: 'wf-1' })
+        .expect(201);
+
+      await post('/workflows/wf-1/run', 'both')
+        .send({ expectShrink: 'the depot was decommissioned' })
+        .expect(201);
+
+      expect(writeStore.labels[0]).toMatchObject({
+        _expectShrink: 'the depot was decommissioned',
+      });
+    });
+
+    it('refuses an acknowledgement with no reason behind it', async () => {
+      await post('/workflows', 'both')
+        .send({ ...loadingGraph, id: 'wf-1' })
+        .expect(201);
+
+      // The reason is the whole value of the acknowledgement: it is the only
+      // answer anybody has in six months to "why was this allowed to collapse?".
+      const response = await post('/workflows/wf-1/run', 'both')
+        .send({ expectShrink: '   ' })
+        .expect(201);
+
+      expect(response.body.status).toBe('failed');
+      expect(JSON.stringify(response.body)).toMatch(/given no reason/);
+      expect(writeStore.committed).toEqual([]);
+    });
+
+    /**
+     * The run route the connector surface had is gone too.
+     *
+     * `commitAsSystem` checks nothing by design — it takes a principal id as
+     * attribution rather than as an authorisation — so the route that reaches it
+     * is the last place there are grants to consult. Leaving a second one
+     * standing would leave one of the two unchecked the next time either is
+     * edited.
+     */
+    it('has no connector run route beside it', async () => {
+      await post('/connectors/c1/run', 'both').send({}).expect(404);
+      expect(writeStore.committed).toEqual([]);
     });
   });
 
@@ -568,26 +697,49 @@ describe('connector and connection configuration is not served in the clear', ()
     expect(JSON.stringify(response.body)).not.toContain('s3cr3t');
   });
 
-  it('redacts it out of the connectors listed against a connection', async () => {
+  /**
+   * The route is `connections/:id/workflows` now, and it answers a different
+   * question — which is why it cannot leak this at all rather than having to
+   * redact it.
+   *
+   * "Which connectors read through this connection" was never the question an
+   * operator was asking before deleting one; "what breaks" was, and what breaks
+   * is a list of pipelines. Answering with workflow identity — id, name, status,
+   * and which node reaches it — means no source config passes through the
+   * handler, so the credential cannot be forgotten on the way out the way it was
+   * on `GET connections` and `GET connectors` before `config-secrets.ts` existed.
+   */
+  it('names the workflows that read through a connection, and carries no config at all', async () => {
     await seedConnection();
-    await store.saveConnector(
+    await store.saveWorkflow(
       {
-        id: 'c1',
+        id: 'wf-1',
         name: 'Nightly',
-        kind: 'sql',
-        enabled: true,
-        targetType: 'Subwo',
-        connectionId: 'conn-1',
-        config: { url: URL_WITH_PASSWORD },
+        nodes: [
+          {
+            id: 'in',
+            name: 'in',
+            kind: 'source',
+            sourceKind: 'sql',
+            connectionId: 'conn-1',
+            config: { url: URL_WITH_PASSWORD },
+          },
+          sink('out', 'Subwo'),
+        ],
+        edges: [{ from: 'in', to: 'out' }],
       },
       'app-b',
     );
+
     const response = await request(app.getHttpServer())
-      .get(`${BASE}/connections/conn-1/connectors`)
+      .get(`${BASE}/connections/conn-1/workflows`)
       .set('x-principal', 'mvr-only')
       .expect(200);
 
     expect(JSON.stringify(response.body)).not.toContain('s3cr3t');
+    expect(response.body).toEqual([
+      { id: 'wf-1', name: 'Nightly', status: 'draft', through: '"in"' },
+    ]);
   });
 
   it('leaves the store telling the truth, so the runner can still connect', async () => {
@@ -627,31 +779,23 @@ describe('connector and connection configuration is not served in the clear', ()
   // The same round trip on the other half of the surface. A connector may carry
   // its own `config.url`, which `applyConnection` lets override the
   // connection's, so the corruption is available on this path too.
-  it('does not write the placeholder back when a console round-trips a connector', async () => {
-    await store.saveConnector(
-      {
-        id: 'c1',
-        name: 'Nightly',
-        kind: 'sql',
-        enabled: true,
-        targetType: 'Subwo',
-        config: { url: URL_WITH_PASSWORD, query: 'SELECT 1' },
-      },
-      'app-b',
-    );
-    const listed = await request(app.getHttpServer())
-      .get(`${BASE}/connectors`)
-      .set('x-principal', 'both')
-      .expect(200);
-
+  /**
+   * The round trip this covered is gone with the route that made it possible.
+   *
+   * What it protected — that a console posting back the placeholder it was shown
+   * does not overwrite the real credential — is still protected on the two
+   * things a console can still post: a connection (`saveConnection`, through
+   * `restoreRedactedSecrets`) and a workflow's source nodes
+   * (`restoreWorkflowSecrets`, asserted at length in
+   * `pipeline.workflow-secrets.spec.ts`). A connector is minted by publishing a
+   * graph, from fields the caller never sends, so there is no request that could
+   * write a placeholder into one.
+   */
+  it('has no connector write for a placeholder to round-trip through', async () => {
     await request(app.getHttpServer())
       .post(`${BASE}/connectors`)
       .set('x-principal', 'both')
-      .send({ ...listed.body[0], name: 'Nightly (EU)' })
-      .expect(201);
-
-    const stored = await store.getConnector('c1');
-    expect(stored?.name).toBe('Nightly (EU)');
-    expect(stored?.config.url).toBe(URL_WITH_PASSWORD);
+      .send({ name: 'Nightly', kind: 'sql', targetType: 'Subwo', config: { url: 'REDACTED' } })
+      .expect(404);
   });
 });

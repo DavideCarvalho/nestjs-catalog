@@ -9,21 +9,37 @@ import {
 import { SOURCES, type SqlDescription, describeSql, toBufferedFetchResult } from './sources';
 
 /**
- * Asking a connector what its source actually looks like.
+ * Asking one source node of a graph what it actually looks like.
  *
  * WHY THIS EXISTS
  * ---------------
- * A connector cannot create the type it loads into: `appendRowsAsSystem` looks
- * the type up in the registry and refuses when it is absent, so the only way one
+ * A load cannot create the type it writes into: `appendRowsAsSystem` looks the
+ * type up in the registry and refuses when it is absent, so the only way one
  * comes into existence is a publisher — a decorated entity, or a
  * `PUT /publish/:type/schema` body somebody wrote. That is deliberate and stays
  * that way (see below). What it costs is that pointing the catalog at a table
  * nobody has written an entity for means writing the schema out by hand, column
  * by column, from a database somebody has to open a client against.
  *
- * This closes that gap from the other end: the connector runs its own configured
+ * This closes that gap from the other end: the node runs its own configured
  * query, reads the columns off the answer, and REPORTS them. A person looks at
  * the report and confirms it, and confirming is what creates the type.
+ *
+ * WHY IT IS A NODE AND NOT A CONNECTOR
+ * ------------------------------------
+ * It used to be a connector, and the route was `POST connectors/:id/discover`.
+ * Both are gone, because a connector is no longer something anybody authors —
+ * it is what a published workflow runs as, and its own `kind` and `config` are
+ * not read. This function had already noticed: it refused any connector with a
+ * `workflowId` and told the caller to "discover from the graph's source node
+ * instead", which was the right instruction pointing at a thing that did not
+ * exist. It exists now. See {@link DiscoverySource}.
+ *
+ * The ordering constraint is worth stating because it is easy to get backwards:
+ * discovery has to work on a graph that is still a **draft**. It is how the type
+ * gets its shape, and the type has to exist before a sink can commit into it, so
+ * requiring a published workflow would be requiring somebody to publish a graph
+ * whose target type they cannot create until they have published it.
  *
  * WHY IT CREATES NOTHING
  * ----------------------
@@ -132,8 +148,18 @@ export interface SchemaDrift {
 }
 
 export interface ConnectorSchemaDiscovery {
-  connectorId: string;
-  connectorName: string;
+  /**
+   * Which node this describes, rather than which connector.
+   *
+   * The rename is the visible half of the move. A connector's own kind and
+   * config stopped being read the moment it gained a `workflowId`, and every
+   * connector has one now — so `connectorId` here would have named a row whose
+   * configuration had nothing to do with the columns underneath it. A graph can
+   * also have several sources, which the old pair could not express at all.
+   */
+  workflowId: string;
+  nodeId: string;
+  nodeName: string;
   kind: ConnectorKind;
   targetType: string;
   /** Whether `targetType` already exists. False is the "this would create it" case. */
@@ -153,14 +179,54 @@ export interface ConnectorSchemaDiscovery {
   drift: SchemaDrift | null;
 }
 
-export interface DiscoverSchemaInput {
+/**
+ * One source node, resolved down to something a fetcher can read.
+ *
+ * **This is the shape that replaced `CatalogConnector` here, and the swap is the
+ * whole point of the change.** Discovery used to take a connector, and it
+ * refused outright when that connector had a `workflowId` — the message said
+ * "discover from the graph's source node instead", which was correct advice with
+ * nothing behind it, because nothing could. Now that a workflow is the only
+ * thing anybody authors, every connector has a `workflowId`, so the old shape
+ * refused *every* connector there is and discovery would have died with the
+ * route that reached it. Discovery is how a type gets its shape before anything
+ * can be published into it, so it had to survive the move rather than be
+ * rebuilt afterwards.
+ *
+ * `reader` is connector-shaped and that is not a leftover: a fetcher's contract
+ * is `{ connector, secret, state, mode }`, and re-shaping the fetchers to take a
+ * node would have given the sources two entry points to keep in agreement. It is
+ * produced by `WorkflowRunnerService.resolveSourceNode` — the same method a run
+ * resolves with, deliberately, because a discovery that folded a connection in
+ * differently from the run would describe a source that never loads.
+ */
+export interface DiscoverySource {
+  /** The graph this node belongs to. */
+  workflowId: string;
+  /** The node, which is what a person pressed the button on. */
+  nodeId: string;
+  nodeName: string;
+  /** The type the graph's sink commits. What drift is measured against. */
+  targetType: string;
   /**
-   * The connector with its connection already folded in — `applyConnection`'s
-   * output, exactly as the runner fetches with. Discovery that resolved the
-   * address differently from the run would describe a different source from the
-   * one that loads.
+   * The node with its connection already folded in — `applyConnection`'s
+   * output, exactly as the runner fetches with.
    */
-  connector: CatalogConnector;
+  reader: CatalogConnector;
+  /**
+   * Whether any node stands between this source and the sink.
+   *
+   * Replaces the old `connector.transformId` test, and covers strictly more:
+   * that test could only see one transform hanging off one connector, while a
+   * graph may put three in a row. The caveat it drives is the same and matters
+   * more here, because the columns below are the input to whatever those nodes
+   * do rather than the columns of the lake.
+   */
+  transformed: boolean;
+}
+
+export interface DiscoverSchemaInput {
+  source: DiscoverySource;
   secret?: string;
   /** The type as it stands, when it exists. What drift is measured against. */
   existing?: CatalogObjectTypeDef;
@@ -190,33 +256,29 @@ export const SAMPLE_LIMIT = 200;
  * batch of objects as already read, so the next run skipped them. Discovery
  * moves nothing.
  */
-export async function discoverConnectorSchema(
+export async function discoverSourceSchema(
   input: DiscoverSchemaInput,
 ): Promise<ConnectorSchemaDiscovery> {
-  const { connector, secret, existing } = input;
-
-  if (connector.workflowId) {
-    throw new Error(
-      `"${connector.name}" takes its source from workflow ${connector.workflowId}, so its own kind and config are not read at all. Discover from the graph's source node instead — describing this connector's config would describe a source that never loads.`,
-    );
-  }
+  const { source, secret, existing } = input;
+  const reader = source.reader;
 
   const described =
-    connector.kind === 'sql'
-      ? await describeFromDriver(connector, secret)
-      : await describeFromSample(connector, secret, input.sampleLimit ?? SAMPLE_LIMIT);
+    reader.kind === 'sql'
+      ? await describeFromDriver(reader, secret)
+      : await describeFromSample(reader, secret, input.sampleLimit ?? SAMPLE_LIMIT);
 
   const columns = flagUnusableNames(described.columns);
 
   return {
-    connectorId: connector.id,
-    connectorName: connector.name,
-    kind: connector.kind,
-    targetType: connector.targetType,
+    workflowId: source.workflowId,
+    nodeId: source.nodeId,
+    nodeName: source.nodeName,
+    kind: reader.kind,
+    targetType: source.targetType,
     typeExists: existing !== undefined,
     basis: described.basis,
     sampled: described.sampled,
-    caveat: withTransformCaveat(described.caveat, connector),
+    caveat: withTransformCaveat(described.caveat, source),
     columns,
     drift: existing ? driftFrom(existing, columns) : null,
   };
@@ -226,19 +288,21 @@ export async function discoverConnectorSchema(
  * The caveat that outranks the others: this is the shape BEFORE the transform.
  *
  * A transform sits between the fetch and the publish, and what it emits is what
- * has to match the type — so on a connector that has one, every column here is
- * an input to code, not a column of the lake. Reported rather than refused: the
- * source's column list is exactly what somebody writing that transform needs,
- * and the alternative is them reading it out of a database client anyway.
+ * has to match the type — so where one stands between this source and the sink,
+ * every column here is an input to code, not a column of the lake. Reported
+ * rather than refused: the source's column list is exactly what somebody writing
+ * that transform needs, and the alternative is them reading it out of a database
+ * client anyway.
  *
  * Not solvable by running the transform over the sample, either. The SQL path
  * reads no rows at all — that is the point of `LIMIT 0` — so there would be
  * nothing to run it over on the one kind where the description is otherwise
- * exact.
+ * exact. On a graph it is less solvable still: what the sink receives is the
+ * output of a chain, and running that chain would be running the load.
  */
-function withTransformCaveat(caveat: string, connector: CatalogConnector): string {
-  if (!connector.transformId) return caveat;
-  return `${caveat} These are the columns the SOURCE returns; this connector runs a transform afterwards, and the type has to match what the transform emits, not this.`;
+function withTransformCaveat(caveat: string, source: DiscoverySource): string {
+  if (!source.transformed) return caveat;
+  return `${caveat} These are the columns the SOURCE returns; this graph runs a transform between here and the sink, and the type has to match what that emits, not this.`;
 }
 
 /** The SQL path: the driver describes the result set and no row is read. */

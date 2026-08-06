@@ -8,9 +8,9 @@ import { type CanActivate, type ExecutionContext, Injectable, Module } from '@ne
 import { Test } from '@nestjs/testing';
 import request from 'supertest';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ConnectorRunnerService } from './connector-runner.service';
 import { CatalogPipelineModule } from './pipeline.module';
 import { CATALOG_PIPELINE_EM, CATALOG_PIPELINE_REGISTRY } from './seams';
+import { WorkflowLauncher } from './workflow-launcher.service';
 
 /** See the note in `pipeline.module.integration.spec.ts`: the package cannot load here. */
 vi.mock('@dudousxd/nestjs-durable', () => ({
@@ -28,9 +28,15 @@ vi.mock('@dudousxd/nestjs-durable', () => ({
  * operator attaches to the one run where the collapse is intended: a source
  * that really was emptied, a first load after a truncation.
  *
- * The runner accepted it before this route forwarded it, which meant the
- * acknowledgement existed and could not be given by anybody using the shipped
- * API — reachable only from a host's own controller.
+ * **It lives on the workflow run route now, and that move is the point of these
+ * tests.** It used to be `POST connectors/:id/run`, which no longer exists — a
+ * connector is not something anybody authors or runs directly. Had it simply
+ * gone with that route, the only remaining way to get a refused load through
+ * would have been raising the row-count bound in policy: standing the guard down
+ * for every future load of that type rather than for the one snapshot somebody
+ * looked at. That is the failure `EXPECT_SHRINK_LABEL` exists to prevent,
+ * arrived at by deleting its only entrance, so these tests are what stop the
+ * entrance being deleted again.
  *
  * **The scheduled path deliberately has no field for it, and that asymmetry is
  * the design.** A cron run is unattended; an acknowledgement supplied once and
@@ -53,34 +59,57 @@ class AllowWriter implements CanActivate {
 }
 
 /** Records how it was called; runs nothing. */
-class SpyRunner {
-  readonly calls: unknown[][] = [];
-  run(...args: unknown[]) {
-    this.calls.push(args);
+class SpyLauncher {
+  readonly calls: Array<Record<string, unknown>> = [];
+  run(input: Record<string, unknown>) {
+    this.calls.push(input);
     return Promise.resolve({ id: 'run-1', status: 'succeeded' });
   }
 }
 
-const CONNECTOR = {
-  id: 'c1',
+const WORKFLOW = {
+  id: 'w1',
   name: 'Mvr nightly',
-  kind: 'sql',
+  nodes: [
+    {
+      id: 'source',
+      kind: 'source',
+      name: 'Nightly',
+      sourceKind: 'sql',
+      config: { url: 'postgres://x/y', query: 'select 1' },
+    },
+    { id: 'sink', kind: 'sink', name: 'Mvr', targetType: 'Mvr' },
+  ],
+  edges: [{ from: 'source', to: 'sink' }],
+  status: 'ready',
+  version: 1,
+  graphHash: 'hash',
   targetType: 'Mvr',
-  config: {},
-  mode: 'full',
   enabled: true,
+  createdBy: 'ana',
+  createdAt: '2026-01-01T00:00:00.000Z',
+  updatedAt: '2026-01-01T00:00:00.000Z',
 };
 
-const spy = new SpyRunner();
+const spy = new SpyLauncher();
 
 /**
- * The two stores, sized to what this route touches before dispatching: it looks
- * the connector up to check the grant against its target type, and nothing
- * else. Everything past that point belongs to the runner, which is a spy here.
+ * The store, sized to what this route touches before dispatching: it loads the
+ * graph to check the grant against what its sinks commit, and nothing else.
+ * Everything past that point belongs to the launcher, which is a spy here.
  */
 const pipelineStore = {
-  getConnector: (id: string) => Promise.resolve(id === CONNECTOR.id ? CONNECTOR : undefined),
-  listConnectors: () => Promise.resolve([CONNECTOR]),
+  listConnectors: () => Promise.resolve([]),
+  listWorkflows: () => Promise.resolve([WORKFLOW]),
+  getWorkflow: (id: string) => Promise.resolve(id === WORKFLOW.id ? WORKFLOW : undefined),
+  saveWorkflow: () => Promise.reject(new Error('nothing here saves')),
+  publishWorkflow: () => Promise.reject(new Error('nothing here publishes')),
+  saveWorkflowSchedule: () => Promise.reject(new Error('nothing here schedules')),
+  adoptConnector: () => Promise.resolve(undefined),
+  connectorsUsingWorkflow: () => Promise.resolve([]),
+  writeStage: () => Promise.reject(new Error('nothing here stages')),
+  readStage: () => Promise.resolve([]),
+  dropStages: () => Promise.resolve(0),
 };
 
 @Module({
@@ -92,7 +121,7 @@ const pipelineStore = {
 })
 class FakeStoreModule {}
 
-describe('POST connectors/:id/run and a deliberate collapse', () => {
+describe('POST workflows/:id/run and a deliberate collapse', () => {
   let app: INestApplication;
 
   beforeEach(async () => {
@@ -118,8 +147,8 @@ describe('POST connectors/:id/run and a deliberate collapse', () => {
       ],
     })
       // The store is stubbed to the minimum the route touches before dispatching:
-      // it looks the connector up to check the grant, and nothing else.
-      .overrideProvider(ConnectorRunnerService)
+      // it loads the graph to check the grant, and nothing else.
+      .overrideProvider(WorkflowLauncher)
       .useValue(spy)
       .compile();
 
@@ -133,28 +162,42 @@ describe('POST connectors/:id/run and a deliberate collapse', () => {
 
   it('forwards the reason an operator gave for the collapse', async () => {
     await request(app.getHttpServer())
-      .post('/catalog/pipeline/connectors/c1/run')
+      .post('/catalog/pipeline/workflows/w1/run')
       .send({ snapshotId: 's1', expectShrink: 'the depot was decommissioned' });
 
-    expect(spy.calls[0]?.[3]).toEqual({ expectShrink: 'the depot was decommissioned' });
+    expect(spy.calls[0]?.expectShrink).toBe('the depot was decommissioned');
   });
 
   it('passes nothing at all when the operator said nothing', async () => {
     // `undefined` and "the field was sent empty" are different statements — the
-    // runner refuses the second — and a route that flattened them would turn
-    // that refusal into silence.
+    // sink refuses the second — and a route that flattened them would turn that
+    // refusal into silence.
     await request(app.getHttpServer())
-      .post('/catalog/pipeline/connectors/c1/run')
+      .post('/catalog/pipeline/workflows/w1/run')
       .send({ snapshotId: 's1' });
 
-    expect(spy.calls[0]?.[3]).toBeUndefined();
+    expect('expectShrink' in (spy.calls[0] ?? {})).toBe(false);
   });
 
-  it('forwards an empty reason rather than dropping it, so the runner can refuse it', async () => {
+  it('forwards an empty reason rather than dropping it, so the sink can refuse it', async () => {
     await request(app.getHttpServer())
-      .post('/catalog/pipeline/connectors/c1/run')
+      .post('/catalog/pipeline/workflows/w1/run')
       .send({ snapshotId: 's1', expectShrink: '' });
 
-    expect(spy.calls[0]?.[3]).toEqual({ expectShrink: '' });
+    expect(spy.calls[0]?.expectShrink).toBe('');
+  });
+
+  /**
+   * The route that used to carry this is gone, and that has to stay asserted.
+   *
+   * If `POST connectors/:id/run` ever came back it would be a second way to run
+   * a pipeline — which is the thing this whole change removed — and it would be
+   * the one that bypasses the graph's own sink authorisation.
+   */
+  it('has no connector run route to give the acknowledgement to instead', async () => {
+    await request(app.getHttpServer())
+      .post('/catalog/pipeline/connectors/c1/run')
+      .send({ expectShrink: 'the depot was decommissioned' })
+      .expect(404);
   });
 });

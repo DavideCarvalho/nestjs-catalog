@@ -11,6 +11,7 @@ import {
   type Type,
 } from '@nestjs/common';
 import { ConnectionChecker } from './connection-checker.service';
+import { CATALOG_ADOPT_CONNECTORS, ConnectorAdoption } from './connector-adoption.service';
 import { ConnectorRunSteps } from './connector-run.steps';
 import { ConnectorRunWorkflow } from './connector-run.workflow';
 import { ConnectorRunnerService } from './connector-runner.service';
@@ -216,6 +217,23 @@ export interface CatalogPipelineModuleOptions {
    * the cron fire time) but so every replica does not read the store on a timer.
    */
   scheduler?: boolean;
+  /**
+   * Whether THIS process wraps pre-workflow connectors into workflows at boot.
+   * Defaults to whatever {@link scheduler} is, and then to true.
+   *
+   * The default is the interesting part. It is deliberately *not* an
+   * independent `true`: adoption writes, and the same reasoning that stops every
+   * replica polling the store on a timer stops every replica racing to wrap the
+   * same twelve connectors. Defaulting it to the scheduler's answer means a host
+   * that has already declared which pods do the background work does not have to
+   * declare it a second time — and a second lever that has to be kept in step
+   * with the first is a second lever somebody forgets.
+   *
+   * Passing false everywhere is supported and its consequence is stated rather
+   * than hidden: any connector predating workflows keeps running exactly as it
+   * is, and no route can edit it. See {@link ConnectorAdoption}.
+   */
+  adoptConnectors?: boolean;
   /** Passed to `SubprocessTransformRunner` for Python transforms. */
   pythonVenv?: string;
 }
@@ -264,6 +282,15 @@ export class CatalogPipelineModule {
         useValue: options.scheduler ?? true,
       },
       {
+        // Defaulted to the scheduler's own answer rather than to `true`, which
+        // is the difference between one process adopting and every replica
+        // adopting. A host that has said "this pod does not run schedules" has
+        // already said which pods do the writing; making it say so twice is how
+        // the two come to disagree.
+        provide: CATALOG_ADOPT_CONNECTORS,
+        useValue: options.adoptConnectors ?? options.scheduler ?? true,
+      },
+      {
         // Constructed rather than auto-wired so the venv path is visible beside
         // the rest of this module's configuration.
         provide: SubprocessTransformRunner,
@@ -275,6 +302,7 @@ export class CatalogPipelineModule {
       WorkflowLauncher,
       ConnectionChecker,
       ConnectorScheduler,
+      ConnectorAdoption,
       LoadExpectationsAnnouncer,
       SecretEnvAllowlistAnnouncer,
       ConnectorRunSteps,
@@ -330,6 +358,7 @@ export const CATALOG_PIPELINE_TOKENS = {
   registry: CATALOG_PIPELINE_REGISTRY,
   scope: CATALOG_PIPELINE_SCOPE,
   schedulerEnabled: CATALOG_SCHEDULER_ENABLED,
+  adoptConnectors: CATALOG_ADOPT_CONNECTORS,
   expectations: CATALOG_LOAD_EXPECTATIONS,
 } as const;
 

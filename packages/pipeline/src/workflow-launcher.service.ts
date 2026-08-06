@@ -176,6 +176,17 @@ export class WorkflowLauncher {
      * Omitted, one is minted, which is what a button press does.
      */
     snapshotId?: string;
+    /**
+     * The operator's reason for expecting this load to lose rows.
+     *
+     * Forwarded, never defaulted, and the distinction is the same one
+     * `POST connectors/:id/run` used to make: `undefined` means nobody said
+     * anything, and an empty string means somebody sent the field with nothing
+     * behind it — which the sink refuses. Collapsing the two here would turn
+     * that refusal into silence, and silence is what lets an acknowledgement
+     * with no author attached to a snapshot.
+     */
+    expectShrink?: string;
   }): Promise<ConnectorRun> {
     const workflow = await this.runner.requireWorkflow(input.workflowId);
     const connectorId = input.connectorId ?? (await this.runner.attributionFor(workflow));
@@ -183,7 +194,13 @@ export class WorkflowLauncher {
     const durability = this.durability();
 
     if (durability.available && this.engine) {
-      return this.startDurable(workflow, connectorId, input.principalId, snapshotId);
+      return this.startDurable(
+        workflow,
+        connectorId,
+        input.principalId,
+        snapshotId,
+        input.expectShrink,
+      );
     }
 
     this.logger.log(`Running "${workflow.name}" inline as ${snapshotId}: ${durability.detail}`);
@@ -192,6 +209,7 @@ export class WorkflowLauncher {
       connectorId,
       principalId: input.principalId,
       snapshotId,
+      expectShrink: input.expectShrink,
     });
   }
 
@@ -200,6 +218,7 @@ export class WorkflowLauncher {
     connectorId: string,
     principalId: string,
     snapshotId: string,
+    expectShrink?: string,
   ): Promise<ConnectorRun> {
     const engine = this.engine;
     if (!engine) {
@@ -214,6 +233,13 @@ export class WorkflowLauncher {
       workflowName: workflow.name,
       connectorId,
       principalId,
+      // Spread conditionally so the field is ABSENT rather than explicitly
+      // `undefined` on a run nobody acknowledged. The payload is serialised into
+      // the durable store and read back on replay, and an explicit `undefined`
+      // is not a thing JSON has — so a field written one way and read back the
+      // other is exactly the kind of difference that makes a replay diverge from
+      // its first attempt.
+      ...(expectShrink === undefined ? {} : { expectShrink }),
     };
 
     try {

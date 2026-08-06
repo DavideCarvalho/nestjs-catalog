@@ -87,6 +87,7 @@ class StubPipelineStore implements CatalogPipelineStore {
       // publishes immediately afterwards, which is what these tests then get to
       // assert rather than assume.
       status: 'draft',
+      enabled: true,
       version: 1,
       nodes: input.nodes,
       edges: input.edges,
@@ -112,6 +113,7 @@ class StubPipelineStore implements CatalogPipelineStore {
       targetType: 'Mvr',
       graphHash: 'hash',
       status: 'ready',
+      enabled: true,
       version: 1,
       nodes: [],
       edges: [],

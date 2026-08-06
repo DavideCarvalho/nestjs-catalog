@@ -54,6 +54,7 @@ const workflow: CatalogWorkflow = {
   nodes: [],
   edges: [],
   status: 'ready',
+  enabled: true,
   version: 4,
   graphHash: 'abcdef0123456789',
   targetType: 'Mvr',

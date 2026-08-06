@@ -469,6 +469,38 @@ export class RoutingPipelineStore implements CatalogPipelineStore {
   }
 
   /**
+   * Forwarded through `requireWorkflows`, not probed like the two below it.
+   *
+   * The difference is what an absent answer would mean. A store with no
+   * revisions has an honest empty answer; a store that cannot hold a schedule
+   * has none — silently doing nothing with a cron somebody typed is exactly the
+   * failure mode a scheduling incident already came through here once, where the
+   * loop announced it was watching and parsed nothing. So this refuses out loud
+   * rather than resolving to a no-op.
+   */
+  saveWorkflowSchedule(
+    id: string,
+    input: { schedule?: string; enabled?: boolean },
+    changedBy: string,
+  ): Promise<CatalogWorkflow> {
+    return requireWorkflows(this.inner).saveWorkflowSchedule(id, input, changedBy);
+  }
+
+  /**
+   * Routed to the environment's own store, which is the only place it could go.
+   *
+   * Adoption reads a connector, writes a workflow and re-points the connector,
+   * all in one environment's tables — so a proxy that fanned it out would adopt
+   * one environment's connector into another's graph.
+   */
+  adoptConnector(
+    connectorId: string,
+    adoptedBy: string,
+  ): Promise<{ workflow: CatalogWorkflow; connector: CatalogConnector } | undefined> {
+    return requireWorkflows(this.inner).adoptConnector(connectorId, adoptedBy);
+  }
+
+  /**
    * Optional on the interface, so probed rather than required — but forwarded,
    * which is the part that was missing.
    *

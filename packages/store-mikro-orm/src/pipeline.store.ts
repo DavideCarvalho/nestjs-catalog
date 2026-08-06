@@ -22,6 +22,7 @@ import type {
   WorkflowExecutionMode,
   WorkflowNode,
   WorkflowNodeOutcome,
+  WorkflowSourceNode,
   WorkflowStatus,
 } from '@dudousxd/nestjs-catalog';
 import {
@@ -903,6 +904,12 @@ export class MySqlPipelineStore
         version: 1,
         graphHash,
         targetType,
+        // A new graph is enabled, and carries no schedule until somebody sets
+        // one through `saveWorkflowSchedule`. Enabled-by-default matters more
+        // than it looks: `enabled` is half the test the scheduler applies, so
+        // defaulting it false would mean every graph anybody ever published
+        // needed a second, undiscoverable step before it would run.
+        enabled: true,
         createdBy,
         createdAt: new Date(),
         updatedAt: new Date(),
@@ -995,6 +1002,15 @@ export class MySqlPipelineStore
     em.persist(row);
     await em.flush();
 
+    // The connector, minted or brought back into step. After the flush and not
+    // before it, because the row it points at has to exist and be `ready` first
+    // — `saveConnector`'s own rule, which this deliberately does not go through:
+    // that method is the authored-object path and is no longer reachable from
+    // any route, and routing a mint through the validation written for a person
+    // filling in a form would make publishing fail on rules about a form nobody
+    // saw.
+    await this.mintConnectorFor(em, row, workflow.nodes, publishedBy);
+
     // Only on the transition. Re-publishing an unchanged graph is not a change,
     // and an event on every idempotent call would put a stream of them in front
     // of anybody watching for the one that mattered.
@@ -1014,28 +1030,97 @@ export class MySqlPipelineStore
   }
 
   /**
-   * Back to `draft`, and refused while anything still runs it.
+   * The connector a published graph runs as: minted once, then kept in step.
    *
-   * The same refusal `deleteWorkflow` makes, listing the same names, because the
-   * consequence is the same: a connector may only run a ready graph, so
-   * unpublishing one out from under a schedule is indistinguishable from
-   * deleting it as far as the next window is concerned. Cascading — disabling
-   * those connectors here — was the alternative and is refused on principle:
-   * turning off somebody's loads as a side effect of an edit to something else
-   * is exactly the silent action this status was added to prevent.
+   * **Found by `workflowId`, never by name**, and that is the whole of what
+   * makes a re-publish safe. The connector id is the mutex key, the owner of
+   * every `ConnectorRun` and the holder of the watermark; minting a second row
+   * because somebody renamed a graph would silently start a fresh pipeline
+   * beside the old one, with an empty watermark and no history, and both would
+   * be on the same cron.
+   *
+   * `kind` is copied off the first source node purely so the column holds
+   * something true-ish. It is **not read** at run time — a connector with a
+   * `workflowId` takes its sources from the graph — and the only reason it is
+   * populated at all is that the column is non-null and a lie that reads
+   * plausibly is better than a lie that reads like the first item of an enum.
+   *
+   * A brought-back connector is re-enabled from the workflow rather than left
+   * as it was, because `unpublishWorkflow` disables it: publishing again with
+   * the connector still disabled would report success and run nothing, which is
+   * the silent no-op this whole change exists to remove.
    */
-  async unpublishWorkflow(id: string, unpublishedBy: string): Promise<CatalogWorkflow> {
-    const inUse = await this.connectorsUsingWorkflow(id);
-    if (inUse.length > 0) {
-      throw new BadRequestException(
-        `${inUse.length} connector(s) still run this workflow: ${inUse
-          .map((connector) => connector.name)
-          .join(
-            ', ',
-          )}. Point them elsewhere before unpublishing it, or their next run fails with nothing to execute.`,
+  private async mintConnectorFor(
+    em: EntityManager,
+    workflow: WorkflowRow,
+    nodes: WorkflowNode[],
+    by: string,
+  ): Promise<ConnectorRow> {
+    const existing = await em.findOne(ConnectorRow, { workflowId: workflow.id });
+    const source = nodes.find((node): node is WorkflowSourceNode => node.kind === 'source');
+
+    const row =
+      existing ??
+      em.create(ConnectorRow, {
+        id: randomUUID(),
+        name: workflow.name,
+        kind: source?.sourceKind ?? 'inline',
+        targetType: workflow.targetType,
+        config: {},
+        enabled: workflow.enabled,
+        createdBy: by,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+    row.name = workflow.name;
+    row.description = workflow.description;
+    row.workflowId = workflow.id;
+    row.targetType = workflow.targetType;
+    // The copy, written from the authority in the same transaction that changes
+    // it. See `CatalogConnector.schedule`: nothing reads this, and it is here so
+    // that a row adopted from before the move can still be asked what it used to
+    // do.
+    row.schedule = workflow.schedule;
+    row.enabled = workflow.enabled;
+    // Cleared rather than left, and only on a mint. A connector that reaches
+    // here already carrying a `transformId` is one adoption wrapped, and its
+    // transform is now a node in the graph — leaving the field set would trip
+    // the both-transform-and-workflow refusal on the next `saveConnector`.
+    row.transformId = undefined;
+    row.updatedAt = new Date();
+
+    em.persist(row);
+    await em.flush();
+    if (!existing) {
+      this.logger.log(
+        `Published workflow "${workflow.name}" runs as connector ${row.id}; ${by} published it.`,
       );
     }
+    return row;
+  }
 
+  /**
+   * Back to `draft`, and the connector it ran as goes quiet with it.
+   *
+   * This refused, until now, while any connector still ran the graph — and the
+   * docblock argued the refusal on principle, that turning off somebody's loads
+   * as a side effect of an edit to something else is a silent action. The
+   * principle stands; the situation it described does not. A connector was an
+   * independently authored object then, so "point them elsewhere first" was
+   * advice somebody could act on. A published graph now runs as exactly one
+   * connector, its own, minted by `publishWorkflow` — so the old check would
+   * refuse every unpublish there has ever been, and there is nowhere else to
+   * point anything.
+   *
+   * So it cascades, and the thing the refusal protected is protected by *how*
+   * it cascades: **disabled, not deleted**. The id survives, so the run history,
+   * the watermark and the mutex key are all still there and re-publishing
+   * resumes the same pipeline. And it is the opposite of silent — this is a
+   * transition somebody asked for by name, and the disable is what makes the
+   * screen's "not running" true rather than aspirational.
+   */
+  async unpublishWorkflow(id: string, unpublishedBy: string): Promise<CatalogWorkflow> {
     const em = this.em.fork();
     const row = await em.findOne(WorkflowRow, { id });
     if (!row) {
@@ -1046,8 +1131,194 @@ export class MySqlPipelineStore
 
     row.status = 'draft';
     em.persist(row);
+    const stopped = await em.nativeUpdate(ConnectorRow, { workflowId: id }, { enabled: false });
     await em.flush();
-    this.logger.log(`${unpublishedBy} took workflow "${row.name}" (${row.id}) back to draft.`);
+    this.logger.log(
+      `${unpublishedBy} took workflow "${row.name}" (${row.id}) back to draft; ${stopped} connector(s) disabled with it.`,
+    );
+    return toWorkflow(row);
+  }
+
+  /**
+   * Wrap a pre-workflow connector into the graph it always was.
+   *
+   * The whole of it is here rather than in a migration script because it needs
+   * three things only this class has together: the connector's config **opened**
+   * (a sealed credential copied verbatim into a node would be sealed under a
+   * `SecretContext` of `('connector', connectorId)` and opened under one of
+   * `('workflow', workflowId)`, which fails to decrypt), `saveWorkflow`'s
+   * re-sealing on the way in, and `publishWorkflow`'s find-by-`workflowId`,
+   * which is what makes the existing connector be updated rather than a second
+   * one minted beside it.
+   *
+   * The ordering is load-bearing and reads backwards at first: the connector is
+   * re-pointed at the graph **before** the graph is published, precisely so that
+   * `mintConnectorFor` finds it. Publishing first would mint a new connector,
+   * and the old one would be left holding the history.
+   *
+   * Node ids are fixed strings rather than UUIDs, and that is deliberate: a node
+   * id is a durable step name, and a stable one means a re-adoption of the same
+   * connector produces the same graph rather than a second version of it.
+   */
+  async adoptConnector(
+    connectorId: string,
+    adoptedBy: string,
+  ): Promise<{ workflow: CatalogWorkflow; connector: CatalogConnector } | undefined> {
+    const connector = await this.getConnector(connectorId);
+    if (!connector) return undefined;
+    // Already a graph's. Idempotent, which is what makes this safe at boot.
+    if (connector.workflowId) return undefined;
+
+    const sourceId = 'source';
+    const transformId = 'transform';
+    const sinkId = 'sink';
+
+    const { nodes, edges } = wrapAsGraph(connector, sourceId, transformId, sinkId);
+
+    // Checked before anything is written. An adoption that published something
+    // `validateWorkflow` objects to would put a graph nobody could have drawn
+    // into a state only a person is supposed to be able to reach.
+    //
+    // The empty target type is checked separately because `validateWorkflow`
+    // does not catch it — it checks the wiring, and a sink naming `''` is
+    // perfectly wired. It matters here and not on the ordinary publish path
+    // because `publishWorkflow` re-derives `targetType` from the sink, so a
+    // connector that somehow reached this state would produce a `ready` graph
+    // committing into a type with no name, which nothing downstream would refuse
+    // until the load reached the registry.
+    const issues = [
+      ...validateWorkflow({ nodes, edges }),
+      ...(connector.targetType
+        ? []
+        : [
+            {
+              code: 'no-sink' as const,
+              nodeIds: [sinkId],
+              message: 'It names no object type, so its sink would commit into nothing.',
+            },
+          ]),
+    ];
+    if (issues.length > 0) {
+      throw new BadRequestException(
+        `Connector "${connector.name}" cannot be wrapped into a workflow: ${issues
+          .map((issue) => issue.message)
+          .join(' ')} It keeps running exactly as it is; nothing has changed.`,
+      );
+    }
+
+    const draft = await this.saveWorkflow(
+      {
+        name: connector.name,
+        description:
+          connector.description ??
+          `Adopted from connector ${connector.id}, which was authored before a workflow was the only thing anybody authors.`,
+        nodes,
+        edges,
+      },
+      adoptedBy,
+    );
+
+    const em = this.em.fork();
+    const row = await em.findOne(ConnectorRow, { id: connector.id });
+    if (!row) {
+      throw new NotFoundException(`Connector ${connector.id} vanished mid-adoption.`);
+    }
+    row.workflowId = draft.id;
+    // Cleared, because it is a node of the graph now. Leaving it set would trip
+    // the both-transform-and-workflow refusal on the next `saveConnector` — and
+    // would be a second answer to what shapes this data, which is the thing that
+    // refusal exists to prevent.
+    row.transformId = undefined;
+    // Re-keyed under the source node. See `CatalogConnector.state`: a graph
+    // keys a watermark by node id, and a flat blob carried over unchanged leaves
+    // the new node with none.
+    const flat = row.state ?? {};
+    row.state = Object.keys(flat).length > 0 ? { [sourceId]: { committed: flat } } : {};
+    em.persist(row);
+    await em.flush();
+
+    // The schedule moves to where it is authored now, and the copy on the
+    // connector is rewritten from it by `mintConnectorFor` a moment later — so
+    // the two are equal at the end of this method by construction rather than by
+    // being written twice.
+    if (connector.schedule) {
+      await this.saveWorkflowSchedule(
+        draft.id,
+        { schedule: connector.schedule, enabled: connector.enabled },
+        adoptedBy,
+      );
+    } else if (!connector.enabled) {
+      await this.saveWorkflowSchedule(draft.id, { enabled: false }, adoptedBy);
+    }
+
+    // Publishes, and updates the connector re-pointed above rather than minting
+    // a second one — the reason the re-point had to come first.
+    const workflow = await this.publishWorkflow(draft.id, adoptedBy);
+    const adopted = await this.getConnector(connector.id);
+    if (!adopted) {
+      throw new NotFoundException(`Connector ${connector.id} vanished mid-adoption.`);
+    }
+
+    this.logger.log(
+      `Adopted connector "${connector.name}" (${connector.id}) into workflow ${workflow.id}: ${nodes.length} nodes, ${
+        connector.schedule
+          ? `schedule "${connector.schedule}" moved to the graph`
+          : 'manual runs only'
+      }.`,
+    );
+    return { workflow, connector: adopted };
+  }
+
+  /**
+   * Set when this graph runs, and whether it runs at all.
+   *
+   * Both fields are optional and an absent one means "leave it alone", which is
+   * the same merge {@link saveLoadExpectation} performs and for the same reason:
+   * a form that renders only the cron must not be able to silently re-enable a
+   * pipeline somebody turned off.
+   *
+   * The cron is **not parsed here**. That is deliberate and it is the one thing
+   * about this method worth arguing: `prevCronFireMs` lives behind an optional
+   * peer dependency, so a store that validated crons would refuse every schedule
+   * on a deployment that simply has not installed `cron-parser` — turning a
+   * missing optional dep into "you may not schedule anything", with a message
+   * about syntax. The scheduler parses it, names the workflow and the
+   * expression when it cannot, and keeps going for everything else.
+   */
+  async saveWorkflowSchedule(
+    id: string,
+    input: { schedule?: string; enabled?: boolean },
+    changedBy: string,
+  ): Promise<CatalogWorkflow> {
+    const em = this.em.fork();
+    const row = await em.findOne(WorkflowRow, { id });
+    if (!row) {
+      throw new NotFoundException(`Workflow ${id} does not exist, so it cannot be scheduled.`);
+    }
+
+    if (input.schedule !== undefined) {
+      const cron = input.schedule.trim();
+      row.schedule = cron.length > 0 ? cron : undefined;
+    }
+    if (input.enabled !== undefined) row.enabled = input.enabled;
+
+    em.persist(row);
+    // Through to the copy in the same transaction, so the two are never
+    // observable disagreeing. `nativeUpdate` rather than a load-and-set because
+    // there is nothing to read: these two columns are written from here and
+    // from `mintConnectorFor`, and from nowhere else at all.
+    await em.nativeUpdate(
+      ConnectorRow,
+      { workflowId: id },
+      { schedule: row.schedule ?? null, enabled: row.enabled },
+    );
+    await em.flush();
+
+    this.logger.log(
+      `${changedBy} set workflow "${row.name}" to ${
+        row.enabled ? (row.schedule ?? 'manual runs only') : 'disabled'
+      }.`,
+    );
     return toWorkflow(row);
   }
 
@@ -1058,26 +1329,39 @@ export class MySqlPipelineStore
   }
 
   /**
-   * Refuses while any connector still runs it.
+   * Delete the graph, and the connector it ran as with it.
    *
-   * The same protection `deleteConnection` gives, for the same reason: a
-   * constraint violation says a row is referenced, and an operator needs to know
-   * *which connectors* would start failing so they can be pointed somewhere else
-   * first.
+   * This refused while any connector still ran the graph, on the same reasoning
+   * `deleteConnection` still uses: an operator needs to know which loads would
+   * start failing before they break one. That reasoning survives the change and
+   * points the other way now. `deleteConnection` refuses because a connection is
+   * shared — several pipelines read through one, and the operator has a real
+   * choice about each. A published workflow's connector is not shared; it *is*
+   * this workflow, minted by `publishWorkflow` and unable to run without it, so
+   * refusing would mean no workflow could ever be deleted and the only way out
+   * would be a route that deletes a connector — which is the route this change
+   * removed.
+   *
+   * Deleted rather than disabled, unlike `unpublishWorkflow`: there is no graph
+   * left for the id to resume onto, and a connector whose `workflowId` names
+   * nothing is exactly the row the scheduler complains about once per boot
+   * forever.
+   *
+   * **The run history goes too**, because it is keyed on the connector id. That
+   * is the real cost of this operation and it is why it is a delete rather than
+   * something softer — an operator who wants the history keeps the graph and
+   * unpublishes it.
    */
   async deleteWorkflow(id: string): Promise<boolean> {
-    const inUse = await this.connectorsUsingWorkflow(id);
-    if (inUse.length > 0) {
-      throw new BadRequestException(
-        `${inUse.length} connector(s) still run this workflow: ${inUse
-          .map((connector) => connector.name)
-          .join(
-            ', ',
-          )}. Point them elsewhere before deleting it, or their next run fails with nothing to execute.`,
-      );
-    }
     const em = this.em.fork();
-    return (await em.nativeDelete(WorkflowRow, { id })) > 0;
+    const deleted = (await em.nativeDelete(WorkflowRow, { id })) > 0;
+    if (deleted) {
+      const dropped = await em.nativeDelete(ConnectorRow, { workflowId: id });
+      if (dropped > 0) {
+        this.logger.log(`Deleted workflow ${id} and the ${dropped} connector(s) that ran it.`);
+      }
+    }
+    return deleted;
   }
 
   /**
@@ -1898,6 +2182,82 @@ function isRowRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+/**
+ * One connector, drawn as the graph it always was.
+ *
+ * Extracted from `adoptConnector` so that the method reads as the sequence it is
+ * — build, validate, save, re-point, publish — rather than burying the ordering
+ * that matters underneath a node literal. The shape is the whole claim of the
+ * migration: a connector *is* a single source, at most one transform, and one
+ * sink, so nothing here is invented and every field comes off the row.
+ *
+ * Node ids are the fixed strings the caller passes rather than UUIDs, and that
+ * is deliberate: a node id is a durable step name, so a stable one means
+ * re-adopting the same connector produces the same graph rather than a second
+ * version of it.
+ */
+function wrapAsGraph(
+  connector: CatalogConnector,
+  sourceId: string,
+  transformId: string,
+  sinkId: string,
+): { nodes: WorkflowNode[]; edges: WorkflowEdge[] } {
+  const transformed = Boolean(connector.transformId);
+  const nodes: WorkflowNode[] = [
+    {
+      id: sourceId,
+      kind: 'source',
+      name: connector.name,
+      sourceKind: connector.kind,
+      connectionId: connector.connectionId,
+      // Opened, because `getConnector` opened it. `saveWorkflow` re-seals it
+      // under the workflow's own context on the way in — copying the sealed
+      // column across instead would write ciphertext sealed under a
+      // `SecretContext` of `('connector', id)` and opened under one of
+      // `('workflow', id)`, which does not decrypt.
+      config: connector.config ?? {},
+      secretEnvVar: connector.secretEnvVar,
+      mode: connector.mode,
+      position: { x: 0, y: 0 },
+    },
+    {
+      id: sinkId,
+      kind: 'sink',
+      name: connector.targetType,
+      targetType: connector.targetType,
+      // The sink commits the way the connector did. Said rather than left
+      // absent: `CatalogConnector.mode` defaults to `full` on read so an absent
+      // mode would silently agree, but writing it means a later reader of the
+      // graph sees the decision rather than inferring it.
+      mode: connector.mode ?? 'full',
+      position: { x: transformed ? 440 : 220, y: 0 },
+    },
+  ];
+
+  if (!transformed || !connector.transformId) {
+    return { nodes, edges: [{ from: sourceId, to: sinkId }] };
+  }
+
+  // Spliced between the two rather than appended, so the array order matches the
+  // order the graph runs in. Nothing depends on it — `workflowRunOrder` walks
+  // the edges — but a canvas draws the array, and a graph whose boxes are laid
+  // out backwards reads as a different pipeline.
+  nodes.splice(1, 0, {
+    id: transformId,
+    kind: 'transform',
+    name: 'Transform',
+    transformId: connector.transformId,
+    position: { x: 220, y: 0 },
+  });
+  return {
+    nodes,
+    edges: [
+      { from: sourceId, to: transformId },
+      { from: transformId, to: sinkId },
+    ],
+  };
+}
+
 function toWorkflow(row: WorkflowRow): CatalogWorkflow {
   return {
     id: row.id,
@@ -1913,6 +2273,8 @@ function toWorkflow(row: WorkflowRow): CatalogWorkflow {
     version: row.version,
     graphHash: row.graphHash,
     targetType: row.targetType,
+    schedule: row.schedule,
+    enabled: row.enabled,
     createdBy: row.createdBy,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
