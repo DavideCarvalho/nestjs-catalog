@@ -105,7 +105,6 @@ const pipelineStore = {
   saveWorkflow: () => Promise.reject(new Error('nothing here saves')),
   publishWorkflow: () => Promise.reject(new Error('nothing here publishes')),
   saveWorkflowSchedule: () => Promise.reject(new Error('nothing here schedules')),
-  adoptConnector: () => Promise.resolve(undefined),
   connectorsUsingWorkflow: () => Promise.resolve([]),
   writeStage: () => Promise.reject(new Error('nothing here stages')),
   readStage: () => Promise.resolve([]),

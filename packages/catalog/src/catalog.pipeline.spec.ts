@@ -826,7 +826,6 @@ describe('store capability checks', () => {
       // that narrowed without it would accept a cron and then throw on writing
       // one, which is the shape of a scheduling failure this codebase has had.
       saveWorkflowSchedule: async () => undefined,
-      adoptConnector: async () => undefined,
       writeStage: async () => ({ written: 0 }),
       readStage: async () => [],
     });

@@ -23,16 +23,7 @@
  */
 
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import {
-  CircleCheck,
-  Clock,
-  Loader2,
-  Play,
-  Sparkles,
-  TriangleAlert,
-  Undo2,
-  Upload,
-} from 'lucide-react';
+import { CircleCheck, Clock, Loader2, Play, TriangleAlert, Undo2, Upload } from 'lucide-react';
 import { useState } from 'react';
 import { cn } from '../cn';
 import {
@@ -52,28 +43,6 @@ import { WORKFLOW_NAME } from './name';
 const MUTED = 'text-zinc-400 dark:text-zinc-500';
 const RULE = 'border-zinc-200 dark:border-zinc-800';
 const PANEL = 'bg-white dark:bg-zinc-900';
-
-/**
- * Who a graph is attributed to when nobody drew it.
- *
- * `ConnectorAdoption` wraps a pre-workflow connector into the graph it always
- * was, at boot, and publishes it — so an operator on an upgraded deployment
- * opens this screen and finds pipelines marked `ready` that they never drew and
- * never declared finished. That is worth saying out loud rather than leaving
- * them to infer it from a description.
- *
- * Matched on `createdBy` rather than on the generated description, because a
- * connector that carried a description of its own keeps it — so the description
- * is silent on exactly the graphs that had the most history behind them. The
- * string is the server's `ADOPTION_ACTOR`, and it is a copy: a rename there
- * makes this badge disappear rather than lie, which is the failure mode to
- * prefer between the two.
- */
-export const WORKFLOW_ADOPTION_ACTOR = 'connector-adoption';
-
-export function wasAdopted(workflow: Pick<CatalogWorkflow, 'createdBy'>): boolean {
-  return workflow.createdBy === WORKFLOW_ADOPTION_ACTOR;
-}
 
 /**
  * Whether a failure is the row-count bound refusing a load, rather than
@@ -136,46 +105,7 @@ export function WorkflowStatusBadge({ workflow }: { workflow: CatalogWorkflow })
           </span>
         </Tooltip>
       )}
-      {wasAdopted(workflow) && (
-        <Tooltip
-          content={`Nobody drew this. It was a connector from before a ${WORKFLOW_NAME.singular} was the only thing anybody authors, and it was wrapped into this graph at boot — one source, optionally one transform, one sink — and published as ready without a person declaring it finished. It keeps the connector's id, so its run history and its incremental watermark carry over. Worth reading before you trust the shape.`}
-        >
-          <span className="flex cursor-help items-center gap-1 rounded-sm bg-sky-100 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-[0.12em] text-sky-800 dark:bg-sky-950 dark:text-sky-300">
-            <Sparkles size={9} aria-hidden />
-            adopted
-          </span>
-        </Tooltip>
-      )}
     </span>
-  );
-}
-
-/**
- * The paragraph the badge cannot hold.
- *
- * On screen rather than in a tooltip, and only for an adopted graph, because a
- * tooltip is something you find when you already suspect there is something to
- * find. Somebody opening a pipeline they have never seen and being told it is
- * `ready` has no reason to hover anything.
- */
-export function AdoptionNote({ workflow }: { workflow: CatalogWorkflow }) {
-  if (!wasAdopted(workflow)) return null;
-  return (
-    <div
-      className={cn(
-        'mt-2.5 flex flex-wrap items-baseline gap-x-2 rounded-md border px-2.5 py-1.5',
-        'border-sky-200 bg-sky-50 text-sky-900',
-        'dark:border-sky-900 dark:bg-sky-950/40 dark:text-sky-200',
-      )}
-    >
-      <p className="font-mono text-[10px] uppercase tracking-[0.14em]">adopted at boot</p>
-      <p className="text-[11px] leading-relaxed">
-        This graph was not drawn by anybody. A connector that predates {WORKFLOW_NAME.plural} was
-        wrapped into it and published as <em>ready</em> automatically, so "ready" here means "it
-        validated", not "somebody looked at it and said it was finished". Its run history and
-        incremental watermark carried over with the connector's id.
-      </p>
-    </div>
   );
 }
 

@@ -517,20 +517,6 @@ export class RoutingPipelineStore implements CatalogPipelineStore {
   }
 
   /**
-   * Routed to the environment's own store, which is the only place it could go.
-   *
-   * Adoption reads a connector, writes a workflow and re-points the connector,
-   * all in one environment's tables — so a proxy that fanned it out would adopt
-   * one environment's connector into another's graph.
-   */
-  adoptConnector(
-    connectorId: string,
-    adoptedBy: string,
-  ): Promise<{ workflow: CatalogWorkflow; connector: CatalogConnector } | undefined> {
-    return requireWorkflows(this.inner).adoptConnector(connectorId, adoptedBy);
-  }
-
-  /**
    * Optional on the interface, so probed rather than required — but forwarded,
    * which is the part that was missing.
    *

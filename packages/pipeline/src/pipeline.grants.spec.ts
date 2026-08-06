@@ -243,9 +243,6 @@ class MemoryPipelineStore implements CatalogPipelineStore {
     this.workflows.set(id, saved);
     return Promise.resolve(saved);
   }
-  adoptConnector(): Promise<undefined> {
-    return Promise.resolve(undefined);
-  }
   connectorsUsingWorkflow(id: string): Promise<CatalogConnector[]> {
     return Promise.resolve(
       [...this.connectors.values()].filter((connector) => connector.workflowId === id),

@@ -18,9 +18,9 @@ import { CATALOG_PIPELINE_SCOPE, type CatalogPipelineScope, passthroughScope } f
 /**
  * Whether this process reconciles open run rows against the engine.
  *
- * The same axis the scheduler and the adoption pass load on, and for the same
- * reason: this writes, and a deployment with six API replicas should not have
- * six processes racing to close the same row. The writes are individually
+ * The same axis the scheduler loads on, and for the same reason: this writes,
+ * and a deployment with six API replicas should not have six processes racing
+ * to close the same row. The writes are individually
  * harmless — the second one finds the row already `failed` and skips it — but
  * six copies of a warning is six chances to read the important line as noise.
  *
