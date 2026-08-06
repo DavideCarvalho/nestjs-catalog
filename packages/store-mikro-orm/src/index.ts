@@ -73,6 +73,8 @@ export {
   BATCH_COLUMN,
   ident,
   LOADED_AT_COLUMN,
+  outputAlias,
+  physicalColumn,
   PRINCIPAL_COLUMN,
   RESERVED_COLUMNS,
   ROW_COLUMN,

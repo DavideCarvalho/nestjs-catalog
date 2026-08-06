@@ -34,6 +34,8 @@ import {
   ROW_COLUMN,
   SNAPSHOT_COLUMN,
   ident,
+  outputAlias,
+  physicalColumn,
   tableFor,
 } from './identifiers';
 import { refreshView, relationsFor, runReadOnlyQuery } from './query';
@@ -894,9 +896,18 @@ export class MySqlWarehouseStore
     const size = Math.max(1, query.size ?? 25);
     const offset = (Math.max(1, query.page ?? 1) - 1) * size;
 
+    // Aliased to `outputAlias`, the same name the committed view exposes, and
+    // NOT to the property's name. `ident` refuses rather than escapes, so a
+    // verbatim alias here was the second of the two statements that made "is
+    // this a SQL identifier?" a condition on every property name in the
+    // catalog — and a property that cannot be named `Asset Id` is a property
+    // whose loads write NULL, because a load reads `row[property.name]` out of a
+    // record the source keyed `Asset Id`. `normalise` below looks the value back
+    // up under the same alias and hands it out under the property's own name, so
+    // nothing outside this method sees the difference.
     const rows = await em.getConnection().execute<Array<Record<string, unknown>>>(
       `SELECT ${selected
-        .map((p) => `${ident(physicalColumn(p.name))} AS ${ident(p.name)}`)
+        .map((p) => `${ident(physicalColumn(p.name))} AS ${ident(outputAlias(p.name))}`)
         .join(',')}
          FROM ${ident(table)} WHERE ${where} ORDER BY ${orderBy} LIMIT ? OFFSET ?`,
       [...params, size, offset],
@@ -1139,14 +1150,6 @@ function unknownOperator(operator: never): never {
   throw new BadRequestException(`This store cannot filter with ${String(operator)}.`);
 }
 
-/** Property name → physical column. Stable, so it never needs storing twice. */
-function physicalColumn(propertyName: string): string {
-  return propertyName
-    .replace(/[^A-Za-z0-9_]/g, '_')
-    .replace(/_+/g, '_')
-    .slice(0, 60);
-}
-
 /**
  * Deliberately wide types.
  *
@@ -1186,14 +1189,23 @@ function coerce(value: unknown, type: ScalarType): unknown {
   return String(value);
 }
 
-/** MySQL hands back TINYINT for booleans and strings for DOUBLE; undo that. */
+/**
+ * MySQL hands back TINYINT for booleans and strings for DOUBLE; undo that.
+ *
+ * In under the alias `read` selected, out under the property's own name. Those
+ * are the same string for almost every property and are not for one whose name
+ * SQL cannot take, so they are written as the two different things they are —
+ * looking the value up by `property.name` would hand back `undefined` for
+ * exactly the properties this change exists to make work, and `undefined` here
+ * is indistinguishable from a genuine NULL.
+ */
 function normalise(
   row: Record<string, unknown>,
   properties: CatalogObjectTypeDef['properties'],
 ): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const property of properties) {
-    const value = row[property.name];
+    const value = row[outputAlias(property.name)];
     if (value === null || value === undefined) {
       out[property.name] = null;
     } else if (property.type === 'boolean') {

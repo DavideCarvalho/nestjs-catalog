@@ -15,6 +15,7 @@ import {
   ROW_COLUMN,
   SNAPSHOT_COLUMN,
   ident,
+  outputAlias,
   physicalColumn,
   shadowViewFor,
   tableFor,
@@ -71,6 +72,17 @@ export function quoteString(value: string): string {
  * the physical table by hand would have to reproduce that union correctly, and
  * a snapshot in the middle of a broken chain would answer confidently and
  * wrongly.
+ *
+ * **The output alias is `outputAlias(p.name)`, not `p.name`.** This line used to
+ * take the property's name verbatim, and since `ident` refuses rather than
+ * escapes, that made "is this a SQL identifier?" a condition on every property
+ * name in the catalog — enforced at publish time, and enforced for the sake of
+ * this one statement. The cost of that condition landed somewhere else entirely:
+ * a source whose columns really are called `Asset Id` had to be published under
+ * renamed properties, and a load reads `row[property.name]`, so every renamed
+ * column went in NULL on every row of every run. See `outputAlias` in the core
+ * package for what it does and for why a name that is already an identifier is
+ * still kept exactly as it is — no view that resolves today changes shape.
  */
 export async function refreshView(
   client: ClickHouseClient,
@@ -80,7 +92,7 @@ export async function refreshView(
   const view = viewFor(type.name);
   const shadow = shadowViewFor(type.name);
   const columns = type.properties.map(
-    (p) => `${ident(physicalColumn(p.name))} AS ${ident(p.name)}`,
+    (p) => `${ident(physicalColumn(p.name))} AS ${ident(outputAlias(p.name))}`,
   );
   // The snapshot id rides along so a query can tell which load it is reading
   // without joining back to the snapshot table.
@@ -131,12 +143,18 @@ export async function dropView(client: ClickHouseClient, typeName: string): Prom
  * Two relations per type, and the distinction is the whole point of the screen:
  * the view is the committed snapshot, the physical table is every load that has
  * ever run.
+ *
+ * Both column lists are what the SQL actually exposes rather than what the type
+ * calls the field: `outputAlias` for the view because that is what
+ * {@link refreshView} aliases to, `physicalColumn` for the table because that is
+ * the column the load wrote. A schema panel that listed the property name for a
+ * property called `Asset Id` would be offering an autocompletion that fails.
  */
 export function relationsFor(types: CatalogObjectTypeDef[]): CatalogQueryRelation[] {
   const relations: CatalogQueryRelation[] = [];
   for (const type of types) {
     const columns = type.properties.map((p) => ({
-      name: p.name,
+      name: outputAlias(p.name),
       type: p.type,
     }));
     relations.push({

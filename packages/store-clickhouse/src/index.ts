@@ -20,6 +20,7 @@ export {
   CARRY_FORWARD_BATCH,
   ident,
   LOADED_AT_COLUMN,
+  outputAlias,
   physicalColumn,
   PRINCIPAL_COLUMN,
   RESERVED_COLUMNS,

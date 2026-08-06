@@ -1,4 +1,5 @@
 import type { CatalogObjectTypeDef, ScalarType } from '@dudousxd/nestjs-catalog';
+import { outputAlias } from './identifiers';
 
 /**
  * Scalar type → ClickHouse column type.
@@ -85,6 +86,13 @@ export function coerce(value: unknown, type: ScalarType): unknown {
  * parses to `Invalid Date` in Safari. The column is declared
  * `DateTime64(3, 'UTC')`, so reading it as UTC is restoring what the wire format
  * dropped rather than assuming anything.
+ *
+ * In under the alias `read` selected — {@link outputAlias} — and out under the
+ * property's own name. Those are the same string for almost every property and
+ * are not for one whose name SQL cannot take, so they are written as the two
+ * different things they are: looking the value up by `property.name` would hand
+ * back `undefined` for exactly the properties the alias change exists to make
+ * work, and `undefined` here is indistinguishable from a genuine NULL.
  */
 export function normalise(
   row: Record<string, unknown>,
@@ -92,7 +100,7 @@ export function normalise(
 ): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const property of properties) {
-    out[property.name] = normaliseValue(row[property.name], property.type);
+    out[property.name] = normaliseValue(row[outputAlias(property.name)], property.type);
   }
   return out;
 }

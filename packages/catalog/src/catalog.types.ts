@@ -320,13 +320,20 @@ export interface CatalogObjectPage {
      * How the source spells this column, when it is not how the property is
      * named.
      *
-     * Carried because on a published type the two really do differ: a source
-     * column called `Asset Id` cannot be a SQL identifier, so the property is
-     * `Asset_Id` and `columnName` keeps the original. A reader recognises the
-     * source spelling — it is what is on their spreadsheet — and a filter has to
-     * be built from the property name, so a screen that shows only one of the two
-     * either fails to be recognised or invites a filter on a name that resolves
-     * to nothing. Both are here so a screen can show one and send the other.
+     * Lineage, and only lineage — nothing reads a record through it. A reader
+     * recognises the source spelling because it is what is on their spreadsheet,
+     * and a filter has to be built from the property name, so both are here and a
+     * screen can show one and send the other.
+     *
+     * The two differ less often than they used to. A property may now be named
+     * `Asset Id` outright: a store cleans the name to reach its column and
+     * aliases its view to the cleaned form, so a name is no longer required to be
+     * a SQL identifier. Publishers were previously told to send `{ name:
+     * 'Asset_Id', columnName: 'Asset Id' }`, which is where most of the divergent
+     * pairs in an older catalog come from — and it was a costly instruction,
+     * because a load matches records to properties by NAME, so those columns
+     * loaded NULL. The two still differ whenever a publisher chooses different
+     * names for its own reasons, which is why the field stays.
      *
      * Optional: a page served by a version of this library that predates the
      * field simply does not say, and a screen falls back to the property name.
