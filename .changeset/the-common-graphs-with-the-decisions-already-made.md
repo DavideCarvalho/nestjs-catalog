@@ -21,7 +21,8 @@ so a screen shows them rather than burying them.
 - **Replicate a table** — SQL straight into a type. Two nodes and one edge, and the entire value is
   the refusal described below.
 - **Load a file drop** — a CSV/NDJSON/JSON drop from a path or a bucket. Structurally the same and
-  separate on purpose: a DPAS-style header is the likeliest place to meet `Asset LIN/TAMCN`.
+  separate on purpose: a spreadsheet header is the likeliest place to meet a column headed with a
+  year.
 - **Fan one source into several types** — one expensive read, a transform *per branch*, a sink per
   type. Per branch because both successors of a source read the same rows, so one shared transform
   would commit identical wide rows into every type.
@@ -36,24 +37,36 @@ so a screen shows them rather than burying them.
 
 ## The naming problem, and why two templates refuse rather than guess
 
-The warehouse matches records to properties **by property name** — `row[property.name]`. The name
-is also written verbatim as the view's output column and as the alias of every read, and both go
-through `ident`, which refuses rather than escapes. So a property name must be a SQL identifier, and
-publishing refuses one that is not.
+The warehouse matches records to properties **by property name** — `row[property.name]`. So on a
+graph with no transform on the path, where a record arrives keyed by the source's own spelling, the
+property has to be named that spelling exactly. `columnName` is display metadata and is never a
+lookup key, so recording the source's spelling there redirects nothing.
 
-Put those together and a column spelled `Asset Id` cannot be replicated by a graph with no transform
-on the path, in either direction. Keep the source's spelling and publishing refuses it. Sanitise it
-to `Asset_Id` and leave `columnName` as `Asset Id`, and the store asks each record for `Asset_Id`,
-the record has `Asset Id`, the answer is `undefined`, and `undefined` is written as null in every row
-of every run forever while the load reports success. The second is the naive fix and is exactly what
-produced the six null types; `columnName` is display metadata and is never a lookup key.
+That used to make an entire class of columns unloadable, because the name was also written verbatim
+as the view's output column and as the alias of every read, both through `ident`, which refuses
+rather than escapes. `Asset Id` could be neither kept (publishing refused the name) nor renamed to
+`Asset_Id` (the record still arrives keyed `Asset Id`, the store asks for `Asset_Id`, gets
+`undefined`, and writes null into every row of every run while reporting success). The second is the
+naive fix and is exactly what produced the six null types.
 
-`fix/view-alias-sanitised` proposes making the alias sanitise so a property could keep the source's
-spelling end to end. **It has not landed** — the branch carries no commits and the publish-time
-refusal is still in force. So "Replicate a table" and "Load a file drop" **refuse**, name every
-offending column, and say what the remedy is, rather than encoding the guess. A column list nobody
-has discovered is *also* a refusal: proceeding on silence is asserting the names are fine because
-nobody looked, which is how the six were built.
+**`fix/view-alias-sanitised` has since landed and closed the first door.** Both alias sites go
+through `outputAlias`, so a property keeps the source's spelling end to end: `Asset Id` is a
+perfectly good name, lands in `Asset_Id`, and reads back as `Asset Id`. `Asset LIN/TAMCN` likewise.
+These templates no longer refuse them — doing so would send an operator off to perform the exact
+rename that caused the incident.
+
+**What survived is narrower and is still a trap.** The publish-time refusal asks whether a name
+*cleans* to an identifier, not whether it is one, and a name can still fail that: `2024 Total`
+cleans to `2024_Total`, and no store will quote a column starting with a digit. For those columns
+both doors are still shut in the old way. So "Replicate a table" and "Load a file drop" still
+**refuse**, on precisely that set, and name every offending column together with what it cleans to.
+The check is `isSafeIdentifier(physicalColumn(name))` — the same two calls, in the same order, that
+the publish-time refusal and the DDL make.
+
+A column list nobody has discovered is *also* still a refusal. That set shrank and did not empty: an
+undiscovered `2024 Total` still ends as a property renamed to `2024_Total`, loading null into every
+row and reporting success. Proceeding on silence is asserting the names are fine because nobody
+looked, which is how the six were built.
 
 ## What every template obeys
 
@@ -73,13 +86,19 @@ Per-deployment templates are a store concern and a separate change.
 
 ## Also here
 
-`isSafeIdentifier` and `UnsafeIdentifierError` moved into a dependency-free `catalog.identifiers.ts`
-and are now exported from `@dudousxd/nestjs-catalog/client` as well as the package root. They used to
-sit in `catalog.store.ts`, which imports `@nestjs/common` at module scope, so a browser could not
-reach them without dragging NestJS along — and a canvas that answered "can this be a property name?"
-from its own copy of the pattern would be the fourth definition of a rule whose own docblock says one
-definition is the guarantee and two identical ones are a habit. Every existing import path still
-works; `catalog.store.ts` re-exports all three.
+The whole naming rule — `isSafeIdentifier`, `assertSafeIdentifier`, `UnsafeIdentifierError`,
+`physicalColumn` and `outputAlias` — moved into a dependency-free `catalog.identifiers.ts` and is now
+exported from `@dudousxd/nestjs-catalog/client` as well as the package root. It used to sit in
+`catalog.store.ts`, which imports `@nestjs/common` at module scope, so a browser could not reach any
+of it without dragging NestJS along — and a canvas that answered "can this be a property name?" from
+its own copy of the pattern would be a fresh definition of a rule whose own docblock says one
+definition is the guarantee and two identical ones are a habit.
+
+`physicalColumn` had to travel with `isSafeIdentifier` rather than being left behind, because the
+question a publisher is refused on is the *composition* of the two. A browser holding only half of it
+would answer the obsolete, stricter question and refuse graphs the server would accept.
+
+Every existing import path still works; `catalog.store.ts` re-exports all five.
 
 ## Not shipped
 

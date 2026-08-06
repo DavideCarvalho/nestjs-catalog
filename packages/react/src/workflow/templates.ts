@@ -11,6 +11,7 @@ import {
   type WorkflowSourceNode,
   type WorkflowTransformNode,
   isSafeIdentifier,
+  physicalColumn,
 } from '@dudousxd/nestjs-catalog/client';
 
 /**
@@ -53,45 +54,49 @@ import {
  * **It does not restate a list.** Source kinds come from {@link CONNECTOR_KINDS}
  * through {@link SOURCE_KINDS}, starter code is keyed by `TransformLanguage`,
  * nodes are built through {@link NODE_FACTORIES} keyed by `WorkflowNodeKind`,
- * and the identifier rule is `isSafeIdentifier` from the catalog itself — the
- * same function the DDL and the publish-time refusal run. All four are exhaustive
- * mappings over an exported union, so a kind or a language added to the library
- * without a line here is a **compile error**, not a template that quietly stops
- * covering it. This codebase has been bitten repeatedly by hand-maintained lists
- * that go silent.
+ * and the naming rule is `isSafeIdentifier(physicalColumn(…))` from the catalog
+ * itself — the same two calls, in the same order, that the DDL makes and that
+ * the publish-time refusal makes. All four are exhaustive mappings over an
+ * exported union, so a kind or a language added to the library without a line
+ * here is a **compile error**, not a template that quietly stops covering it.
+ * This codebase has been bitten repeatedly by hand-maintained lists that go
+ * silent.
  *
  * THE NAMING PROBLEM, WHICH IS THE WHOLE REASON FOR THE REFUSALS
  * -------------------------------------------------------------
  * The warehouse matches records to properties **by property name** —
- * `row[property.name]`, in both the MySQL and ClickHouse stores. The property
- * name is also written verbatim as the view's output column and as the alias of
- * every read, and both go through `ident`, which refuses rather than escapes. So
- * a property name must be a SQL identifier, and publishing refuses one that is
- * not.
- *
- * Put those two facts together and a column the source spells `Asset Id` or
- * `Asset LIN/TAMCN` cannot be replicated by a graph with no transform on the
- * path, in either direction:
- *
- * - Keep the source's spelling as the property name and publishing refuses it.
- * - Sanitise it to `Asset_Id` and leave `columnName` as `Asset Id` — and the
- *   store asks each record for `Asset_Id`, the record has `Asset Id`, the answer
- *   is `undefined`, `undefined` is written as null in every row of every run
- *   forever, and the load reports success.
- *
- * The second is the naive fix and is precisely what produced the six null types.
+ * `row[property.name]`, in both the MySQL and ClickHouse stores. So on a graph
+ * with no transform on the path, where a record arrives keyed by the source's
+ * own column spelling, the property has to be named that spelling exactly.
  * `columnName` is display metadata; it is never a lookup key and never becomes
- * SQL.
+ * SQL, so recording the source's spelling there does not redirect anything.
  *
- * A parallel branch, `fix/view-alias-sanitised`, proposes making the view alias
- * sanitise so that a property could keep the source's own spelling end to end.
- * **At the time of writing it has not landed** — the branch carries no commits,
- * the four alias sites still emit `… AS ident(p.name)`, and the publish-time
- * refusal is still in force. So the templates that would otherwise have to guess
- * do not guess: {@link replicateTable} and {@link loadFileDrop} **refuse**, name
- * every offending column, and say what the remedy is. When that branch lands,
- * the single call to {@link refuseUnusableColumnNames} is the thing to revisit,
- * and this paragraph is the note saying so.
+ * That used to make the whole class of awkward columns unloadable. A property
+ * name was written verbatim as the view's output column and as the alias of
+ * every read, both through `ident`, which refuses rather than escapes — so a
+ * source column called `Asset Id` could be neither kept (publishing refused the
+ * name) nor renamed to `Asset_Id` (the record still arrives keyed `Asset Id`,
+ * the store asks for `Asset_Id`, gets `undefined`, and writes null into every
+ * row of every run while reporting success). The second is the naive fix and is
+ * precisely what produced the six null types.
+ *
+ * **`fix/view-alias-sanitised` has since landed, and it closed the first door.**
+ * Both alias sites now go through `outputAlias`, which cleans a name SQL cannot
+ * take and leaves one it can exactly as it is, so a property may keep the
+ * source's own spelling end to end: `Asset Id` is now a perfectly good property
+ * name, lands in a column called `Asset_Id`, and reads back under `Asset Id`.
+ * `Asset LIN/TAMCN` likewise. Refusing those would now be refusing a graph the
+ * server would happily accept, so the templates no longer do.
+ *
+ * **What is left is narrower and is still a trap.** The publish-time refusal
+ * asks whether the name *cleans* to an identifier, not whether it is one, and a
+ * name can still fail that: `2024 Total` cleans to `2024_Total`, and no store
+ * will quote a column starting with a digit. For those columns both doors are
+ * still shut in exactly the old way — the name is refused at publish, and the
+ * rename that gets reached for instead is the one that writes nulls forever. So
+ * {@link replicateTable} and {@link loadFileDrop} still **refuse**, on precisely
+ * that set, and name every offending column. The refusal did not go away; its
+ * subject got smaller and its reason got sharper.
  */
 
 /* -------------------------------------------------------------------------- */
@@ -507,32 +512,66 @@ return records.map((record) =>
 /* -------------------------------------------------------------------------- */
 
 /**
+ * Whether a column name could be published as a property name at all.
+ *
+ * `isSafeIdentifier(physicalColumn(name))` — the same two calls, in the same
+ * order, that `identifierRefusal` makes at publish time and that every store
+ * makes on the way to a column. Both come from `@dudousxd/nestjs-catalog/client`
+ * and are the functions themselves, not a copy of either: a canvas whose idea of
+ * a legal name differs from the server's by one character is a canvas that
+ * promises a load the publisher then refuses, or refuses one it would have
+ * taken.
+ *
+ * **It is the composition and not `isSafeIdentifier` alone**, and getting that
+ * wrong in either direction is a real failure rather than a nicety. Asking only
+ * `isSafeIdentifier(name)` is the obsolete, stricter question — it refuses
+ * `Asset Id`, which now works end to end, and the operator sent away by that
+ * refusal is being sent to do the rename that writes nulls. Asking only whether
+ * the cleaning *ran* would pass everything, since `physicalColumn` always
+ * returns something. What has to be asked is whether what it returns is a name a
+ * store can create.
+ *
+ * **Which is a narrow set, and worth naming exactly so nobody re-derives it.**
+ * The cleaning already guarantees the character set and the length, so the only
+ * things left for `isSafeIdentifier` to reject are a cleaned form that starts
+ * with a digit and one that is empty. In practice: `2024 Total` → `2024_Total`
+ * is refused; `FY24 Hours` → `FY24_Hours` is not, because the digits are not
+ * first; `#Rank` → `_Rank` is not, because punctuation becomes an underscore and
+ * an underscore may lead; `Asset LIN/TAMCN` → `Asset_LIN_TAMCN` is not. A column
+ * named with the empty string is the other refusal, and a source producing one
+ * has a problem this template is not the right place to explain.
+ */
+function canBePropertyName(column: string): boolean {
+  return isSafeIdentifier(physicalColumn(column));
+}
+
+/**
  * Refuse the column names that cannot become property names, or say nothing.
  *
- * The single most important function in this file, and the one place the state
- * of `fix/view-alias-sanitised` is encoded. See the header for the full
- * argument; the short version is that with no transform on the path a record
- * arrives keyed by the source's own spelling and the store asks for
- * `row[property.name]`, so the two have to be the same string — and a property
- * name has to be a SQL identifier, because it is written verbatim into the view
- * and into every read.
+ * The single most important function in this file, and the one place the naming
+ * rule is applied. See the header for the full argument; the short version is
+ * that with no transform on the path a record arrives keyed by the source's own
+ * spelling and the store asks for `row[property.name]`, so the two have to be
+ * the same string — and while that string no longer has to be a SQL identifier
+ * itself, it still has to *clean* to one.
  *
  * Three outcomes rather than two, and the third is not a formality:
  *
- * - Every column is usable — nothing is returned.
+ * - Every column is usable — nothing is returned. This is now the answer for
+ *   `Asset Id` and `Asset LIN/TAMCN`, which it was not before
+ *   `fix/view-alias-sanitised` landed.
  * - Some are not — a refusal naming every one of them. All of them, not the
  *   first, because a legacy export is usually wrong about forty columns in the
  *   same way and one refusal per attempt would make fixing it a morning.
- * - **Nobody knows what the columns are** — also a refusal, with its own code.
- *   A template that proceeded on an empty column list would be asserting the
- *   names are fine because nobody looked, which is exactly how the six null
- *   types were built. Silence is not a pass.
- *
- * `isSafeIdentifier` comes from `@dudousxd/nestjs-catalog/client` and is
- * literally the function the DDL and the publish-time refusal run. A copy of the
- * pattern here would be a fourth definition of the rule, and this codebase's own
- * comment on that subject is that one definition is the guarantee and two
- * identical ones are a habit.
+ * - **Nobody knows what the columns are** — also a refusal, with its own code,
+ *   and it survived the alias fix on purpose. The set it protects against got
+ *   much smaller and did not empty: a source with a `2024 Total` column, applied
+ *   without anybody looking, still ends with that property refused at publish,
+ *   renamed to `2024_Total` by the obvious next move, and loading null into
+ *   every row of every run while reporting success. That is the original
+ *   disaster, still reachable, one column narrower. A template that proceeded on
+ *   an unknown column list would be asserting the names are fine because nobody
+ *   looked. Silence is not a pass.
  */
 export function refuseUnusableColumnNames(
   columns: readonly string[] | undefined,
@@ -542,23 +581,23 @@ export function refuseUnusableColumnNames(
     return {
       code: 'columns-unknown',
       subjects: [],
-      message: `Nobody has said which columns ${context.what} produces, so this template cannot check the one thing that would make it commit nulls. With no transform on the path a record arrives keyed by the source's own column spelling and the warehouse looks every field up by property name, so the two have to match exactly — and a property name has to be a SQL identifier. Run schema discovery on the source first, or ${context.remedy}`,
+      message: `Nobody has said which columns ${context.what} produces, so this template cannot check the one thing that would make it commit nulls. With no transform on the path a record arrives keyed by the source's own column spelling and the warehouse looks every field up by property name, so the two have to match exactly — and while a property name may now be spelled however the source spells it, it still has to clean to something a store can create as a column. Run schema discovery on the source first, or ${context.remedy}`,
     };
   }
 
-  const offenders = columns.filter((column) => !isSafeIdentifier(column));
+  const offenders = columns.filter((column) => !canBePropertyName(column));
   if (offenders.length === 0) return undefined;
 
   return {
     code: 'columns-not-identifiers',
     subjects: offenders,
-    message: `${offenders.length === 1 ? 'One column' : `${offenders.length} columns`} of ${context.what} ${offenders.length === 1 ? 'is' : 'are'} spelled in a way that cannot be a property name: ${offenders.map((name) => JSON.stringify(name)).join(', ')}. A property name is written verbatim as the view's output column and as the alias of every read, so publishing refuses one that is not a SQL identifier — and the warehouse matches records to properties by that same name, so sanitising it to \`Asset_Id\` while the record still arrives as \`Asset Id\` writes null into that column on every run and reports success. That is what happened to six types in one evening, so this template refuses rather than guessing which way you meant. ${context.remedy}`,
+    message: `${offenders.length === 1 ? 'One column' : `${offenders.length} columns`} of ${context.what} ${offenders.length === 1 ? 'is' : 'are'} spelled in a way that cannot be a property name: ${offenders.map((name) => `${JSON.stringify(name)} (cleans to ${JSON.stringify(physicalColumn(name))})`).join(', ')}. A property name does not have to be a SQL identifier — a store cleans it, so \`Asset Id\` is a perfectly good name and lands in \`Asset_Id\` — but what the cleaning produces still has to be one, and ${offenders.length === 1 ? 'this one is not' : 'these are not'}. Publishing refuses the name, and the rename reached for instead is the trap: the warehouse matches records to properties by name, so a property called \`${physicalColumn(offenders[0])}\` while the record still arrives keyed \`${offenders[0]}\` writes null into that column on every run and reports success. That is what happened to six types in one evening, so this template refuses rather than guessing which way you meant. ${context.remedy}`,
   };
 }
 
 /** The remedy sentence, which is the same one every no-transform template gives. */
 const RENAME_REMEDY =
-  "Put a transform between the source and the sink whose job is to rename the record keys to the property names — the model's own answer, and the reason `columnName` exists is to record what the source called it. (If `fix/view-alias-sanitised` has since landed, a property can keep the source spelling and this refusal should be revisited.)";
+  "Put a transform between the source and the sink whose job is to rename the record keys to the property names — the model's own answer, and the reason `columnName` exists is to record what the source called it. For these columns the rename is genuinely unavoidable, which is why it is worth writing rather than a chore: there is no spelling that is both what the source sends and something a store can create.";
 
 /* -------------------------------------------------------------------------- */
 /* Cadences                                                                    */
@@ -714,7 +753,7 @@ export const WORKFLOW_TEMPLATES: Record<WorkflowTemplateId, WorkflowTemplateMeta
     summary: 'One SQL query straight into one object type, with no transform in between.',
     assumes: [
       'The query returns one row per record of the type, already shaped the way the type wants it.',
-      'Every column it returns is spelled in a way that can be a property name. The template checks this and refuses if not.',
+      'Every column it returns is spelled in a way that can be a property name — which allows `Asset Id`, and not `2024 Total`. The template checks this and refuses if not.',
     ],
   },
   'load-file-drop': {
@@ -723,7 +762,7 @@ export const WORKFLOW_TEMPLATES: Record<WorkflowTemplateId, WorkflowTemplateMeta
     summary: 'A CSV, NDJSON or JSON drop — on disk or in an object store — into one object type.',
     assumes: [
       'The drop is a full extract each time, not a delta.',
-      'Its header row is spelled in a way that can be a property name. The template checks this and refuses if not.',
+      'Its header row is spelled in a way that can be a property name — which allows `Asset LIN/TAMCN`, and not a column headed with a year. The template checks this and refuses if not.',
     ],
   },
   'fan-out-types': {
@@ -800,10 +839,19 @@ export interface ReplicateTableOptions {
  * into most of the columns.
  *
  * So this template checks, and refuses, and names every offending column. It
- * does **not** offer to sanitise them: that is the naive fix, it is what was
- * done six times in one evening, and until `fix/view-alias-sanitised` lands
- * there is no spelling that works for both the record key and the SQL alias. See
- * the header.
+ * does **not** offer to sanitise them: that is the naive fix and it is what was
+ * done six times in one evening. For the columns that now reach this refusal
+ * there is no spelling that is both the key the record arrives under and a name
+ * a store can create, so the rename has to be paired with a transform that
+ * renames the record's keys — which is a decision about the data rather than a
+ * shape, and belongs to whoever knows the data.
+ *
+ * **What it no longer refuses.** `Asset Id` and `Asset LIN/TAMCN` pass now.
+ * `fix/view-alias-sanitised` made the view's output alias and the read's lookup
+ * key clean together, so a property keeps the source's spelling end to end and a
+ * two-node graph over those columns is simply correct. Refusing them would be
+ * this template sending somebody off to do the exact rename that caused the
+ * incident it exists to prevent. See the header.
  */
 export function replicateTable(options: ReplicateTableOptions): TemplateOutcome {
   const targetType = options.targetType.trim();
@@ -852,7 +900,7 @@ export function replicateTable(options: ReplicateTableOptions): TemplateOutcome 
         FULL_MODE_DECLARATION,
         {
           what: 'No transform sits between the source and the sink.',
-          why: 'Every column the query returns was checked against the identifier rule the store and the publish API both use, and all of them can be property names — so the records arrive keyed exactly as the type will ask for them. Had any column failed, this template would have refused instead of adding a transform, because the rename it would have to write is a decision about your data rather than a shape.',
+          why: 'Every column the query returns was checked with the same two calls the store and the publish API make — cleaning the name, then asking whether the result is an identifier — and all of them can be property names, so the records arrive keyed exactly as the type will ask for them. Name the properties as the query spells them; a column called `Asset Id` wants a property called `Asset Id`, not `Asset_Id`. Had any column failed, this template would have refused instead of adding a transform, because the rename it would have to write is a decision about your data rather than a shape.',
           changeAt: 'Add a transform node on the edge if the mapping ever stops being one-to-one.',
         },
       ],
@@ -883,9 +931,15 @@ export interface FileDropOptions {
  * it because the config, the assumptions and the failure mode differ enough that
  * one template covering both would have to hedge every sentence. A drop is a
  * full extract that lands on a schedule somebody else controls, its columns come
- * from a spreadsheet header rather than a `SELECT` list, and its header is
- * overwhelmingly the *most* likely place to meet `Asset LIN/TAMCN` — which is
- * why the same refusal matters more here, not less.
+ * from a spreadsheet header rather than a `SELECT` list, and a spreadsheet header
+ * is overwhelmingly the most likely place to meet a column headed `2024 Total`
+ * or `2024 Q1 Hours` — which is why the same refusal matters more here, not less.
+ *
+ * `Asset LIN/TAMCN`, the header this template was written around, is no longer
+ * one of them: it cleans to `Asset_LIN_TAMCN` and is published under its own
+ * spelling. Nor is `FY24 Hours`, which cleans to `FY24_Hours` — the year has to
+ * be at the *front* to be a problem. What is refused is a header whose cleaned
+ * form starts with a digit, and that really does need a transform.
  */
 export function loadFileDrop(options: FileDropOptions): TemplateOutcome {
   const targetType = options.targetType.trim();
@@ -1012,7 +1066,7 @@ export function fanOutTypes(options: FanOutOptions): TemplateOutcome {
     const refusal = refuseUnusableColumnNames(target.properties, {
       what: `the properties of ${target.targetType.trim()}`,
       remedy:
-        "A property name is written verbatim into SQL, so publishing refuses one that is not an identifier. Rename it in the type, and record the source spelling in that property's `columnName`.",
+        "A property name is cleaned into the column a store creates for it, and what the cleaning produces has to be an identifier — so publishing refuses this one. Rename it in the type, and record the source spelling in that property's `columnName`. This branch already has a transform on it, so make that transform emit the new key too.",
     });
     if (refusal) refusals.push(refusal);
   }
@@ -1318,15 +1372,22 @@ export interface PeriodicFullReloadOptions {
  * and wrote down why. A template that supplied a default reason would be
  * defeating exactly the mechanism it is here to satisfy.
  *
- * **Where the schedule goes.** The graph itself has no schedule field: today a
- * workflow is put on a timer by a connector that points at it with `workflowId`
- * and carries the `schedule` string, and the workflow has to be `ready` before
- * that connector may name it. The plan therefore *declares* the cadence and
- * leaves placing it to whatever is applying the plan, which is also what keeps
- * this template correct through `feat/workflow-is-the-api` — that branch merges
- * connectors into workflows and moves where a schedule lives, and a template
- * that had hard-coded the connector hop would have to be rewritten rather than
- * rebased.
+ * **Where the schedule goes, and why the plan does not say.** The plan carries
+ * the cadence as data — {@link TemplatePlan.schedule} — and leaves *placing* it
+ * to whatever applies the plan. That was a deliberate bet, and it paid.
+ *
+ * When this was written, a workflow was put on a timer by a connector that
+ * pointed at it with `workflowId` and carried the `schedule` string. A template
+ * that had written that hop into its plan or its `todo` would have had to be
+ * rewritten when the workflow became the only authored object: connectors stopped
+ * being authored at all, and a schedule now lives on the workflow, set through
+ * `PUT workflows/:id/schedule`. Because the plan only ever declared "this runs
+ * `0 2 * * *`" and never "create a connector that says so", the move cost this
+ * template nothing — the same plan, rebased with no conflict, describes the new
+ * arrangement as accurately as it described the old one.
+ *
+ * What did not change, and is the part worth stating: only a `ready` graph is
+ * scheduled. A schedule written against a draft is stored and does not fire.
  */
 export function periodicFullReload(options: PeriodicFullReloadOptions): TemplateOutcome {
   const targetType = options.targetType.trim();
@@ -1411,7 +1472,7 @@ export function periodicFullReload(options: PeriodicFullReloadOptions): Template
       ],
       todo: [
         configTodo(options.sourceKind, source.name),
-        `The schedule is part of this plan but is not part of the graph: put \`${schedule.cron}\` on whatever runs this workflow on a timer, and publish the workflow first — only a \`ready\` graph can be scheduled.`,
+        `The schedule is part of this plan but is not part of the graph: send \`${schedule.cron}\` to \`PUT workflows/:id/schedule\` once the workflow exists, and publish it first — a schedule on a draft is stored and never fires.`,
         `The expectation is a separate write against \`${targetType}\`. Applying the graph without it leaves the type undeclared, which is the state this template exists to avoid.`,
       ],
     },

@@ -112,26 +112,40 @@ export type {
 export type { SnapshotRef } from './catalog.store';
 
 /**
- * Whether a name can be written into SQL, shipped to the browser deliberately.
+ * How a name becomes a column, shipped to the browser deliberately.
  *
  * The second exception to "types only" on this entry point, and it is made for
  * the same reason `validateWorkflow` is the first: the answer has to be the
  * same one the server will give, and the only way to guarantee that is for both
- * to run this function.
+ * to run these functions.
  *
- * A property `name` is what the warehouse looks every field up by —
- * `row[property.name]` — and it is written verbatim as the view's output column
- * and as the alias of every read, so publishing refuses one that is not an
- * identifier. A console proposing to replicate a table therefore has to be able
- * to ask, *before* it draws anything, whether the source's own column spellings
- * could be property names. When they cannot, the graph that looks obvious —
- * source straight into sink — writes null into every one of those columns on
- * every run and reports success. That is not a hypothesis; it is what happened
- * to six types in one evening.
+ * A console proposing to replicate a table has to be able to ask, *before* it
+ * draws anything, whether the source's own column spellings could be published
+ * as property names — because a property `name` is what the warehouse looks
+ * every field up by, `row[property.name]`, so a name the publisher then refuses
+ * has to be renamed, and a rename with nothing renaming the record's keys to
+ * match writes null into that column on every run and reports success. That is
+ * not a hypothesis; it is what happened to six types in one evening.
+ *
+ * **Both halves, because the composition is the rule.** A name no longer has to
+ * be an identifier itself — the view's output alias and the read's lookup key go
+ * through {@link outputAlias} together, so `Asset Id` is a perfectly good
+ * property name and lands in `Asset_Id`. What is still refused is a name whose
+ * *cleaned* form is not an identifier: `2024 Total` cleans to `2024_Total`, and
+ * no store will quote a name starting with a digit. So the question worth asking
+ * from a browser is `isSafeIdentifier(physicalColumn(name))` — the same two
+ * calls, in the same order, that `identifierRefusal` makes at publish time.
+ * Exporting only `isSafeIdentifier` would let a console answer the stricter,
+ * obsolete question and refuse a graph the server would have accepted.
  *
  * Safe to export because `catalog.identifiers.ts` imports nothing at all.
  */
-export { isSafeIdentifier, UnsafeIdentifierError } from './catalog.identifiers';
+export {
+  isSafeIdentifier,
+  outputAlias,
+  physicalColumn,
+  UnsafeIdentifierError,
+} from './catalog.identifiers';
 
 /** What a tier-0 edit to a type may change. */
 export interface TypePatch {

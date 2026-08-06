@@ -4,6 +4,7 @@ import {
   type TransformLanguage,
   WORKFLOW_NODE_ID_PATTERN,
   isSafeIdentifier,
+  physicalColumn,
   validateWorkflow as validateCoreWorkflow,
 } from '@dudousxd/nestjs-catalog/client';
 import { describe, expect, it } from 'vitest';
@@ -246,10 +247,30 @@ describe('a plan whose transforms do not exist yet', () => {
 });
 
 describe('the identifier refusal', () => {
-  it('refuses the column names that produced the null columns, and names each one', () => {
+  it('lets a column keep the source spelling, because the alias fix landed', () => {
+    // `Asset Id` and `Asset LIN/TAMCN` are the exact headers this file was
+    // written to refuse, and refusing them is now wrong: both alias sites go
+    // through `outputAlias`, so a property keeps the source's spelling end to
+    // end. Sending somebody away from this graph would send them to do the
+    // rename that caused the incident.
     const outcome = replicateTable({
       targetType: 'Subwo',
       sourceColumns: ['wo_number', 'Asset Id', 'base', 'Asset LIN/TAMCN'],
+    });
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    // And it stays a two-node graph: no transform got added to "fix" the names.
+    expect(outcome.plan.nodes.map((node) => node.kind)).toEqual(['source', 'sink']);
+    expect(outcome.plan.transforms).toEqual([]);
+  });
+
+  it('still refuses a name that cannot clean to a column, and names each one', () => {
+    // What survived the alias fix: cleaning `2024 Total` gives `2024_Total`, and
+    // no store will quote a column starting with a digit. Publishing refuses the
+    // name, and the rename reached for instead is the original null-column trap.
+    const outcome = replicateTable({
+      targetType: 'Subwo',
+      sourceColumns: ['wo_number', '2024 Total', 'base', '99 Hours'],
     });
     expect(outcome.ok).toBe(false);
     if (outcome.ok) return;
@@ -257,15 +278,17 @@ describe('the identifier refusal', () => {
     expect(outcome.refusals[0].code).toBe('columns-not-identifiers');
     // All of them, not the first: a legacy export is wrong about forty columns
     // in the same way and one refusal per attempt would make it a morning.
-    expect(outcome.refusals[0].subjects).toEqual(['Asset Id', 'Asset LIN/TAMCN']);
-    expect(outcome.refusals[0].message).toContain('"Asset Id"');
-    expect(outcome.refusals[0].message).toContain('"Asset LIN/TAMCN"');
+    expect(outcome.refusals[0].subjects).toEqual(['2024 Total', '99 Hours']);
+    // The cleaned form is named too, because that is the string SQL rejects and
+    // the one the publish-time refusal quotes back.
+    expect(outcome.refusals[0].message).toContain('"2024_Total"');
+    expect(outcome.refusals[0].message).toContain('"99_Hours"');
   });
 
   it('refuses when nobody has said what the columns are', () => {
-    // Silence is not a pass. Proceeding on an unknown column list is asserting
-    // the names are fine because nobody looked, which is how the six types were
-    // built.
+    // Silence is still not a pass. The set it protects got smaller and did not
+    // empty: an undiscovered `2024 Total` still ends as a property renamed to
+    // `2024_Total`, loading null into every row and reporting success.
     const outcome = replicateTable({ targetType: 'Subwo' });
     expect(outcome.ok).toBe(false);
     if (outcome.ok) return;
@@ -273,21 +296,30 @@ describe('the identifier refusal', () => {
   });
 
   it('refuses a file drop header the same way', () => {
-    // The header of a DPAS-style spreadsheet is the most likely place to meet
-    // this, so the drop template must not be the lenient one.
+    // A spreadsheet header is the most likely place to meet a column headed with
+    // a year, so the drop template must not be the lenient one. Note `FY24
+    // Hours` would NOT be refused — it cleans to `FY24_Hours`, which is legal.
+    // Only a leading digit survives the cleaning as a problem.
     const outcome = loadFileDrop({
       targetType: 'Mel',
       kind: 'file',
-      sourceColumns: ['Asset LIN/TAMCN'],
+      sourceColumns: ['2024 Q1 Hours'],
     });
     expect(outcome.ok).toBe(false);
     if (outcome.ok) return;
     expect(outcome.refusals[0].code).toBe('columns-not-identifiers');
+
+    // …and takes the header it was written around, which now works.
+    expect(
+      loadFileDrop({ targetType: 'Mel', kind: 'file', sourceColumns: ['Asset LIN/TAMCN'] }).ok,
+    ).toBe(true);
   });
 
   it('agrees with the catalog rule exactly, rather than with a copy of it', () => {
-    // If these two ever disagree the canvas is promising a load the publisher
-    // would refuse, which is the drift the shared function exists to prevent.
+    // The question is `isSafeIdentifier(physicalColumn(name))` — the composition,
+    // which is what the publish-time refusal asks. Asserting against
+    // `isSafeIdentifier` alone would pin the obsolete, stricter rule and this
+    // whole suite would go green on a canvas that refuses graphs the server takes.
     const names = [
       'asset_id',
       'Asset Id',
@@ -298,14 +330,30 @@ describe('the identifier refusal', () => {
       'total-rows',
       'a.b',
       'año',
+      '2024 Total',
+      '#Rank',
       'x'.repeat(63),
       'x'.repeat(64),
       '',
     ];
     for (const name of names) {
       const refusal = refuseUnusableColumnNames([name], { what: 'it', remedy: '' });
-      expect(refusal === undefined).toBe(isSafeIdentifier(name));
+      expect(refusal === undefined).toBe(isSafeIdentifier(physicalColumn(name)));
     }
+
+    // And the two questions genuinely differ, so the line above is not asserting
+    // the same thing twice: these pass the composition and fail the bare rule.
+    expect(['Asset Id', 'Asset LIN/TAMCN', 'a.b', 'x'.repeat(64)].map(isSafeIdentifier)).toEqual([
+      false,
+      false,
+      false,
+      false,
+    ]);
+    expect(
+      ['Asset Id', 'Asset LIN/TAMCN', 'a.b', 'x'.repeat(64)].map((name) =>
+        isSafeIdentifier(physicalColumn(name)),
+      ),
+    ).toEqual([true, true, true, true]);
   });
 
   it('says nothing when every column is already usable', () => {
@@ -321,13 +369,13 @@ describe('the identifier refusal', () => {
       language: 'javascript',
       targets: [
         { targetType: 'Mvr', properties: ['asset_id'] },
-        { targetType: 'Subwo', properties: ['Asset Id'] },
+        { targetType: 'Subwo', properties: ['2024 Total'] },
       ],
     });
     expect(outcome.ok).toBe(false);
     if (outcome.ok) return;
     expect(outcome.refusals[0].code).toBe('columns-not-identifiers');
-    expect(outcome.refusals[0].subjects).toEqual(['Asset Id']);
+    expect(outcome.refusals[0].subjects).toEqual(['2024 Total']);
   });
 });
 
@@ -612,9 +660,22 @@ describe('the periodic full reload', () => {
       sourceKind: 'sql',
       cadence: 'daily',
       because: 'reason',
-      sourceColumns: ['Asset Id'],
+      sourceColumns: ['2024 Total'],
     });
     expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.refusals[0].code).toBe('columns-not-identifiers');
+
+    // Same check means the same boundary, not merely "also refuses something".
+    expect(
+      periodicFullReload({
+        targetType: 'Mvr',
+        sourceKind: 'sql',
+        cadence: 'daily',
+        because: 'reason',
+        sourceColumns: ['Asset Id'],
+      }).ok,
+    ).toBe(true);
   });
 
   it('is the only template that declares an expectation', () => {
