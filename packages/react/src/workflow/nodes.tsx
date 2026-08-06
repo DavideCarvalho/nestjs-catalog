@@ -10,10 +10,11 @@ import {
   Repeat,
   TriangleAlert,
 } from 'lucide-react';
+import { motion, useReducedMotion } from 'motion/react';
 import { type ReactNode, createContext, useContext } from 'react';
 import { cn } from '../cn';
 import { Tooltip } from '../ui/tooltip';
-import type { WorkflowFlowNode, WorkflowNodeData } from './graph';
+import { NODE_WIDTH, type WorkflowFlowNode, type WorkflowNodeData } from './graph';
 import type { WorkflowNodeKind } from './model';
 
 const RULE = 'border-zinc-200 dark:border-zinc-800';
@@ -61,25 +62,43 @@ function useWorkflowNodeHandlers(): WorkflowNodeHandlers {
   return handlers;
 }
 
+/**
+ * The per-kind palette, in three coordinated pieces rather than one accent.
+ *
+ * `accent` is the rail down the left edge, `chip` colours the icon and the kind
+ * word, and `wash` tints the strip they sit in. Three tokens per kind rather
+ * than one, because a single accent bar on an otherwise identical white box
+ * meant the four kinds were told apart by four pixels of colour — which at the
+ * zoom people actually work at is no difference at all.
+ *
+ * Every entry names a `dark:` variant, and that is not decoration: this canvas
+ * is embedded in a host whose theme it follows (see `CANVAS_THEME`), and a
+ * colour with no dark counterpart is the failure mode that has bitten the
+ * dropdowns in this package before — legible on the theme it was written on,
+ * unreadable on the other.
+ */
 const KIND_STYLE: Record<
   WorkflowNodeKind,
-  { accent: string; chip: string; icon: typeof Plug; noun: string }
+  { accent: string; chip: string; wash: string; icon: typeof Plug; noun: string }
 > = {
   source: {
     accent: 'bg-sky-500',
     chip: 'text-sky-700 dark:text-sky-300',
+    wash: 'bg-sky-50/70 dark:bg-sky-950/30',
     icon: Plug,
     noun: 'source',
   },
   transform: {
-    accent: 'bg-sky-500',
-    chip: 'text-sky-700 dark:text-sky-300',
+    accent: 'bg-violet-500',
+    chip: 'text-violet-700 dark:text-violet-300',
+    wash: 'bg-violet-50/70 dark:bg-violet-950/30',
     icon: Repeat,
     noun: 'transform',
   },
   sink: {
     accent: 'bg-emerald-500',
     chip: 'text-emerald-700 dark:text-emerald-300',
+    wash: 'bg-emerald-50/70 dark:bg-emerald-950/30',
     icon: Database,
     noun: 'sink',
   },
@@ -89,6 +108,7 @@ const KIND_STYLE: Record<
   call: {
     accent: 'bg-amber-500',
     chip: 'text-amber-700 dark:text-amber-300',
+    wash: 'bg-amber-50/70 dark:bg-amber-950/30',
     icon: ExternalLink,
     noun: 'call',
   },
@@ -103,8 +123,11 @@ const KIND_STYLE: Record<
  * widens what you can see to aim at.
  */
 const HANDLE = cn(
-  '!h-3 !w-3 !rounded-full !border-2',
+  '!h-3 !w-3 !rounded-full !border-2 !transition-transform',
   '!border-zinc-300 !bg-white dark:!border-zinc-600 dark:!bg-zinc-800',
+  // Grows under the pointer, so the thing you are about to drag from
+  // acknowledges you before the drag starts.
+  'hover:!scale-125',
   // React Flow adds these while a connection is being dragged. Colouring them
   // is what makes an illegal target — one that would close a loop, or a source
   // that takes no input — visibly refuse *before* the mouse is released.
@@ -151,8 +174,24 @@ function RunBadge({ run }: { run: NonNullable<WorkflowNodeData['run']> }) {
   return null;
 }
 
+/**
+ * How a node arrives.
+ *
+ * On mount only, so it plays when a graph is opened and when somebody adds a box
+ * — and not while one is dragged, because dragging does not remount. Scale from
+ * just under one rather than from zero: the node grows into place instead of
+ * being inflated, which at eight nodes on a canvas is the difference between a
+ * screen settling and a screen erupting.
+ *
+ * Under `prefers-reduced-motion` the node is simply there. Nothing is conveyed
+ * by the arrival that its presence does not already convey, which is the test
+ * for whether skipping an animation costs anybody information.
+ */
+const ARRIVE = { type: 'spring', stiffness: 420, damping: 34, mass: 0.7 } as const;
+
 export function WorkflowNodeBody({ id, data, selected }: NodeProps<WorkflowFlowNode>) {
   const { onInspect, onEditCode, canEdit } = useWorkflowNodeHandlers();
+  const reduced = useReducedMotion();
   const style = KIND_STYLE[data.kind];
   const Icon = style.icon;
 
@@ -160,12 +199,30 @@ export function WorkflowNodeBody({ id, data, selected }: NodeProps<WorkflowFlowN
   const warnings = data.problems.filter((problem) => problem.level === 'warning');
 
   return (
-    <div
+    <motion.div
+      // The width comes from the constant rather than from a `w-56` class, and
+      // that is the whole mechanism behind the overlap fix: `WORKFLOW_NODE_WIDTH`
+      // is what the server spaces its columns by, so a node whose drawn width
+      // came from somewhere else could silently stop matching the layout that
+      // was computed for it. There is now one number and no way to change the
+      // box without changing it.
+      //
+      // A width in `style` rather than an animated value, deliberately: React
+      // Flow measures `offsetWidth` to place the edges, and a width mid-tween
+      // would move every connection while it settled.
+      style={{ width: NODE_WIDTH }}
+      initial={reduced ? false : { opacity: 0, scale: 0.94 }}
+      animate={{ opacity: 1, scale: 1 }}
+      transition={reduced ? { duration: 0 } : ARRIVE}
       className={cn(
-        'relative w-56 overflow-hidden rounded-lg border shadow-sm transition-shadow',
+        'group/node relative overflow-hidden rounded-xl border',
+        // A lift on hover and a deeper one while selected. `transition-all`
+        // rather than `transition-shadow` because the ring width changes too,
+        // and a ring that snaps while the shadow fades reads as a glitch.
+        'shadow-sm transition-all duration-150 motion-safe:hover:-translate-y-px hover:shadow-md',
         RULE,
         PANEL,
-        selected && 'ring-2 ring-sky-500/40',
+        selected && 'shadow-md ring-2 ring-sky-500/50 dark:ring-sky-400/50',
         errors.length > 0 && 'border-red-400 dark:border-red-800',
         errors.length === 0 && warnings.length > 0 && 'border-amber-300 dark:border-amber-800',
       )}
@@ -192,31 +249,42 @@ export function WorkflowNodeBody({ id, data, selected }: NodeProps<WorkflowFlowN
         />
       )}
 
-      <div className="pl-3 pr-2 py-2">
-        <div className="flex items-center gap-1.5">
-          <Icon size={12} className={style.chip} />
-          <span className={cn('font-mono text-[9px] uppercase tracking-[0.16em]', style.chip)}>
-            {style.noun}
-          </span>
-          <span className="ml-auto flex items-center gap-1">
-            {data.run && <RunBadge run={data.run} />}
-            {errors.length > 0 && (
-              <Tooltip content={errors.map((p) => p.message).join(' ')}>
-                <span className="flex items-center">
-                  <CircleAlert size={11} className="text-red-500" />
-                </span>
-              </Tooltip>
-            )}
-            {errors.length === 0 && warnings.length > 0 && (
-              <Tooltip content={warnings.map((p) => p.message).join(' ')}>
-                <span className="flex items-center">
-                  <TriangleAlert size={11} className="text-amber-500" />
-                </span>
-              </Tooltip>
-            )}
-          </span>
-        </div>
+      {/* The kind, on its own tinted strip above a hairline. Separating it from
+          the name gives the two lines that matter — what this is and what it is
+          called — room to be read as two lines rather than as a paragraph. */}
+      <div
+        className={cn(
+          'flex items-center gap-1.5 border-b pl-3 pr-2 py-1',
+          RULE,
+          style.wash,
+          // The accent rail runs the full height, so the header's left padding
+          // has to clear it exactly as the body's does.
+        )}
+      >
+        <Icon size={12} className={style.chip} />
+        <span className={cn('font-mono text-[9px] uppercase tracking-[0.16em]', style.chip)}>
+          {style.noun}
+        </span>
+        <span className="ml-auto flex items-center gap-1">
+          {data.run && <RunBadge run={data.run} />}
+          {errors.length > 0 && (
+            <Tooltip content={errors.map((p) => p.message).join(' ')}>
+              <span className="flex items-center">
+                <CircleAlert size={11} className="text-red-500" />
+              </span>
+            </Tooltip>
+          )}
+          {errors.length === 0 && warnings.length > 0 && (
+            <Tooltip content={warnings.map((p) => p.message).join(' ')}>
+              <span className="flex items-center">
+                <TriangleAlert size={11} className="text-amber-500" />
+              </span>
+            </Tooltip>
+          )}
+        </span>
+      </div>
 
+      <div className="pl-3 pr-2 py-2">
         {/* The whole body is the button rather than a link in the corner: a
             node is one target, and a click anywhere on it should open it. The
             `nodrag` class is what keeps the click from being read as the start
@@ -224,10 +292,12 @@ export function WorkflowNodeBody({ id, data, selected }: NodeProps<WorkflowFlowN
         <button
           type="button"
           onClick={() => onInspect(id)}
-          className="nodrag mt-1 block w-full text-left"
+          className="nodrag block w-full text-left"
         >
-          <span className="block truncate text-[13px] font-medium">{data.label}</span>
-          <span className={cn('block truncate font-mono text-[10px]', MUTED)}>{data.subtitle}</span>
+          <span className="block truncate text-[13px] font-medium leading-snug">{data.label}</span>
+          <span className={cn('mt-0.5 block truncate font-mono text-[10px]', MUTED)}>
+            {data.subtitle}
+          </span>
         </button>
 
         {data.kind === 'transform' && canEdit && (
@@ -239,6 +309,7 @@ export function WorkflowNodeBody({ id, data, selected }: NodeProps<WorkflowFlowN
                 aria-label={`Edit the code behind ${data.label}`}
                 className={cn(
                   'nodrag flex items-center gap-1 rounded border px-1.5 py-0.5 font-mono text-[9px]',
+                  'transition-colors',
                   RULE,
                   MUTED,
                   'hover:bg-zinc-50 dark:hover:bg-zinc-800',
@@ -251,7 +322,7 @@ export function WorkflowNodeBody({ id, data, selected }: NodeProps<WorkflowFlowN
           </div>
         )}
       </div>
-    </div>
+    </motion.div>
   );
 }
 

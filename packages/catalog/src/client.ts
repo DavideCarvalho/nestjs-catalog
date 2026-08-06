@@ -314,6 +314,24 @@ export {
  * `WORKFLOW_NODE_ID_PATTERN` and `WORKFLOW_NODE_KINDS` are what a palette and an
  * id field should be built from rather than from a second copy that drifts.
  */
+/**
+ * The canvas's geometry, from the same place the server lays a graph out.
+ *
+ * On this entry point rather than only on the package root because the two
+ * things that must agree are a browser component and a store: the node draws
+ * itself {@link WORKFLOW_NODE_WIDTH} wide, and `adoptConnector` spaces columns
+ * with {@link workflowColumnX}. A second copy of either number is how a graph
+ * ends up drawn with its boxes overlapping — which is exactly what happened.
+ */
+export {
+  WORKFLOW_COLUMN_GAP,
+  WORKFLOW_NODE_HEIGHT,
+  WORKFLOW_NODE_WIDTH,
+  WORKFLOW_ROW_GAP,
+  workflowColumnX,
+  workflowRowY,
+} from './catalog.pipeline';
+
 export {
   validateWorkflow,
   WORKFLOW_EXECUTION_MODES,

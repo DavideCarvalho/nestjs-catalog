@@ -11,6 +11,12 @@
  * The graph model, the working name and the validation rules stay on the root
  * entry — none of them import React Flow, and a host should be able to check a
  * graph, or name one, without pulling in a canvas to do it.
+ *
+ * `motion` is the second optional peer this subpath needs, for the same class of
+ * reason: the delete control on a selected edge animates in and out, and
+ * `useReducedMotion` is how it declines to. Both are declined together —
+ * anything mounting a node canvas is already installing a graph library, and a
+ * host that wants neither wants the root entry point instead.
  */
 export { WorkflowCanvas, type WorkflowCanvasProps } from '../WorkflowCanvas';
 export {

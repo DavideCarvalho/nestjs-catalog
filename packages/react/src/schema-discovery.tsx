@@ -26,7 +26,7 @@
 
 import type { ScalarType } from '@dudousxd/nestjs-catalog/client';
 import { useMutation } from '@tanstack/react-query';
-import { CircleCheck, Loader2, ScanSearch, TriangleAlert } from 'lucide-react';
+import { CircleCheck, Loader2, Save, ScanSearch, TriangleAlert } from 'lucide-react';
 import { useState } from 'react';
 import { cn } from './cn';
 import { Button } from './ui/button';
@@ -283,6 +283,8 @@ export function SchemaDiscoveryPanel({
   nodeId,
   bridge,
   disabledReason,
+  onSave,
+  saving = false,
   onDiscovered,
 }: {
   workflowId: string;
@@ -290,6 +292,22 @@ export function SchemaDiscoveryPanel({
   bridge: SchemaDiscoveryBridge;
   /** Why the button cannot be pressed, said out loud. Absent means it can. */
   disabledReason?: string;
+  /**
+   * Do the thing `disabledReason` asks for, from here.
+   *
+   * Both reasons this panel can be disabled for are "save it first", and until
+   * this existed the panel said so while the save control lived in a header the
+   * panel is not even in — the inspector is a side sheet over the canvas. A
+   * reader was being told to do something with no way to do it where they were
+   * standing, and the report that produced was "it's disabled and I can't see
+   * anything" rather than "ah, I should save".
+   *
+   * Optional because a host may mount this panel somewhere with no draft behind
+   * it; the sentence alone is still correct, just less useful.
+   */
+  onSave?: () => void;
+  /** Whether that save is in flight, so the button says so rather than lying. */
+  saving?: boolean;
   /**
    * Told to whoever mounted this, because the answer outlives the panel.
    *
@@ -341,7 +359,33 @@ export function SchemaDiscoveryPanel({
           {disabledReason ??
             'Reads the source and reports its columns. Creates nothing on its own, and works on a draft — the type has to exist before a sink can commit into it.'}
         </span>
+
+        {/*
+         * The remedy, beside the sentence that asks for it.
+         *
+         * Only when there is something to remedy — an enabled panel showing a
+         * save button would be offering an action with no bearing on the one
+         * thing this panel does.
+         *
+         * The label says "Save" and the hint says it does not publish, carrying
+         * the same care the `!draft.id` reason already takes: a reader told to
+         * save is entitled to worry they are being asked to publish, and on this
+         * screen publishing is a different, louder thing.
+         */}
+        {disabledReason !== undefined && onSave && (
+          <Button variant="secondary" size="sm" onClick={onSave} disabled={saving}>
+            {saving ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />}
+            {saving ? 'Saving…' : 'Save now'}
+          </Button>
+        )}
       </div>
+
+      {disabledReason !== undefined && onSave && (
+        <p className={cn('mt-1.5 text-[11px]', MUTED)}>
+          Saving stores the graph as a draft. It does not publish it, and nothing runs because of
+          it.
+        </p>
+      )}
 
       {discover.error ? (
         <p className="mt-2 text-[11px] text-red-600">

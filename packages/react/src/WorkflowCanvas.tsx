@@ -46,6 +46,7 @@ import {
   TriangleAlert,
   Unplug,
 } from 'lucide-react';
+import { useReducedMotion } from 'motion/react';
 import type { ReactNode } from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { connectionOptionsFor } from './ConnectionPanel';
@@ -78,6 +79,7 @@ import { TextAreaField, TextField } from './ui/field';
 import { Select, SelectField, type SelectOption } from './ui/select';
 import { Sheet } from './ui/sheet';
 import { Tooltip, TooltipProvider } from './ui/tooltip';
+import { WorkflowEdgeProvider, workflowEdgeTypes } from './workflow/edges';
 import {
   NODE_HEIGHT,
   NODE_WIDTH,
@@ -85,6 +87,7 @@ import {
   type WorkflowFlowEdge,
   type WorkflowFlowNode,
   defaultLabel,
+  flowingEdgeIds,
   layout,
   layoutIfUnarranged,
   nextPosition,
@@ -911,6 +914,7 @@ function GraphSurface({
   onNodeEnter,
   onNodeLeave,
   onPaneClick,
+  onDisconnect,
   nodeMenu,
 }: {
   loading: boolean;
@@ -931,6 +935,8 @@ function GraphSurface({
   onNodeEnter: (id: string) => void;
   onNodeLeave: () => void;
   onPaneClick: () => void;
+  /** Reached from the × on a selected edge. The same callback the rail uses. */
+  onDisconnect: (edge: WorkflowEdge) => void;
   /** The wiring menu, which has to be a child of `ReactFlow` to be placed. */
   nodeMenu: ReactNode;
 }) {
@@ -948,40 +954,43 @@ function GraphSurface({
 
       {!loading && !failed && (
         <WorkflowNodeProvider handlers={{ onInspect, onEditCode, canEdit }}>
-          <ReactFlow
-            className={CANVAS_THEME}
-            nodes={flowNodes}
-            edges={flowEdges}
-            nodeTypes={workflowNodeTypes}
-            onNodesChange={onNodesChange}
-            onEdgesChange={onEdgesChange}
-            onConnect={onConnect}
-            isValidConnection={isValidConnection}
-            onConnectEnd={onConnectEnd}
-            onNodeMouseEnter={(_event, node) => onNodeEnter(node.id)}
-            onNodeMouseLeave={onNodeLeave}
-            onPaneClick={onPaneClick}
-            connectionLineType={ConnectionLineType.SmoothStep}
-            nodesDraggable={canEdit}
-            nodesConnectable={canEdit}
-            elementsSelectable
-            nodesFocusable
-            edgesFocusable
-            deleteKeyCode={canEdit ? ['Delete', 'Backspace'] : null}
-            // A wider drop zone than the 20px default, because these handles are
-            // the only drop target on the screen and missing one reads as the
-            // canvas ignoring you.
-            connectionRadius={28}
-            proOptions={{ hideAttribution: false }}
-            ariaLabelConfig={ARIA_LABELS}
-            aria-label={`${WORKFLOW_NAME.title} canvas. ${draft.nodes.length} nodes, ${draft.edges.length} connections.`}
-            fitView
-          >
-            <Background variant={BackgroundVariant.Dots} gap={18} size={1} />
-            <Controls showInteractive={false} />
-            <MiniMap pannable zoomable nodeColor={(node) => miniMapColor(node.data)} />
-            {nodeMenu}
-          </ReactFlow>
+          <WorkflowEdgeProvider handlers={{ onDisconnect, canEdit }}>
+            <ReactFlow
+              className={CANVAS_THEME}
+              nodes={flowNodes}
+              edges={flowEdges}
+              nodeTypes={workflowNodeTypes}
+              edgeTypes={workflowEdgeTypes}
+              onNodesChange={onNodesChange}
+              onEdgesChange={onEdgesChange}
+              onConnect={onConnect}
+              isValidConnection={isValidConnection}
+              onConnectEnd={onConnectEnd}
+              onNodeMouseEnter={(_event, node) => onNodeEnter(node.id)}
+              onNodeMouseLeave={onNodeLeave}
+              onPaneClick={onPaneClick}
+              connectionLineType={ConnectionLineType.SmoothStep}
+              nodesDraggable={canEdit}
+              nodesConnectable={canEdit}
+              elementsSelectable
+              nodesFocusable
+              edgesFocusable
+              deleteKeyCode={canEdit ? ['Delete', 'Backspace'] : null}
+              // A wider drop zone than the 20px default, because these handles are
+              // the only drop target on the screen and missing one reads as the
+              // canvas ignoring you.
+              connectionRadius={28}
+              proOptions={{ hideAttribution: false }}
+              ariaLabelConfig={ARIA_LABELS}
+              aria-label={`${WORKFLOW_NAME.title} canvas. ${draft.nodes.length} nodes, ${draft.edges.length} connections.`}
+              fitView
+            >
+              <Background variant={BackgroundVariant.Dots} gap={18} size={1} />
+              <Controls showInteractive={false} />
+              <MiniMap pannable zoomable nodeColor={(node) => miniMapColor(node.data)} />
+              {nodeMenu}
+            </ReactFlow>
+          </WorkflowEdgeProvider>
         </WorkflowNodeProvider>
       )}
     </div>
@@ -1394,9 +1403,25 @@ function storedWorkflow(
  * The reasons therefore name saving and never publishing — a reader told to
  * publish first would go and do it, and find they cannot.
  */
-function discoveryTarget(
-  draft: Draft,
-): { workflowId: string } | { workflowId?: undefined; because: string } {
+type DiscoveryTarget = { workflowId: string } | { workflowId?: undefined; because: string };
+
+/**
+ * The refusal, and the way out of it, travelling together.
+ *
+ * They are one prop rather than three because they are one thought: both reasons
+ * discovery can be refused are "save it first", and a panel that states the
+ * condition without carrying the remedy is what produced the report that started
+ * this — the sentence said "Save first" while the save control was in a header
+ * behind the side sheet the sentence was printed in.
+ */
+type DiscoveryOffer = DiscoveryTarget & {
+  /** Save the draft from wherever the refusal is being shown. */
+  onSave: () => void;
+  /** Whether that save is in flight. */
+  saving: boolean;
+};
+
+function discoveryTarget(draft: Draft): DiscoveryTarget {
   if (!draft.id) {
     return {
       because: `Save this ${WORKFLOW_NAME.singular} first — discovery reads the stored node, and there is nothing stored yet. It does not need to be published.`,
@@ -1649,13 +1674,22 @@ function Canvas({
     }));
   }, [draft.nodes, draft.edges, describe, problemsFor, runFor, selectedNodeIds]);
 
+  // `useReducedMotion` returns null until it has asked, which is neither yes nor
+  // no; coerced here because every consumer of it wants the boolean, and the
+  // safe reading of "has not answered yet" is "do not animate".
+  const reducedMotion = useReducedMotion() !== false;
+  const flowing = useMemo(
+    () => flowingEdgeIds(draft.edges, run?.nodes ?? [], { reducedMotion }),
+    [draft.edges, run, reducedMotion],
+  );
+
   const flowEdges = useMemo<WorkflowFlowEdge[]>(() => {
     const selectedIds = new Set(selectedEdgeIds);
-    return toFlowEdges(draft.edges, draft.nodes, brokenEdgeIds).map((edge) => ({
+    return toFlowEdges(draft.edges, draft.nodes, brokenEdgeIds, flowing).map((edge) => ({
       ...edge,
       selected: selectedIds.has(edge.id),
     }));
-  }, [draft.edges, draft.nodes, brokenEdgeIds, selectedEdgeIds]);
+  }, [draft.edges, draft.nodes, brokenEdgeIds, selectedEdgeIds, flowing]);
 
   /**
    * React Flow's changes, applied to the stored model rather than to a second
@@ -2268,6 +2302,7 @@ function Canvas({
           onNodeEnter={menu.onNodeEnter}
           onNodeLeave={menu.onNodeLeave}
           onPaneClick={menu.close}
+          onDisconnect={disconnect}
           nodeMenu={
             <NodeWiringMenu
               node={menu.anchor}
@@ -2342,7 +2377,7 @@ function Canvas({
         problems={problemsOf(problemsFor, inspectingNode)}
         pending={problemsOf(pendingFor, inspectingNode)}
         discovery={discovery}
-        discoverable={discoveryTarget(draft)}
+        discoverable={{ ...discoveryTarget(draft), onSave: saveNow, saving: save.isPending }}
         onDiscovered={rememberShape}
         onClose={() => setInspecting(null)}
         onChange={(next) => {
@@ -3739,7 +3774,7 @@ function KindInspector({
    * because what it reads is decided by a workflow this graph does not own.
    */
   discovery: SchemaDiscoveryBridge;
-  discoverable: { workflowId: string } | { workflowId?: undefined; because: string };
+  discoverable: DiscoveryOffer;
   /** And what it answered, passed back out for the same reason. */
   onDiscovered: (nodeId: string, shape: SourceShape) => void;
   onChange: (node: WorkflowNode) => void;
@@ -3829,7 +3864,7 @@ function NodeInspector({
   /** Passed through to the sink inspector, the one node that names a type. */
   modelHref?: (typeName: string) => string;
   discovery: SchemaDiscoveryBridge;
-  discoverable: { workflowId: string } | { workflowId?: undefined; because: string };
+  discoverable: DiscoveryOffer;
   /** What a discovery said, passed up so it outlives this sheet. */
   onDiscovered: (nodeId: string, shape: SourceShape) => void;
   problems: WorkflowProblem[];
@@ -4099,7 +4134,7 @@ function SourceInspector({
    * unavailable are completely different and only one of them is worth waiting
    * for. `undefined` means press it.
    */
-  discoverable: { workflowId: string } | { workflowId?: undefined; because: string };
+  discoverable: DiscoveryOffer;
   /**
    * What discovery said about this node, handed up rather than kept here.
    *
@@ -4237,6 +4272,8 @@ function SourceInspector({
         nodeId={node.id}
         bridge={discovery}
         onDiscovered={onDiscovered}
+        onSave={discoverable.onSave}
+        saving={discoverable.saving}
         {...(discoverable.workflowId === undefined ? { disabledReason: discoverable.because } : {})}
       />
     </div>

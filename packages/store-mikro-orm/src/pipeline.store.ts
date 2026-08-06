@@ -40,7 +40,9 @@ import {
   isWorkflowNode,
   isWorkflowStatus,
   validateWorkflow,
+  workflowColumnX,
   workflowGraphHash,
+  workflowRowY,
 } from '@dudousxd/nestjs-catalog';
 import type { EntityManager } from '@mikro-orm/mysql';
 import {

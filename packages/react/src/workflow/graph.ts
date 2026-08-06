@@ -1,4 +1,10 @@
-import { workflowRunOrder } from '@dudousxd/nestjs-catalog/client';
+import {
+  WORKFLOW_NODE_HEIGHT,
+  WORKFLOW_NODE_WIDTH,
+  workflowColumnX,
+  workflowRowY,
+  workflowRunOrder,
+} from '@dudousxd/nestjs-catalog/client';
 import type { Edge, Node } from '@xyflow/react';
 import { MarkerType } from '@xyflow/react';
 import {
@@ -30,11 +36,18 @@ import { type WorkflowProblem, edgeId } from './validate';
  * measured anything — on a graph loaded from the server, or one somebody just
  * pasted — and a layout that waits for measurements draws every node stacked at
  * the origin for one frame, which reads as a broken canvas.
+ *
+ * **Re-exported from core rather than declared here**, and that is the point of
+ * the change that moved them. The server also writes positions —
+ * `adoptConnector` wraps a connector into a graph and has to space its columns —
+ * and while these numbers lived only in this file it had nothing to derive from,
+ * so it used a literal that was four pixels narrower than the node. Every
+ * adopted graph drew its boxes overlapping. Sharing the constant is what stops
+ * the two from being able to disagree; the names stay `NODE_WIDTH`/`NODE_HEIGHT`
+ * because they are part of this package's published `/workflow` surface.
  */
-export const NODE_WIDTH = 224;
-export const NODE_HEIGHT = 80;
-const COLUMN_GAP = 96;
-const ROW_GAP = 32;
+export const NODE_WIDTH = WORKFLOW_NODE_WIDTH;
+export const NODE_HEIGHT = WORKFLOW_NODE_HEIGHT;
 
 /**
  * What a node needs to draw itself.
@@ -189,10 +202,21 @@ export function defaultLabel(kind: WorkflowNodeKind): string {
   return 'Transform';
 }
 
+/**
+ * The stored edges, as React Flow draws them.
+ *
+ * `flowing` is the set of edge ids whose upstream node is running right now, and
+ * it is a parameter rather than something derived here because this module knows
+ * nothing about runs. It is also **the caller's job to pass an empty set when
+ * motion is unwanted** — see `WorkflowCanvas`, which reads `prefers-reduced-motion`
+ * — because React Flow's `animated` flag is a CSS keyframe in its own stylesheet
+ * and there is nothing this package can turn off from the outside.
+ */
 export function toFlowEdges(
   edges: WorkflowEdge[],
   nodes: WorkflowNode[],
   brokenEdgeIds: ReadonlySet<string>,
+  flowing: ReadonlySet<string> = new Set(),
 ): WorkflowFlowEdge[] {
   const labelOf = new Map(nodes.map((node) => [node.id, nodeName(node)]));
   return edges.map((edge) => {
@@ -204,7 +228,17 @@ export function toFlowEdges(
       id,
       source: edge.from,
       target: edge.to,
-      type: 'smoothstep',
+      // This package's own edge rather than the built-in `smoothstep`, because
+      // clicking a connection has to offer to remove it. See `workflow/edges.tsx`.
+      type: 'workflowEdge',
+      // The names, not the ids: they become the accessible name of the delete
+      // button, which has to say which connection it removes in the words that
+      // are on the canvas.
+      data: { fromLabel: from, toLabel: to },
+      // Marching ants while the node feeding this edge is actually running. The
+      // one thing a canvas can say about a run that a list of statuses cannot:
+      // where the work currently is.
+      animated: flowing.has(id),
       // An arrowhead, because "the output of this feeds that" is directional and
       // a plain line says only that two nodes are related.
       markerEnd: { type: MarkerType.ArrowClosed, width: 14, height: 14 },
@@ -324,13 +358,7 @@ export function layout(nodes: WorkflowNode[], edges: WorkflowEdge[]): WorkflowNo
     const placed = node.kind === 'sink' ? sinkColumn : (column.get(node.id) ?? 0);
     const row = rows.get(placed) ?? 0;
     rows.set(placed, row + 1);
-    return {
-      ...node,
-      position: {
-        x: placed * (NODE_WIDTH + COLUMN_GAP),
-        y: row * (NODE_HEIGHT + ROW_GAP),
-      },
-    };
+    return { ...node, position: { x: workflowColumnX(placed), y: workflowRowY(row) } };
   });
 }
 
@@ -384,6 +412,35 @@ export function layoutIfUnarranged(nodes: WorkflowNode[], edges: WorkflowEdge[])
 }
 
 /**
+ * Which edges should show their work moving, and when that is none of them.
+ *
+ * An edge flows while the node feeding it is running. That is the one thing a
+ * picture can say about a run which the per-node status list cannot: not what
+ * each step's outcome was, but where the work *is* right now.
+ *
+ * `reducedMotion` short-circuits to the empty set, and this function exists
+ * largely so that decision is a value rather than a branch inside a render.
+ * React Flow's `animated` is a CSS keyframe in its own stylesheet — there is no
+ * prop to soften it and no way to reach it from here — so the only honest
+ * accommodation is not to mark the edge at all. Nothing is lost by it: a running
+ * node still spins its own badge and the run panel still lists every step, which
+ * is the test for whether an animation was carrying information or decorating
+ * it.
+ */
+export function flowingEdgeIds(
+  edges: WorkflowEdge[],
+  runNodes: readonly WorkflowRunNode[],
+  options: { reducedMotion: boolean },
+): ReadonlySet<string> {
+  if (options.reducedMotion) return new Set();
+  const running = new Set(
+    runNodes.filter((node) => node.status === 'running').map((node) => node.nodeId),
+  );
+  if (running.size === 0) return new Set();
+  return new Set(edges.filter((edge) => running.has(edge.from)).map((edge) => edgeId(edge)));
+}
+
+/**
  * Where to drop a node somebody just added.
  *
  * To the right of everything that already exists, rather than at the origin,
@@ -395,8 +452,8 @@ export function nextPosition(nodes: WorkflowNode[]): { x: number; y: number } {
   const xs = nodes.map((node) => node.position?.x ?? 0);
   const right = Math.max(...xs);
   const inColumn = xs.filter((x) => x === right);
-  return {
-    x: right + NODE_WIDTH + COLUMN_GAP,
-    y: inColumn.length * (NODE_HEIGHT + ROW_GAP),
-  };
+  // `workflowColumnX(1)` is one whole column — the node's width plus the gap —
+  // added to wherever the rightmost node happens to be, which need not sit on a
+  // column boundary once somebody has dragged things around.
+  return { x: right + workflowColumnX(1), y: workflowRowY(inColumn.length) };
 }

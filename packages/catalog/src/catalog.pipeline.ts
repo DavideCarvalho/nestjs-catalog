@@ -826,8 +826,74 @@ interface WorkflowNodeBase {
    * a person arranged and the server then forgot is a canvas that loses work.
    * Excluded from the graph fingerprint for the same reason a rename is: moving
    * a box is not a new version of the graph.
+   *
+   * A position is in the units {@link WORKFLOW_NODE_WIDTH} is measured in, and
+   * anything **generating** one should space it with {@link workflowColumnX} and
+   * {@link workflowRowY} rather than by picking a number.
    */
   position?: { x: number; y: number };
+}
+
+/**
+ * How big a node is on the canvas, and therefore how far apart two of them have
+ * to be.
+ *
+ * ## Why the server owns a number about pixels
+ *
+ * Because the server *writes positions*. `adoptConnector` lays a connector out
+ * as a graph, and anything else that mints a graph without a person drawing it —
+ * a promotion, a template, a script — has the same job. A writer that does not
+ * know how wide a node is can only guess, and the guess was wrong: adoption used
+ * to place columns 220 apart against a node 224 wide, so every adopted graph
+ * drew each box overlapping the next by four pixels. Nothing was stacked and
+ * nothing was missing, so it read as boxes glued together rather than as a bug,
+ * and it survived until somebody opened thirteen of them.
+ *
+ * The fix is not a bigger number. 220 was not too small, it was **derived from
+ * nothing** — it had no relationship to the width it was supposed to clear, so
+ * it was only ever correct by luck and would go wrong again the next time the
+ * node's styling changed. These constants are the relationship, stated once, in
+ * the one package both the writer and the canvas already depend on.
+ *
+ * ## What pins them to the drawing
+ *
+ * {@link WORKFLOW_NODE_WIDTH} is not a description of the node — it is the
+ * *source of* the node's width. `WorkflowNodeBody` in
+ * `@dudousxd/nestjs-catalog-react` sets its own width from this constant rather
+ * than from a Tailwind class, so the two cannot drift: changing this changes the
+ * box, and there is no second number to forget.
+ */
+export const WORKFLOW_NODE_WIDTH = 224;
+
+/** How tall a node is. The other half of {@link WORKFLOW_NODE_WIDTH}'s contract. */
+export const WORKFLOW_NODE_HEIGHT = 80;
+
+/**
+ * Clear space between one column and the next, on top of the node's own width.
+ *
+ * Wide enough for the edge between two nodes to be read as a line with a
+ * direction rather than as a join. This is the part that is taste; the width it
+ * is added to is not.
+ */
+export const WORKFLOW_COLUMN_GAP = 96;
+
+/** Clear space between two nodes sharing a column. */
+export const WORKFLOW_ROW_GAP = 32;
+
+/**
+ * The x of the nth column, counting from zero.
+ *
+ * Every generator of a layout goes through this rather than multiplying by a
+ * literal, which is what makes "columns never overlap" a property of one
+ * function instead of a coincidence repeated at each call site.
+ */
+export function workflowColumnX(column: number): number {
+  return column * (WORKFLOW_NODE_WIDTH + WORKFLOW_COLUMN_GAP);
+}
+
+/** The y of the nth row within a column, counting from zero. */
+export function workflowRowY(row: number): number {
+  return row * (WORKFLOW_NODE_HEIGHT + WORKFLOW_ROW_GAP);
 }
 
 /**

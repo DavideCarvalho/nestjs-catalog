@@ -720,6 +720,102 @@ describe('whether the source fits the sink', () => {
   });
 });
 
+/**
+ * "Discover schema — Save first … ué mas ta desabilitado não vejo nada."
+ *
+ * Two separable complaints hide in that sentence, and only one of them is about wording.
+ *
+ * The first is whether the refusal is even TRUE. Discovery reads the stored node, so refusing it
+ * on a draft with unsaved edits is right — but only if `dirty` means what it says. Merely opening
+ * a workflow must not set it, and the trap is close by: `draftFrom` runs `layoutIfUnarranged` on
+ * the way in, so a change that made arranging a graph count as editing it would leave discovery
+ * permanently unreachable on every graph the server laid out. That is the first test here, and it
+ * is why it asserts on a graph whose nodes came from the server already positioned as well as on
+ * the plain path.
+ *
+ * The second is that being told "Save first" is useless where the save control is somewhere else —
+ * the panel is inside a side sheet and the Save button is in the header behind it. The remedy now
+ * sits beside the sentence.
+ */
+describe('asking a source what it reads', () => {
+  it('is offered straight away on a workflow nobody has edited', async () => {
+    // The reported symptom, checked at its cause. If this goes red, the refusal is firing on a
+    // graph nobody touched, and no amount of better wording fixes that.
+    const { transport } = fakeTransport(answersFor([wholeWorkflow()]));
+    await openCanvas(transport);
+
+    fireEvent.click(panel('Wiring').getByText('Feed'));
+
+    const discover = await screen.findByRole('button', { name: 'Discover schema' });
+    expect(discover).toHaveProperty('disabled', false);
+    expect(screen.queryByText(/Save first/)).toBeNull();
+  });
+
+  it('stays offered when the server sent a graph with no positions and the canvas arranged it', async () => {
+    // `layoutIfUnarranged` rewrites every position on the way in for a graph created through the
+    // API. That is a derived layout, not an edit — it re-derives identically next time and there
+    // is nothing to save — so it must not mark the draft dirty. A version of this that did would
+    // make discovery unreachable on exactly the graphs that most need it.
+    const unarranged = wholeWorkflow({
+      nodes: [
+        { id: 'src_1', name: 'Feed', kind: 'source', sourceKind: 'http', config: {} },
+        { id: 'snk_1', name: 'Out', kind: 'sink', targetType: 'Mvr' },
+      ],
+    });
+    const { transport } = fakeTransport(answersFor([unarranged]));
+    await openCanvas(transport);
+
+    // Nothing was edited, so the button reads "Saved" rather than "Save".
+    expect(saveButton().textContent).toContain('Saved');
+
+    fireEvent.click(panel('Wiring').getByText('Feed'));
+
+    expect(await screen.findByRole('button', { name: 'Discover schema' })).toHaveProperty(
+      'disabled',
+      false,
+    );
+  });
+
+  it('offers the save it asks for, in the panel that asks for it', async () => {
+    // Being told to do something with no way to do it where you are standing is what produced
+    // "it's disabled and I can't see anything" rather than "ah, I should save".
+    const { transport } = fakeTransport(answersFor([wholeWorkflow()]));
+    await openCanvas(transport);
+
+    // An edit, which is what makes the stored node differ from the one on screen.
+    fireEvent.click(panel('Wiring').getByText('Feed'));
+    fireEvent.change(inspector().getByLabelText(/^Name/), { target: { value: 'Vehicle feed' } });
+
+    await waitFor(() => expect(screen.getByText(/Save first/)).toBeDefined());
+    expect(inspector().getByRole('button', { name: /Save now/ })).toHaveProperty('disabled', false);
+  });
+
+  it('says the save does not publish, because a reader told to save would reasonably fear it did', async () => {
+    // The same care the `!draft.id` refusal already takes. Publishing is a different, louder thing
+    // on this screen, and somebody nudged into saving must not think they have just done it.
+    const { transport } = fakeTransport(answersFor([wholeWorkflow()]));
+    await openCanvas(transport);
+
+    fireEvent.click(panel('Wiring').getByText('Feed'));
+    fireEvent.change(inspector().getByLabelText(/^Name/), { target: { value: 'Vehicle feed' } });
+
+    await waitFor(() => expect(screen.getByText(/Save first/)).toBeDefined());
+    expect(inspector().getByText(/does not publish it/)).toBeDefined();
+  });
+
+  it('offers no save when there is nothing to save first', async () => {
+    // An enabled panel showing a save button would be offering an action with no bearing on the
+    // one thing the panel does.
+    const { transport } = fakeTransport(answersFor([wholeWorkflow()]));
+    await openCanvas(transport);
+
+    fireEvent.click(panel('Wiring').getByText('Feed'));
+    await screen.findByRole('button', { name: 'Discover schema' });
+
+    expect(inspector().queryByRole('button', { name: /Save now/ })).toBeNull();
+  });
+});
+
 describe('the wiring menu on a node', () => {
   /** Hover a node by its accessible description, then open its menu. */
   async function openMenuOn(label: string) {
