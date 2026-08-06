@@ -7,6 +7,7 @@ import type {
   CatalogQueryRequest,
   CatalogQueryResult,
   CatalogQueryStore,
+  CatalogQueryStreamRequest,
   CatalogReadQuery,
   CatalogReadResult,
   CatalogReadStore,
@@ -17,6 +18,7 @@ import type {
 import {
   isCatalogStoreCapabilities,
   isQueryStore,
+  isStreamingQueryStore,
   isWriteStore,
   supportsCarryForward,
   supportsObjectFilters,
@@ -163,6 +165,9 @@ export class FanoutCatalogStore implements CatalogWriteStore {
   declare readonly carryForward?: CatalogMergeStore['carryForward'];
   declare readonly runQuery?: (request: CatalogQueryRequest) => Promise<CatalogQueryResult>;
   declare readonly queryRelations?: () => Promise<CatalogQueryRelation[]>;
+  declare readonly streamQuery?: (
+    request: CatalogQueryStreamRequest,
+  ) => AsyncIterable<Record<string, unknown>>;
 
   /**
    * Which operators the primary can push into its predicate — and therefore
@@ -249,6 +254,15 @@ export class FanoutCatalogStore implements CatalogWriteStore {
       // into a decision.
       this.runQuery = (request) => store.runQuery(request);
       this.queryRelations = () => store.queryRelations();
+      // Probed separately from the other two, because it is optional ON a query
+      // store rather than part of what makes one: a primary that answers
+      // `runQuery` and not this is an ordinary configuration, and binding an
+      // absent method would advertise streaming the primary cannot do — which
+      // the export route would take at its word and stop capping.
+      if (isStreamingQueryStore(store)) {
+        const streaming = store;
+        this.streamQuery = (request) => streaming.streamQuery(request);
+      }
     }
 
     this.logger.log(
@@ -1087,6 +1101,7 @@ export const PROBED_STORE_METHODS = [
   'carryForward',
   'runQuery',
   'queryRelations',
+  'streamQuery',
 ] as const;
 
 /**

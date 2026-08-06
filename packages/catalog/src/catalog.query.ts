@@ -53,6 +53,28 @@ export interface CatalogQueryRelation {
   columns: Array<{ name: string; type: string }>;
 }
 
+/**
+ * The same statement, asked for a row at a time.
+ *
+ * Two fields differ from {@link CatalogQueryRequest} and both differ because the
+ * caller is an export rather than a screen.
+ *
+ * `maxRows` is optional here and **absent means every row**. A table is a page
+ * of a result and a cap is what makes the page; an export is the whole thing by
+ * definition, and a capped export is a prefix presented as a file.
+ *
+ * `timeoutMs` is optional for the matching reason. A statement backing a screen
+ * has to answer while somebody waits; an export of a large table legitimately
+ * runs for minutes, and the bound that matters for it is that no stage holds
+ * more than a row — which is what the stream is for. An implementation given no
+ * timeout should impose none of its own.
+ */
+export interface CatalogQueryStreamRequest {
+  sql: string;
+  maxRows?: number;
+  timeoutMs?: number;
+}
+
 export interface CatalogQueryStore {
   /**
    * Run a read-only statement.
@@ -65,6 +87,27 @@ export interface CatalogQueryStore {
 
   /** What a query may select from. */
   queryRelations(): Promise<CatalogQueryRelation[]>;
+
+  /**
+   * The same read, handing rows over as the engine produces them.
+   *
+   * **Optional, and the option is the store's to take rather than the caller's.**
+   * A store fronting an API, or one on a driver that buffers its result set
+   * before resolving, cannot offer this honestly, and a shim that collected the
+   * rows and yielded them back would satisfy the type while doing the exact
+   * thing the type exists to avoid. So an absent `streamQuery` is a real answer,
+   * and {@link CatalogService.streamSavedQuery} falls back to the capped
+   * buffered read for it — see the note there about what that costs.
+   *
+   * The contract on an implementation is one sentence: **do not read ahead of
+   * the consumer.** Whatever the driver offers must pause when the consumer
+   * stops pulling, all the way to the socket, or the memory has only moved.
+   *
+   * Returned synchronously — an async generator, not a promise for one — so that
+   * a consumer's `for await` owns the resource from the first pull, and an
+   * abandoned iteration runs the generator's `finally`.
+   */
+  streamQuery?(request: CatalogQueryStreamRequest): AsyncIterable<Record<string, unknown>>;
 }
 
 export function isQueryStore(store: unknown): store is CatalogQueryStore {
@@ -73,6 +116,13 @@ export function isQueryStore(store: unknown): store is CatalogQueryStore {
     store !== null &&
     typeof Reflect.get(store, 'runQuery') === 'function'
   );
+}
+
+/** A query store that can hand rows over without materialising the result set. */
+export function isStreamingQueryStore(
+  store: unknown,
+): store is CatalogQueryStore & Required<Pick<CatalogQueryStore, 'streamQuery'>> {
+  return isQueryStore(store) && typeof Reflect.get(store, 'streamQuery') === 'function';
 }
 
 /**

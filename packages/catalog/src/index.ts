@@ -24,7 +24,9 @@ export {
   type CatalogQueryRequest,
   type CatalogQueryResult,
   type CatalogQueryStore,
+  type CatalogQueryStreamRequest,
   isQueryStore,
+  isStreamingQueryStore,
 } from './catalog.query';
 export { CATALOG_OPTIONS, type CatalogModuleOptions } from './catalog.options';
 // Everything, deliberately, and here more than anywhere: this is a seam two
@@ -107,7 +109,11 @@ export {
 // The environment surface: which catalog database a call is served from, and
 // how a connector or a transform is promoted between them.
 export * from './catalog.environment';
-export { QueryCache, toCsv } from './catalog.query-cache';
+export { QueryCache } from './catalog.query-cache';
+// CSV. `toCsv` is the shape it always was; `csvLines` is the one the export
+// route uses, and `guardFormula` is exported because a host writing its own
+// export route needs the escaping and not the framing.
+export { type CsvRow, csvCell, csvLines, guardFormula, toCsv } from './catalog.csv';
 export {
   SubprocessTransformRunner,
   type TransformRunnerOptions,

@@ -8,6 +8,7 @@ import type {
   CatalogQueryRequest,
   CatalogQueryResult,
   CatalogQueryStore,
+  CatalogQueryStreamRequest,
 } from '@dudousxd/nestjs-catalog';
 import type {
   CarryForwardResult,
@@ -38,7 +39,7 @@ import {
   physicalColumn,
   tableFor,
 } from './identifiers';
-import { refreshView, relationsFor, runReadOnlyQuery } from './query';
+import { refreshView, relationsFor, runReadOnlyQuery, streamReadOnlyQuery } from './query';
 
 /**
  * MySQL as a warehouse: one physical table per object type, append-only,
@@ -922,6 +923,17 @@ export class MySqlWarehouseStore
 
   async runQuery(request: CatalogQueryRequest): Promise<CatalogQueryResult> {
     return runReadOnlyQuery(this.em.fork(), request);
+  }
+
+  /**
+   * Rows as the engine produces them, for the export route.
+   *
+   * Offered rather than left off because this driver can honestly do it — see
+   * {@link streamReadOnlyQuery} for how, and for what the caller owes the
+   * generator in return.
+   */
+  streamQuery(request: CatalogQueryStreamRequest): AsyncIterable<Record<string, unknown>> {
+    return streamReadOnlyQuery(this.em, request);
   }
 
   async queryRelations(): Promise<CatalogQueryRelation[]> {
