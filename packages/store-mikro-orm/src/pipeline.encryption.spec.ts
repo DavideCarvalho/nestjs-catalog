@@ -718,3 +718,70 @@ describe('a connector, which reads through all of the same machinery', () => {
     ).rejects.toBeInstanceOf(BadRequestException);
   });
 });
+
+describe('a credential inside a workflow call node', () => {
+  /** `call → sink`: the graph shape a call node makes on its own. */
+  function callingGraph(config: Record<string, unknown>): {
+    nodes: WorkflowNode[];
+    edges: WorkflowEdge[];
+  } {
+    return {
+      nodes: [
+        {
+          id: 'c1',
+          name: 'Reconcile',
+          kind: 'call',
+          callName: 'billing.reconcile',
+          callVersion: '2',
+          config,
+        },
+        { id: 'k1', name: 'Commit', kind: 'sink', targetType: 'Mvr' },
+      ],
+      edges: [{ from: 'c1', to: 'k1' }],
+    };
+  }
+
+  // The same rule as a source node's config, and for a sharper reason: this bag
+  // is handed to a workflow that may be dispatched to a worker in another
+  // language, so it is one more place for a password to arrive rather than one
+  // fewer.
+  it('is refused, exactly as one on a source node is', async () => {
+    const db = new Db();
+    const store = new MySqlPipelineStore(db.em);
+
+    await expect(
+      store.saveWorkflow({ name: 'Ledger', ...callingGraph({ url: URL_WITH_PASSWORD }) }, 'davi'),
+    ).rejects.toThrow(/nodes\["c1"\]\.config\.url/);
+    expect(db.table(WorkflowRow).size).toBe(0);
+  });
+
+  it('is sealed when this deployment encrypts, and opened again on the way out', async () => {
+    const db = new Db();
+    const store = new MySqlPipelineStore(db.em, { encryptCredentials: true }, new FakeVault());
+
+    const saved = await store.saveWorkflow(
+      { name: 'Ledger', ...callingGraph({ url: URL_WITH_PASSWORD }) },
+      'davi',
+    );
+
+    expect(JSON.stringify(db.stored(WorkflowRow))).not.toContain(PASSWORD);
+    // Opened on read, because the run hands this config to the child verbatim —
+    // a ciphertext left sealed here is a parameter the callee cannot use.
+    const read = await store.getWorkflow(saved.id);
+    const call = read?.nodes.find((node) => node.kind === 'call');
+    expect(call?.kind === 'call' && call.config.url).toBe(URL_WITH_PASSWORD);
+  });
+
+  it('leaves a call node with nothing secret in it alone', async () => {
+    const db = new Db();
+    const store = new MySqlPipelineStore(db.em);
+
+    const saved = await store.saveWorkflow(
+      { name: 'Ledger', ...callingGraph({ region: 'gov-west' }) },
+      'davi',
+    );
+
+    const call = saved.nodes.find((node) => node.kind === 'call');
+    expect(call?.kind === 'call' && call.config).toEqual({ region: 'gov-west' });
+  });
+});

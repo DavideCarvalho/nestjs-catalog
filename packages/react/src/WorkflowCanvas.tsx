@@ -33,6 +33,7 @@ import {
   CircleDashed,
   Code2,
   Database,
+  ExternalLink,
   LayoutGrid,
   Link2,
   Loader2,
@@ -72,7 +73,7 @@ import {
 } from './source-fields';
 import { Button } from './ui/button';
 import { ConfirmDialog } from './ui/dialog';
-import { TextField } from './ui/field';
+import { TextAreaField, TextField } from './ui/field';
 import { Select, SelectField, type SelectOption } from './ui/select';
 import { Sheet } from './ui/sheet';
 import { Tooltip, TooltipProvider } from './ui/tooltip';
@@ -100,6 +101,7 @@ import {
 import {
   type CatalogWorkflow,
   WORKFLOW_NODE_KINDS,
+  type WorkflowCallNode,
   type WorkflowEdge,
   type WorkflowNode,
   type WorkflowNodeKind,
@@ -305,6 +307,14 @@ function newNodeOfKind(
   }
   if (kind === 'transform') {
     return { id, name, kind: 'transform', transformId: '', position };
+  }
+  if (kind === 'call') {
+    // Both empty, and the graph is invalid until they are not — deliberately.
+    // There is no list of workflows to default from (see `CallableWorkflowRef`
+    // in core), and defaulting a *version* to "1" would be the one guess that
+    // matters: it would silently pin whichever code happens to be registered as
+    // version 1 in whatever deployment this graph is promoted into.
+    return { id, name, kind: 'call', callName: '', callVersion: '', config: {}, position };
   }
   return { id, name, kind: 'sink', targetType: '', position };
 }
@@ -570,6 +580,7 @@ const TODO_FOR: Partial<Record<WorkflowProblemCode, string>> = {
   'dead-end': 'wire it into something that ends at a sink',
   'sink-has-no-type': 'choose the object type it commits',
   'transform-not-named': 'choose the transform it runs',
+  'call-not-named': 'name the workflow it calls, and the version to pin',
   'missing-transform': 'choose a transform that still exists',
   'source-has-input': 'unwire whatever feeds it — a source reads, it is not fed',
   'sink-has-output': 'unwire what it feeds — nothing runs after a sink',
@@ -758,7 +769,7 @@ function CanvasActions({
   );
 }
 
-/** The three things that can be put on the canvas, and the button that tidies them. */
+/** The four things that can be put on the canvas, and the button that tidies them. */
 function AddNodeBar({
   refreshing,
   onAdd,
@@ -787,6 +798,12 @@ function AddNodeBar({
         label="Sink"
         hint="Writes and commits one object type. Several are fine — each commits independently."
         onClick={() => onAdd('sink')}
+      />
+      <AddButton
+        icon={ExternalLink}
+        label="Call"
+        hint="Hands this step to a durable workflow that already exists, by name and pinned version. It runs as a child of this load, with its own retries."
+        onClick={() => onAdd('call')}
       />
       <Tooltip content="Lay the nodes out left to right by dependency, with every sink in the last column.">
         <button
@@ -842,6 +859,9 @@ function miniMapColor(data: { kind?: unknown } | undefined): string {
   if (!isWorkflowNodeKind(kind)) return '#a1a1aa';
   if (kind === 'source') return '#0ea5e9';
   if (kind === 'sink') return '#10b981';
+  // The same amber the node itself draws (see `KIND_STYLE`), so the overview
+  // and the canvas agree about which boxes are somebody else's workflow.
+  if (kind === 'call') return '#f59e0b';
   return '#8b5cf6';
 }
 
@@ -2928,6 +2948,217 @@ function SinkInspector({
   );
 }
 
+/**
+ * Which workflow this node hands its step to, and what it hands it.
+ *
+ * ## Two fields, typed, and no picker
+ *
+ * The obvious design is a dropdown of the workflows this deployment has, and it
+ * cannot be built honestly today: nothing can enumerate them. The durable
+ * engine answers `workflowBody(name, version)` for the process asking and
+ * nothing else, and a missing body means *either* "not registered" *or* "its
+ * body is in another SDK" *or* "it is a group resolved against a live worker" —
+ * so a list inferred from it would omit precisely the cross-SDK workflows this
+ * node exists to call, and would omit them silently. A picker that quietly
+ * hides the thing you are looking for is worse than a text box.
+ *
+ * So: text, and `CallableWorkflowRef` in core is the shape to hand this
+ * component the day a deployment can announce its registrations. One entry per
+ * name **and version**, never per name — a picker that chose the version for
+ * you would undo the pin below.
+ *
+ * ## Why the version is a required field and not a convenience
+ *
+ * Without it the load would run whichever version is registered on the day it
+ * runs, so the person who owns that workflow could change what this pipeline
+ * does by deploying theirs. With it, a mismatch stops the load and says so.
+ * What it cannot do is *prevent* the wrong version starting: the engine starts
+ * the newest registered version and takes no version argument, so the check
+ * happens immediately after the start and cancels. The note below says that in
+ * the room where somebody is typing the version, rather than only in a
+ * docblock they will never open.
+ */
+function CallInspector({
+  node,
+  canEdit,
+  onChange,
+}: {
+  node: WorkflowCallNode;
+  canEdit: boolean;
+  onChange: (node: WorkflowNode) => void;
+}) {
+  // Held locally, pushed up when it parses — the same rule `SourceInspector`
+  // follows for its text fields. Re-deriving the box from the stored config
+  // would rewrite what somebody is halfway through typing, and a JSON editor
+  // that reformats mid-keystroke is unusable.
+  const [text, setText] = useState(() => configText(node.config));
+  const [invalid, setInvalid] = useState(false);
+
+  const pushConfig = (next: string) => {
+    setText(next);
+    const parsed = parseConfigText(next);
+    setInvalid(parsed === undefined);
+    if (parsed !== undefined) onChange({ ...node, config: parsed });
+  };
+
+  return (
+    <div className="space-y-3">
+      <TextField
+        label="Workflow"
+        value={node.callName}
+        onChange={(callName) => onChange({ ...node, callName })}
+        placeholder="billing.reconcile"
+        disabled={!canEdit}
+        hint="The name it is registered under in this deployment, exactly. Its body may be in another language — that is the point of calling it rather than writing it here."
+      />
+      <TextField
+        label="Version"
+        value={node.callVersion}
+        onChange={(callVersion) => onChange({ ...node, callVersion })}
+        placeholder="1"
+        disabled={!canEdit}
+        hint="Pinned, and part of what this graph is. Registered without a version, a workflow is version 1. Repointing this at another version is an edit to this graph, and shows up as one."
+      />
+      <TextAreaField
+        label="Parameters"
+        value={text}
+        onChange={pushConfig}
+        rows={5}
+        mono
+        placeholder="{}"
+        disabled={!canEdit}
+        hint={
+          invalid
+            ? 'That is not valid JSON yet, so it has not been saved onto the node.'
+            : 'A JSON object, handed to the workflow as `input`. Beside it, under `catalog`, it also gets this run’s id and the staged rows of whatever feeds this node — handles, never the rows themselves. Not a place for a password: name an env var the callee already reads.'
+        }
+      />
+      <p className={cn('text-[11px] leading-relaxed', MUTED)}>
+        This runs as a child of the load, with its own retries, and the load waits for it. If it
+        fails, this node fails and nothing after it runs. Cancelling the load cancels it; letting
+        the load time out does not, so a workflow you call should carry its own execution timeout.
+      </p>
+      <p className={cn('text-[11px] leading-relaxed', MUTED)}>
+        Whether two loads calling it can overlap is decided by how <em>it</em> was registered, not
+        by this graph — and on the path a workflow in another language is reached by, that
+        declaration may not be visible to the engine at all, so assume it can run alongside itself.
+      </p>
+    </div>
+  );
+}
+
+/**
+ * The parameter box's two directions, kept together because they are inverses.
+ *
+ * An empty object shows as an empty box rather than as `{}`: the node starts
+ * with no parameters, and opening a fresh call node onto punctuation somebody
+ * has to delete is a worse start than a placeholder.
+ */
+function configText(config: Record<string, unknown>): string {
+  return Object.keys(config).length === 0 ? '' : JSON.stringify(config, null, 2);
+}
+
+/**
+ * A JSON object, or `undefined` for anything else — including an array and
+ * including `null`, both of which `JSON.parse` accepts and neither of which is
+ * a parameter bag. Blank means no parameters, which is not an error.
+ */
+function parseConfigText(text: string): Record<string, unknown> | undefined {
+  if (text.trim().length === 0) return {};
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined;
+    const config: Record<string, unknown> = {};
+    for (const key of Object.keys(parsed)) config[key] = Reflect.get(parsed, key);
+    return config;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The fields that belong to one kind of node and to no other.
+ *
+ * Split out of `NodeInspector` rather than written inline, because that
+ * function is otherwise about the things every node has — its name, its wiring,
+ * its problems, deleting it — and the per-kind chain is the one part of it that
+ * grows every time the vocabulary does. Narrowing is what the union is for, so
+ * a kind added without a branch here shows up as a node with a name and nothing
+ * to configure, which is visible on the screen rather than silent.
+ */
+function KindInspector({
+  node,
+  transforms,
+  connections,
+  typeOptions,
+  canEdit,
+  discovery,
+  discoverable,
+  onChange,
+  onEditCode,
+  onCreateTransform,
+  creatingTransform,
+  createTransformError,
+}: {
+  node: WorkflowNode;
+  transforms: CatalogTransform[];
+  connections: CatalogConnection[];
+  typeOptions: SelectOption[];
+  canEdit: boolean;
+  /**
+   * Asking a source what its columns are. Passed straight through to the one
+   * branch that has a source in it — a `call` node has no schema to discover,
+   * because what it reads is decided by a workflow this graph does not own.
+   */
+  discovery: SchemaDiscoveryBridge;
+  discoverable: { workflowId: string } | { workflowId?: undefined; because: string };
+  onChange: (node: WorkflowNode) => void;
+  onEditCode: (nodeId: string) => void;
+  onCreateTransform: (nodeId: string) => void;
+  creatingTransform: boolean;
+  createTransformError: unknown;
+}) {
+  if (node.kind === 'transform') {
+    return (
+      <TransformInspector
+        node={node}
+        transforms={transforms}
+        canEdit={canEdit}
+        creating={creatingTransform}
+        createError={createTransformError}
+        onChange={onChange}
+        onEditCode={onEditCode}
+        onCreate={onCreateTransform}
+      />
+    );
+  }
+  if (node.kind === 'source') {
+    return (
+      <SourceInspector
+        // Keyed so the text fields reset when a different source is opened.
+        // Without it the draft state would survive the swap and one node's URL
+        // would appear inside another.
+        key={node.id}
+        node={node}
+        connections={connections}
+        canEdit={canEdit}
+        discovery={discovery}
+        discoverable={discoverable}
+        onChange={onChange}
+      />
+    );
+  }
+  if (node.kind === 'call') {
+    // Keyed for the same reason the source inspector is: the parameter box
+    // holds text somebody is midway through typing, and it must not survive
+    // being pointed at a different node.
+    return <CallInspector key={node.id} node={node} canEdit={canEdit} onChange={onChange} />;
+  }
+  return (
+    <SinkInspector node={node} typeOptions={typeOptions} canEdit={canEdit} onChange={onChange} />
+  );
+}
+
 function NodeInspector({
   node,
   draft,
@@ -3069,42 +3300,20 @@ function NodeInspector({
             hint="What it is called on the canvas and in the wiring list. Renaming it does not change what the graph does, so it does not bump the version."
           />
 
-          {node.kind === 'transform' && (
-            <TransformInspector
-              node={node}
-              transforms={transforms}
-              canEdit={canEdit}
-              creating={creatingTransform}
-              createError={createTransformError}
-              onChange={onChange}
-              onEditCode={onEditCode}
-              onCreate={onCreateTransform}
-            />
-          )}
-
-          {node.kind === 'source' && (
-            <SourceInspector
-              // Keyed so the text fields reset when a different source is
-              // opened. Without it the draft state would survive the swap and
-              // one node's URL would appear inside another.
-              key={node.id}
-              node={node}
-              connections={connections}
-              canEdit={canEdit}
-              discovery={discovery}
-              discoverable={discoverable}
-              onChange={onChange}
-            />
-          )}
-
-          {node.kind === 'sink' && (
-            <SinkInspector
-              node={node}
-              typeOptions={typeOptions}
-              canEdit={canEdit}
-              onChange={onChange}
-            />
-          )}
+          <KindInspector
+            node={node}
+            transforms={transforms}
+            connections={connections}
+            typeOptions={typeOptions}
+            canEdit={canEdit}
+            discovery={discovery}
+            discoverable={discoverable}
+            onChange={onChange}
+            onEditCode={onEditCode}
+            onCreateTransform={onCreateTransform}
+            creatingTransform={creatingTransform}
+            createTransformError={createTransformError}
+          />
 
           <WiringList
             title="Fed by"

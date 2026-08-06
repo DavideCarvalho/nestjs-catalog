@@ -161,6 +161,11 @@ export { AccessConsole, type AccessConsoleProps } from './AccessConsole';
 // rather than declared here — a node, an edge and a graph have one definition,
 // and it belongs to the package that executes them. See `workflow/model.ts`.
 export {
+  // Declared with nothing producing it: the shape a workflow picker would be
+  // handed the day a deployment can announce its registrations. Named here
+  // rather than withheld because a host writing that picker is exactly who
+  // would need it, and this list has already been the thing that fell behind.
+  type CallableWorkflowRef,
   type CatalogWorkflow,
   describeDurability,
   type DurabilityCopy,
@@ -170,6 +175,7 @@ export {
   producedTypes,
   WORKFLOW_NODE_ID_PATTERN,
   WORKFLOW_NODE_KINDS,
+  type WorkflowCallNode,
   type WorkflowDurability,
   type WorkflowEdge,
   type WorkflowGraph,

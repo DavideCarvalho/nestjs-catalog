@@ -2,10 +2,12 @@ import { workflowRunOrder } from '@dudousxd/nestjs-catalog/client';
 import type { Edge, Node } from '@xyflow/react';
 import { MarkerType } from '@xyflow/react';
 import {
+  type WorkflowCallNode,
   type WorkflowEdge,
   type WorkflowNode,
   type WorkflowNodeKind,
   type WorkflowRunNode,
+  type WorkflowSourceNode,
   nodeName,
 } from './model';
 import { type WorkflowProblem, edgeId } from './validate';
@@ -76,18 +78,37 @@ export interface NodeDescriptions {
  * circular, since a connector references a workflow.
  */
 function subtitleFor(node: WorkflowNode, describe: NodeDescriptions): string {
-  if (node.kind === 'source') {
-    const kind = typeof node.sourceKind === 'string' ? node.sourceKind : '';
-    if (kind.length === 0) return 'no source kind chosen';
-    const connection = describe.connectionName(node.connectionId);
-    if (connection) return `${kind} · ${connection}`;
-    return node.mode === 'incremental' ? `${kind} · incremental` : kind;
-  }
+  if (node.kind === 'source') return sourceSubtitle(node, describe);
   if (node.kind === 'sink') {
     const type = typeof node.targetType === 'string' ? node.targetType.trim() : '';
     return type.length > 0 ? `commits ${type}` : 'no object type chosen';
   }
+  if (node.kind === 'call') return callSubtitle(node);
   return describe.transformName(node.transformId) ?? 'no transform chosen';
+}
+
+/** What a source reads from: its kind, and the connection or mode that narrows it. */
+function sourceSubtitle(node: WorkflowSourceNode, describe: NodeDescriptions): string {
+  const kind = typeof node.sourceKind === 'string' ? node.sourceKind : '';
+  if (kind.length === 0) return 'no source kind chosen';
+  const connection = describe.connectionName(node.connectionId);
+  if (connection) return `${kind} · ${connection}`;
+  return node.mode === 'incremental' ? `${kind} · incremental` : kind;
+}
+
+/**
+ * `name@version`, and the version is on the face of the node deliberately.
+ *
+ * It is the half that decides which code actually runs and the half people
+ * forget is there: a node reading `billing` and a node reading `billing@2` are
+ * different loads, and only one of them is pinned. So an unpinned call says so
+ * on the canvas rather than only in the inspector nobody has open.
+ */
+function callSubtitle(node: WorkflowCallNode): string {
+  const name = typeof node.callName === 'string' ? node.callName.trim() : '';
+  const version = typeof node.callVersion === 'string' ? node.callVersion.trim() : '';
+  if (name.length === 0) return 'no workflow chosen';
+  return version.length > 0 ? `${name}@${version}` : `${name} · no version pinned`;
 }
 
 /**
@@ -164,6 +185,7 @@ export function toFlowNodes(
 export function defaultLabel(kind: WorkflowNodeKind): string {
   if (kind === 'source') return 'Source';
   if (kind === 'sink') return 'Sink';
+  if (kind === 'call') return 'Call';
   return 'Transform';
 }
 

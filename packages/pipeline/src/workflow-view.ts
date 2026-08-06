@@ -152,6 +152,11 @@ function toNode(raw: unknown): WorkflowNode {
   }
 
   const config = readRecord(raw, 'config');
+
+  if (kind === 'call') {
+    return toCallNode(raw, { id, name, config, position });
+  }
+
   const declared = readUnknown(raw, 'sourceKind');
 
   if (!isConnectorKind(declared)) {
@@ -178,6 +183,36 @@ function toNode(raw: unknown): WorkflowNode {
     mode: readMode(raw),
     position,
   };
+}
+
+/**
+ * A call node, refused at the boundary if it names half of what it needs.
+ *
+ * Checked here rather than left to `validateWorkflow`, which a draft is stored
+ * without running: a call node saved with an empty version is a node that would
+ * run whichever version is registered on the day somebody publishes it — the
+ * exact substitution the pin exists to prevent, arrived at by saving something
+ * unfinished rather than by anybody choosing it.
+ */
+function toCallNode(
+  raw: unknown,
+  base: {
+    id: string;
+    name: string;
+    config: Record<string, unknown>;
+    position?: { x: number; y: number };
+  },
+): WorkflowNode {
+  const callName = readString(raw, 'callName');
+  const callVersion = readString(raw, 'callVersion');
+  if (!callName || !callVersion) {
+    throw new BadRequestException(
+      `Call node "${base.name}" (${base.id}) names ${
+        callName ? 'no version of the workflow it calls' : 'no workflow to call'
+      }. A call pins a name and a version together, because the version is what decides which code runs.`,
+    );
+  }
+  return { ...base, kind: 'call', callName, callVersion };
 }
 
 /**

@@ -224,6 +224,10 @@ export type {
   ConnectorRun,
   TransformLanguage,
   TransformResult,
+  CallableWorkflowRef,
+  WorkflowCallEnvelope,
+  WorkflowCallNode,
+  WorkflowCallOutput,
   WorkflowEdge,
   WorkflowExecutionMode,
   WorkflowGraph,
@@ -251,6 +255,10 @@ export {
   isWorkflowEdge,
   isWorkflowNode,
   TRANSFORM_LANGUAGES,
+  // A screen that shows what a call node got back narrows it the same way the
+  // runner does, so the two cannot disagree about what "no rows" looks like.
+  readWorkflowCallOutput,
+  WORKFLOW_CALL_CONTRACT,
 } from './catalog.pipeline';
 
 /**

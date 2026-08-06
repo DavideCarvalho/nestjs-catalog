@@ -1,7 +1,13 @@
 import type { WorkflowNodeStepInput, WorkflowNodeStepOutput } from '@dudousxd/nestjs-catalog';
-import { Step } from '@dudousxd/nestjs-durable';
+import { Step, WorkflowEngine } from '@dudousxd/nestjs-durable';
 import { FatalError, type StepLogger } from '@dudousxd/nestjs-durable-core';
-import { BadRequestException, Inject, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  Inject,
+  Injectable,
+  NotFoundException,
+  Optional,
+} from '@nestjs/common';
 import { CATALOG_PIPELINE_SCOPE, type CatalogPipelineScope } from './seams';
 import {
   type WorkflowFinishInput,
@@ -22,6 +28,7 @@ import {
 export const WORKFLOW_PLAN_STEP = 'catalog.workflow.plan';
 export const WORKFLOW_NODE_STEP = 'catalog.workflow.node';
 export const WORKFLOW_FINISH_STEP = 'catalog.workflow.finish';
+export const WORKFLOW_CALL_CHECK_STEP = 'catalog.workflow.call-check';
 
 export interface WorkflowPlanStepInput {
   workflowId: string;
@@ -30,6 +37,31 @@ export interface WorkflowPlanStepInput {
   snapshotId: string;
   connectorId: string;
   principalId: string;
+}
+
+/** What {@link WorkflowRunSteps.checkCall} needs to say which pin was broken. */
+export interface WorkflowCallCheckInput {
+  childRunId: string;
+  /** Both carried so the refusal names the box on the canvas, not an id. */
+  nodeId: string;
+  nodeName: string;
+  callName: string;
+  /** The version the node pinned. */
+  callVersion: string;
+}
+
+/**
+ * What the check saw.
+ *
+ * `started: false` means there is no run row yet — see the note on
+ * {@link WorkflowRunSteps.checkCall} for why that is reported rather than
+ * thrown. A `true` with no `version` is impossible by construction; the field
+ * is there so a run's history records what was checked and not merely that
+ * something was.
+ */
+export interface WorkflowCallCheckResult {
+  started: boolean;
+  version?: string;
 }
 
 /**
@@ -57,6 +89,12 @@ export class WorkflowRunSteps {
     // the pass-through.
     @Inject(CATALOG_PIPELINE_SCOPE)
     private readonly scope: CatalogPipelineScope,
+    // Only {@link checkCall} touches it, and only to read a run row and cancel
+    // one. Optional for the same reason `WorkflowLauncher` has it optional —
+    // `CATALOG_DURABLE=off` provides no engine and a catalog with no call nodes
+    // must still boot — and the one step that needs it refuses rather than
+    // proceeding unchecked.
+    @Optional() private readonly engine?: WorkflowEngine,
   ) {}
 
   /**
@@ -124,6 +162,93 @@ export class WorkflowRunSteps {
     // second table holds what the transform said.
     for (const line of output.logs) log?.info(line);
     return output;
+  }
+
+  /**
+   * Is the child that was just started the version the node pinned?
+   *
+   * ## Why this step exists at all
+   *
+   * Because the engine has no way to start a *particular* version.
+   * `engine.start(name, …)` resolves `latest.get(name)` and takes no version
+   * argument; a version is honoured only on **resume**, where a run continues
+   * on the version it began on. `ctx.child` therefore starts whatever is
+   * newest, and a node that recorded a version and did nothing else would be
+   * decoration on a promise nobody keeps.
+   *
+   * What *is* available is the truth after the fact: the run row carries
+   * `workflowVersion`, set at start and never changed. So the pin is enforced
+   * by observing it and refusing — the child is cancelled and the node fails,
+   * naming both versions. Called immediately after `ctx.startChild` and before
+   * the join, so in the ordinary case this lands while the child is still
+   * getting going, long before it has finished doing anything.
+   *
+   * **The honest limit**: a child of the wrong version is *stopped*, not
+   * *prevented*. Between the start and this check it has had a moment to run,
+   * and a workflow whose first act is a side effect will have performed it.
+   * Nothing this side of a version argument on `start` can close that, and
+   * pretending otherwise in a docblock would be worse than the gap.
+   *
+   * ## Why a missing run row is not a failure here
+   *
+   * `startChildDeferred` starts the child on a microtask *and delivers a
+   * refused start to the parent as a failed child*. So "no run row" is what a
+   * refusal looks like from here — an unregistered name, an input the callee's
+   * `validateInput` rejected, or its singleton queue being full — and every one
+   * of those has a real message attached that only the join can see. Throwing
+   * here would replace all of them with "no run row", so this reports
+   * `started: false` and lets the join say what actually happened. The body
+   * then re-runs this step after the join, which is what closes the gap for a
+   * child whose row merely arrived late.
+   */
+  @Step({
+    name: WORKFLOW_CALL_CHECK_STEP,
+    // Short and few: the row either exists within a second of the start or the
+    // start was refused, and retrying a refusal is waiting for nothing.
+    retries: 3,
+    backoff: 'exp',
+    backoffMs: 1_000,
+    backoffMaxMs: 5_000,
+    jitter: true,
+  })
+  async checkCall(input: WorkflowCallCheckInput): Promise<WorkflowCallCheckResult> {
+    // `getRun` is checked, not assumed. The `WorkflowEngine` token does not
+    // always resolve to an engine with a store behind it: a thin/tenant worker
+    // gets a start-only facade under the same token, whose `getRun` does not
+    // exist and whose `cancel` throws. Calling it would be a `TypeError` inside
+    // a step, which reads as a bug in this package rather than as the
+    // deployment fact it is.
+    if (!this.engine || typeof this.engine.getRun !== 'function') {
+      // Refused rather than waved through, and this is the one place in this
+      // package that fails for want of an engine. `WorkflowLauncher.durability`
+      // reports what it observed instead of asserting — it can afford to,
+      // because the consequence of being wrong is a run that is slower to
+      // recover. Here the consequence of being wrong is a load that ran
+      // somebody else's newer code while its own graph said otherwise, and
+      // "unchecked" and "checked and fine" must not read the same.
+      throw new UnrunnableWorkflowError(
+        `Call node "${input.nodeName}" (${input.nodeId}) pins ${input.callName}@${input.callVersion}, and the process running ${WORKFLOW_CALL_CHECK_STEP} has no durable engine it can read a run from. A pin nobody checked is not a pin, so this run stops rather than using whichever version happened to start.`,
+      );
+    }
+
+    const run = await this.engine.getRun(input.childRunId);
+    if (!run) return { started: false };
+
+    const started = typeof run.workflowVersion === 'string' ? run.workflowVersion : '';
+    if (started === input.callVersion) return { started: true, version: started };
+
+    // Cancelled before the refusal is thrown, and best-effort: the run is being
+    // failed either way, and a cancel that could not be delivered must not turn
+    // "you got the wrong version" into a message about the cancel.
+    let stopped = 'it was cancelled';
+    try {
+      await this.engine.cancel(input.childRunId);
+    } catch (error) {
+      stopped = `it could not be cancelled (${describe(error)}) and may still be running`;
+    }
+    throw new UnrunnableWorkflowError(
+      `Call node "${input.nodeName}" (${input.nodeId}) pins ${input.callName}@${input.callVersion}, but this deployment started ${input.callName}@${started || 'an unnamed version'} as child run ${input.childRunId} — the engine always starts the newest registered version. The load stops here and ${stopped}. Either register the pinned version alongside the newer one, or repoint the node, which is an edit to this graph and a new version of it.`,
+    );
   }
 
   /**

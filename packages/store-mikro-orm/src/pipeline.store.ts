@@ -316,7 +316,7 @@ export class MySqlPipelineStore
   }
 
   /**
-   * Seal the credential in every source node of a graph.
+   * Seal the credential in every config-carrying node of a graph.
    *
    * Per node rather than over the graph as a whole, because a `SecretContext`
    * describes one field of one row and a graph is one row holding several
@@ -325,8 +325,15 @@ export class MySqlPipelineStore
    * which is correct — they are the same field of the same row, and a provider
    * scoping by it is scoping to the graph, which is the thing a key should be
    * bound to.
+   *
+   * A **call** node's config takes the same path as a source's, and that is why
+   * the field carries the same name. It is a parameter bag that leaves this
+   * process — handed to a workflow that may be dispatched to a worker in
+   * another language — which is exactly the shape a credential ends up in when
+   * nobody stops it. The predicate is untouched: top-level strings, as
+   * everywhere else in this file.
    */
-  private async sealSourceNodes(
+  private async sealNodeConfigs(
     nodes: WorkflowNode[],
     id: string | undefined,
   ): Promise<WorkflowNode[]> {
@@ -335,7 +342,7 @@ export class MySqlPipelineStore
     if (!this.options?.encryptCredentials) return nodes;
     const sealed: WorkflowNode[] = [];
     for (const node of nodes) {
-      if (node.kind !== 'source') {
+      if (!carriesConfig(node)) {
         sealed.push(node);
         continue;
       }
@@ -344,12 +351,12 @@ export class MySqlPipelineStore
     return sealed;
   }
 
-  /** One graph, with every source node's config opened. */
+  /** One graph, with every config-carrying node's config opened. */
   private async withOpenGraph(workflow: CatalogWorkflow): Promise<CatalogWorkflow> {
     let opened = false;
     const nodes: WorkflowNode[] = [];
     for (const node of workflow.nodes) {
-      if (node.kind !== 'source') {
+      if (!carriesConfig(node)) {
         nodes.push(node);
         continue;
       }
@@ -853,6 +860,12 @@ export class MySqlPipelineStore
    * have put the write side out of step with the redaction on the read side,
    * which documents that same boundary deliberately.
    *
+   * A **call** node's `config` is covered by the same rule and named the same
+   * way for exactly that reason — see {@link carriesConfig}. It is handed to a
+   * workflow that may run in another process in another language, which is a
+   * further place for a password to arrive than a source's config has, not a
+   * lesser one.
+   *
    * **The hash is taken from the plaintext graph, before any sealing.** A
    * fingerprint is a statement about what the graph *does*, and sealing does
    * not change that. Hashing the sealed form would bump the version on every
@@ -890,7 +903,7 @@ export class MySqlPipelineStore
     // Sealed first, then checked — the ordering `saveConnector` explains, here
     // applied per source node.
     const id = input.id ?? randomUUID();
-    const sealedNodes = await this.sealSourceNodes(nodes, id);
+    const sealedNodes = await this.sealNodeConfigs(nodes, id);
     this.assertNoNewPlaintextGraphCredential(sealedNodes, existing?.nodes, `"${input.name}"`);
 
     const row =
@@ -1808,7 +1821,7 @@ function assertNoNewPlaintextGraphCredential(
 ): void {
   const storedConfigs = storedNodeConfigs(stored);
   for (const node of nodes) {
-    if (node.kind !== 'source') continue;
+    if (!carriesConfig(node)) continue;
     assertNoNewPlaintextCredential(
       node.config,
       storedConfigs.get(node.id),
@@ -1816,6 +1829,21 @@ function assertNoNewPlaintextGraphCredential(
       `nodes["${node.id}"].config`,
     );
   }
+}
+
+/**
+ * The node kinds that hold a `config` — the ones sealed, opened and refused.
+ *
+ * A predicate rather than a `kind !== 'source'` at each of the three call
+ * sites, because those three have to agree exactly: a node sealed on the way in
+ * and not opened on the way out is a graph that runs with ciphertext in its
+ * parameters, and one refused but not sealed is a promise this file has already
+ * had to fix twice.
+ */
+function carriesConfig(
+  node: WorkflowNode,
+): node is Extract<WorkflowNode, { config: Record<string, unknown> }> {
+  return node.kind === 'source' || node.kind === 'call';
 }
 
 /** Each stored node's config, by node id, trusting nothing about the shape. */

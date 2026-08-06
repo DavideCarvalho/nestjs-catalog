@@ -105,10 +105,13 @@ export {
   type StreamedFetchResult,
 } from './sources';
 export {
+  WORKFLOW_CALL_CHECK_STEP,
   WORKFLOW_FINISH_STEP,
   WORKFLOW_NODE_STEP,
   WORKFLOW_PLAN_STEP,
   WorkflowRunSteps,
+  type WorkflowCallCheckInput,
+  type WorkflowCallCheckResult,
 } from './workflow-run.steps';
 export {
   CATALOG_WORKFLOW_RUN,
@@ -119,7 +122,9 @@ export {
 export {
   WorkflowRunnerService,
   stageRefsFor,
+  type WorkflowCallTarget,
   type WorkflowFinishInput,
+  type WorkflowPlanEntry,
   type WorkflowPlanResult,
 } from './workflow-runner.service';
 export {

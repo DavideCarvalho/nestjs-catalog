@@ -319,8 +319,8 @@ async function chooseOption(comboboxLabel: string, option: RegExp) {
   fireEvent.click(screen.getByRole('option', { name: option }));
 }
 
-/** Press one of the three add buttons, by the accessible name that says what it does. */
-function addNodeOfKind(kind: 'source' | 'transform' | 'sink') {
+/** Press one of the add buttons, by the accessible name that says what it does. */
+function addNodeOfKind(kind: 'source' | 'transform' | 'sink' | 'call') {
   fireEvent.click(screen.getByLabelText(`Add a ${kind} node`));
 }
 
@@ -655,6 +655,130 @@ describe('a transform node on a catalog with no transforms', () => {
   });
 });
 
+/**
+ * The node that hands a step to a workflow somebody else registered.
+ *
+ * What is worth testing here is the pair of fields and nothing about how they look: the version is
+ * the half that decides which code runs, and a canvas that let it be left blank would store a node
+ * that silently follows whatever gets deployed next. There is deliberately no picker to test — see
+ * `CallInspector` — so the assertions are that both fields are typed, that both are demanded, and
+ * that what is typed reaches the save.
+ */
+describe('a node that calls another workflow', () => {
+  it('asks for the version as well as the name, and says why on the node', async () => {
+    const { transport } = fakeTransport(answersFor([wholeWorkflow()]));
+    await openCanvas(transport);
+
+    addNodeOfKind('call');
+
+    const todo = panel('Still to do');
+    await waitFor(() => expect(todo.getByText('Call')).toBeDefined());
+    expect(todo.getByText(/name the workflow it calls, and the version to pin/)).toBeDefined();
+  });
+
+  it('still refuses to save quietly when only the name was filled in', async () => {
+    const { transport } = fakeTransport(answersFor([wholeWorkflow()]));
+    await openCanvas(transport);
+
+    addNodeOfKind('call');
+    await waitFor(() => expect(panel('Still to do')).toBeDefined());
+
+    fireEvent.change(inspector().getByLabelText(/^Workflow/), {
+      target: { value: 'billing.reconcile' },
+    });
+
+    // Touching it is the statement "I think this is done", so the check gets its full wording —
+    // and it is about the version, which is the half people leave behind.
+    await waitFor(() =>
+      expect(
+        screen.getAllByText(/does not name a version of the workflow it calls/).length,
+      ).toBeGreaterThan(0),
+    );
+    expect(saveButton().className).toContain('bg-amber-600');
+  });
+
+  it('sends the name, the version and the parameters it was given', async () => {
+    const { transport, lastPostTo } = fakeTransport(answersFor([wholeWorkflow()]), {
+      '/pipeline/workflows': wholeWorkflow(),
+    });
+    await openCanvas(transport);
+
+    addNodeOfKind('call');
+    await waitFor(() => expect(panel('Still to do')).toBeDefined());
+
+    fireEvent.change(inspector().getByLabelText(/^Workflow/), {
+      target: { value: 'billing.reconcile' },
+    });
+    fireEvent.change(inspector().getByLabelText(/^Version/), { target: { value: '2' } });
+    fireEvent.change(inspector().getByLabelText(/^Parameters/), {
+      target: { value: '{"region":"gov-west"}' },
+    });
+
+    fireEvent.click(saveButton());
+
+    await waitFor(() => expect(lastPostTo('/pipeline/workflows')).toBeDefined());
+    const sent = readCallNodes(lastPostTo('/pipeline/workflows')?.body);
+    expect(sent).toEqual([
+      { callName: 'billing.reconcile', callVersion: '2', config: { region: 'gov-west' } },
+    ]);
+  });
+
+  // Half-typed JSON must not reach the node: a config that parsed a moment ago and does not now
+  // would otherwise be replaced by whatever the last keystroke left behind.
+  it('keeps the last parameters that parsed while the box does not', async () => {
+    const { transport, lastPostTo } = fakeTransport(answersFor([wholeWorkflow()]), {
+      '/pipeline/workflows': wholeWorkflow(),
+    });
+    await openCanvas(transport);
+
+    addNodeOfKind('call');
+    await waitFor(() => expect(panel('Still to do')).toBeDefined());
+
+    fireEvent.change(inspector().getByLabelText(/^Workflow/), { target: { value: 'billing' } });
+    fireEvent.change(inspector().getByLabelText(/^Version/), { target: { value: '1' } });
+    fireEvent.change(inspector().getByLabelText(/^Parameters/), {
+      target: { value: '{"region":"gov-west"}' },
+    });
+    fireEvent.change(inspector().getByLabelText(/^Parameters/), { target: { value: '{"region"' } });
+
+    await waitFor(() => expect(screen.getByText(/not valid JSON yet/)).toBeDefined());
+
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(lastPostTo('/pipeline/workflows')).toBeDefined());
+    expect(readCallNodes(lastPostTo('/pipeline/workflows')?.body)).toEqual([
+      { callName: 'billing', callVersion: '1', config: { region: 'gov-west' } },
+    ]);
+  });
+
+  // A called workflow may itself read from a system, so this is a real graph and core says so.
+  // The canvas must not add an opinion of its own on top of it.
+  it('accepts a graph whose only reader is a call', async () => {
+    const calling = wholeWorkflow({
+      nodes: [
+        {
+          id: 'call_1',
+          name: 'Reconcile',
+          kind: 'call',
+          callName: 'billing.reconcile',
+          callVersion: '2',
+          config: {},
+          position: { x: 0, y: 0 },
+        },
+        { id: 'snk_1', name: 'Out', kind: 'sink', targetType: 'Mvr', position: { x: 320, y: 0 } },
+      ],
+      edges: [{ from: 'call_1', to: 'snk_1' }],
+    });
+    const { transport } = fakeTransport(answersFor([calling]));
+    render(withCatalog(transport, <WorkflowCanvas />));
+
+    await screen.findAllByText('Reconcile');
+    // The pinned version is on the face of the node, not only in the inspector: `billing` and
+    // `billing@2` are different loads.
+    expect(screen.getAllByText('billing.reconcile@2').length).toBeGreaterThan(0);
+    expect(panel('Problems').getByText(/Nothing to flag here/)).toBeDefined();
+  });
+});
+
 /* --- narrowing helpers, so nothing here needs an `as` --------------------- */
 
 function readRecord(value: unknown): Record<string, unknown> {
@@ -684,4 +808,21 @@ function readNodes(body: unknown): SentNode[] {
       position: typeof x === 'number' && typeof y === 'number' ? { x, y } : undefined,
     };
   });
+}
+
+/** The call nodes out of a saved body, narrowed field by field rather than asserted. */
+function readCallNodes(body: unknown): Array<Record<string, unknown>> {
+  const nodes = readRecord(body).nodes;
+  if (!Array.isArray(nodes)) return [];
+  const calls: Array<Record<string, unknown>> = [];
+  for (const raw of nodes) {
+    const record = readRecord(raw);
+    if (record.kind !== 'call') continue;
+    calls.push({
+      callName: record.callName,
+      callVersion: record.callVersion,
+      config: readRecord(record.config),
+    });
+  }
+  return calls;
 }

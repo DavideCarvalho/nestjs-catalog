@@ -4,6 +4,7 @@ import {
   CircleCheck,
   Code2,
   Database,
+  ExternalLink,
   Loader2,
   Plug,
   Repeat,
@@ -81,6 +82,15 @@ const KIND_STYLE: Record<
     chip: 'text-emerald-700 dark:text-emerald-300',
     icon: Database,
     noun: 'sink',
+  },
+  // Amber and its own icon, because a call is the one node whose work does not
+  // happen here: the box on the canvas is a handle on a workflow somebody else
+  // owns, and it should not read as another transform.
+  call: {
+    accent: 'bg-amber-500',
+    chip: 'text-amber-700 dark:text-amber-300',
+    icon: ExternalLink,
+    noun: 'call',
   },
 };
 

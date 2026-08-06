@@ -20,8 +20,10 @@
  */
 
 export type {
+  CallableWorkflowRef,
   CatalogWorkflow,
   WorkflowEdge,
+  WorkflowCallNode,
   WorkflowGraph,
   WorkflowNode,
   WorkflowNodeKind,
