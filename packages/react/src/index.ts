@@ -9,6 +9,16 @@ export {
   LoadExpectationSection,
   type LoadExpectationSectionProps,
 } from './LoadExpectationSection';
+// Mounted on the Model screen too, directly above the expectation section — the
+// two are one question in two halves: who loads this type, and what is checked
+// when they do. `loadersOf` is exported beside the component because it is the
+// whole rule (a graph's SINKS decide, not its stored `targetType`), and a host
+// that renders its own row wants the rule rather than a second reading of it.
+export {
+  LoadedBySection,
+  type LoadedBySectionProps,
+  loadersOf,
+} from './LoadedBySection';
 export { cn } from './cn';
 export { ObjectExplorer, type ObjectExplorerProps } from './ObjectExplorer';
 export { DashboardBoard } from './DashboardBoard';
