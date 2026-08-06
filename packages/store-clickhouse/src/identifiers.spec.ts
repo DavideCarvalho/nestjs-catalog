@@ -9,11 +9,21 @@
  * the rule comes from the core package, and these cases are what says so.
  */
 import {
+  CATALOG_RESERVED_COLUMNS,
   UnsafeIdentifierError as CatalogUnsafeIdentifierError,
   isSafeIdentifier,
 } from '@dudousxd/nestjs-catalog';
 import { describe, expect, it } from 'vitest';
-import { UnsafeIdentifierError, ident } from './identifiers';
+import {
+  BATCH_COLUMN,
+  LOADED_AT_COLUMN,
+  PRINCIPAL_COLUMN,
+  RESERVED_COLUMNS,
+  ROW_COLUMN,
+  SNAPSHOT_COLUMN,
+  UnsafeIdentifierError,
+  ident,
+} from './identifiers';
 
 /** Names a publisher has actually sent, plus the boundary the rule turns on. */
 const NAMES = [
@@ -57,5 +67,26 @@ describe('UnsafeIdentifierError', () => {
     // Identity, not shape — and the same assertion the MySQL adapter's spec makes, which is what
     // makes the two adapters comparable at all without a spec that imports both.
     expect(UnsafeIdentifierError).toBe(CatalogUnsafeIdentifierError);
+  });
+});
+
+describe('RESERVED_COLUMNS', () => {
+  it("is the core package's list, not a copy of it that happens to agree", () => {
+    // Identity again, and for the reason the identifier rule is: this list was assembled here from
+    // this adapter's own constants while the docblock at the top of the file already said it came
+    // from the core package. The two agreed, which is what made the claim survive being read.
+    expect(RESERVED_COLUMNS).toBe(CATALOG_RESERVED_COLUMNS);
+  });
+
+  it('covers every bookkeeping column this adapter actually writes', () => {
+    // The other half, and the one the move could have broken. The five constants below are what
+    // goes into `CREATE TABLE` and into every SELECT list; the list above is what a publisher's
+    // property name is checked against. Renaming one of them without moving the core's list would
+    // give this store a column it writes and cannot see a collision with — which is `_row` all over
+    // again, the constant that existed precisely because a literal buried in a SQL string was
+    // missing from the reserved list.
+    expect([...RESERVED_COLUMNS].sort()).toEqual(
+      [SNAPSHOT_COLUMN, PRINCIPAL_COLUMN, LOADED_AT_COLUMN, BATCH_COLUMN, ROW_COLUMN].sort(),
+    );
   });
 });

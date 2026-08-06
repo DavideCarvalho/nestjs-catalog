@@ -9,7 +9,9 @@ import type {
 import {
   isCatalogStoreCapabilities,
   isWriteStore,
+  resolveObjectFilters,
   supportsCarryForward,
+  supportsObjectFilters,
 } from '@dudousxd/nestjs-catalog';
 import { beforeAll, describe, expect, it } from 'vitest';
 
@@ -238,6 +240,41 @@ function idsOf(result: CatalogReadResult): string[] {
 }
 
 /**
+ * Read through the filters the *service* would have built, and hand back the ids.
+ *
+ * `resolveObjectFilters` rather than hand-written `CatalogResolvedFilter`
+ * literals, so a case here exercises the coercion a real request goes through —
+ * `score:gte:30` becoming the number 30 and `seenAt:gte:...` becoming a `Date` is
+ * exactly where a store's predicate can be wrong in a way that still returns
+ * rows. A filter the resolver itself rejects is a broken case rather than a
+ * finding about the store, so the problems are asserted empty before the read.
+ */
+async function filteredIds(
+  store: CatalogWriteStore,
+  type: CatalogObjectTypeDef,
+  raw: string[],
+): Promise<string[]> {
+  const { filters, problems } = resolveObjectFilters(type.properties, raw);
+  expect(problems).toEqual([]);
+  expect(filters).toHaveLength(raw.length);
+
+  const result = await store.read(type, [...FIELDS], {
+    page: 1,
+    size: 200,
+    sort: 'id',
+    dir: 'asc',
+    filters,
+  });
+
+  // The count is a second statement on both shipped adapters. A filter applied
+  // to the page and not to the count is the failure with no visible symptom: a
+  // screen showing three rows above the words "of 4,812". The page holds every
+  // match here — `size` is far past the fixture — so the two have to agree.
+  expect(result.total).toBe(result.rows.length);
+  return idsOf(result);
+}
+
+/**
  * Run the contract.
  *
  * `boot` is a getter rather than the store itself because the engine is started
@@ -388,6 +425,102 @@ export function describeCatalogStoreContract(boot: () => ContractStore): void {
       const rows = await readAll(subject.store, def);
       expect(rows.total).toBe(3);
       expect(idsOf(rows)).toEqual(['a', 'b', 'c']);
+    });
+
+    it('narrows a read to the rows every declared operator matches', async (context) => {
+      const store = subject.store;
+      if (!supportsObjectFilters(store)) {
+        // The core package's own predicate, like every other capability question
+        // in this file. A store that declares nothing is offered no filter
+        // controls and refuses a hand-built filter, which is the correct
+        // behaviour and not a contract failure — what it is not allowed to do is
+        // declare the operators and then not apply them, which is what every
+        // case below is here to catch.
+        skipping(
+          context,
+          'declares no objectFilterOperators, so the service offers no filter controls and refuses a filter rather than reading unfiltered.',
+        );
+        return;
+      }
+      const def = await ready('ContractObjectFilters');
+
+      // Distinct values per column so a wrong predicate cannot coincide with the
+      // right answer, and one row whose `label` is blank — written as `''`,
+      // which both adapters coerce to NULL on the way in — because `empty`,
+      // `notEmpty` and `ne` are the three that are wrong if NULL is handled
+      // naively, and there is nothing to be wrong about without such a row.
+      await store.write(
+        def,
+        [
+          { id: 'a', label: 'alpha', score: 10, active: true, seenAt: '2026-01-01T00:00:00.000Z' },
+          { id: 'b', label: 'bravo', score: 20, active: false, seenAt: '2026-02-01T00:00:00.000Z' },
+          {
+            id: 'c',
+            label: 'charlie',
+            score: 30,
+            active: true,
+            seenAt: '2026-03-01T00:00:00.000Z',
+          },
+          { id: 'd', label: '', score: 40, active: false, seenAt: '2026-04-01T00:00:00.000Z' },
+        ],
+        { snapshotId: 'filters', principalId: 'contract', batch: 0 },
+      );
+      await store.commit(def, 'filters');
+      expect(idsOf(await readAll(store, def))).toEqual(['a', 'b', 'c', 'd']);
+
+      const declared = store.objectFilterOperators;
+      /** Assert a filter only when the store said it applies that operator. */
+      async function whenDeclared(raw: string[], expected: string[]): Promise<void> {
+        const wanted = raw.map((entry) => entry.split(':')[1]);
+        if (!wanted.every((op) => declared.some((each) => each === op))) return;
+        expect(await filteredIds(store, def, raw)).toEqual(expected);
+      }
+
+      await whenDeclared(['label:eq:alpha'], ['a']);
+      // Includes `d`, whose label is NULL. `<>` is never true of NULL in SQL, so
+      // the naive translation drops every row with no value at all — and a
+      // reader of "label is not alpha" would conclude those rows say alpha.
+      await whenDeclared(['label:ne:alpha'], ['b', 'c', 'd']);
+      await whenDeclared(['label:contains:rav'], ['b']);
+      await whenDeclared(['label:empty'], ['d']);
+      await whenDeclared(['label:notEmpty'], ['a', 'b', 'c']);
+      await whenDeclared(['score:gte:30'], ['c', 'd']);
+      await whenDeclared(['score:lt:20'], ['a']);
+      await whenDeclared(['active:eq:true'], ['a', 'c']);
+      await whenDeclared(['seenAt:gte:2026-03-01T00:00:00.000Z'], ['c', 'd']);
+      // Two filters at once, which is the form a person actually builds: the
+      // contract says *every* filter must be applied, so they conjoin. A store
+      // that applied the last one and dropped the rest would pass every case
+      // above and fail only here.
+      await whenDeclared(['score:gt:10', 'score:lte:30'], ['b', 'c']);
+      await whenDeclared(['active:eq:false', 'score:lt:40'], ['b']);
+    });
+
+    it('refuses a filter on a column the same read declined to return', async (context) => {
+      const store = subject.store;
+      if (!supportsObjectFilters(store)) {
+        skipping(context, 'declares no objectFilterOperators, so it has no filter to refuse.');
+        return;
+      }
+      const def = await ready('ContractFilterOutsideRead');
+
+      await store.write(def, [contractRow('a', 'alpha', 1), contractRow('b', 'bravo', 2)], {
+        snapshotId: 'narrow',
+        principalId: 'contract',
+        batch: 0,
+      });
+      await store.commit(def, 'narrow');
+
+      // A predicate over a column the same request did not select is how a
+      // hidden or classified value leaks out through row membership — `gte` and
+      // `lte` let a reader binary-search a value they may not see, in as many
+      // requests as it takes. The service resolves filters against the visible
+      // columns, so only a caller building the query itself gets here, and it
+      // has to be a refusal rather than an unfiltered page.
+      const { filters } = resolveObjectFilters(def.properties, ['label:eq:alpha']);
+      await expect(
+        store.read(def, ['id'], { page: 1, size: 200, sort: 'id', dir: 'asc', filters }),
+      ).rejects.toThrow(/label/i);
     });
 
     it('round-trips every scalar it was given', async () => {

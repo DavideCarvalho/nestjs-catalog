@@ -1,5 +1,6 @@
 import type {
   CarryForwardResult,
+  CatalogFilterOperator,
   CatalogMergeStore,
   CatalogObjectTypeDef,
   CatalogQueryRelation,
@@ -18,6 +19,7 @@ import {
   isQueryStore,
   isWriteStore,
   supportsCarryForward,
+  supportsObjectFilters,
 } from '@dudousxd/nestjs-catalog';
 import { BadRequestException, Inject, Injectable, Logger } from '@nestjs/common';
 import { composeCapabilities, explainCapabilities } from './capabilities';
@@ -162,6 +164,31 @@ export class FanoutCatalogStore implements CatalogWriteStore {
   declare readonly runQuery?: (request: CatalogQueryRequest) => Promise<CatalogQueryResult>;
   declare readonly queryRelations?: () => Promise<CatalogQueryRelation[]>;
 
+  /**
+   * Which operators the primary can push into its predicate — and therefore
+   * which this store can, since {@link read} is the primary's `read`.
+   *
+   * `declare` for the same reason every field above it is: `supportsObjectFilters`
+   * asks by looking for the property, so a fan-out that always carried it would
+   * answer yes on behalf of a primary that cannot filter, and the service would
+   * hand that primary a filter it silently ignores — a screen presenting the whole
+   * table as though it were the matching rows. Absent when the primary declares
+   * nothing, which makes the fan-out unfilterable in exactly the cases its primary
+   * is.
+   *
+   * **Not intersected with the followers**, unlike the capability object one file
+   * over, and the difference is not an inconsistency. Capabilities are intersected
+   * because they are a single answer covering both read paths and there is no
+   * per-store question to ask; filtering has one — the operators are read off
+   * whichever store is in hand — so {@link readFrom} asks the follower it is about
+   * to read instead of degrading the ordinary read path to protect a verification
+   * path that can check for itself. Intersecting here would mean attaching a
+   * follower that cannot filter silently removes the filter controls from a
+   * catalog whose primary filters perfectly well, which is a capability lost for
+   * nothing: no ordinary read ever reaches that follower.
+   */
+  declare readonly objectFilterOperators?: readonly CatalogFilterOperator[];
+
   constructor(
     @Inject(CATALOG_FANOUT_PRIMARY) readonly primary: FanoutPrimary,
     @Inject(CATALOG_FANOUT_FOLLOWERS) readonly followers: FanoutFollower[],
@@ -207,6 +234,12 @@ export class FanoutCatalogStore implements CatalogWriteStore {
       this.carryForward = (type, snapshotId, options) =>
         this.mergeForward(type, snapshotId, options);
     }
+    if (supportsObjectFilters(primary.store)) {
+      // Copied rather than bound, because it is a value and not a method: what
+      // the primary declares at construction is what it declares, and a fan-out
+      // re-reading it per call would be reading a field nothing mutates.
+      this.objectFilterOperators = primary.store.objectFilterOperators;
+    }
     if (isQueryStore(primary.store)) {
       const store = primary.store;
       // Bound to the primary directly rather than fanned out. A read-only SQL
@@ -247,6 +280,15 @@ export class FanoutCatalogStore implements CatalogWriteStore {
    * failover, no round-robin — because every one of those turns a stale follower
    * into an answer somebody acts on. What this is for is looking at a follower
    * with your own eyes before making it the primary.
+   *
+   * Which is why the filter check is here rather than nowhere.
+   * {@link objectFilterOperators} reports the *primary's* operators, and this
+   * method is the one call that does not read the primary — so a follower that
+   * declares no filtering would be handed the filters and return every row it
+   * has, and the caller comparing it against the primary would be comparing a
+   * filtered page to an unfiltered one and concluding the follower has extra
+   * data. Refusing by name costs a verification run nothing: the filters were
+   * hand-built by whoever is doing the comparing, and they can drop them.
    */
   async readFrom(
     name: string,
@@ -254,7 +296,22 @@ export class FanoutCatalogStore implements CatalogWriteStore {
     fields: string[],
     query: CatalogReadQuery,
   ): Promise<CatalogReadResult> {
-    return this.storeNamed(name).read(type, fields, query);
+    const store = this.storeNamed(name);
+    const wanted = query.filters ?? [];
+    if (wanted.length > 0) {
+      const operators = supportsObjectFilters(store) ? store.objectFilterOperators : [];
+      const unsupported = [
+        ...new Set(wanted.map((filter) => filter.op).filter((op) => !operators.includes(op))),
+      ];
+      if (unsupported.length > 0) {
+        throw new BadRequestException(
+          operators.length === 0
+            ? `"${name}" does not filter object reads, so it cannot answer this comparison — it would return every row it has and look like a follower holding more data than the primary. Read it without filters.`
+            : `"${name}" cannot filter with ${unsupported.join(', ')}. It applies ${operators.join(', ')}.`,
+        );
+      }
+    }
+    return store.read(type, fields, query);
   }
 
   /** The store registered under a name, primary or follower. */
