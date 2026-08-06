@@ -352,6 +352,7 @@ export {
 export { ConfirmDialog } from './ui/dialog';
 export { FieldGroup, TextAreaField, TextField } from './ui/field';
 export { Select, SelectField, type SelectOption } from './ui/select';
+export { Combobox, ComboboxField, type ComboOption, type ComboboxProps } from './ui/combobox';
 export { Switch } from './ui/switch';
 export { Sheet } from './ui/sheet';
 // `codeEditorRoot` and `codeEditorText` come with it because the editor renders
