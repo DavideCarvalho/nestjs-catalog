@@ -1,5 +1,368 @@
 # @dudousxd/nestjs-catalog-pipeline
 
+## 0.12.0
+
+### Minor Changes
+
+- cbab48c: A property may be named the way its source spells it, and the publish check refuses only what
+  genuinely cannot become a column.
+
+  A store matches a source's record to a property by property NAME — it reads `row[property.name]` —
+  and nothing on the write path consults `columnName`. But the name was also written _verbatim_ as the
+  output alias of the committed view and of every read, through an `ident` that refuses rather than
+  escapes, so a property could not be called `Asset Id` at all. Publishers therefore did what the
+  refusal told them to do: renamed the property to `Asset_Id` and put the source's spelling in
+  `columnName`. Thirteen types were loaded that way and six came out with most of their columns NULL —
+  73 of 84 on the largest, across 313,833 rows — with every run green, every row count right, and
+  nothing visible short of opening a cell.
+
+  - **The view's output alias and the read's alias now go through `outputAlias`**, in both shipped
+    adapters (`query.ts` and the store in each of `store-mikro-orm` and `store-clickhouse`). A name
+    SQL cannot take is cleaned to its physical column; **a name SQL can take is kept byte for byte**,
+    so no view that resolves today changes shape. The two names that would otherwise have moved — one
+    whose doubled underscores would collapse, one over 60 characters — are pinned by tests.
+  - **The publish-time refusal asks the question it actually needs to**: does this name _clean_ to an
+    identifier? `Asset Id` does and is accepted; `2024 Total` does not, because `2024_Total` starts
+    with a digit, and is still refused before a single row exists. The refused value named in the
+    message is the cleaned one, which is exactly the string `ident` would refuse, so publish-time and
+    DDL-time still say one sentence about one string. Length alone can no longer refuse a name, since
+    the cleaning cuts at 60 and the rule allows 63.
+  - **The refusal message now says what a rename costs.** Taking the suggested name means the load
+    looks up `row[<new name>]` in records the source still keys by the old one, so the message names
+    `row[name]` and says a transform has to go with it. That sentence is the one whose absence turned
+    a correct refusal into six empty tables.
+  - **`physicalColumn` moved to `@dudousxd/nestjs-catalog`** and is re-exported by both adapters
+    unchanged. It was three byte-identical private copies — two of them inside `store-mikro-orm`, one
+    deciding the view's columns and one deciding the table's — and it is now what decides whether a
+    published name can work at all, so the publish check and the DDL run the same function rather than
+    copies of it. `outputAlias` lives beside it. Both are new named exports; nothing was removed.
+
+  **What an existing deployment sees: nothing.** Every property name stored today is a SQL identifier,
+  because the old publish check demanded one, and `outputAlias` returns such a name unchanged — so
+  every view keeps every column it has, `read()` still returns rows keyed by the property's own name,
+  and no migration or republish is needed. What changes is what a _new_ publish may say, and one
+  repair: a type that picked up a name like `Asset Id` before the publish check existed used to fail
+  at every commit and be warned about on every publish. It now cleans to a column like any other, so
+  it works and the warning correctly stops.
+
+- 2d115cd: A workflow node that hands its step to a durable workflow that already exists.
+
+  A graph could do three things — read, transform, commit — and every one of them had to be written
+  here. A deployment that already runs durable workflows, including ones whose body is in Python, had
+  no way to put one in a pipeline. `call` is a fourth node kind: it names a registered workflow and a
+  version, and runs it as a **tracked child** of the catalog's own durable run.
+
+  - **The version is pinned, and pinned means checked.** A node stores `callName` _and_ `callVersion`,
+    and both are part of the graph fingerprint, so repointing a node at `foo@2` is a new version of
+    the graph. The honest limit is written down where it applies: `engine.start` resolves the newest
+    registered version and takes no version argument, so the child is started and then **checked** —
+    `catalog.workflow.call-check` reads the child's run row, and a mismatch cancels the child and
+    fails the node naming both versions. A wrong version is stopped, not prevented. The step refuses
+    outright when the process running it has no engine to check against, because "unchecked" and
+    "checked and fine" must not read the same.
+  - **Handles cross the boundary, never rows.** The child receives one documented envelope —
+    `{catalog: {contract, runId, nodeId, workflowId, workflowVersion, principalId, inputs}, input}` —
+    where `inputs` names the stages its inbound edges wrote, addressed by `(runId, nodeId, batch)` as
+    everything else in a run is. A child that produces rows for the graph stages them under the
+    calling node's id and returns `{batches, rowCount}`. There is no shared type between a catalog
+    node and an arbitrary workflow and none is pretended: `readWorkflowCallOutput` reads those two
+    counts, reads their absence as "called for its effect, no rows" and says so in the run log, and
+    **refuses half of them** rather than turning a callee's bug into a load that came out short.
+  - **Nothing validates the callee's input at save time, because nothing can.** `register()` takes
+    `validateInput` and `searchAttributesSchema`, but neither is reachable: the registry is private
+    and no public method hands a registration out. What does happen is that `engine.start` runs the
+    callee's own `validateInput`, and a refused start is delivered to the parent as a failed child —
+    so a bad wiring fails at the node, naming the node, the workflow, the version and the child run.
+  - **A busy callee waits rather than failing.** A singleton with `maxQueueDepth` refuses a start once
+    its backlog is full, which is contention and not a fault; the node retries five times over about
+    seven and a half minutes, suspended at zero compute, each attempt with its own child id, and then
+    fails saying it was contention and quoting the engine. Skipping was rejected: a node that quietly
+    produced nothing is the failure this service exists to remove.
+  - **Failure and cancellation, stated:** a failed child fails the node, everything downstream is
+    `skipped`, and the load is failed. Cancelling the parent cascades to the child; letting the parent
+    hit its `executionTimeout` does **not**, because that sweep marks the run cancelled without going
+    through `cancel`. The parent's own execution timeout is still what stops a hung child holding a
+    connector's singleton slot for ever — admission counts `suspended` runs, and a timed-out parent is
+    no longer one. A called workflow should carry its own `executionTimeout`; `ctx.child` takes none.
+  - **Serialisation belongs to the callee, and is weaker across SDKs.** Calling a workflow does not
+    lend it the caller's singleton. On the convention/`attach` path a cross-SDK body is reached by,
+    the synthesised registration carries no singleton, timeout or validator at all. The canvas says so
+    rather than implying otherwise.
+  - **`expectShrink` reaches every node step and no callee.** The acknowledgement on
+    `POST workflows/:id/run` stands the row-count bound down for one snapshot, and the bound is
+    applied at the sink — so a call node does not forward it. Handing a one-time acknowledgement to
+    an arbitrary workflow would put it somewhere nothing on this side can account for what was done
+    with it.
+  - **A `call` node counts as something that reads**, so `call → sink` is a valid graph and
+    `no-source` is no longer raised on one. A graph of transforms alone is still refused.
+  - **On a pod with no durable engine the run is refused up front**, naming the node and the workflow,
+    instead of opening a run row and failing at the node.
+  - The canvas gains a Call node with a workflow field, a version field and a JSON parameter box, in
+    the same node inspector that authors a source or a sink — the one screen a pipeline is now
+    published, scheduled and run from, so a call node is drawn, saved and published exactly like the
+    rest of the graph rather than through a surface of its own.
+    **Deliberately no picker**: nothing can enumerate a deployment's workflows — `workflowBody` answers
+    only for the asking process, and a missing body equally means a `registerRemote` body in another
+    SDK or a group resolved against a live worker — so a list inferred from it would silently omit the
+    cross-SDK workflows this node exists to call. `CallableWorkflowRef` is the shape to hand it the day
+    a deployment can announce its registrations: one entry per name **and** version.
+  - A call node's `config` travels the same credential path a source node's does — sealed under
+    `encryptCredentials`, refused in plaintext without it, redacted on the way out and restored on the
+    way back in — which is why it carries the same field name.
+
+  **Calling a durable _step_ is not offered, and cannot be.** A step has no global identity: it is
+  routed by a name a worker subscribes to and addressed within a run by its `seq`, so there is nothing
+  to start, await or cancel. Wrap it in a one-step workflow. This is written into `WORKFLOW_NODE_KINDS`
+  beside the other rejected kinds rather than left to be rediscovered.
+
+- 5d81530: A run row nothing revisits is closed by asking the engine, not a clock
+
+  `closeAbandonedAttempts` closes a row left at `running` when the **next attempt at the same
+  snapshot** opens. That is exact, and it is also the whole of its reach: a durable run plans once and
+  its node retries reuse that row, so the attempt that does the closing is a planning step being
+  retried or an operator re-driving the same `snapshotId`. A durable run that dies without ever
+  reaching its finish step — the two-hour execution timeout, a cancellation, a worker that never
+  resumes — leaves a row nothing comes back to, because the next run of that pipeline mints a _new_
+  snapshot. That row sat at `running` with `fetched = 0` and no error indefinitely. `minor` and not
+  `major`: this is 0.x, and the project versions on that basis.
+
+  **The lever is that the snapshot id IS the durable run id.** It is minted by `WorkflowLauncher.run`
+  and handed straight to `engine.start`, so there is nothing to correlate: the question "is this load
+  still going" can be put to the component that decides the answer. `closeRunsTheEngineHasFinished`
+  asks `engine.getRun(snapshotId)` and closes the row when the engine has no record of the run or
+  reports it terminal. An age threshold was never available here for the reason it was never available
+  to the first rule — the loads this is about _are_ the slow ones, so "open for a long time" is
+  indistinguishable from working.
+
+  **Three answers, and only two of them are writes.** No record of the run (never held, or pruned by a
+  retention policy) and a terminal status are closes. A **non-terminal** status is left exactly alone,
+  and that is the answer that must never be got wrong: closing a live load writes `failed` onto a
+  healthy run and makes the row disagree with the data it is about to commit. Terminal is read from the
+  engine's own exported `TERMINAL_RUN_STATUSES` rather than a hand-written list, so a status a later
+  release adds — `blocked` and `cancelling` are both recent, both non-terminal — falls to "alive",
+  which is the direction that costs nothing.
+
+  **When the engine cannot be asked, nothing is written and the reason is said once, at boot.** Two
+  shapes, reported differently because they are different facts: no engine resolved at all
+  (`CATALOG_DURABLE=off`, so every run here is `inline` and there is nothing to reconcile — logged as
+  the ordinary state it is), and an engine that resolved and cannot read a run. The second is the thin
+  tenant worker, which is given `DurableStartClient` under the `WorkflowEngine` token — a store-less,
+  start-only facade with no `getRun` at all — and it warns, because durable runs exist on that
+  deployment and this process can see none of them. The engine is therefore injected by explicit token
+  and typed `object`: declaring `WorkflowEngine` as the _type_ would state a contract that token does
+  not keep, and the compiler would agree that `engine.getRun` exists where it does not.
+
+  **A timer, on one process, and here is what it costs.** The trigger had to be something other than
+  "the next attempt", which by definition never comes for these rows.
+
+  - **Boot only** was the cheapest and does not work: the run dies mid-afternoon, and a pod not
+    restarted until Thursday leaves the row `running` until Thursday. Kept as the _first_ tick, because
+    a pod replacing a killed one is exactly when the killed one's leftovers are visible.
+  - **A read path** is always fresh and is refused on principle: it makes a `GET` write to a governance
+    record, so what a run row says would depend on who looked and when — and it costs an engine
+    round-trip per open row on every render of the runs list.
+  - **A pass every `CATALOG_RUN_RECONCILE_MS`** (default 5 minutes) costs one
+    `ORDER BY started_at DESC LIMIT CATALOG_RUN_RECONCILE_SCAN` (default 200) over the run table, one
+    `listConnectors` for the names, and one `engine.getRun` per row _currently_ marked running — nought
+    or one when nothing is wrong. Nothing in that grows with the data a load moves. Not the scheduler's
+    30s tick: a hundredfold the queries for no gain, in the loop whose one job is starting loads on
+    time.
+
+  New: `AbandonedRunReconciler`, `CATALOG_RECONCILE_RUNS`, and
+  `CatalogPipelineModuleOptions.reconcileRuns` — defaulting to `scheduler` and then to `true`, the same
+  axis and the same default as `adoptConnectors`, because this writes and six replicas racing to close
+  one row is six copies of the warning about it.
+
+  Two things it deliberately will not do:
+
+  - **Only rows that positively say `executionMode: 'durable'`.** An `inline` row has no durable run,
+    so `getRun` would answer "no record" for a load running perfectly — the same third-state error,
+    reached by asking a question that never applied. A row with _no_ execution mode is refused for the
+    same reason rather than guessed at, which means `ConnectorRunnerService`'s rows are not reconciled:
+    that path is being retired into workflows, it keeps the next-attempt rule, and buying it a second
+    would mean inferring durability from a missing column.
+  - **It re-reads the run list before it writes.** Between listing the rows and the engine answering,
+    every one of them had a chance to record its own outcome, and its own outcome is worth more — it is
+    the one that knows what the load did. Only a row still `running` at the second read is closed. The
+    starting race needs no such guard and gets none: `engine.start` awaits `createRun` strictly before
+    it dispatches, and the catalog row is opened by the plan step, which runs after the dispatch — so
+    "no record" can never mean "not started yet", and a grace period would be a clock with the same
+    objection as before.
+
+- dd79c42: The workflow is the only thing anybody authors
+
+  A connector stops being an authored object. It becomes what a published workflow
+  runs as: minted by `publishWorkflow`, removed with the graph, with no route to
+  create one directly. `minor` and not `major` on purpose — this is 0.x, and the
+  project versions on that basis rather than on whether a route was removed.
+
+  **Routes gone.** `POST connectors`, `DELETE connectors/:id`,
+  `POST connectors/:id/run`, `POST connectors/:id/discover`, and
+  `GET workflows/:id/connectors`. `GET connectors` stays, as a read: it is where a
+  run history and a watermark are actually keyed, and an internal record no route
+  exposes is one an operator debugs by opening the database.
+
+  **Routes arrived.** `PUT workflows/:id/schedule`, because a schedule is a
+  statement about a pipeline and a pipeline is a graph; and
+  `POST workflows/:id/nodes/:nodeId/discover`, because discovery is how a type gets
+  its shape before anything can be published into it. `GET connections/:id/connectors`
+  became `GET connections/:id/workflows`, which is the question an operator is
+  actually asking before they delete one.
+
+  **Three things had to move rather than be dropped, and each was load-bearing.**
+
+  _Discovery._ `discoverConnectorSchema` refused any connector carrying a
+  `workflowId`, telling the caller to discover from the graph's source node
+  instead — correct advice pointing at something that did not exist. Every
+  connector carries one now, so the old shape would have refused every connector
+  there is. It takes a `DiscoverySource` and resolves through
+  `WorkflowRunnerService.resolveSourceNode`, the same method a run resolves with,
+  so a discovery cannot describe a source the load never touches. It answers on a
+  **draft**, deliberately: a sink cannot commit into a type that does not exist, so
+  requiring a published graph would require publishing a graph whose target type
+  cannot be created until it is published.
+
+  _The schedule._ Authored on `CatalogWorkflow` now, and `ConnectorScheduler` reads
+  workflows. The connector keeps a copy for evidence and nothing reads it. Every
+  way a schedule can exist and not fire — a draft, a disabled graph, an unparseable
+  cron, a ready graph with no connector — is now logged by name rather than skipped:
+  this loop once announced it was watching schedules every 30000ms while parsing
+  nothing, and a silent skip is that failure wearing a different cause.
+
+  _`expectShrink`._ The acknowledgement that lets a deliberately collapsing load
+  past the row-count bound reached it only through `POST connectors/:id/run`.
+  Removing that route without moving this would have left an operator unable to
+  re-drive a refused load at all, which pushes them to raise the bound in policy —
+  standing the guard down for every future load of the type rather than for one
+  snapshot. It is on `POST workflows/:id/run`, carried through the durable step
+  input, and a scheduled window still has no field for it.
+
+  **Existing connectors are migrated, not frozen.** `ConnectorAdoption` wraps every
+  connector that predates workflows into the graph it always was — one source,
+  optionally one transform, one sink — at boot, idempotently, and loudly. It keeps
+  the connector **id**, so the run history, the singleton mutex key and the
+  watermark stay attached to the same pipeline; **re-keys the watermark** under the
+  new source node, so the first run after the upgrade does not re-read an
+  incremental source from the beginning; and moves the schedule onto the graph. A
+  connector whose wrap does not validate is refused and keeps running exactly as it
+  was. Turn it off with `adoptConnectors: false`, and be aware of the consequence:
+  those connectors keep loading and no route can edit them.
+
+  **Unpublishing and deleting a workflow now cascade.** Both used to refuse while a
+  connector still ran the graph, on the reasoning that "point them elsewhere first"
+  was advice somebody could act on. It no longer is — a published graph runs as
+  exactly one connector, its own — so the old check would refuse every unpublish
+  there has ever been. Unpublishing **disables** the connector, keeping the id and
+  the history so re-publishing resumes the same pipeline; deleting removes it,
+  which takes the run history with it.
+
+  **Not included: the console.** `#connectors` and `#workflows` are still two
+  screens, and `CatalogClient.saveConnector`, `deleteConnector`, `runConnector`,
+  `discoverConnectorSchema` and `connectionConnectors` still address routes this
+  release removes, so those actions 404. Merging the two screens into one place to
+  author a pipeline is the other half of this work and is deliberately not
+  half-done here.
+
+- d4a39ba: A run the graph path left open is closed by the attempt that follows it
+
+  `closeAbandonedAttempts` existed only on `ConnectorRunnerService`, and the two runners are two
+  implementations of a load rather than one wrapping the other — so making the workflow the only
+  thing anybody runs took the protection away with it. A step whose lease expires is re-dispatched
+  while the attempt holding it is still inside the load: that attempt never reaches `finishRun`, and
+  its row sits at `running` with `fetched = 0` and no error for good, with the truth written down
+  only in `durable_step_checkpoints`. `minor` and not `major`: this is 0.x, and the project versions
+  on that basis.
+
+  **One implementation, two callers.** The rule moves to `abandoned-runs.ts` and both runners call
+  it. It is subtle in a specific way — what it keys on, and which of two attempts it may touch — and
+  a second copy that drifted would not fail; it would quietly close the wrong row, or stop closing
+  any. The keying is unchanged and is the whole design: **the snapshot id, not age**. A durable retry
+  reuses the snapshot and nothing else does, so a concurrent run of the same connector is untouched,
+  and an age threshold is unusable because the loads this is about are the slow ones. Both stated
+  limits survive: the last attempt of a series is closed by nothing, and an attempt still alive
+  elsewhere may write its own outcome over this — which is correct, it is the one that knows.
+
+  **A workflow run stops adopting the row it finds.** `WorkflowRunnerService.plan` was idempotent by
+  `(connectorId, snapshotId)`: an existing row at the same snapshot was adopted rather than opened
+  again, so a planning step that committed `startRun` and lost its result would not leave one row per
+  attempt. That answered the multiplicity and left the silence — the adopting attempt wrote its own
+  outcome over the row and nothing anywhere said an earlier one had vanished, which is the failure
+  this scan exists to end, arrived at from the other side. The earlier row is now closed with the
+  message that names the three causes and points at the checkpoints table, and this attempt opens its
+  own. A run list reporting "a load that never happened" is exactly right when the row says which
+  load and why it never happened.
+
+  Consequences worth knowing:
+
+  - **A snapshot can carry more than one row.** `findRun` answers with the one still being written,
+    and otherwise with the one that recorded an outcome last. `started_at` is stored to the second,
+    so a first match could otherwise report an abandoned attempt's failure as the outcome of the run
+    that had just replaced it — which is what `WorkflowLauncher.awaitRun` hands back to whoever
+    pressed Run.
+  - **`WorkflowPlanResult` gains `notes`.** The row a workflow run reports into is opened by the plan
+    step and finished by a later one, so a line written at the open would be overwritten by the finish
+    step's `logs`. The closure travels on the plan's checkpoint instead — which is also what makes it
+    survive a replay, the case that matters, since what is being recorded is that a previous attempt
+    did not. Optional, so a run whose plan was checkpointed by an older build replays without it.
+  - **`emptyProgress(logs?)`** takes the lines a run starts with, so the note sits above the first
+    node's output rather than wherever a caller remembered to push it.
+  - **The two housekeeping rules read one list.** `sweepAbandonedStages` no longer runs its own
+    query. Two reads are two answers to which runs there were, and the read is now guarded — the
+    workflow path's `findRun` on the way in was not, so a store that could not answer took the load
+    with it.
+
+  `sweepAbandonedStages` and this are **not** the same job and are not merged: the sweep takes runs
+  that _failed_, at _other_ snapshots, older than the retention window, and drops staged rows; this
+  takes runs still _running_, at _this_ snapshot, at any age, and writes them an outcome. Disjoint on
+  every clause. They do compose — staged rows are only ever collected from a failed run, so a row
+  abandoned at `running` kept its stages for good until something closed it.
+
+  **The limit is wider on the graph path and is written down rather than papered over.** A durable
+  workflow run plans once and its node retries reuse that row, so the attempt that does the closing is
+  a planning step being retried or an operator re-driving the same `snapshotId`. A durable run that
+  dies without reaching its finish step — an execution timeout, a cancellation, a worker that never
+  resumes — leaves a row nothing revisits, because the next run mints a new snapshot. Closing that one
+  needs the engine's own view of the run, which is not a clock. `AbandonedRunReconciler` does it, in
+  the changeset beside this one: the snapshot id _is_ the durable run id, so `engine.getRun` answers
+  whether a run this deployment still calls `running` is actually alive. The two rules are complements
+  — this one needs no engine and closes the earlier attempts of a retry series as the next one opens;
+  that one needs an engine and closes the row nothing will ever come back to.
+
+### Patch Changes
+
+- 9744e91: Test cron against the parser that ships, not a stub of it
+
+  Every scheduled connector in a deployment was silently inert. The worker said so
+  at boot, once, and contradicted itself on the next line:
+
+      ERROR [ConnectorScheduler] No connector will run on a schedule:
+            parser.parseExpression is not a function.
+      LOG   [ConnectorScheduler] Watching connector schedules every 30000ms.
+
+  `cron-parser` v4 exported `parseExpression`; v5 replaced it with
+  `CronExpressionParser.parse`. The durable core read only the v4 shape, so
+  `prevCronFireMs` threw on the first expression it was handed — which is every
+  expression, for every connector, on every tick.
+
+  **No test here could have caught it.** `cron-parser` is an optional peer this
+  package did not install, so `prevCronFireMs` throws in this repository for a
+  second, unrelated reason, and any scheduler spec had to stub the parser and
+  assert against the stub. A stub of the thing that broke cannot fail when the
+  thing that broke changes.
+
+  So `cron-parser` is now a devDependency, and one spec exercises the real seam:
+  that the version this lockfile resolves is one the durable core can read
+  through. It does not test `cron-parser` — that library has its own tests — it
+  tests the join, which is the only thing an API change breaks and exactly what
+  nobody was checking. It pins the arithmetic a scheduler depends on (the answer
+  is aligned to the expression, not to the instant, because an unaligned fire time
+  mints a new run id every tick and turns idempotent scheduling into a runaway),
+  the timezone being honoured, and both refusals.
+
+  Verified by reproducing the incident: with `@dudousxd/nestjs-durable-core`
+  pinned back to 0.62.0, four of the six cases fail with `parser.parseExpression
+is not a function` — the log line from the outage, in CI.
+
 ## 0.11.0
 
 ### Minor Changes

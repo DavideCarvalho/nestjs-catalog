@@ -1,5 +1,91 @@
 # @dudousxd/nestjs-catalog-store-clickhouse
 
+## 0.2.0
+
+### Minor Changes
+
+- cbab48c: A property may be named the way its source spells it, and the publish check refuses only what
+  genuinely cannot become a column.
+
+  A store matches a source's record to a property by property NAME — it reads `row[property.name]` —
+  and nothing on the write path consults `columnName`. But the name was also written _verbatim_ as the
+  output alias of the committed view and of every read, through an `ident` that refuses rather than
+  escapes, so a property could not be called `Asset Id` at all. Publishers therefore did what the
+  refusal told them to do: renamed the property to `Asset_Id` and put the source's spelling in
+  `columnName`. Thirteen types were loaded that way and six came out with most of their columns NULL —
+  73 of 84 on the largest, across 313,833 rows — with every run green, every row count right, and
+  nothing visible short of opening a cell.
+
+  - **The view's output alias and the read's alias now go through `outputAlias`**, in both shipped
+    adapters (`query.ts` and the store in each of `store-mikro-orm` and `store-clickhouse`). A name
+    SQL cannot take is cleaned to its physical column; **a name SQL can take is kept byte for byte**,
+    so no view that resolves today changes shape. The two names that would otherwise have moved — one
+    whose doubled underscores would collapse, one over 60 characters — are pinned by tests.
+  - **The publish-time refusal asks the question it actually needs to**: does this name _clean_ to an
+    identifier? `Asset Id` does and is accepted; `2024 Total` does not, because `2024_Total` starts
+    with a digit, and is still refused before a single row exists. The refused value named in the
+    message is the cleaned one, which is exactly the string `ident` would refuse, so publish-time and
+    DDL-time still say one sentence about one string. Length alone can no longer refuse a name, since
+    the cleaning cuts at 60 and the rule allows 63.
+  - **The refusal message now says what a rename costs.** Taking the suggested name means the load
+    looks up `row[<new name>]` in records the source still keys by the old one, so the message names
+    `row[name]` and says a transform has to go with it. That sentence is the one whose absence turned
+    a correct refusal into six empty tables.
+  - **`physicalColumn` moved to `@dudousxd/nestjs-catalog`** and is re-exported by both adapters
+    unchanged. It was three byte-identical private copies — two of them inside `store-mikro-orm`, one
+    deciding the view's columns and one deciding the table's — and it is now what decides whether a
+    published name can work at all, so the publish check and the DDL run the same function rather than
+    copies of it. `outputAlias` lives beside it. Both are new named exports; nothing was removed.
+
+  **What an existing deployment sees: nothing.** Every property name stored today is a SQL identifier,
+  because the old publish check demanded one, and `outputAlias` returns such a name unchanged — so
+  every view keeps every column it has, `read()` still returns rows keyed by the property's own name,
+  and no migration or republish is needed. What changes is what a _new_ publish may say, and one
+  repair: a type that picked up a name like `Asset Id` before the publish check existed used to fail
+  at every commit and be warned about on every publish. It now cleans to a column like any other, so
+  it works and the warning correctly stops.
+
+- ce475f1: Two stores that can filter now say so, and ClickHouse stops keeping its own copy of the reserved
+  column list.
+
+  **`store-clickhouse` and `store-fanout` declare `objectFilterOperators`.** The design is that a
+  store _declares_ which operators it can push into a predicate: the service offers a screen exactly
+  those and refuses a filter naming anything else, so a store that ignores a filter can never answer
+  with more rows than were asked for. That part worked. What was missing was the declaration on two
+  stores that can, in fact, filter — so a ClickHouse deployment and a fan-out deployment each got no
+  filter controls at all, and a hand-built filter came back as a refusal, for stores with a perfectly
+  good WHERE clause available the entire time.
+
+  - **ClickHouse applies all nine operators**, in the same `where` its `count()` and its page both
+    read from — a filter on the page and not the count is a screen showing three rows above the words
+    "of 4,812". Two predicates are not MySQL's, and deliberately: `empty`/`notEmpty` compare against
+    `''` only on the text types, because ClickHouse refuses `Nullable(Float64) = String` outright
+    where MySQL coerces it, and `contains` is `ILIKE` rather than `LIKE`, the same choice the search
+    box already makes so that a control does not behave differently depending on which adapter is
+    mounted. `eq` is left case-sensitive, which is a real difference from MySQL's default collation
+    and is stated rather than papered over: matching it would mean lowering both sides of every
+    comparison, forfeiting the sparse index, and still not matching, since that collation is
+    accent-insensitive too. A filter on a column the same read did not select is refused, as on MySQL:
+    a predicate over a hidden or classified column leaks it through row membership.
+  - **The fan-out reports its primary's operators**, and reports nothing when the primary declares
+    nothing — `read` is the primary's `read`, so that is the only answer it can keep. Not intersected
+    with the followers, unlike the capability object: nothing routes an ordinary read to a follower,
+    so intersecting would remove the filter controls from a catalog that filters fine for the sake of
+    a store nobody reads. The one read path that does leave the primary, `readFrom(name, ...)`, now
+    **refuses** a filter the named store cannot apply — otherwise a follower that filters nothing
+    returns its whole table and the operator comparing it against the primary before a flip reads that
+    as the follower holding extra rows.
+
+  **`RESERVED_COLUMNS` in `store-clickhouse` is `CATALOG_RESERVED_COLUMNS`,** re-exported rather than
+  rebuilt. The file's own docblock already said the identifier rule came from the core package "next
+  to `CATALOG_RESERVED_COLUMNS`, and taken from there for the same reason that list is" — and the list
+  was not taken from there. It was assembled locally and agreed with the core's by coincidence, which
+  is what let the claim survive being read. The two lists were byte-identical, so nothing changes for
+  a deployment; what changes is that they can no longer come apart. The five per-column constants stay
+  (the DDL and the SELECT lists need each name on its own) and both adapters now assert that those
+  constants and the shared list still describe the same set — the half a re-export cannot give you,
+  and the failure `_row` already caused once.
+
 ## 0.1.2
 
 ### Patch Changes

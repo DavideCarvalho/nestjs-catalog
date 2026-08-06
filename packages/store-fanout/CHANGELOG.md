@@ -1,5 +1,93 @@
 # @dudousxd/nestjs-catalog-store-fanout
 
+## 0.3.0
+
+### Minor Changes
+
+- 688becb: Stream the CSV export, and stop a cell in it executing when somebody opens the file.
+
+  `GET saved-queries/:id/export.csv` ran the query, held the result, built the whole CSV string and
+  then answered. That is the same shape that stopped a 981,469-row connector load ever finishing, and
+  it is worse on an export, because an export has no row cap by design: the point of it is to take
+  everything.
+
+  - **Rows are written to the response as they arrive.** `CatalogQueryStore` gains an optional
+    `streamQuery`, `csvLines` turns an async row source into CSV a line at a time, and the handler
+    returns a `StreamableFile` over it. `@Res({ passthrough: true })` is unchanged and still correct —
+    what changed is the returned value, because the express adapter answers a _string_ body with
+    `res.send()`, which sets a `content-length` on a body nobody has counted. The response is now
+    chunked and carries none. Back-pressure runs the whole way: the pipe stops when the socket is full,
+    the readable stops pulling, and the generator stops asking the store — so a slow client slows the
+    database read rather than filling this process. A client that abandons the download tears the
+    readable down, which runs the generator's `finally`.
+  - **The export is no longer capped or cached** on a store that streams. `maxQueryRows` bounds a
+    screen's page; a capped export is a prefix handed over as a complete file. The cache is skipped in
+    both directions — it holds a capped page, and filling it from an export would put the whole result
+    in the object the cache exists to avoid. No statement timeout is applied either: an export of a
+    large table legitimately runs for minutes, and the bound that matters for it is that no stage holds
+    more than a row.
+  - **`MySqlWarehouseStore` implements `streamQuery`**, on MikroORM v7's Kysely-backed
+    `connection.stream()` inside a real `READ ONLY` transaction handle — passing the handle matters,
+    since a stream executed on some other pooled connection would be protected by nothing. The rollback
+    is in the generator's `finally`, so it runs when a consumer stops early. `FanoutCatalogStore`
+    forwards it when its primary has it; `RoutingCatalogStore` forwards it per environment.
+  - **A store that cannot stream keeps the capped buffered read**, and the truncation is logged.
+    Lifting the cap there would not make the export complete, it would move the failure into a driver
+    that has no cap to report. `ClickHouseWarehouseStore` is in this group today.
+  - **A cell whose value would be read as a formula is neutralised.** `=`, `+`, `-` and `@` all start
+    an expression in Excel and Sheets, including through leading blank the importer strips first and
+    including a leading tab or carriage return, and the values here come from whatever the queried
+    source contained. Such a cell is prefixed with `'`. **A value that is plainly a number is exempt**,
+    so `-42` still reads back as `-42` for a machine: a spreadsheet evaluates `-42` to the number it
+    already was, so there is nothing there to defend against, and the apostrophe is a real cost —
+    outside a spreadsheet the cell now carries a character the database did not have. The guard runs
+    before the CSV quoting, so a value that needed both comes out as `"'=1+1,x"`, escaped once.
+
+  `toCsv` keeps its name, its signature and its bytes, and moves from `catalog.query-cache` to
+  `catalog.csv` alongside `csvLines`, `csvCell` and `guardFormula`; the package entry point exports all
+  four. Its output changes only where the formula guard applies.
+
+- ce475f1: Two stores that can filter now say so, and ClickHouse stops keeping its own copy of the reserved
+  column list.
+
+  **`store-clickhouse` and `store-fanout` declare `objectFilterOperators`.** The design is that a
+  store _declares_ which operators it can push into a predicate: the service offers a screen exactly
+  those and refuses a filter naming anything else, so a store that ignores a filter can never answer
+  with more rows than were asked for. That part worked. What was missing was the declaration on two
+  stores that can, in fact, filter — so a ClickHouse deployment and a fan-out deployment each got no
+  filter controls at all, and a hand-built filter came back as a refusal, for stores with a perfectly
+  good WHERE clause available the entire time.
+
+  - **ClickHouse applies all nine operators**, in the same `where` its `count()` and its page both
+    read from — a filter on the page and not the count is a screen showing three rows above the words
+    "of 4,812". Two predicates are not MySQL's, and deliberately: `empty`/`notEmpty` compare against
+    `''` only on the text types, because ClickHouse refuses `Nullable(Float64) = String` outright
+    where MySQL coerces it, and `contains` is `ILIKE` rather than `LIKE`, the same choice the search
+    box already makes so that a control does not behave differently depending on which adapter is
+    mounted. `eq` is left case-sensitive, which is a real difference from MySQL's default collation
+    and is stated rather than papered over: matching it would mean lowering both sides of every
+    comparison, forfeiting the sparse index, and still not matching, since that collation is
+    accent-insensitive too. A filter on a column the same read did not select is refused, as on MySQL:
+    a predicate over a hidden or classified column leaks it through row membership.
+  - **The fan-out reports its primary's operators**, and reports nothing when the primary declares
+    nothing — `read` is the primary's `read`, so that is the only answer it can keep. Not intersected
+    with the followers, unlike the capability object: nothing routes an ordinary read to a follower,
+    so intersecting would remove the filter controls from a catalog that filters fine for the sake of
+    a store nobody reads. The one read path that does leave the primary, `readFrom(name, ...)`, now
+    **refuses** a filter the named store cannot apply — otherwise a follower that filters nothing
+    returns its whole table and the operator comparing it against the primary before a flip reads that
+    as the follower holding extra rows.
+
+  **`RESERVED_COLUMNS` in `store-clickhouse` is `CATALOG_RESERVED_COLUMNS`,** re-exported rather than
+  rebuilt. The file's own docblock already said the identifier rule came from the core package "next
+  to `CATALOG_RESERVED_COLUMNS`, and taken from there for the same reason that list is" — and the list
+  was not taken from there. It was assembled locally and agreed with the core's by coincidence, which
+  is what let the claim survive being read. The two lists were byte-identical, so nothing changes for
+  a deployment; what changes is that they can no longer come apart. The five per-column constants stay
+  (the DDL and the SELECT lists need each name on its own) and both adapters now assert that those
+  constants and the shared list still describe the same set — the half a re-export cannot give you,
+  and the failure `_row` already caused once.
+
 ## 0.2.1
 
 ### Patch Changes
