@@ -320,6 +320,17 @@ const NODE_FACTORIES: NodeFactories = {
   source: (id, name, init) => ({ id, name, kind: 'source', ...init }),
   transform: (id, name, init) => ({ id, name, kind: 'transform', ...init }),
   sink: (id, name, init) => ({ id, name, kind: 'sink', ...init }),
+  // `call` arrived after these templates were written, and the map above is
+  // exactly why: the build stopped rather than the kind going quietly missing.
+  //
+  // No template below builds one, and that is a statement rather than an
+  // omission. A call node hands a step to a workflow this graph does not own,
+  // pinned by name and version — which is a decision about somebody else's
+  // code, and a template exists to make a decision once on the reader's behalf.
+  // There is nothing here to decide for them, and no way to enumerate a
+  // deployment's registrations to offer a choice from. The factory is complete
+  // so that a template CAN build one the day a case is worth prefilling.
+  call: (id, name, init) => ({ id, name, kind: 'call', ...init }),
 };
 
 /* -------------------------------------------------------------------------- */
