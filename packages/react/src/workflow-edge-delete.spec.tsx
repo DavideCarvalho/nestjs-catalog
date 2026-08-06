@@ -19,13 +19,28 @@
  *
  * WHAT IS ASSERTED, AND WHAT CANNOT BE
  * ------------------------------------
- * jsdom does no layout, so nothing here looks at where the × landed — every element is 0×0 and a
- * test about its position would pass for the wrong reason. What is checked is what exists, what it
- * is called, and what pressing it does to the graph that gets SAVED, which is the same standard
- * `workflow-canvas.spec.tsx` sets for placement.
+ * jsdom does no layout, so nothing here MEASURES where the × landed — every element is 0×0 and a
+ * `getBoundingClientRect` assertion would pass for any placement at all, including the broken one.
+ * What is checked is what exists, what it is called, what pressing it does to the graph that gets
+ * SAVED, and — see "WHERE THE × IS TOLD TO GO" below — the instruction it was given about where to
+ * be, read off the element that carries it.
  *
  * `toBeChecked` / `toBeDisabled` are NOT available — this repo registers no jest-dom setup, and
  * they throw rather than fail.
+ *
+ * WHERE THE × IS TOLD TO GO
+ * -------------------------
+ * Everything in the first version of this file passed while the × was invisible and unclickable.
+ * It was in the document, it had the right accessible name, and clicking it removed the right
+ * edge — and it was painted 414px away from its line, underneath a node, because the element that
+ * carried `transform: translate(…labelX…, …labelY…)` also animated `scale`, and Motion composes
+ * the whole `transform` property from the values it animates. At rest it wrote `transform: none`.
+ *
+ * So one test here reads the transform. Not the rect: jsdom lays nothing out, and the property
+ * under test is not "the button is at coordinates" but "the positioning element still carries the
+ * translate after the animated element has mounted and settled" — which is precisely what Motion
+ * took away. An inline transform is a string this component wrote, so reading it back is reading
+ * the instruction, and the instruction is what went missing.
  *
  * THE PAIR THAT MATTERS
  * ---------------------
@@ -378,6 +393,67 @@ describe('reaching the same thing without a pointer', () => {
     fireEvent.click(saveButton());
     await waitFor(() => expect(lastPostTo('/pipeline/workflows')).toBeDefined());
     expect(readEdges(lastPostTo('/pipeline/workflows')?.body)).toEqual([]);
+  });
+});
+
+/**
+ * The element that says where the × goes, and the translate read back off it.
+ *
+ * `.nodrag.nopan` is the positioning wrapper — the one React Flow must not treat as canvas to
+ * drag, which is the same element the placement belongs on. Found from the button rather than by
+ * querying the layer, so a second edge control appearing somewhere else cannot satisfy this.
+ */
+function placementOf(control: HTMLElement): HTMLElement {
+  const wrapper = control.closest('.nodrag.nopan');
+  if (!(wrapper instanceof HTMLElement)) throw new Error('The × has no positioning wrapper');
+  return wrapper;
+}
+
+/** The `translate(Xpx, Ypx)` half of the placement, or null if there is not one. */
+function translateIn(transform: string): { x: number; y: number } | null {
+  const found = /translate\(\s*(-?[\d.]+)px\s*,\s*(-?[\d.]+)px\s*\)/.exec(transform);
+  if (!found) return null;
+  return { x: Number(found[1]), y: Number(found[2]) };
+}
+
+describe('where the × is placed', () => {
+  /**
+   * The regression. See "WHERE THE × IS TOLD TO GO" at the top of this file.
+   *
+   * The property under test is the INLINE TRANSFORM, not a rect: jsdom lays nothing out, so every
+   * element here is 0×0 and `getBoundingClientRect` would agree with any placement, including the
+   * one that put this control under a node. The transform is a string this component wrote, and
+   * the bug was that something else wrote over it.
+   */
+  it('carries the translate to its own line, on an element no animation composes', async () => {
+    const { transport } = fakeTransport(answersFor([wholeWorkflow()]));
+    await openCanvas(transport);
+
+    fireEvent.click(await edgeElement());
+    await waitFor(() => expect(removeButtons()).toHaveLength(1));
+
+    // Retried rather than read once: the mount animation is what used to clobber the transform, so
+    // this has to keep holding after Motion has had frames to write to the element it owns.
+    await waitFor(() => {
+      const placement = placementOf(removeButtons()[0]);
+      const moved = translateIn(placement.style.transform);
+      expect(moved, `the × was placed with "${placement.style.transform}"`).not.toBeNull();
+    });
+
+    const placement = placementOf(removeButtons()[0]);
+    const moved = translateIn(placement.style.transform);
+    if (!moved) throw new Error('unreachable — asserted above');
+
+    // Somewhere along its own line, which for these two nodes means somewhere between the column
+    // the source is in and the column the sink is in. The broken version put it at 0.
+    expect(moved.x).toBeGreaterThan(workflowColumnX(0));
+    expect(moved.x).toBeLessThan(workflowColumnX(1) + WORKFLOW_NODE_WIDTH);
+    // And still centred on that point rather than hanging off it by its top-left corner.
+    expect(placement.style.transform).toContain('-50%');
+
+    // The split that keeps it true: the element being animated is INSIDE the one being placed. Put
+    // both jobs back on one element and Motion composes `transform` from its own values again.
+    expect(removeButtons()[0].parentElement).not.toBe(placement);
   });
 });
 

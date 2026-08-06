@@ -565,15 +565,25 @@ async function openCanvas(transport: CatalogTransport) {
   await screen.findAllByText('Feed');
 }
 
-/** Open a stored node's inspector the way a pointer does: click the box. */
+/**
+ * Open a stored node's inspector the way a pointer does: click the box.
+ *
+ * The box, specifically, and not the handle beside it. A node now carries TWO controls whose
+ * accessible names mention its label — the body ("Feed …", which opens the inspector) and the
+ * connection handle ("output of Feed", which starts a wire) — so a name match alone is ambiguous.
+ * The body is a real `<button>` and the handle is a `<div role="button">`, which is the honest way
+ * to tell them apart here: React Flow renders the handle, so it cannot be an element of our
+ * choosing, and asserting on a class would pin a style rather than a control.
+ */
 async function inspect(nodeLabel: string) {
   const node = document.querySelector(`.react-flow__node[aria-label^="${nodeLabel}"]`);
   if (!node) throw new Error(`No canvas node whose description starts "${nodeLabel}"`);
-  fireEvent.click(
-    within(node instanceof HTMLElement ? node : document.body).getByRole('button', {
-      name: new RegExp(nodeLabel.split(', ')[1] ?? ''),
-    }),
-  );
+  const named = within(node instanceof HTMLElement ? node : document.body).getAllByRole('button', {
+    name: new RegExp(nodeLabel.split(', ')[1] ?? ''),
+  });
+  const body = named.find((control) => control.tagName === 'BUTTON');
+  if (!body) throw new Error(`No clickable body on the node "${nodeLabel}"`);
+  fireEvent.click(body);
   return within(await screen.findByRole('dialog'));
 }
 

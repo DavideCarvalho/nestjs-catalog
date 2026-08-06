@@ -11,11 +11,18 @@ import {
   TriangleAlert,
 } from 'lucide-react';
 import { motion, useReducedMotion } from 'motion/react';
-import { type ReactNode, createContext, useContext } from 'react';
+import {
+  type KeyboardEvent as ReactKeyboardEvent,
+  type MouseEvent as ReactMouseEvent,
+  type ReactNode,
+  createContext,
+  useContext,
+} from 'react';
 import { cn } from '../cn';
 import { Tooltip } from '../ui/tooltip';
 import { NODE_WIDTH, type WorkflowFlowNode, type WorkflowNodeData } from './graph';
 import type { WorkflowNodeKind } from './model';
+import type { WiringHandleType, WorkflowWiring } from './wiring';
 
 const RULE = 'border-zinc-200 dark:border-zinc-800';
 const PANEL = 'bg-white dark:bg-zinc-900';
@@ -40,6 +47,8 @@ interface WorkflowNodeHandlers {
   onEditCode(nodeId: string): void;
   /** Whether editing is offered at all. */
   canEdit: boolean;
+  /** Click-to-click wiring: what a click on a handle does, and what is in flight. */
+  wiring: WorkflowWiring;
 }
 
 const WorkflowNodeContext = createContext<WorkflowNodeHandlers | null>(null);
@@ -76,27 +85,32 @@ function useWorkflowNodeHandlers(): WorkflowNodeHandlers {
  * colour with no dark counterpart is the failure mode that has bitten the
  * dropdowns in this package before — legible on the theme it was written on,
  * unreadable on the other.
+ *
+ * The rail is a gradient rather than a flat fill. It is 4px wide and runs the
+ * full height of the box, which is exactly the shape where a flat fill reads as
+ * a printing error and a gradient reads as an edge — and it is the only piece of
+ * a node that carries its kind at a glance from across the canvas.
  */
 const KIND_STYLE: Record<
   WorkflowNodeKind,
   { accent: string; chip: string; wash: string; icon: typeof Plug; noun: string }
 > = {
   source: {
-    accent: 'bg-sky-500',
+    accent: 'bg-gradient-to-b from-sky-400 to-sky-600',
     chip: 'text-sky-700 dark:text-sky-300',
     wash: 'bg-sky-50/70 dark:bg-sky-950/30',
     icon: Plug,
     noun: 'source',
   },
   transform: {
-    accent: 'bg-violet-500',
+    accent: 'bg-gradient-to-b from-violet-400 to-violet-600',
     chip: 'text-violet-700 dark:text-violet-300',
     wash: 'bg-violet-50/70 dark:bg-violet-950/30',
     icon: Repeat,
     noun: 'transform',
   },
   sink: {
-    accent: 'bg-emerald-500',
+    accent: 'bg-gradient-to-b from-emerald-400 to-emerald-600',
     chip: 'text-emerald-700 dark:text-emerald-300',
     wash: 'bg-emerald-50/70 dark:bg-emerald-950/30',
     icon: Database,
@@ -106,7 +120,7 @@ const KIND_STYLE: Record<
   // happen here: the box on the canvas is a handle on a workflow somebody else
   // owns, and it should not read as another transform.
   call: {
-    accent: 'bg-amber-500',
+    accent: 'bg-gradient-to-b from-amber-400 to-amber-600',
     chip: 'text-amber-700 dark:text-amber-300',
     wash: 'bg-amber-50/70 dark:bg-amber-950/30',
     icon: ExternalLink,
@@ -123,17 +137,100 @@ const KIND_STYLE: Record<
  * widens what you can see to aim at.
  */
 const HANDLE = cn(
-  '!h-3 !w-3 !rounded-full !border-2 !transition-transform',
+  '!h-3 !w-3 !rounded-full !border-2 !transition-all !duration-150',
   '!border-zinc-300 !bg-white dark:!border-zinc-600 dark:!bg-zinc-800',
-  // Grows under the pointer, so the thing you are about to drag from
-  // acknowledges you before the drag starts.
-  'hover:!scale-125',
+  // A pointer, not a crosshair: a click is now enough. See `wiring.tsx`.
+  '!cursor-pointer',
+  // Grows under the pointer, so the thing you are about to click
+  // acknowledges you before you commit to it.
+  'hover:!scale-125 hover:!border-violet-400',
+  'focus-visible:!outline-none focus-visible:!ring-2 focus-visible:!ring-sky-500/50',
   // React Flow adds these while a connection is being dragged. Colouring them
   // is what makes an illegal target — one that would close a loop, or a source
   // that takes no input — visibly refuse *before* the mouse is released.
   '[.react-flow__handle-connecting&]:!border-red-500',
   '[.react-flow__handle-valid&]:!border-emerald-500 [.react-flow__handle-valid&]:!bg-emerald-500',
 );
+
+/**
+ * What a handle looks like while a click-started wire is open.
+ *
+ * The drag has had this since the beginning — React Flow paints the handle under
+ * the cursor valid or invalid, which is what makes an illegal drop refuse itself
+ * before the mouse is released. A click has no "under the cursor" moment, so the
+ * same judgement is shown on every handle at once: where this wire can land is
+ * green, where it cannot is faded almost out, and the end it started from is
+ * held in the connection line's own violet.
+ *
+ * The pulse is `motion-safe:`, so somebody who has asked for stillness gets the
+ * colour and not the throb. The colour is the information.
+ */
+type HandleWiringState = 'idle' | 'origin' | 'open' | 'shut';
+
+const HANDLE_WIRING: Record<HandleWiringState, string> = {
+  idle: '',
+  origin: '!border-violet-500 !bg-violet-500 !ring-4 !ring-violet-500/25',
+  open: cn(
+    '!border-emerald-500 !bg-emerald-500 !ring-4 !ring-emerald-500/25',
+    'motion-safe:!animate-pulse',
+  ),
+  shut: '!opacity-20',
+};
+
+function handleWiringState(
+  wiring: WorkflowWiring,
+  nodeId: string,
+  type: WiringHandleType,
+): HandleWiringState {
+  const { pending } = wiring;
+  if (!pending) return 'idle';
+  if (pending.nodeId === nodeId && pending.type === type) return 'origin';
+  return wiring.accepts(nodeId, type) ? 'open' : 'shut';
+}
+
+/** The box's version of {@link handleWiringState}. Drawn on the whole node. */
+function nodeWiringState(wiring: WorkflowWiring, nodeId: string): HandleWiringState {
+  if (!wiring.pending) return 'idle';
+  if (wiring.pending.nodeId === nodeId) return 'origin';
+  if (wiring.accepts(nodeId, 'target') || wiring.accepts(nodeId, 'source')) return 'open';
+  return 'shut';
+}
+
+/**
+ * The props that turn a handle into something a click, or a key, can operate.
+ *
+ * Spread onto `<Handle>` rather than written inline twice, because the two
+ * handles differ only in which side of the node they are. React Flow spreads its
+ * own rest props last, so an `onClick` given here is the one that runs — and the
+ * canvas turns `connectOnClick` off besides, so there is exactly one click path
+ * and it is this one. `onMouseDown` is untouched: that is where the drag lives,
+ * and the drag still works.
+ *
+ * `role`/`tabIndex`/`onKeyDown` because a handle is now a control, and a control
+ * that only a pointer can reach is not one. React Flow renders a `<div>`, so the
+ * button semantics have to be stated rather than inherited.
+ */
+function wireOn(nodeId: string, type: WiringHandleType, wiring: WorkflowWiring) {
+  const start = () => wiring.onHandleClick(nodeId, type);
+  return {
+    role: 'button',
+    tabIndex: 0,
+    onClick: (event: ReactMouseEvent<HTMLDivElement>) => {
+      // Kept off the node underneath, which would otherwise read the same click
+      // as "open this node's inspector" and cover the canvas with a sheet.
+      event.stopPropagation();
+      start();
+    },
+    onKeyDown: (event: ReactKeyboardEvent<HTMLDivElement>) => {
+      if (event.key !== 'Enter' && event.key !== ' ') return;
+      // Space on a focused element scrolls the page by default, and Enter would
+      // reach the node's own key handling.
+      event.preventDefault();
+      event.stopPropagation();
+      start();
+    },
+  };
+}
 
 function RunBadge({ run }: { run: NonNullable<WorkflowNodeData['run']> }) {
   if (run.status === 'running') {
@@ -190,13 +287,14 @@ function RunBadge({ run }: { run: NonNullable<WorkflowNodeData['run']> }) {
 const ARRIVE = { type: 'spring', stiffness: 420, damping: 34, mass: 0.7 } as const;
 
 export function WorkflowNodeBody({ id, data, selected }: NodeProps<WorkflowFlowNode>) {
-  const { onInspect, onEditCode, canEdit } = useWorkflowNodeHandlers();
+  const { onInspect, onEditCode, canEdit, wiring } = useWorkflowNodeHandlers();
   const reduced = useReducedMotion();
   const style = KIND_STYLE[data.kind];
   const Icon = style.icon;
 
   const errors = data.problems.filter((problem) => problem.level === 'error');
   const warnings = data.problems.filter((problem) => problem.level === 'warning');
+  const landing = nodeWiringState(wiring, id);
 
   return (
     <motion.div
@@ -219,12 +317,20 @@ export function WorkflowNodeBody({ id, data, selected }: NodeProps<WorkflowFlowN
         // A lift on hover and a deeper one while selected. `transition-all`
         // rather than `transition-shadow` because the ring width changes too,
         // and a ring that snaps while the shadow fades reads as a glitch.
-        'shadow-sm transition-all duration-150 motion-safe:hover:-translate-y-px hover:shadow-md',
+        'shadow-sm transition-all duration-150 motion-safe:hover:-translate-y-0.5 hover:shadow-lg',
+        'hover:border-zinc-300 dark:hover:border-zinc-700',
         RULE,
         PANEL,
         selected && 'shadow-md ring-2 ring-sky-500/50 dark:ring-sky-400/50',
         errors.length > 0 && 'border-red-400 dark:border-red-800',
         errors.length === 0 && warnings.length > 0 && 'border-amber-300 dark:border-amber-800',
+        // While a wire is open, the whole box says whether it can take it — the
+        // handle is 12px across and the node is 224, and somebody looking for
+        // "where can this go" is looking at boxes. Same judgement, same
+        // function, drawn bigger.
+        landing === 'open' && 'ring-2 ring-emerald-500/45 dark:ring-emerald-400/45',
+        landing === 'origin' && 'ring-2 ring-violet-500/50 dark:ring-violet-400/50',
+        landing === 'shut' && 'opacity-40',
       )}
     >
       <span className={cn('absolute inset-y-0 left-0 w-1', style.accent)} />
@@ -236,16 +342,18 @@ export function WorkflowNodeBody({ id, data, selected }: NodeProps<WorkflowFlowN
         <Handle
           type="target"
           position={Position.Left}
-          className={HANDLE}
+          className={cn(HANDLE, HANDLE_WIRING[handleWiringState(wiring, id, 'target')])}
           aria-label={`input of ${data.label}`}
+          {...wireOn(id, 'target', wiring)}
         />
       )}
       {data.kind !== 'sink' && (
         <Handle
           type="source"
           position={Position.Right}
-          className={HANDLE}
+          className={cn(HANDLE, HANDLE_WIRING[handleWiringState(wiring, id, 'source')])}
           aria-label={`output of ${data.label}`}
+          {...wireOn(id, 'source', wiring)}
         />
       )}
 

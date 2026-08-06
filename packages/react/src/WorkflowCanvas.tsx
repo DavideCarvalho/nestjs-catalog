@@ -134,6 +134,12 @@ import {
   problemsByNode,
   validateWorkflow,
 } from './workflow/validate';
+import {
+  PendingWireLine,
+  WiringHint,
+  type WorkflowWiring,
+  useClickWiring,
+} from './workflow/wiring';
 
 const MUTED = 'text-zinc-400 dark:text-zinc-500';
 const RULE = 'border-zinc-200 dark:border-zinc-800';
@@ -915,6 +921,8 @@ function GraphSurface({
   onNodeLeave,
   onPaneClick,
   onDisconnect,
+  wiring,
+  wiringRefusal,
   nodeMenu,
 }: {
   loading: boolean;
@@ -937,6 +945,10 @@ function GraphSurface({
   onPaneClick: () => void;
   /** Reached from the × on a selected edge. The same callback the rail uses. */
   onDisconnect: (edge: WorkflowEdge) => void;
+  /** Click-to-click wiring, handed to the nodes and to the line that follows. */
+  wiring: WorkflowWiring;
+  /** Why the last click was not allowed to close a connection, if it was not. */
+  wiringRefusal: string | null;
   /** The wiring menu, which has to be a child of `ReactFlow` to be placed. */
   nodeMenu: ReactNode;
 }) {
@@ -953,7 +965,7 @@ function GraphSurface({
       {failed && <CanvasFailure error={error} onRetry={onRetry} />}
 
       {!loading && !failed && (
-        <WorkflowNodeProvider handlers={{ onInspect, onEditCode, canEdit }}>
+        <WorkflowNodeProvider handlers={{ onInspect, onEditCode, canEdit, wiring }}>
           <WorkflowEdgeProvider handlers={{ onDisconnect, canEdit }}>
             <ReactFlow
               className={CANVAS_THEME}
@@ -970,6 +982,12 @@ function GraphSurface({
               onNodeMouseLeave={onNodeLeave}
               onPaneClick={onPaneClick}
               connectionLineType={ConnectionLineType.SmoothStep}
+              // Off, so there is exactly ONE click path through a handle and it
+              // is the one in `workflow/wiring.tsx`. React Flow's own click
+              // wiring connects but draws nothing while it is open and cannot
+              // say why it refused — running both would mean two states
+              // disagreeing about whether a wire is in flight.
+              connectOnClick={false}
               nodesDraggable={canEdit}
               nodesConnectable={canEdit}
               elementsSelectable
@@ -986,8 +1004,27 @@ function GraphSurface({
               fitView
             >
               <Background variant={BackgroundVariant.Dots} gap={18} size={1} />
-              <Controls showInteractive={false} />
-              <MiniMap pannable zoomable nodeColor={(node) => miniMapColor(node.data)} />
+              {/* Rounded and lifted, so the two overlays read as panels sitting
+                  on the canvas rather than as browser chrome bolted to it. The
+                  colours are still React Flow's variables, which `CANVAS_THEME`
+                  already themes both ways. */}
+              <Controls
+                showInteractive={false}
+                className="!overflow-hidden !rounded-lg !border !border-zinc-200 !shadow-sm dark:!border-zinc-800 [&>button]:!border-none"
+              />
+              <MiniMap
+                pannable
+                zoomable
+                nodeColor={(node) => miniMapColor(node.data)}
+                className="!overflow-hidden !rounded-lg !border !border-zinc-200 !shadow-sm dark:!border-zinc-800"
+              />
+              <PendingWireLine pending={wiring.pending} />
+              <WiringHint
+                pending={wiring.pending}
+                refusal={wiringRefusal}
+                nodes={draft.nodes}
+                onCancel={wiring.cancel}
+              />
               {nodeMenu}
             </ReactFlow>
           </WorkflowEdgeProvider>
@@ -1866,6 +1903,23 @@ function Canvas({
     [draft.nodes, draft.edges],
   );
 
+  /**
+   * Wiring by clicking twice, which is the gesture people actually reach for.
+   *
+   * Built on the same `connect` the menu, the rail and the drag all end in, so
+   * there is one place a connection is made and one place it is refused. Why
+   * React Flow's own `connectOnClick` is turned off in favour of this — it
+   * connects but draws nothing, and cannot say why it refused — is written out
+   * at the top of `workflow/wiring.tsx`.
+   */
+  const { wiring, refusal: wiringRefusal } = useClickWiring({
+    canEdit,
+    nodes: draft.nodes,
+    edges: draft.edges,
+    onConnect: connect,
+    onSay: setAnnouncement,
+  });
+
   const save = useMutation({
     mutationFn: () =>
       client.saveWorkflow({
@@ -2301,8 +2355,17 @@ function Canvas({
           onConnectEnd={announceRefusedDrop}
           onNodeEnter={menu.onNodeEnter}
           onNodeLeave={menu.onNodeLeave}
-          onPaneClick={menu.close}
+          // Clicking empty canvas puts away everything that is half-open: the
+          // wiring menu, and a wire that was started and never landed. React
+          // Flow only fires this for clicks on the pane ITSELF, so finishing a
+          // wire on a handle does not also cancel it on the way past.
+          onPaneClick={() => {
+            menu.close();
+            wiring.cancel();
+          }}
           onDisconnect={disconnect}
+          wiring={wiring}
+          wiringRefusal={wiringRefusal}
           nodeMenu={
             <NodeWiringMenu
               node={menu.anchor}
