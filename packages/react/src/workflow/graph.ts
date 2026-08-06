@@ -6,12 +6,14 @@ import {
   type WorkflowCallNode,
   type WorkflowEdge,
   type WorkflowIfNode,
+  type WorkflowIfPredicate,
   type WorkflowNode,
   type WorkflowNodeKind,
   type WorkflowRunNode,
   type WorkflowSourceNode,
   nodeName,
   unreachableNodeKind,
+  unreachablePredicateKind,
 } from './model';
 import { type WorkflowProblem, edgeId } from './validate';
 
@@ -102,11 +104,28 @@ function subtitleFor(node: WorkflowNode, describe: NodeDescriptions): string {
  * and `CLICKHOUSE_URL` on its own does not say whether it is being tested for
  * presence or for a value. The name is shown; a value never is — the node stores
  * the name of a variable and this screen has no more than that.
+ *
+ * The predicate is read into a variable that admits `undefined` before it is
+ * narrowed, even though the type says it is always there. This runs on whatever
+ * a server sent, and a canvas that throws while drawing a node is a screen
+ * nobody can use to fix the node — a subtitle saying the gate has no test is.
  */
 function ifSubtitle(node: WorkflowIfNode): string {
-  const name = typeof node.envVar === 'string' ? node.envVar.trim() : '';
-  if (name.length === 0) return 'no variable chosen';
-  return node.equals === undefined ? `if ${name} is set` : `if ${name} = ${node.equals}`;
+  const predicate: WorkflowIfPredicate | undefined = node.predicate;
+  if (!predicate) return 'nothing to decide on';
+  if (predicate.kind === 'env') {
+    const name = typeof predicate.envVar === 'string' ? predicate.envVar.trim() : '';
+    if (name.length === 0) return 'no variable chosen';
+    return predicate.equals === undefined
+      ? `if ${name} is set`
+      : `if ${name} = ${predicate.equals}`;
+  }
+  if (predicate.kind === 'rowCount') {
+    return predicate.atLeast === 1
+      ? 'if any rows arrived'
+      : `if ${predicate.atLeast} rows or more arrived`;
+  }
+  return unreachablePredicateKind(predicate, 'ifSubtitle');
 }
 
 /** What a source reads from: its kind, and the connection or mode that narrows it. */

@@ -4,8 +4,10 @@ import {
   type ConnectorKind,
   type ConnectorRun,
   WORKFLOW_BRANCH_LABELS,
+  WORKFLOW_PREDICATE_KINDS,
   type WorkflowBranchLabel,
   type WorkflowEdge,
+  type WorkflowIfPredicate,
   type WorkflowNode,
   type WorkflowSkipReason,
   isConnectorKind,
@@ -268,6 +270,38 @@ function toIfNode(
   raw: unknown,
   base: { id: string; name: string; position?: { x: number; y: number } },
 ): WorkflowNode {
+  return { ...base, kind: 'if', predicate: toPredicate(readUnknown(raw, 'predicate'), base) };
+}
+
+/**
+ * The test a gate arrived carrying, narrowed one kind at a time.
+ *
+ * The kind is read first and refused if it is not one of the two, rather than
+ * being guessed from which fields are present. Guessing is what the flat shape
+ * would have forced — "it has an `envVar`, so it must be an env test" — and it
+ * answers a payload carrying both fields, or neither, by picking one. A gate
+ * that runs the test its author did not choose is the failure this whole node is
+ * arranged against, so the ambiguity is refused at the boundary instead.
+ */
+function toPredicate(raw: unknown, base: { id: string; name: string }): WorkflowIfPredicate {
+  const kind = readUnknown(raw, 'kind');
+  if (kind === 'rowCount') {
+    return toRowCountPredicate(raw, base);
+  }
+  if (kind === 'env') {
+    return toEnvPredicate(raw, base);
+  }
+  throw new BadRequestException(
+    `If node "${base.name}" (${base.id}) carries a predicate of kind ${JSON.stringify(
+      kind,
+    )}, and a gate can test one of ${WORKFLOW_PREDICATE_KINDS.map((one) => `"${one}"`).join(
+      ' or ',
+    )}. Without one there is nothing for it to decide on, and a gate that decides anyway sends half the graph down a path nobody chose.`,
+  );
+}
+
+/** Refused at the boundary for the reason {@link toCallNode} gives: a draft is stored unvalidated. */
+function toEnvPredicate(raw: unknown, base: { id: string; name: string }): WorkflowIfPredicate {
   const envVar = readString(raw, 'envVar');
   if (!envVar) {
     throw new BadRequestException(
@@ -286,11 +320,36 @@ function toIfNode(
   // to anything". `null` is folded in with absent because that is what a JSON
   // round trip of an unset optional field produces.
   return {
-    ...base,
-    kind: 'if',
+    kind: 'env',
     envVar,
     equals: typeof equals === 'string' ? equals : undefined,
   };
+}
+
+/**
+ * A row-count test, refused unless the threshold is a whole number of at least
+ * one.
+ *
+ * The same refusal `validateWorkflow` makes, made here as well because a draft
+ * is stored without validating and a threshold arriving as the *string* `"5"` —
+ * which is what an unparsed form field is — would compare false against every
+ * count and strand the `then` branch on every run. Zero is refused for the
+ * reason given on {@link WorkflowRowCountPredicate.atLeast}: it can only ever
+ * answer one way.
+ */
+function toRowCountPredicate(
+  raw: unknown,
+  base: { id: string; name: string },
+): WorkflowIfPredicate {
+  const atLeast = readUnknown(raw, 'atLeast');
+  if (typeof atLeast !== 'number' || !Number.isInteger(atLeast) || atLeast < 1) {
+    throw new BadRequestException(
+      `If node "${base.name}" (${base.id}) branches on a row count of ${JSON.stringify(
+        atLeast,
+      )}, and a threshold has to be a whole number of at least 1. "At least 1" is the "did anything arrive at all" test; anything else here compares false against every count, which is a branch that silently never runs.`,
+    );
+  }
+  return { kind: 'rowCount', atLeast };
 }
 
 /**

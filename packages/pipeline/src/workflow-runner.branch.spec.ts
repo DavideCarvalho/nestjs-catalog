@@ -59,7 +59,12 @@ const workflow: CatalogWorkflow = {
       sourceKind: 'inline',
       config: { records: [{ id: 1 }, { id: 2 }] },
     },
-    { id: 'gate', kind: 'if', name: 'Has ClickHouse', envVar: VARIABLE },
+    {
+      id: 'gate',
+      kind: 'if',
+      name: 'Has ClickHouse',
+      predicate: { kind: 'env', envVar: VARIABLE },
+    },
     { id: 'warm', kind: 'sink', name: 'Into Clickhouse', targetType: 'Clickhouse' },
     { id: 'cold', kind: 'sink', name: 'Into Mysql', targetType: 'Mysql' },
   ],

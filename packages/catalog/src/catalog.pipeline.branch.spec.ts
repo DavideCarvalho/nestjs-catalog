@@ -51,7 +51,18 @@ function sink(id: string, overrides: Partial<WorkflowSinkNode> = {}): WorkflowSi
 }
 
 function gate(id: string, overrides: Partial<WorkflowIfNode> = {}): WorkflowIfNode {
-  return { id, name: id, kind: 'if', envVar: 'CLICKHOUSE_URL', ...overrides };
+  return {
+    id,
+    name: id,
+    kind: 'if',
+    predicate: { kind: 'env', envVar: 'CLICKHOUSE_URL' },
+    ...overrides,
+  };
+}
+
+/** A gate that branches on how many rows reached it. */
+function counting(id: string, atLeast = 1): WorkflowIfNode {
+  return { id, name: id, kind: 'if', predicate: { kind: 'rowCount', atLeast } };
 }
 
 /** `['a', 'b']` is a plain wire; `['a', 'b', 'then']` is a branch. */
@@ -137,7 +148,7 @@ describe('what a graph with a branch is allowed to look like', () => {
 
   it('refuses a gate that names no variable', () => {
     const blank = graph(
-      [source('src'), gate('gate', { envVar: '' }), sink('out')],
+      [source('src'), gate('gate', { predicate: { kind: 'env', envVar: '' } }), sink('out')],
       [
         ['src', 'gate'],
         ['gate', 'out', 'then'],
@@ -145,6 +156,66 @@ describe('what a graph with a branch is allowed to look like', () => {
     );
 
     expect(codes(blank)).toContain('if-not-named');
+  });
+
+  it('accepts a gate that branches on how many rows reached it', () => {
+    // The shape the row-count predicate exists for: a sink behind a gate that
+    // only opens when the read brought something back. There is no `else` wire
+    // at all, which is the point — the alternative to loading is not loading.
+    const guarded = graph(
+      [source('src'), counting('any'), sink('out')],
+      [
+        ['src', 'any'],
+        ['any', 'out', 'then'],
+      ],
+    );
+
+    expect(validateWorkflow(guarded)).toEqual([]);
+  });
+
+  it('refuses a row-count gate whose threshold can only answer one way', () => {
+    // A threshold of zero passes on every run including an empty one, so the
+    // else side never executes on any deployment. That is the same silent
+    // half-graph an unlabelled wire produces, reached by typing a number.
+    const always = graph(
+      [source('src'), counting('any', 0), sink('out')],
+      [
+        ['src', 'any'],
+        ['any', 'out', 'then'],
+      ],
+    );
+
+    expect(codes(always)).toContain('if-threshold-invalid');
+  });
+
+  it('refuses a row-count threshold that is not a whole number', () => {
+    // `NaN` is what an unparsed form field arrives as, and every comparison
+    // against it is false — a `then` branch that silently never runs again.
+    const nonsense = graph(
+      [source('src'), counting('any', Number.NaN), sink('out')],
+      [
+        ['src', 'any'],
+        ['any', 'out', 'then'],
+      ],
+    );
+
+    expect(codes(nonsense)).toContain('if-threshold-invalid');
+  });
+
+  it('refuses a row-count gate fed by two nodes, like any other gate', () => {
+    // Doubly important for this predicate: with two inbound stages there is no
+    // single answer to "how many rows reached it", so the count tested would be
+    // one of two streams picked by array order.
+    const merging = graph(
+      [source('a'), source('b'), counting('any'), sink('out')],
+      [
+        ['a', 'any'],
+        ['b', 'any'],
+        ['any', 'out', 'then'],
+      ],
+    );
+
+    expect(codes(merging)).toContain('if-needs-one-input');
   });
 
   it('lets one branch feed several nodes', () => {
@@ -317,7 +388,11 @@ describe('what a branch does to a graph’s identity', () => {
       ],
     );
     const isBlank = graph(
-      [gate('g', { equals: '' }), source('s'), sink('o')],
+      [
+        gate('g', { predicate: { kind: 'env', envVar: 'CLICKHOUSE_URL', equals: '' } }),
+        source('s'),
+        sink('o'),
+      ],
       [
         ['s', 'g'],
         ['g', 'o', 'then'],
@@ -326,19 +401,102 @@ describe('what a branch does to a graph’s identity', () => {
 
     expect(workflowGraphHash(isSet)).not.toBe(workflowGraphHash(isBlank));
   });
+
+  it('tells a gate that reads a variable apart from one that counts rows', () => {
+    // Switching which *kind* of test a gate makes changes which half of the
+    // pipeline runs on every deployment. A hash that folded the two together
+    // would leave two runs claiming the same graph version having taken
+    // different branches, which is the one question the version answers.
+    const wires: Wire[] = [
+      ['s', 'g'],
+      ['g', 'o', 'then'],
+    ];
+    const byVariable = graph([gate('g'), source('s'), sink('o')], wires);
+    const byRows = graph([counting('g'), source('s'), sink('o')], wires);
+
+    expect(workflowGraphHash(byVariable)).not.toBe(workflowGraphHash(byRows));
+  });
+
+  it('changes the fingerprint when the threshold changes', () => {
+    const wires: Wire[] = [
+      ['s', 'g'],
+      ['g', 'o', 'then'],
+    ];
+    const any = graph([counting('g', 1), source('s'), sink('o')], wires);
+    const many = graph([counting('g', 1000), source('s'), sink('o')], wires);
+
+    expect(workflowGraphHash(any)).not.toBe(workflowGraphHash(many));
+  });
 });
 
 describe('reading a stored branch back', () => {
   it('narrows a gate that names a variable', () => {
-    expect(isWorkflowNode({ id: 'g', name: 'g', kind: 'if', envVar: 'X' })).toBe(true);
-    expect(isWorkflowNode({ id: 'g', name: 'g', kind: 'if', envVar: 'X', equals: 'local' })).toBe(
-      true,
-    );
+    expect(
+      isWorkflowNode({ id: 'g', name: 'g', kind: 'if', predicate: { kind: 'env', envVar: 'X' } }),
+    ).toBe(true);
+    expect(
+      isWorkflowNode({
+        id: 'g',
+        name: 'g',
+        kind: 'if',
+        predicate: { kind: 'env', envVar: 'X', equals: 'local' },
+      }),
+    ).toBe(true);
   });
 
   it('refuses a gate with no variable and one whose expectation is not text', () => {
     expect(isWorkflowNode({ id: 'g', name: 'g', kind: 'if' })).toBe(false);
-    expect(isWorkflowNode({ id: 'g', name: 'g', kind: 'if', envVar: 'X', equals: 3 })).toBe(false);
+    expect(
+      isWorkflowNode({
+        id: 'g',
+        name: 'g',
+        kind: 'if',
+        predicate: { kind: 'env', envVar: 'X', equals: 3 },
+      }),
+    ).toBe(false);
+    // The flat shape the node used to have. Refused rather than adapted: a gate
+    // whose test has to be guessed from which fields are present is exactly the
+    // ambiguity the predicate union removed.
+    expect(isWorkflowNode({ id: 'g', name: 'g', kind: 'if', envVar: 'X' })).toBe(false);
+  });
+
+  it('narrows a gate that counts rows, and refuses one whose threshold is not a number', () => {
+    expect(
+      isWorkflowNode({
+        id: 'g',
+        name: 'g',
+        kind: 'if',
+        predicate: { kind: 'rowCount', atLeast: 1 },
+      }),
+    ).toBe(true);
+    // A threshold that arrived as text — an unparsed form field — compares
+    // false against every count, so the `then` side would never run again and
+    // nothing would say why. Refused on the way out of the column instead.
+    expect(
+      isWorkflowNode({
+        id: 'g',
+        name: 'g',
+        kind: 'if',
+        predicate: { kind: 'rowCount', atLeast: '5' },
+      }),
+    ).toBe(false);
+    expect(
+      isWorkflowNode({
+        id: 'g',
+        name: 'g',
+        kind: 'if',
+        predicate: { kind: 'rowCount', atLeast: Number.NaN },
+      }),
+    ).toBe(false);
+  });
+
+  it('refuses a predicate whose kind is not one this build can evaluate', () => {
+    // The forward-compatibility case: a graph written by a newer build that has
+    // a third predicate kind. Refusing is the point — running it would mean
+    // guessing a branch, and a guessed branch is half a load nobody chose.
+    expect(
+      isWorkflowNode({ id: 'g', name: 'g', kind: 'if', predicate: { kind: 'code', body: '...' } }),
+    ).toBe(false);
   });
 
   it('refuses a wire whose branch is not one of the two labels', () => {

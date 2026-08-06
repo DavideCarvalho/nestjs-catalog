@@ -108,9 +108,13 @@ import {
   type WorkflowBranchLabel,
   type WorkflowCallNode,
   type WorkflowEdge,
+  type WorkflowEnvPredicate,
   type WorkflowIfNode,
+  type WorkflowIfPredicate,
   type WorkflowNode,
   type WorkflowNodeKind,
+  type WorkflowPredicateKind,
+  type WorkflowRowCountPredicate,
   type WorkflowRun,
   type WorkflowSinkNode,
   type WorkflowSourceNode,
@@ -119,10 +123,12 @@ import {
   describeDurability,
   isWorkflowBranchLabel,
   isWorkflowNodeKind,
+  isWorkflowPredicateKind,
   newLocalId,
   nodeName,
   producedTypes,
   unreachableNodeKind,
+  unreachablePredicateKind,
 } from './workflow/model';
 import { WORKFLOW_NAME } from './workflow/name';
 import { WorkflowNodeProvider, workflowNodeTypes } from './workflow/nodes';
@@ -347,7 +353,12 @@ function newNodeOfKind(
     // nothing to guess: which variable tells this deployment apart from another
     // is the entire content of the node, and a default would be a decision the
     // graph appears to make and nobody authored.
-    return { id, name, kind: 'if', envVar: '', position };
+    //
+    // The *kind* of test does get a default, and it is the deployment one,
+    // because a predicate has to be one of them and an empty variable name is a
+    // gate that visibly refuses to publish. A row-count gate with its default
+    // threshold would publish happily while testing something nobody chose.
+    return { id, name, kind: 'if', predicate: { kind: 'env', envVar: '' }, position };
   }
   if (kind === 'sink') {
     return { id, name, kind: 'sink', targetType: '', position };
@@ -653,6 +664,7 @@ const TODO_FOR: Partial<Record<WorkflowProblemCode, string>> = {
   'source-has-input': 'unwire whatever feeds it — a source reads, it is not fed',
   'sink-has-output': 'unwire what it feeds — nothing runs after a sink',
   'if-not-named': 'name the environment variable it decides on',
+  'if-threshold-invalid': 'give it a whole number of rows, 1 or more, to branch on',
   'if-needs-one-input': 'leave it one input — a gate carries one stream through',
   'branch-not-labelled': 'say whether that wire is the "then" or the "else"',
   'branch-on-plain-edge': 'remove the branch label — only an if node branches',
@@ -3791,7 +3803,18 @@ function readTime(observedAt: string | undefined): string {
 /**
  * What this gate decides on, and what the decision costs.
  *
- * ## Two fields and no picker, for a different reason than the call node's
+ * ## The kind of test comes first, and switching it replaces the test
+ *
+ * A gate tests one thing — a variable where the load runs, or how many rows
+ * reached it — and the model says so with a union rather than with two sets of
+ * optional fields. The form is built the same way round: pick the kind, then
+ * fill in the fields that kind has. Switching the picker hands back a whole new
+ * predicate rather than merging the old one's fields into it, which does discard
+ * a variable name somebody typed — deliberately, because the alternative is a
+ * node quietly carrying the leftovers of a test it is no longer making, and the
+ * next reader cannot tell which of the two it will actually do.
+ *
+ * ## No picker for the variable, for a different reason than the call node's
  *
  * A call node has no picker because nothing can enumerate the workflows. This
  * one has no picker because the list would be *wrong*: the variables that matter
@@ -3819,46 +3842,33 @@ function IfInspector({
   canEdit: boolean;
   onChange: (node: WorkflowNode) => void;
 }) {
-  // Whether to compare against a value at all is a *mode*, not an empty text
-  // box: `equals: ''` is a real test ("set, but blank") and `equals: undefined`
-  // is a different one ("set to anything"), and a single field could not express
-  // both — clearing the box would silently switch which question is being asked.
-  const comparing = node.equals !== undefined;
+  const setPredicate = (predicate: WorkflowIfPredicate) => onChange({ ...node, predicate });
 
   return (
     <div className="space-y-3">
-      <TextField
-        label="Environment variable"
-        value={node.envVar}
-        onChange={(envVar) => onChange({ ...node, envVar })}
-        placeholder="CLICKHOUSE_URL"
-        disabled={!canEdit}
-        hint="The name of a variable on the machine that runs the load — not on this one. Only its name is stored, and only “set” or “not set” is ever written to the run log, so naming one that holds a credential is safe."
-      />
       <SelectField
-        label="Test"
-        ariaLabel="What this gate tests the variable for"
-        value={comparing ? 'equals' : 'set'}
-        onValueChange={(mode) =>
-          onChange(mode === 'equals' ? { ...node, equals: '' } : { ...node, equals: undefined })
-        }
+        label="Decide on"
+        ariaLabel="What this gate branches on"
+        value={node.predicate.kind}
+        onValueChange={(kind) => {
+          // Narrowed rather than trusted, because `onValueChange` hands back a
+          // string and the model wants one of two. An unrecognised one is
+          // dropped: a gate is never left holding a test nothing can evaluate.
+          if (!isWorkflowPredicateKind(kind)) return;
+          setPredicate(freshPredicate(kind));
+        }}
         options={[
-          { value: 'set', label: 'Is set to anything' },
-          { value: 'equals', label: 'Equals a particular value' },
+          { value: 'env', label: 'An environment variable', hint: 'where the load runs' },
+          {
+            value: 'rowCount',
+            label: 'How many rows reached it',
+            hint: 'off the run’s own record',
+          },
         ]}
         disabled={!canEdit}
-        hint="“Is set” is the deployment test: a deployment that has a ClickHouse has its URL and one that does not has nothing. Compare against a value when the variable exists everywhere and only its contents differ."
+        hint="A variable tells one deployment apart from another. A row count tells a load that found data apart from one that found none — which is how a sink is kept from committing an empty snapshot over what is live."
       />
-      {comparing && (
-        <TextField
-          label="Equals"
-          value={node.equals ?? ''}
-          onChange={(equals) => onChange({ ...node, equals })}
-          placeholder="local"
-          disabled={!canEdit}
-          hint="Compared exactly, with no trimming. An empty value here means “set, but blank”, which is a different test from “is set to anything”."
-        />
-      )}
+      <PredicateFields predicate={node.predicate} canEdit={canEdit} onChange={setPredicate} />
       <p className={cn('text-[11px] leading-relaxed', MUTED)}>
         The wires out of this node are labelled <strong>then</strong> and <strong>else</strong>,
         under “Feeds” below. To invert the test, swap which one is which — there is no “not”,
@@ -3876,6 +3886,149 @@ function IfInspector({
         take one branch on the way in and the other on the way back.
       </p>
     </div>
+  );
+}
+
+/**
+ * The test a freshly picked kind starts as.
+ *
+ * An env test starts blank, so the graph refuses to publish until somebody names
+ * a variable — there is nothing to guess. A row-count test starts at 1, which is
+ * not a guess but the *only* threshold that means "did anything arrive at all",
+ * which is the case the predicate was built for; a bigger number is a claim
+ * about a particular pipeline and is typed.
+ */
+function freshPredicate(kind: WorkflowPredicateKind): WorkflowIfPredicate {
+  if (kind === 'env') return { kind: 'env', envVar: '' };
+  if (kind === 'rowCount') return { kind: 'rowCount', atLeast: 1 };
+  return unreachablePredicateKind(kind, 'freshPredicate');
+}
+
+/**
+ * The fields one kind of test has, and none of the fields the other has.
+ *
+ * Split per kind and ending in a refusal, so a predicate kind added to the model
+ * without a form here stops the build naming this file — the same rule
+ * `KindInspector` follows for node kinds, and for the same reason: the failure
+ * it prevents is a node somebody can select, that shows nothing to configure,
+ * and that runs anyway.
+ */
+function PredicateFields({
+  predicate,
+  canEdit,
+  onChange,
+}: {
+  predicate: WorkflowIfPredicate;
+  canEdit: boolean;
+  onChange: (predicate: WorkflowIfPredicate) => void;
+}) {
+  if (predicate.kind === 'env') {
+    return <EnvPredicateFields predicate={predicate} canEdit={canEdit} onChange={onChange} />;
+  }
+  if (predicate.kind === 'rowCount') {
+    return <RowCountPredicateFields predicate={predicate} canEdit={canEdit} onChange={onChange} />;
+  }
+  return unreachablePredicateKind(predicate, 'PredicateFields');
+}
+
+function EnvPredicateFields({
+  predicate,
+  canEdit,
+  onChange,
+}: {
+  predicate: WorkflowEnvPredicate;
+  canEdit: boolean;
+  onChange: (predicate: WorkflowIfPredicate) => void;
+}) {
+  // Whether to compare against a value at all is a *mode*, not an empty text
+  // box: `equals: ''` is a real test ("set, but blank") and `equals: undefined`
+  // is a different one ("set to anything"), and a single field could not express
+  // both — clearing the box would silently switch which question is being asked.
+  const comparing = predicate.equals !== undefined;
+
+  return (
+    <>
+      <TextField
+        label="Environment variable"
+        value={predicate.envVar}
+        onChange={(envVar) => onChange({ ...predicate, envVar })}
+        placeholder="CLICKHOUSE_URL"
+        disabled={!canEdit}
+        hint="The name of a variable on the machine that runs the load — not on this one. Only its name is stored, and only “set” or “not set” is ever written to the run log, so naming one that holds a credential is safe."
+      />
+      <SelectField
+        label="Test"
+        ariaLabel="What this gate tests the variable for"
+        value={comparing ? 'equals' : 'set'}
+        onValueChange={(mode) =>
+          onChange(
+            mode === 'equals' ? { ...predicate, equals: '' } : { ...predicate, equals: undefined },
+          )
+        }
+        options={[
+          { value: 'set', label: 'Is set to anything' },
+          { value: 'equals', label: 'Equals a particular value' },
+        ]}
+        disabled={!canEdit}
+        hint="“Is set” is the deployment test: a deployment that has a ClickHouse has its URL and one that does not has nothing. Compare against a value when the variable exists everywhere and only its contents differ."
+      />
+      {comparing && (
+        <TextField
+          label="Equals"
+          value={predicate.equals ?? ''}
+          onChange={(equals) => onChange({ ...predicate, equals })}
+          placeholder="local"
+          disabled={!canEdit}
+          hint="Compared exactly, with no trimming. An empty value here means “set, but blank”, which is a different test from “is set to anything”."
+        />
+      )}
+    </>
+  );
+}
+
+/**
+ * One threshold, and the sentence that says what it is for.
+ *
+ * A text box with a numeric keypad rather than `type="number"`, which is the
+ * rule `ObjectExplorer` already writes down: that control drops what it cannot
+ * parse and answers a scroll wheel, so a number somebody typed can change while
+ * they are reading the form. Non-digits are stripped here instead, and an empty
+ * box is stored as 0 — which the validator refuses by name, so a half-filled
+ * gate says so on the canvas rather than publishing a test that always passes.
+ */
+function RowCountPredicateFields({
+  predicate,
+  canEdit,
+  onChange,
+}: {
+  predicate: WorkflowRowCountPredicate;
+  canEdit: boolean;
+  onChange: (predicate: WorkflowIfPredicate) => void;
+}) {
+  const digits = Number.isInteger(predicate.atLeast) && predicate.atLeast > 0;
+
+  return (
+    <>
+      <TextField
+        label="At least this many rows"
+        value={digits ? String(predicate.atLeast) : ''}
+        onChange={(typed) => {
+          const cleaned = typed.replace(/[^0-9]/g, '');
+          onChange({
+            ...predicate,
+            atLeast: cleaned.length === 0 ? 0 : Number.parseInt(cleaned, 10),
+          });
+        }}
+        inputMode="numeric"
+        placeholder="1"
+        disabled={!canEdit}
+        hint="1 is “did anything arrive at all”. A larger number is for a load whose export is never legitimately small — under it, treat the upstream as broken rather than as data."
+      />
+      <p className={cn('text-[11px] leading-relaxed', MUTED)}>
+        The count is the one on the single wire feeding this node, taken from what that node
+        recorded — nothing is re-counted, and nothing is read out of the staged rows.
+      </p>
+    </>
   );
 }
 

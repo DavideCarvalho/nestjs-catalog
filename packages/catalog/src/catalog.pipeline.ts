@@ -1034,6 +1034,180 @@ export interface WorkflowCallNode extends WorkflowNodeBase {
 }
 
 /**
+ * The kinds of test an {@link WorkflowIfNode} can make.
+ *
+ * A second predicate shape was always going to arrive — the note on
+ * {@link WorkflowIfNode} says so about `code` — and the shape it arrives into is
+ * the decision worth arguing about, because the alternative was to keep both
+ * tests' fields flat on the node and mark them optional. That version types a
+ * gate as "an env var, maybe, and a threshold, maybe": a node carrying both is
+ * representable, a node carrying neither is representable, and every reader has
+ * to invent its own rule for which one wins. It is the same mistake the note on
+ * {@link WorkflowNode} refuses for node kinds, one level down.
+ *
+ * So the predicate is a union with a discriminant of its own, and every decision
+ * made per predicate kind ends in {@link unreachablePredicateKind} — a third
+ * shape is then a build failure listing the files that have to answer for it,
+ * rather than a gate that saves, draws, and quietly always takes the `else`.
+ */
+export const WORKFLOW_PREDICATE_KINDS = [
+  /** Reads a variable where the load runs. See {@link WorkflowEnvPredicate}. */
+  'env',
+  /** Counts the rows handed to the gate. See {@link WorkflowRowCountPredicate}. */
+  'rowCount',
+] as const;
+
+export type WorkflowPredicateKind = (typeof WORKFLOW_PREDICATE_KINDS)[number];
+
+/** Same reason as {@link isConnectorKind}: one list, no second copy to drift. */
+export function isWorkflowPredicateKind(value: unknown): value is WorkflowPredicateKind {
+  return WORKFLOW_PREDICATE_KINDS.some((kind) => kind === value);
+}
+
+/**
+ * {@link unreachableNodeKind}, one level down, and for the identical reason.
+ *
+ * Every branch over {@link WorkflowIfPredicate} ends here, so a predicate kind
+ * added to the list without a rule for hashing it, validating it or evaluating
+ * it is a type error naming the file — not a graph that runs and decides
+ * something nobody authored. It throws as well, because predicates arrive as
+ * JSON out of a column and a build older than the data is a thing that happens.
+ */
+export function unreachablePredicateKind(predicate: never, where: string): never {
+  const kind = typeof predicate === 'string' ? predicate : Reflect.get(Object(predicate), 'kind');
+  throw new Error(
+    `${where} does not handle an if-node predicate of kind ${JSON.stringify(kind)}. The predicate kinds and every decision made per kind are meant to move together.`,
+  );
+}
+
+/**
+ * Tests a variable on the machine that runs the load.
+ *
+ * The original predicate, and the one the node was built for: a deployment that
+ * has a ClickHouse has its URL and one that does not has nothing. It names the
+ * variable and never its value — see the note on {@link WorkflowIfNode} for why
+ * that is a safety property rather than a convenience.
+ */
+export interface WorkflowEnvPredicate {
+  kind: 'env';
+  /**
+   * The name of the environment variable to read on the machine that runs the
+   * node. **The name, never the value** — nothing about a credential is stored
+   * in a catalog.
+   */
+  envVar: string;
+  /**
+   * What it has to equal for the `then` branch to be taken.
+   *
+   * Absent means "is it set to anything non-empty", which is the ClickHouse
+   * case: a deployment that has one has the URL, a deployment that does not has
+   * nothing. Present means an exact string comparison, which is the
+   * `DEPLOY_ENV = local` case.
+   */
+  equals?: string;
+}
+
+/**
+ * Tests how many rows reached the gate.
+ *
+ * ## The case
+ *
+ * "Only run the sink if the source returned anything." A nightly export that
+ * comes back empty because the upstream system is mid-maintenance is not a
+ * failure — nothing is broken, there is simply nothing to load — but committing
+ * it repoints the live view of a type at an empty snapshot, and the run reports
+ * success while doing it. A gate in front of the sink turns that into a skip,
+ * and a skipped node is never executed, so nothing commits. That is the same
+ * guarantee the `else` branch already gives, pointed at the case that actually
+ * happens.
+ *
+ * ## Which rows
+ *
+ * The ones on the single inbound edge. `validateWorkflow` refuses a gate with
+ * more than one (`if-needs-one-input`) and refuses one with none as unreachable,
+ * so "how many rows" has exactly one answer — and it is the count on the very
+ * {@link WorkflowStageRef} the gate hands on, so the number tested and the rows
+ * carried cannot disagree.
+ *
+ * ## Where the number comes from, which is the replay argument
+ *
+ * `WorkflowStageRef.rowCount`, off {@link WorkflowNodeStepInput.inputs}, which
+ * is part of the step's checkpointed input and was itself produced by an
+ * upstream step's checkpointed output. Nothing counts rows at evaluation time
+ * and nothing reads the stage store: a resumed run on another pod sees the same
+ * number the first attempt saw, and the branch it produced is read back off
+ * {@link WorkflowNodeStepOutput.branch} anyway.
+ *
+ * ## Why a threshold and not "greater than zero"
+ *
+ * `atLeast: 1` *is* "did anything arrive", so the common case costs nothing to
+ * express — and "a full export is never under ten thousand rows, so treat a
+ * hundred as a broken upstream rather than as data" is the next thing anybody
+ * asks for, and it would otherwise need a second predicate kind for one integer.
+ *
+ * One comparison and one direction, deliberately. `atMost`, `equals` and a
+ * chosen operator were all considered and are all the same mistake the node's
+ * own `negate` flag would have been: the inverse test is already expressible by
+ * swapping which successor is on `then` and which is on `else`, and two ways to
+ * say one thing is two places to look when a load takes the branch nobody
+ * expected.
+ */
+export interface WorkflowRowCountPredicate {
+  kind: 'rowCount';
+  /**
+   * How many rows have to reach the gate for the `then` branch to be taken.
+   *
+   * A whole number of at least one, and `validateWorkflow` says so. Zero is
+   * refused rather than treated as "always" because it is a gate that can only
+   * ever answer one way — the `else` subtree would never run on any deployment,
+   * which is the silent half-graph this node's whole design is arranged against.
+   */
+  atLeast: number;
+}
+
+/**
+ * What an `if` node tests. See {@link WORKFLOW_PREDICATE_KINDS}.
+ */
+export type WorkflowIfPredicate = WorkflowEnvPredicate | WorkflowRowCountPredicate;
+
+/**
+ * Narrow a stored predicate, for the same reason {@link isWorkflowNode} narrows
+ * a stored node: it arrives as JSON out of a column, and a gate read back
+ * without its test is a gate that has to invent one.
+ *
+ * A row count that is not a whole number — `NaN` from a JSON round trip of an
+ * unparsed field, an `Infinity` that serialised as `null` — is refused rather
+ * than kept, because every comparison against it is false and the symptom is a
+ * `then` branch that silently never runs again.
+ */
+export function isWorkflowIfPredicate(value: unknown): value is WorkflowIfPredicate {
+  if (typeof value !== 'object' || value === null) return false;
+  const kind = Reflect.get(value, 'kind');
+  if (!isWorkflowPredicateKind(kind)) return false;
+  if (kind === 'env') {
+    // The variable name is required and its expected value is not, exactly as
+    // the type says: an absent `equals` is the "is it set at all" test, so a
+    // stored predicate without one is complete rather than half-narrowed.
+    const equals = Reflect.get(value, 'equals');
+    return (
+      typeof Reflect.get(value, 'envVar') === 'string' &&
+      (equals === undefined || typeof equals === 'string')
+    );
+  }
+  if (kind === 'rowCount') {
+    const atLeast = Reflect.get(value, 'atLeast');
+    return typeof atLeast === 'number' && Number.isInteger(atLeast) && atLeast >= 0;
+  }
+  return isWorkflowPredicateKindUnhandled(kind);
+}
+
+/** The narrowing counterpart of {@link unreachablePredicateKind}. */
+function isWorkflowPredicateKindUnhandled(kind: never): false {
+  void kind;
+  return false;
+}
+
+/**
  * Sends the rows down one of its two outbound branches, and skips the other.
  *
  * The node the maintainer asked for, and the reason it is a node rather than a
@@ -1053,10 +1227,17 @@ export interface WorkflowCallNode extends WorkflowNodeBase {
  * for the whole dataset to make a decision that reads none of it) or silently
  * drop one. Merging is what a transform is for; put one in front.
  *
+ * That holds for {@link WorkflowRowCountPredicate} too, which is the one
+ * predicate that sounds like it reads the data and does not: the count it tests
+ * is the number already written on the {@link WorkflowStageRef} it was handed,
+ * so a gate still touches no rows — and with one inbound edge there is exactly
+ * one count for "how many rows" to mean.
+ *
  * ## The predicate is declarative, and that is the safety property
  *
- * It names an **environment variable**, never a value and never code. Three
- * reasons, in order of how much they cost to get wrong:
+ * It is one of {@link WORKFLOW_PREDICATE_KINDS} — a variable's name, or a count
+ * off a checkpoint — and never a value and never code. Three reasons, in order
+ * of how much they cost to get wrong:
  *
  * 1. **Replay.** The durable engine replays a run, possibly on another pod. A
  *    predicate is by definition the thing whose answer decides which half of the
@@ -1066,14 +1247,18 @@ export interface WorkflowCallNode extends WorkflowNodeBase {
  *    variable. The outcome is therefore recorded on first evaluation
  *    ({@link WorkflowNodeOutcome.branch}) and read back afterwards, and the
  *    declarative form is what keeps that record small enough to be a checkpoint.
+ *    Both predicate kinds are answerable from what a step was handed:
+ *    {@link WorkflowRowCountPredicate} reads a number that arrived on the step's
+ *    own checkpointed input rather than counting anything.
  * 2. **A predicate is not a place for a secret.** A name is stored; a value
  *    never is. This is the same rule {@link WorkflowSourceNode.secretEnvVar}
  *    follows and for the same reason.
  * 3. **Code would need a context to read, and this node does not own it.** What
  *    code-bearing nodes may see — allow-listed variables, a `catalog` object —
  *    is a question being answered elsewhere. A `code` predicate is additive the
- *    day it lands: it becomes another shape here, and everything that reads a
- *    branch reads it off the recorded outcome exactly as it does now.
+ *    day it lands: it becomes another member of {@link WorkflowIfPredicate}, and
+ *    everything that reads a branch reads it off the recorded outcome exactly as
+ *    it does now.
  *
  * To invert the test, swap which successor is on `then` and which is on `else`.
  * There is deliberately no `negate` flag: two ways to say one thing is two
@@ -1082,20 +1267,10 @@ export interface WorkflowCallNode extends WorkflowNodeBase {
 export interface WorkflowIfNode extends WorkflowNodeBase {
   kind: 'if';
   /**
-   * The name of the environment variable to read on the machine that runs the
-   * node. **The name, never the value** — nothing about a credential is stored
-   * in a catalog.
+   * What it tests. A union rather than a field per test — see
+   * {@link WORKFLOW_PREDICATE_KINDS} for why that is the whole point.
    */
-  envVar: string;
-  /**
-   * What it has to equal for the `then` branch to be taken.
-   *
-   * Absent means "is it set to anything non-empty", which is the ClickHouse
-   * case: a deployment that has one has the URL, a deployment that does not has
-   * nothing. Present means an exact string comparison, which is the
-   * `DEPLOY_ENV = local` case.
-   */
-  equals?: string;
+  predicate: WorkflowIfPredicate;
 }
 
 /**
@@ -1710,6 +1885,7 @@ export const WORKFLOW_ISSUE_CODES = [
   'transform-not-named',
   'call-not-named',
   'if-not-named',
+  'if-threshold-invalid',
   'if-needs-one-input',
   'branch-not-labelled',
   'branch-on-plain-edge',
@@ -2004,17 +2180,43 @@ function nodeIsUnconfigured(node: WorkflowNode): WorkflowValidationIssue | undef
     };
   }
   if (node.kind === 'call') return callIsUnnamed(node);
-  // The third of the same mistake: a gate that reads nothing. It would have to
-  // pick a branch anyway, and whichever one it picked would be a decision the
-  // graph appears to make and nobody authored.
-  if (node.kind === 'if' && node.envVar.trim().length === 0) {
+  if (node.kind === 'if') return ifIsUnconfigured(node);
+  return undefined;
+}
+
+/**
+ * A gate whose test cannot decide anything.
+ *
+ * The third of the same mistake {@link nodeIsUnconfigured} describes, once per
+ * predicate kind, because "unconfigured" means something different for each and
+ * a single check would have to pick one. Both refusals exist for one reason: a
+ * gate that cannot really choose still picks a branch, and whichever it picks is
+ * a decision the graph appears to make and nobody authored — with half the
+ * pipeline silently not running as the only symptom.
+ */
+function ifIsUnconfigured(node: WorkflowIfNode): WorkflowValidationIssue | undefined {
+  const predicate = node.predicate;
+  if (predicate.kind === 'env') {
+    if (predicate.envVar.trim().length > 0) return undefined;
     return {
       code: 'if-not-named',
       nodeIds: [node.id],
       message: `If "${node.name}" (${node.id}) names no environment variable, so there is nothing for it to decide on. It reads the *name* of a variable on the machine that runs the load — that is how a graph tells a deployment with a ClickHouse apart from one without.`,
     };
   }
-  return undefined;
+  if (predicate.kind === 'rowCount') {
+    // At least one, so both answers are reachable. A threshold of zero is
+    // satisfied by every run including an empty one, so the `else` subtree would
+    // never execute on any deployment — the silent half-graph, arrived at by
+    // typing a number rather than by mislabelling a wire.
+    if (Number.isInteger(predicate.atLeast) && predicate.atLeast >= 1) return undefined;
+    return {
+      code: 'if-threshold-invalid',
+      nodeIds: [node.id],
+      message: `If "${node.name}" (${node.id}) branches on a row count of ${JSON.stringify(predicate.atLeast)}, and a threshold has to be a whole number of at least 1. "At least 1" is the "did anything arrive at all" test; 0 would be satisfied by every run, so the else branch — and everything only it feeds — would never run on any deployment.`,
+    };
+  }
+  return unreachablePredicateKind(predicate, 'validateWorkflow');
 }
 
 /**
@@ -2437,16 +2639,34 @@ function canonicalNode(node: WorkflowNode): string {
     ]);
   }
   if (node.kind === 'if') {
-    // Both halves of the predicate, because both decide which branch runs.
-    // `equals` being absent is a *different* test from `equals` being the empty
-    // string — "set to anything" against "set to nothing" — so the two must not
-    // canonicalise to the same string.
-    return JSON.stringify([node.id, node.kind, node.envVar, node.equals ?? null]);
+    return JSON.stringify([node.id, node.kind, ...canonicalPredicate(node.predicate)]);
   }
   if (node.kind === 'sink') {
     return JSON.stringify([node.id, node.kind, node.targetType, node.mode ?? 'full']);
   }
   return unreachableNodeKind(node, 'workflowGraphHash');
+}
+
+/**
+ * The parts of a predicate that decide which branch runs.
+ *
+ * The kind leads, so the two tests can never canonicalise to the same string —
+ * a gate switched from "is CLICKHOUSE_URL set" to "did 1 row arrive" is a
+ * different pipeline on every deployment, and a hash that missed it would leave
+ * two runs claiming the same graph version while having taken different halves
+ * of it.
+ */
+function canonicalPredicate(predicate: WorkflowIfPredicate): unknown[] {
+  if (predicate.kind === 'env') {
+    // Both halves, because both decide which branch runs. `equals` being absent
+    // is a *different* test from `equals` being the empty string — "set to
+    // anything" against "set to nothing" — so the two must not fold together.
+    return [predicate.kind, predicate.envVar, predicate.equals ?? null];
+  }
+  if (predicate.kind === 'rowCount') {
+    return [predicate.kind, predicate.atLeast];
+  }
+  return unreachablePredicateKind(predicate, 'workflowGraphHash');
 }
 
 function sortedEntries(config: Record<string, unknown>): Array<[string, unknown]> {
@@ -2505,14 +2725,10 @@ export function isWorkflowNode(value: unknown): value is WorkflowNode {
     );
   }
   if (kind === 'if') {
-    // The variable name is required and its expected value is not, exactly as
-    // the type says: an absent `equals` is the "is it set at all" test, so a
-    // stored node without one is complete rather than half-narrowed.
-    const equals = Reflect.get(value, 'equals');
-    return (
-      typeof Reflect.get(value, 'envVar') === 'string' &&
-      (equals === undefined || typeof equals === 'string')
-    );
+    // The predicate in full, refused rather than defaulted: a gate read back
+    // without a test it recognises would have to invent one, and inventing one
+    // means half the graph runs on a decision nobody made.
+    return isWorkflowIfPredicate(Reflect.get(value, 'predicate'));
   }
   if (kind === 'source') {
     const sourceKind = Reflect.get(value, 'sourceKind');

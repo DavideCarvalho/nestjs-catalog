@@ -268,11 +268,15 @@ export type {
   WorkflowEdge,
   WorkflowExecutionMode,
   WorkflowGraph,
+  WorkflowEnvPredicate,
   WorkflowIfNode,
+  WorkflowIfPredicate,
   WorkflowIssueCode,
   WorkflowNode,
   WorkflowNodeKind,
   WorkflowNodeOutcome,
+  WorkflowPredicateKind,
+  WorkflowRowCountPredicate,
   WorkflowRunOrderEntry,
   WorkflowSinkNode,
   WorkflowSkipReason,
@@ -329,13 +333,22 @@ export {
   // it keeps a copy and the copy is what eventually spells one of them wrong —
   // which is a subtree that silently never runs.
   WORKFLOW_BRANCH_LABELS,
+  // The predicate vocabulary, same argument one level down: an inspector that
+  // offers "environment variable" or "row count" has to offer exactly the kinds
+  // the validator and the runner know, and the exhaustiveness helper is what
+  // makes a form missing one a build failure rather than a gate somebody can
+  // save with nothing to decide on.
+  WORKFLOW_PREDICATE_KINDS,
   WORKFLOW_SKIP_REASONS,
   isWorkflowBranchLabel,
+  isWorkflowIfPredicate,
+  isWorkflowPredicateKind,
   isWorkflowSkipReason,
   // Exported so a screen can answer "would this node have run" from a recorded
   // run exactly the way the runner decided it, rather than approximating.
   workflowNodeRuns,
   unreachableNodeKind,
+  unreachablePredicateKind,
   // The draft/ready pair, for the same reason as the list above: a canvas that
   // cannot see it restates it, and the copy is what drifts. Without this the
   // editor could not tell a graph it is allowed to store from one the server

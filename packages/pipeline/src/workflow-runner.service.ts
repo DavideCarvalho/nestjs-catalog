@@ -10,12 +10,14 @@ import {
   SubprocessTransformRunner,
   type WorkflowBranchLabel,
   type WorkflowCallOutput,
+  type WorkflowEnvPredicate,
   type WorkflowExecutionMode,
   type WorkflowIfNode,
   type WorkflowNodeKind,
   type WorkflowNodeOutcome,
   type WorkflowNodeStepInput,
   type WorkflowNodeStepOutput,
+  type WorkflowRowCountPredicate,
   type WorkflowSinkNode,
   type WorkflowSourceNode,
   type WorkflowStageRef,
@@ -25,6 +27,7 @@ import {
   supportsWorkflowStages,
   supportsWorkflows,
   unreachableNodeKind,
+  unreachablePredicateKind,
   workflowNodeRuns,
   workflowRunOrder,
 } from '@dudousxd/nestjs-catalog';
@@ -1217,34 +1220,18 @@ export class WorkflowRunnerService {
    * `catalog` object — is being built elsewhere; when it lands, that function is
    * what it replaces, and everything else here is unaffected because the
    * decision is recorded rather than recomputed.
+   *
+   * The row-count predicate does not go near that seam at all: it reads a number
+   * off `input.inputs`, which is the step's own checkpointed input, so it is a
+   * pure function of what was already written down. See `evaluateRowCount`.
    */
   private async runIf(
     node: WorkflowIfNode,
     input: WorkflowNodeStepInput,
     startedAt: number,
   ): Promise<WorkflowNodeStepOutput> {
-    const name = node.envVar.trim();
-    if (name.length === 0) {
-      // A graph that validated cannot reach this, so reaching it means the
-      // graph was edited under the run or stored by something that skipped the
-      // validator. Guessing a branch would be a decision nobody authored.
-      throw new BadRequestException(
-        `If node "${node.name}" (${node.id}) names no environment variable, so there is nothing for it to decide on and no honest branch to take.`,
-      );
-    }
-
-    const value = readPredicateEnv(name);
-    const matched =
-      node.equals === undefined ? value !== undefined && value.length > 0 : value === node.equals;
+    const { matched, tested } = evaluatePredicate(node, input);
     const branch: WorkflowBranchLabel = matched ? 'then' : 'else';
-
-    // Says what was tested and what was found, and never the value itself: a
-    // variable holding a ClickHouse URL holds a password, and a run log is read
-    // at `catalog:read`. "set" and "not set" is the whole of what decided this.
-    const tested =
-      node.equals === undefined
-        ? `${name} is ${value !== undefined && value.length > 0 ? 'set' : 'not set'}`
-        : `${name} ${value === node.equals ? 'matches' : 'does not match'} the expected value`;
     const passed = input.inputs[0];
 
     return {
@@ -1257,7 +1244,7 @@ export class WorkflowRunnerService {
       elapsedMs: Date.now() - startedAt,
       logs: safeLogLines(
         [
-          `"${node.name}" checked the deployment: ${tested}, so the "${branch}" branch runs and everything reached only through "${matched ? 'else' : 'then'}" is skipped. This decision is recorded on the run and replayed rather than asked again.`,
+          `"${node.name}" ${tested}, so the "${branch}" branch runs and everything reached only through "${matched ? 'else' : 'then'}" is skipped. This decision is recorded on the run and replayed rather than asked again.`,
         ],
         LOG_LINES_PER_NODE,
       ),
@@ -1609,6 +1596,108 @@ export function stageRefsFor(
   runId: string,
 ): WorkflowStageRef[] {
   return inputs.map((nodeId) => stages.get(nodeId) ?? { runId, nodeId, batches: 0, rowCount: 0 });
+}
+
+/**
+ * Answer the gate's question, once.
+ *
+ * Split per predicate kind and ending in `unreachablePredicateKind`, so a third
+ * kind added to the model is a build failure here rather than a gate that runs
+ * and picks a branch nobody authored. Returns the answer *and* the sentence the
+ * run log will carry, together, because the two are the same decision written
+ * twice and a log that disagreed with the branch would be worse than no log.
+ */
+function evaluatePredicate(
+  node: WorkflowIfNode,
+  input: WorkflowNodeStepInput,
+): { matched: boolean; tested: string } {
+  const predicate = node.predicate;
+  if (predicate.kind === 'env') return evaluateEnv(node, predicate);
+  if (predicate.kind === 'rowCount') return evaluateRowCount(node, predicate, input);
+  return unreachablePredicateKind(predicate, 'WorkflowRunnerService.runIf');
+}
+
+/** The deployment test. Reads the environment, and reports only "set" or "not set". */
+function evaluateEnv(
+  node: WorkflowIfNode,
+  predicate: WorkflowEnvPredicate,
+): { matched: boolean; tested: string } {
+  const name = predicate.envVar.trim();
+  if (name.length === 0) {
+    // A graph that validated cannot reach this, so reaching it means the
+    // graph was edited under the run or stored by something that skipped the
+    // validator. Guessing a branch would be a decision nobody authored.
+    throw new BadRequestException(
+      `If node "${node.name}" (${node.id}) names no environment variable, so there is nothing for it to decide on and no honest branch to take.`,
+    );
+  }
+
+  const value = readPredicateEnv(name);
+  const matched =
+    predicate.equals === undefined
+      ? value !== undefined && value.length > 0
+      : value === predicate.equals;
+
+  // Says what was tested and what was found, and never the value itself: a
+  // variable holding a ClickHouse URL holds a password, and a run log is read
+  // at `catalog:read`. "set" and "not set" is the whole of what decided this.
+  const tested =
+    predicate.equals === undefined
+      ? `checked the deployment: ${name} is ${value !== undefined && value.length > 0 ? 'set' : 'not set'}`
+      : `checked the deployment: ${name} ${value === predicate.equals ? 'matches' : 'does not match'} the expected value`;
+  return { matched, tested };
+}
+
+/**
+ * The "was there anything to load" test.
+ *
+ * ## It reads a checkpoint, not the data
+ *
+ * The count comes off `input.inputs[0].rowCount` — a {@link WorkflowStageRef}
+ * the workflow body assembled from the upstream node's *recorded output* and
+ * handed to this step as part of its input. That input is checkpointed, so this
+ * function is a pure function of what the run already wrote down: a replay on
+ * another pod computes the same answer from the same number, and in practice
+ * never even gets here, because the branch itself was checkpointed on the step's
+ * output. Counting the staged rows instead — a read against the stage store —
+ * would put a live query on the replay path, which is the one thing a predicate
+ * must not do.
+ *
+ * ## One input, so one meaning of "how many"
+ *
+ * `validateWorkflow` allows a gate exactly one inbound edge, so `inputs` has one
+ * entry and it is the same ref the gate hands on. Anything else means the graph
+ * was edited under the run or stored past the validator, and it is refused
+ * rather than resolved: summing would count rows this node is not passing on,
+ * and taking the first would silently test one of two streams. Both are a
+ * decision nobody authored, which is the failure this node exists to prevent.
+ */
+function evaluateRowCount(
+  node: WorkflowIfNode,
+  predicate: WorkflowRowCountPredicate,
+  input: WorkflowNodeStepInput,
+): { matched: boolean; tested: string } {
+  const only = input.inputs.length === 1 ? input.inputs[0] : undefined;
+  if (!only) {
+    throw new BadRequestException(
+      `If node "${node.name}" (${node.id}) branches on how many rows reach it, and ${input.inputs.length} stages reached it — a gate carries exactly one. There is no honest count to test, so no branch to take.`,
+    );
+  }
+  if (!Number.isInteger(predicate.atLeast) || predicate.atLeast < 1) {
+    throw new BadRequestException(
+      `If node "${node.name}" (${node.id}) branches on a row count of ${JSON.stringify(predicate.atLeast)}, and a threshold has to be a whole number of at least 1. A gate that can only answer one way is half a graph that never runs.`,
+    );
+  }
+
+  const carried = only.rowCount;
+  return {
+    matched: carried >= predicate.atLeast,
+    // The count is worth saying out loud even though it is also on the node's
+    // outcome: "0 rows reached it" beside "the else branch runs" is the whole
+    // explanation of why a type was not refreshed, in one line, where somebody
+    // asking that question is already looking.
+    tested: `counted what reached it: ${carried} ${carried === 1 ? 'row' : 'rows'}, against a threshold of ${predicate.atLeast}`,
+  };
 }
 
 /**
