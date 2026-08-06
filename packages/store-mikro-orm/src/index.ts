@@ -89,6 +89,7 @@ export {
   refreshView,
   relationsFor,
   runReadOnlyQuery,
+  streamReadOnlyQuery,
   viewFor,
 } from './query';
 export {

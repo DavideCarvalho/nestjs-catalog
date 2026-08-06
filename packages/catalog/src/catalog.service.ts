@@ -3,6 +3,7 @@ import {
   ForbiddenException,
   Inject,
   Injectable,
+  Logger,
   NotFoundException,
   Optional,
 } from '@nestjs/common';
@@ -19,6 +20,7 @@ import {
   type CatalogQueryResult,
   assertReadOnlyShape,
   isQueryStore,
+  isStreamingQueryStore,
 } from './catalog.query';
 import { QueryCache } from './catalog.query-cache';
 import { CatalogRegistry } from './catalog.registry.base';
@@ -57,6 +59,19 @@ const DEFAULT_PAGE_SIZE = 25;
 const DEFAULT_MAX_PAGE_SIZE = 200;
 
 /**
+ * A finished array, seen as the shape a streamed read has.
+ *
+ * Yields out of the caller's array rather than copying it: the rows are already
+ * held by whoever produced them, and a second copy would be the cost this whole
+ * path exists to avoid, paid on the one code path that could least afford it.
+ */
+async function* fromRows(
+  rows: Array<Record<string, unknown>>,
+): AsyncGenerator<Record<string, unknown>> {
+  for (const row of rows) yield row;
+}
+
+/**
  * Reads objects of any catalogued type through one endpoint.
  *
  * This layer owns the decisions that must hold no matter where the rows live:
@@ -77,6 +92,8 @@ export class CatalogService {
   ) {}
 
   private readonly cache = new QueryCache();
+
+  private readonly logger = new Logger(CatalogService.name);
 
   // ---------------------------------------------------------------------------
   // The facade.
@@ -506,6 +523,71 @@ export class CatalogService {
       cacheTtlSeconds: saved.cacheTtlSeconds,
     });
     return { savedQuery: saved, result };
+  }
+
+  /**
+   * The same saved query, as rows arriving rather than a result.
+   *
+   * For the export route, and it differs from {@link runSavedQuery} in three
+   * ways that are all the same decision seen from different sides.
+   *
+   * **No cap when the store streams.** An export is the whole result by
+   * definition — that is what distinguishes it from the table it was exported
+   * from — so `maxQueryRows` is not applied. It cannot be: a capped export is a
+   * prefix handed over as a complete file, with nothing in the file to say so.
+   *
+   * **No cache, in either direction.** Nothing is read from it, because what it
+   * holds is a *capped* page and serving that would silently truncate; and
+   * nothing is written to it, because the thing being produced is the object the
+   * cache exists to avoid holding.
+   *
+   * **No timeout.** {@link CatalogModuleOptions.queryTimeoutMs} bounds a
+   * statement somebody is waiting on behind a screen. An export of a large table
+   * runs for as long as the table takes, and the bound that matters is that
+   * neither this process nor the driver holds more than a row — which the stream
+   * is what provides. A client that gives up closes the connection, and the
+   * consumer stopping its pull is what releases the read.
+   *
+   * **A store that cannot stream falls back to the capped buffered read**, and
+   * that is a real difference in what the same route returns depending on what
+   * is mounted underneath. It is the honest option: lifting the cap on a store
+   * that materialises its result set would not make the export complete, it
+   * would move the failure into the driver, where there is no cap to report. The
+   * truncation is logged, since a CSV has nowhere to carry the fact.
+   */
+  async streamSavedQuery(id: string): Promise<{
+    savedQuery: SavedQuery;
+    columns?: string[];
+    rows: AsyncIterable<Record<string, unknown>>;
+  }> {
+    const saved = await this.getSavedQuery(id);
+    if (!isQueryStore(this.store)) {
+      throw new BadRequestException("This catalog's store does not support SQL queries.");
+    }
+    try {
+      assertReadOnlyShape(saved.sql);
+    } catch (error) {
+      throw new BadRequestException(error instanceof Error ? error.message : String(error));
+    }
+
+    if (isStreamingQueryStore(this.store)) {
+      // Columns are left undefined: a streamed read learns them from its first
+      // row, exactly as the buffered one does from `rows[0]`.
+      return { savedQuery: saved, rows: this.store.streamQuery({ sql: saved.sql }) };
+    }
+
+    const cap = this.options.maxQueryRows ?? 1_000;
+    const result = await this.store.runQuery({
+      sql: saved.sql,
+      maxRows: cap,
+      timeoutMs: this.options.queryTimeoutMs ?? 15_000,
+    });
+    if (result.truncated) {
+      this.logger.warn(
+        `Exported saved query ${saved.id} ("${saved.name}") was cut off at ${cap} rows: the mounted store cannot stream a result, so the export is bounded by maxQueryRows. The downloaded file is a prefix and says nothing about it.`,
+      );
+    }
+    return { savedQuery: saved, columns: result.columns, rows: fromRows(result.rows) };
   }
 
   listDashboards(): Promise<Dashboard[]> {

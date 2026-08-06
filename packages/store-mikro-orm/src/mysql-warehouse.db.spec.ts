@@ -199,4 +199,144 @@ describe('MySqlWarehouseStore', () => {
     const rows = await db.store.read(type, ['id', 'label'], { page: 1, size: 10 });
     expect(rows.total).toBe(1);
   });
+  // -------------------------------------------------------------------------
+  // Streaming a query, which is what the CSV export runs on.
+  // -------------------------------------------------------------------------
+
+  it('hands rows over as the engine produces them, not after it has produced them all', async () => {
+    // The claim `streamQuery` makes to the export route is that nothing between
+    // the engine and the consumer holds the whole result. That is a claim about
+    // what the driver does, so it cannot be checked against a fake — and it
+    // cannot be checked by looking at the rows either, since a buffered read
+    // returns exactly the same ones.
+    //
+    // So it is timed, against an engine made deliberately slow to produce: a
+    // per-row `SLEEP` of 10ms over 400 rows means the last row cannot exist
+    // before four seconds have passed. Reading three rows and stopping is fast
+    // only if the first ones crossed the wire while the rest were still being
+    // computed.
+    //
+    // **The rows have to be wide, and that is the part that is easy to get
+    // wrong.** MySQL writes result rows into a network buffer and flushes it
+    // when it fills (`net_buffer_length`, 16KB by default), so 400 narrow rows
+    // go out in a single packet at the END of the statement and a probe built on
+    // them measures the server's buffering rather than the driver's. Measured:
+    // with a 4-byte column, the first row arrives at 4.1 seconds through
+    // MikroORM AND through raw mysql2 — the shape that looks exactly like a
+    // driver that does not stream, on a driver that does. At 30KB a row the
+    // first arrives in ~22ms both ways.
+    //
+    // No `ORDER BY`, for the neighbouring reason: a sort is entitled to read the
+    // whole result before emitting anything.
+    const type = contractType('MySqlStreamedQuery');
+    await db.publish(type);
+    const rows = Array.from({ length: 400 }, (_, index) =>
+      contractRow(`id-${index}`, `label-${index}`, index),
+    );
+    await db.store.write(type, rows, { snapshotId: 'streamed', principalId: 'contract', batch: 0 });
+    await db.store.commit(type, 'streamed');
+
+    const slow =
+      "SELECT id, REPEAT('x', 30000) AS payload, SLEEP(0.01) AS slept FROM mysqlstreamedquery";
+    const started = Date.now();
+    let elapsed = 0;
+    const seen: Array<Record<string, unknown>> = [];
+    for await (const row of db.store.streamQuery({ sql: slow })) {
+      seen.push(row);
+      if (seen.length === 3) {
+        // Measured HERE rather than after the loop. Leaving the loop unwinds the
+        // generator, and that teardown waits for the engine to finish the
+        // statement it is still running — around four more seconds here, which
+        // would swamp the number this case is about.
+        elapsed = Date.now() - started;
+        break;
+      }
+    }
+
+    expect(seen).toHaveLength(3);
+    expect(typeof seen[0].id).toBe('string');
+    // Three rows at 10ms each is 30ms; the whole result is four seconds. A
+    // second of headroom keeps this from being a benchmark while leaving the two
+    // outcomes four times apart.
+    expect(elapsed).toBeLessThan(1_000);
+
+    // Leaving the loop ran the generator's `finally`, which rolled the read-only
+    // transaction back and released the connection. If it had not, the pool
+    // would be one connection short and this next read would eventually hang
+    // rather than answer.
+    const after = await db.store.read(type, ['id'], { page: 1, size: 1 });
+    expect(after.total).toBe(400);
+  });
+
+  it('streams every row when nothing stops it, with no cap of its own', async () => {
+    // The buffered read caps at `maxRows` and reports `truncated`; this one is
+    // asked for a file and must not invent a bound the caller did not ask for.
+    const type = contractType('MySqlStreamedWhole');
+    await db.publish(type);
+    await db.store.write(
+      type,
+      Array.from({ length: 2_500 }, (_, index) => contractRow(`id-${index}`, 'l', index)),
+      { snapshotId: 'whole', principalId: 'contract', batch: 0 },
+    );
+    await db.store.commit(type, 'whole');
+
+    let counted = 0;
+    for await (const _row of db.store.streamQuery({
+      sql: 'SELECT id FROM mysqlstreamedwhole',
+    })) {
+      counted += 1;
+    }
+
+    // Past `runReadOnlyQuery`'s 1,000-row default, which is the number this
+    // would stop at if the export had gone through the buffered read.
+    expect(counted).toBe(2_500);
+  });
+
+  it('refuses a write inside the transaction it streams in', async () => {
+    // Same guarantee the buffered read makes, obtained differently: that one
+    // issues `START TRANSACTION READ ONLY` as a statement, this one takes a real
+    // transaction handle and passes it to the stream, because a stream executed
+    // on some other pooled connection would be protected by nothing.
+    const type = contractType('MySqlStreamedReadOnly');
+    await db.publish(type);
+    await db.store.write(type, [contractRow('a', 'alpha', 1)], {
+      snapshotId: 'ro',
+      principalId: 'contract',
+      batch: 0,
+    });
+    await db.store.commit(type, 'ro');
+
+    const attempt = async () => {
+      for await (const _row of db.store.streamQuery({
+        sql: "INSERT INTO `obj_mysqlstreamedreadonly` (`id`) VALUES ('sneaky')",
+      })) {
+        // Never reached: the engine refuses the statement.
+      }
+    };
+
+    await expect(attempt()).rejects.toThrow(/READ ONLY/i);
+  });
+
+  it('normalises the scalars a CSV cell cannot carry, exactly as the buffered read does', async () => {
+    const type = contractType('MySqlStreamedScalars');
+    await db.publish(type);
+    await db.store.write(type, [contractRow('a', 'alpha', 7)], {
+      snapshotId: 'scalars',
+      principalId: 'contract',
+      batch: 0,
+    });
+    await db.store.commit(type, 'scalars');
+
+    const streamed: Array<Record<string, unknown>> = [];
+    for await (const row of db.store.streamQuery({
+      sql: 'SELECT id, score, CAST(1 AS UNSIGNED) AS big FROM mysqlstreamedscalars',
+    })) {
+      streamed.push(row);
+    }
+    const buffered = await db.store.runQuery({
+      sql: 'SELECT id, score, CAST(1 AS UNSIGNED) AS big FROM mysqlstreamedscalars',
+    });
+
+    expect(streamed).toEqual(buffered.rows);
+  });
 });

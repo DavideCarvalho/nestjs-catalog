@@ -198,6 +198,86 @@ export async function runReadOnlyQuery(
   }
 }
 
+/**
+ * The same read, one row at a time.
+ *
+ * Written for the CSV export, which has no row cap by design and therefore
+ * cannot use {@link runReadOnlyQuery}: that function's whole shape is a page —
+ * it fetches `maxRows + 1` and reports whether it cut the result short, which is
+ * the right answer for a screen and the wrong one for a file that is supposed to
+ * be everything.
+ *
+ * **The back-pressure is real and comes from the driver.** MikroORM v7 runs on
+ * Kysely, and `connection.stream()` compiles the statement, asks the executor to
+ * stream it, and yields rows as the dialect produces them. Under MySQL that
+ * dialect is mysql2's row stream, which pauses the socket when the reader stops
+ * pulling — so a consumer that writes a line to a socket before asking for the
+ * next row holds one row, not a result set, all the way down to the wire.
+ *
+ * **The read-only transaction is the same guarantee `runReadOnlyQuery` makes and
+ * is obtained differently.** That function issues `START TRANSACTION READ ONLY`
+ * as a statement; a stream needs its rows read *inside* the transaction, so this
+ * takes a real transaction handle (`begin({ readOnly: true })`, which Kysely
+ * emits as `START TRANSACTION READ ONLY`) and passes it to `stream` as the
+ * context. Passing the handle is not a nicety: without it the stream would be
+ * executed on some other connection from the pool and the access mode set here
+ * would be protecting nothing.
+ *
+ * **The rollback sits in a `finally` on the generator**, so it runs when the
+ * consumer stops early as well as when the rows run out — a `for await` that
+ * breaks, or a client that closes the download halfway, calls the generator's
+ * `return`, which unwinds this. A consumer that abandons the iterator without
+ * closing it would leak the transaction, which is the one obligation this shape
+ * puts on a caller that the buffered one does not.
+ *
+ * **The timeout is optional here and mandatory there.** A statement behind a
+ * screen has somebody waiting on it; an export of a large table legitimately
+ * runs for minutes, and cutting it off at the console's fifteen seconds would
+ * make the export impossible for exactly the tables that need one. Given no
+ * budget, no hint is attached and MySQL applies none.
+ */
+export async function* streamReadOnlyQuery(
+  em: EntityManager,
+  request: { sql: string; maxRows?: number; timeoutMs?: number },
+): AsyncGenerator<Record<string, unknown>> {
+  const connection = em.fork().getConnection();
+  const trx = await connection.begin({ readOnly: true });
+  try {
+    for await (const row of connection.stream<Record<string, unknown>>(
+      streamStatement(request),
+      [],
+      trx,
+    )) {
+      yield normaliseRow(row);
+    }
+  } catch (error) {
+    // The database's message is the useful one, exactly as in the buffered read
+    // — "Unknown column 'foo'" is what the person who wrote the query needs.
+    throw new BadRequestException(error instanceof Error ? error.message : String(error));
+  } finally {
+    await connection.rollback(trx).catch(() => undefined);
+  }
+}
+
+/**
+ * The statement a streamed read runs.
+ *
+ * Wrapped in a `SELECT *` for the same reason the buffered one is: an optimizer
+ * hint is only legal on a plain `SELECT`, and the caller's text may start with
+ * `WITH`. Unwrapped when there is neither a budget nor a cap to attach, because
+ * then the wrapper would be a subquery bought for nothing.
+ */
+function streamStatement(request: { sql: string; maxRows?: number; timeoutMs?: number }): string {
+  const sql = request.sql.trim().replace(/;\s*$/, '');
+  const hint =
+    request.timeoutMs === undefined
+      ? ''
+      : `/*+ MAX_EXECUTION_TIME(${Math.max(1000, Math.floor(request.timeoutMs))}) */ `;
+  const limit = request.maxRows === undefined ? '' : ` LIMIT ${Math.max(0, request.maxRows)}`;
+  if (hint === '' && limit === '') return sql;
+  return `SELECT ${hint}* FROM (${sql}) AS ${ident('q')}${limit}`;
+}
+
 /** JSON cannot carry BigInt or Date; neither can a table cell. */
 function normaliseRow(row: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};

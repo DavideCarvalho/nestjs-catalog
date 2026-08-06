@@ -56,21 +56,3 @@ export class QueryCache {
     return this.entries.size;
   }
 }
-
-/** CSV, for the export button. */
-export function toCsv(result: CatalogQueryResult): string {
-  const escapeCell = (value: unknown): string => {
-    if (value === null || value === undefined) return '';
-    const text = typeof value === 'object' ? JSON.stringify(value) : String(value);
-    // Quote when the value could otherwise break the row apart. Doubling the
-    // quote is the CSV escape, not a backslash.
-    return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
-  };
-
-  const lines = [result.columns.map(escapeCell).join(',')];
-  for (const row of result.rows) {
-    lines.push(result.columns.map((column) => escapeCell(row[column])).join(','));
-  }
-  // CRLF: Excel still treats a bare LF file as one long row in some locales.
-  return `${lines.join('\r\n')}\r\n`;
-}

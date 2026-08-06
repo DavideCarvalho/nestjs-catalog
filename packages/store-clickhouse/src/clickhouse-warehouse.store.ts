@@ -907,6 +907,22 @@ export class ClickHouseWarehouseStore
     };
   }
 
+  /**
+   * **No `streamQuery` beside this, and the omission is a statement.**
+   *
+   * `CatalogQueryStore.streamQuery` is optional so that a store which cannot
+   * honestly hand rows over incrementally says so by not offering it, rather
+   * than offering a shim that collects the result and yields it back — which
+   * would satisfy the type while doing the exact thing the method exists to
+   * avoid. `runReadOnlyQuery` here reads the response body whole
+   * (`result.json()`), so this adapter materialises its result set.
+   *
+   * The consequence lands on the CSV export, which falls back to the capped
+   * buffered read on a ClickHouse-backed catalog and logs the truncation.
+   * `@clickhouse/client` does expose a row stream, so this is a gap rather than
+   * an impossibility; it is left open rather than shipped untested, the same
+   * call the pipeline package made about `pg`.
+   */
   async runQuery(request: CatalogQueryRequest): Promise<CatalogQueryResult> {
     return runReadOnlyQuery(this.queryClient, request);
   }

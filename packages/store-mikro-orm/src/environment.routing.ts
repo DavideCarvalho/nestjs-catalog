@@ -44,6 +44,7 @@ import type {
   CatalogQueryRequest,
   CatalogQueryResult,
   CatalogQueryStore,
+  CatalogQueryStreamRequest,
   CatalogReadQuery,
   CatalogReadResult,
   CatalogSnapshot,
@@ -68,6 +69,7 @@ import {
   type CatalogRevision,
   UnresolvedEnvironmentError,
   isQueryStore,
+  isStreamingQueryStore,
   stampEnvironment,
   supportsLoadExpectations,
   supportsSavedQueryRevisions,
@@ -318,6 +320,34 @@ export class RoutingCatalogStore implements CatalogMergeStore, CatalogQueryStore
     // about. `runQuery` is where the refusal belongs, because that is where
     // somebody asked for something.
     return isQueryStore(store) ? store.queryRelations() : Promise.resolve([]);
+  }
+
+  /**
+   * Streaming is routed too, and forwarding it is not optional either.
+   *
+   * Declared unconditionally, and it has to be: which environment is mounted is
+   * decided per request, so a structural probe made on *this* object cannot be
+   * answering about the store that will serve the call. A conditional
+   * declaration has no moment it could be made in, and leaving the method off
+   * would deny a streamed export to every environment on the grounds that one of
+   * them might not manage it — which would put the CSV route back on the read
+   * that materialises the whole result, in the deployment shape most likely to
+   * have a large one.
+   *
+   * The refusal below is a guard against a future store rather than a path any
+   * deployment takes today: `CatalogEnvironmentBundle` constructs a
+   * `MySqlWarehouseStore`, which streams. It is written the way `runQuery`'s is
+   * because if that ever stops being true, the sentence should say which layer
+   * declined rather than surfacing as a missing method somewhere else.
+   */
+  async *streamQuery(request: CatalogQueryStreamRequest): AsyncGenerator<Record<string, unknown>> {
+    const { store } = requireEnvironmentBundle();
+    if (!isStreamingQueryStore(store)) {
+      throw new BadRequestException(
+        "This environment's store cannot hand a SQL result over a row at a time, so it has nothing to export without holding the whole file.",
+      );
+    }
+    yield* store.streamQuery(request);
   }
 }
 

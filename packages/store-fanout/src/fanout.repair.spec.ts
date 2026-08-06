@@ -266,6 +266,9 @@ class RichCatalogStore implements CatalogWriteStore {
   async queryRelations(): Promise<CatalogQueryRelation[]> {
     return [];
   }
+  async *streamQuery(): AsyncGenerator<Record<string, unknown>> {
+    yield { n: 1 };
+  }
 }
 
 /** A store offering nothing beyond the required members. */

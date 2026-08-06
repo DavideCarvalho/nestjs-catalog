@@ -1,3 +1,4 @@
+import { Readable } from 'node:stream';
 import {
   BadRequestException,
   Body,
@@ -13,11 +14,12 @@ import {
   Query,
   Req,
   Res,
+  StreamableFile,
   type Type,
   UseGuards,
 } from '@nestjs/common';
+import { csvLines } from './catalog.csv';
 import type { CatalogPrincipal } from './catalog.principal';
-import { toCsv } from './catalog.query-cache';
 import { CatalogRegistry } from './catalog.registry.base';
 import { RequireScopes } from './catalog.route-auth';
 import { CatalogService } from './catalog.service';
@@ -414,10 +416,39 @@ export function createCatalogController(
     }
 
     /**
-     * The same result as CSV.
+     * The same result as CSV, written out as the rows arrive.
      *
      * A GET, not a POST, so it can be a plain link — a download that only works
      * from JavaScript cannot be pasted into a mail or a scheduled job.
+     *
+     * **Nothing here holds the file.** This used to run the query, hold the
+     * result, build the whole CSV string and then answer — which is the shape
+     * that made a 981,469-row connector load never finish, and it is worse on an
+     * export than on a load, because an export has no row cap by design. Now
+     * `streamSavedQuery` hands over rows, {@link csvLines} turns each into a
+     * line, and the response is written from that.
+     *
+     * **`@Res({ passthrough: true })` is still right, and the returned value is
+     * what had to change.** Passthrough means "I am setting headers, you send
+     * the body", and that is exactly what this handler wants. What it must not
+     * return any more is a string: the express adapter answers a string body
+     * with `res.send()`, which sets `content-length` — and a length header is a
+     * promise about a body nobody has counted yet. A `StreamableFile` is the
+     * body shape the adapter pipes instead, and `applyStreamHeaders` sets a
+     * length only when the `StreamableFile` was given one, which this is not. So
+     * the response is chunked and carries no `content-length`. Taking the
+     * response over with a bare `@Res()` and pumping it by hand would work too,
+     * and would name a platform: this package peer-depends on `@nestjs/common`
+     * and `@nestjs/core` and on no adapter, so a hand-written `write`/`drain`
+     * loop would be one adapter's API written into a library that deliberately
+     * does not have one. A `StreamableFile` leaves the piping to whichever
+     * adapter the host mounted.
+     *
+     * The pipe is also what bounds the memory: `Readable.from` stops pulling
+     * from the generator once its buffer is full, the pipe stops reading once
+     * the socket says wait, and the generator stops pulling from the store. A
+     * client that reads slowly slows the database read down rather than filling
+     * this process with the rows it has not collected.
      */
     @Get('saved-queries/:id/export.csv')
     @RequireScopes('catalog:read')
@@ -425,13 +456,28 @@ export function createCatalogController(
       @Param('id') id: string,
       @Res({ passthrough: true }) response: {
         setHeader(name: string, value: string): void;
+        on(event: 'close', listener: () => void): unknown;
       },
     ) {
-      const { savedQuery, result } = await this.service.runSavedQuery(id);
+      const { savedQuery, columns, rows } = await this.service.streamSavedQuery(id);
       const filename = `${savedQuery.name.replace(/[^A-Za-z0-9_-]+/g, '-')}.csv`;
       response.setHeader('content-type', 'text/csv; charset=utf-8');
       response.setHeader('content-disposition', `attachment; filename="${filename}"`);
-      return toCsv(result);
+      // Byte mode rather than object mode, so the readable's own high-water mark
+      // is measured in bytes: the lines coalesce into socket-sized writes on
+      // their way out, instead of one write per row for however many rows the
+      // table has.
+      const file = Readable.from(csvLines(rows, columns), { objectMode: false });
+      // `pipe` unpipes a dead destination and leaves the SOURCE alone, which
+      // here means an operator who closes the download tab leaves this generator
+      // parked mid-`yield` — and with it, in the shipped MySQL store, an open
+      // read-only transaction on a pooled connection, for the life of the
+      // process. Destroying the readable is what calls the generator's `return`,
+      // which is what runs the `finally` the store put its rollback in. Fires on
+      // an ordinary completion too, where destroying a finished stream is a
+      // no-op.
+      response.on('close', () => file.destroy());
+      return new StreamableFile(file);
     }
 
     /**
