@@ -147,9 +147,20 @@ function instant(row: unknown, column: string): number | undefined {
  * The fix is to notice, not to widen the column: a watermark whose newest write
  * is in the second the database is still *in* is provisional, and the caller
  * records nothing rather than recording something it may have to disbelieve.
- * The cost is bounded and small — at most one extra rebuild per write, because
- * the following check happens at least `staleAfterMs` later and the second has
- * closed by then.
+ *
+ * The comparison is `NOW()` against the **stored** value, and those two round
+ * differently — which is worth stating, because this docblock used to claim a
+ * tighter bound than the engine actually gives. MySQL *rounds* a fractional
+ * second into a `DATETIME(0)` where `NOW()` *truncates*, so a row written at
+ * `…:32.600` is stored as `…:33`, up to half a second ahead of the instant it was
+ * written, and stays provisional until the database's clock has passed it. The
+ * window a write is provisional for is therefore up to 1.5s wide rather than 1s,
+ * and at the default `staleAfterMs` of 1000 that is at most **two** rebuilds a
+ * write does not strictly need, not one. Still bounded, still per write rather
+ * than per request, and still the right side to err on — a rebuild costs a few
+ * hundred rows, and the alternative is a write that stays invisible for the life
+ * of the process. `stored-registry.staleness.db.spec.ts` is where the rounding
+ * was caught, and its `settle` explains it from the test's side.
  *
  * Unreadable clocks answer `true`, deliberately. This is a refinement over the
  * count-and-maximum comparison, and a driver that hands back a shape these
