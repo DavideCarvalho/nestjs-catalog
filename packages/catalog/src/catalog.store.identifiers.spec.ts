@@ -13,7 +13,13 @@
  * store's own spec then checks that its `ident` is this and nothing else.
  */
 import { describe, expect, it } from 'vitest';
-import { UnsafeIdentifierError, assertSafeIdentifier, isSafeIdentifier } from './catalog.store';
+import {
+  UnsafeIdentifierError,
+  assertSafeIdentifier,
+  isSafeIdentifier,
+  outputAlias,
+  physicalColumn,
+} from './catalog.store';
 
 describe('isSafeIdentifier', () => {
   it('accepts what a store can write unquoted-safe', () => {
@@ -87,5 +93,64 @@ describe('assertSafeIdentifier', () => {
     // be an identifier" from "the store broke". With a class per adapter that check re-throws the
     // moment the mounted store is not the one it imported.
     expect(() => assertSafeIdentifier('Asset Id')).toThrow(UnsafeIdentifierError);
+  });
+});
+
+describe('physicalColumn', () => {
+  it('turns a source spelling into a column a store can create', () => {
+    expect(physicalColumn('Asset Id')).toBe('Asset_Id');
+    expect(physicalColumn('Sub/Un Sub')).toBe('Sub_Un_Sub');
+    expect(physicalColumn('Asset LIN/TAMCN')).toBe('Asset_LIN_TAMCN');
+  });
+
+  it('collapses runs of underscores and cuts at 60', () => {
+    // Both are lossy, both are why `assertNoColumnCollisions` exists, and both are why
+    // `outputAlias` below does NOT apply this to a name that is already an identifier.
+    expect(physicalColumn('Asset__Id')).toBe('Asset_Id');
+    expect(physicalColumn('a'.repeat(200))).toBe('a'.repeat(60));
+  });
+
+  it('is allowed to produce something no store will quote', () => {
+    // The cleaning is not a repair. `2024 Total` cleans to a name starting with a digit, which is
+    // what the publish-time refusal is left to catch — asserted here so that "cleans" is never
+    // mistaken for "is guaranteed to work".
+    expect(isSafeIdentifier(physicalColumn('2024 Total'))).toBe(false);
+    expect(isSafeIdentifier(physicalColumn(''))).toBe(false);
+  });
+});
+
+describe('outputAlias', () => {
+  it('cleans a name SQL cannot take, so the name itself never has to be an identifier', () => {
+    // The fix. A view aliasing to `Asset Id` verbatim could not be created at all, which is what
+    // forced publishers to rename the property — and a renamed property is fed from
+    // `row[property.name]`, so it loaded NULL on every row of every run.
+    expect(outputAlias('Asset Id')).toBe('Asset_Id');
+    expect(outputAlias('Asset LIN/TAMCN')).toBe('Asset_LIN_TAMCN');
+    expect(isSafeIdentifier(outputAlias('Asset Id'))).toBe(true);
+  });
+
+  it('leaves a name SQL can take exactly as it is, byte for byte', () => {
+    // **This is the compatibility promise, and it is the whole reason this is not simply
+    // `physicalColumn`.** Every property name in every deployment today is an identifier, because
+    // the publish check demanded one. So every committed view today aliases to the property name,
+    // and somebody is selecting from those columns by name. The two cases that would move under
+    // them are the ones asserted here: a name whose underscores would collapse, and one long
+    // enough to be cut. Both are legal identifiers, both are unchanged, and a change to this
+    // function that renamed either is a change that silently breaks a working query.
+    expect(outputAlias('Asset__Id')).toBe('Asset__Id');
+    expect(outputAlias('a'.repeat(61))).toBe('a'.repeat(61));
+    expect(outputAlias('a'.repeat(63))).toBe('a'.repeat(63));
+    for (const kept of ['Asset_Id', 'asset_id', '_batch', 'Mvr', '_', 'x_9_Y']) {
+      expect(outputAlias(kept)).toBe(kept);
+    }
+  });
+
+  it('never produces an alias two properties could share without sharing a column', () => {
+    // `assertNoColumnCollisions` refuses two names that clean to one column, and this function
+    // adds no collision that check cannot see: a safe name is kept, and if a safe `x` equals some
+    // unsafe name's cleaned form then `x` has no doubled underscores and is under the cut, so `x`
+    // is its own physical column too and the pair collides there.
+    expect(outputAlias('Asset_Id')).toBe(physicalColumn('Asset Id'));
+    expect(physicalColumn('Asset_Id')).toBe(physicalColumn('Asset Id'));
   });
 });

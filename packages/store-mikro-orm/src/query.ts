@@ -6,7 +6,7 @@ import type {
 } from '@dudousxd/nestjs-catalog';
 import type { EntityManager } from '@mikro-orm/mysql';
 import { BadRequestException } from '@nestjs/common';
-import { SNAPSHOT_COLUMN, ident, tableFor } from './identifiers';
+import { SNAPSHOT_COLUMN, ident, outputAlias, physicalColumn, tableFor } from './identifiers';
 
 /**
  * `Mvr` -> `mvr`. The view a query writes in its FROM clause.
@@ -22,13 +22,6 @@ export function viewFor(typeName: string): string {
     .replace(/[^A-Za-z0-9_]/g, '_')
     .replace(/_+/g, '_')
     .toLowerCase();
-}
-
-function physicalColumn(propertyName: string): string {
-  return propertyName
-    .replace(/[^A-Za-z0-9_]/g, '_')
-    .replace(/_+/g, '_')
-    .slice(0, 60);
 }
 
 /**
@@ -49,6 +42,17 @@ function physicalColumn(propertyName: string): string {
  * a snapshot in the middle of a broken chain would answer confidently and
  * wrongly. The copy is paid once per load; the alternative is paid on every
  * read, forever, by people who did not know they were paying it.
+ *
+ * **The output alias is `outputAlias(p.name)`, not `p.name`.** This line used to
+ * take the property's name verbatim, and since `ident` refuses rather than
+ * escapes, that made "is this a SQL identifier?" a condition on every property
+ * name in the catalog — enforced at publish time, and enforced for the sake of
+ * this one statement. The cost of that condition landed somewhere else entirely:
+ * a source whose columns really are called `Asset Id` had to be published under
+ * renamed properties, and a load reads `row[property.name]`, so every renamed
+ * column went in NULL on every row of every run. See `outputAlias` in the core
+ * package for what it does and for why a name that is already an identifier is
+ * still kept exactly as it is — no view that resolves today changes shape.
  */
 export async function refreshView(
   em: EntityManager,
@@ -57,7 +61,7 @@ export async function refreshView(
 ): Promise<void> {
   const view = viewFor(type.name);
   const columns = type.properties.map(
-    (p) => `${ident(physicalColumn(p.name))} AS ${ident(p.name)}`,
+    (p) => `${ident(physicalColumn(p.name))} AS ${ident(outputAlias(p.name))}`,
   );
   // The snapshot id rides along so a query can tell which load it is reading
   // without joining back to the snapshot table.
@@ -80,12 +84,18 @@ export async function dropView(em: EntityManager, typeName: string): Promise<voi
  * the view is the committed snapshot, the physical table is every load that has
  * ever run. Querying across versions means selecting from the second and
  * filtering on `_snapshot_id`.
+ *
+ * Both column lists are what the SQL actually exposes rather than what the type
+ * calls the field: `outputAlias` for the view because that is what
+ * {@link refreshView} aliases to, `physicalColumn` for the table because that is
+ * the column the load wrote. A schema panel that listed the property name for a
+ * property called `Asset Id` would be offering an autocompletion that fails.
  */
 export function relationsFor(types: CatalogObjectTypeDef[]): CatalogQueryRelation[] {
   const relations: CatalogQueryRelation[] = [];
   for (const type of types) {
     const columns = type.properties.map((p) => ({
-      name: p.name,
+      name: outputAlias(p.name),
       type: p.type,
     }));
     relations.push({

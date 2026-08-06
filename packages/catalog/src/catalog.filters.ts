@@ -71,10 +71,14 @@ export function filterOperatorTakesValue(operator: CatalogFilterOperator): boole
 export interface CatalogObjectFilter {
   /**
    * The property's `name`, which is its identity in the type — never its
-   * `columnName`. On a published type the two differ whenever the source spelled
-   * a column in a way SQL cannot: `Asset Id` arrives as `columnName` and the
-   * property is `Asset_Id`. Filtering by the source spelling would resolve to no
-   * property at all on every one of them.
+   * `columnName`, and never the column the view exposes.
+   *
+   * Three names can be in play for one field and only this one identifies it: a
+   * property called `Asset Id` is stored in a column called `Asset_Id`, is
+   * exposed by the SQL console under `Asset_Id`, and may carry any `columnName`
+   * its publisher chose. A filter naming any of the others resolves to no
+   * property at all. The store is what translates this into a column, which is
+   * the only place that translation belongs.
    */
   property: string;
   op: CatalogFilterOperator;

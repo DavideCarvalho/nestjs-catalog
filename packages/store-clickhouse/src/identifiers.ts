@@ -45,12 +45,13 @@ export function ident(value: string): string {
 }
 
 /**
- * Turn a publisher's name into a column we can create.
+ * Turn any string into something that is definitely an identifier.
  *
- * Publishers name things for their own schema — `Asset NSN`, `Sub/Un Sub` — and
- * those cannot be columns here. The mapping is derived rather than stored, so
- * the same property name always resolves to the same column on every node and
- * after every restart.
+ * Distinct from {@link physicalColumn}, which is what this adapter actually
+ * applies to reach a column and is allowed to produce something unusable (`1 2
+ * 3` cleans to `1_2_3`). This one always succeeds: it strips the underscores off
+ * both ends and prefixes a letter when it has to. It is used to *suggest* a name
+ * in a refusal, never to decide where data goes.
  */
 export function toPhysicalName(value: string, prefix = 'c'): string {
   const cleaned = value
@@ -62,13 +63,18 @@ export function toPhysicalName(value: string, prefix = 'c'): string {
   return /^[A-Za-z_]/.test(cleaned) ? cleaned : `${prefix}_${cleaned}`;
 }
 
-/** Property name → physical column. Stable, so it never needs storing twice. */
-export function physicalColumn(propertyName: string): string {
-  return propertyName
-    .replace(/[^A-Za-z0-9_]/g, '_')
-    .replace(/_+/g, '_')
-    .slice(0, 60);
-}
+/**
+ * The cleaning, and the name a read exposes, re-exported rather than declared.
+ *
+ * `physicalColumn` was a private copy here and another private copy — two, in
+ * fact — in the MikroORM adapter, all byte-identical. It is the shared rule's
+ * now for the same reason the character set is: the publish-time refusal in the
+ * pipeline package asks whether a name *cleans* to an identifier, so it has to
+ * be asking about the cleaning the mounted adapter will really perform. The
+ * mapping is still derived rather than stored, so the same property name
+ * resolves to the same column on every node and after every restart.
+ */
+export { outputAlias, physicalColumn } from '@dudousxd/nestjs-catalog';
 
 /** Physical table for an object type — every load of it, ever. */
 export function tableFor(typeName: string): string {

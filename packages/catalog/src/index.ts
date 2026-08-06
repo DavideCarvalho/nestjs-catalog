@@ -233,6 +233,8 @@ export {
   isReservedColumn,
   isSafeIdentifier,
   isWriteStore,
+  outputAlias,
+  physicalColumn,
   type SnapshotRef,
   supportsCarryForward,
   UnsafeIdentifierError,

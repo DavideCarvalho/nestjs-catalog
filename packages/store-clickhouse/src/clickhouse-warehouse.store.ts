@@ -26,6 +26,7 @@ import {
   ROW_COLUMN,
   SNAPSHOT_COLUMN,
   ident,
+  outputAlias,
   physicalColumn,
   stageFor,
   tableFor,
@@ -846,9 +847,18 @@ export class ClickHouseWarehouseStore implements CatalogMergeStore, CatalogQuery
     const size = Math.max(1, query.size ?? 25);
     const offset = (Math.max(1, query.page ?? 1) - 1) * size;
 
+    // Aliased to `outputAlias`, the same name the committed view exposes, and
+    // NOT to the property's name. `ident` refuses rather than escapes, so a
+    // verbatim alias here was the second of the two statements that made "is
+    // this a SQL identifier?" a condition on every property name in the
+    // catalog — and a property that cannot be named `Asset Id` is a property
+    // whose loads write NULL, because a load reads `row[property.name]` out of a
+    // record the source keyed `Asset Id`. `normalise` looks the value back up
+    // under the same alias and hands it out under the property's own name, so
+    // nothing outside this method sees the difference.
     const page = await this.client.query({
       query: `SELECT ${selected
-        .map((p) => `${ident(physicalColumn(p.name))} AS ${ident(p.name)}`)
+        .map((p) => `${ident(physicalColumn(p.name))} AS ${ident(outputAlias(p.name))}`)
         .join(',')}
          FROM ${ident(table)} WHERE ${where}
         ORDER BY ${orderBy} LIMIT {n:UInt64} OFFSET {o:UInt64}`,

@@ -1,6 +1,7 @@
 import type {
   CatalogObjectTypeDef,
   CatalogPropertyDef,
+  CatalogQueryStore,
   CatalogReadResult,
   CatalogWriteStore,
   ScalarType,
@@ -154,6 +155,60 @@ export function contractRow(
   active = true,
 ): Record<string, unknown> {
   return { id, label, score, active, seenAt: SEEN_AT };
+}
+
+/**
+ * The fields of the source-spelling fixture, named the way the source names
+ * them.
+ *
+ * Real column headings out of a real drop: `Asset Id`, `Asset LIN/TAMCN`.
+ * Neither is a SQL identifier, and both are what the records a connector yields
+ * are keyed by.
+ *
+ * `Renamed_Id` is the anti-case, and it is in the fixture on purpose. It is what
+ * a publisher was told to send when a name like `Asset Id` was refused: a
+ * tidied `name`, with the source's spelling parked in `columnName`. The record
+ * written below carries no `Renamed_Id` key, because a source record never
+ * would — so whatever that column reads back as is the answer to "does
+ * `columnName` redirect the read?", asserted rather than assumed.
+ */
+const SOURCE_SPELLED_FIELDS = ['id', 'Asset Id', 'Asset LIN/TAMCN', 'Renamed_Id'] as const;
+
+/** The fixture type for the source-spelling case, named per case like the rest. */
+function sourceSpelledType(name: string): CatalogObjectTypeDef {
+  return {
+    name,
+    displayName: name,
+    pluralDisplayName: `${name}s`,
+    description: 'Fixture for property names spelled the way a source spells them.',
+    tableName: `obj_${name.toLowerCase()}`,
+    group: 'Contract',
+    primaryKey: ['id'],
+    enriched: true,
+    properties: [
+      property('id', 'string', 0, { primary: true, nullable: false }),
+      property('Asset Id', 'string', 1),
+      property('Asset LIN/TAMCN', 'string', 2),
+      property('Renamed_Id', 'string', 3, { columnName: 'Asset Id' }),
+    ],
+    relations: [],
+  };
+}
+
+/**
+ * The store as a SQL console reaches it, or nothing.
+ *
+ * `CatalogQueryStore` is a separate interface from `CatalogWriteStore` and an
+ * adapter may implement one without the other, so the case that needs it asks
+ * rather than assumes — and says so out loud when the answer is no, the same way
+ * every other optional capability in this file is handled. A predicate rather
+ * than a cast: the question is genuinely about the object in hand.
+ */
+function isQueryStore(store: CatalogWriteStore): store is CatalogWriteStore & CatalogQueryStore {
+  return (
+    typeof Reflect.get(store, 'runQuery') === 'function' &&
+    typeof Reflect.get(store, 'queryRelations') === 'function'
+  );
 }
 
 /**
@@ -384,6 +439,110 @@ export function describeCatalogStoreContract(boot: () => ContractStore): void {
         .replace('T', ' ')
         .replace(/(\.\d+)?Z?$/, '');
       expect(seenAt).toBe('2026-01-02 03:04:05');
+    });
+
+    it('loads and returns a property named the way the source spells it', async () => {
+      // **The case this suite was missing when six real types loaded empty.**
+      //
+      // A store matches a source's record to a property by property NAME — it
+      // reads `row[property.name]` — and nothing on the write path consults
+      // `columnName`. But the name was also written verbatim as the output alias
+      // of the committed view and of every read, through an `ident` that refuses
+      // rather than escapes, so a property could not be *called* `Asset Id` at
+      // all. Publishers therefore did the only thing left: renamed the property
+      // to `Asset_Id` and put the source's spelling in `columnName`. Thirteen
+      // types went in that way and six came out with most of their columns NULL,
+      // 313,833 rows on the largest of them, every run green.
+      //
+      // Written as a round trip and not as an assertion about SQL, because the
+      // whole failure was invisible in the SQL: the statements were all
+      // well-formed, the loads all committed, and the only observable was a cell.
+      const def = sourceSpelledType('ContractSourceSpelling');
+      await subject.publish(def);
+
+      // Keyed exactly as a connector's records are keyed, and carrying nothing
+      // called `Renamed_Id` — which is the point of that property being here.
+      const written = await subject.store.write(
+        def,
+        [
+          { id: 'a', 'Asset Id': 'A-71', 'Asset LIN/TAMCN': 'T-9' },
+          { id: 'b', 'Asset Id': 'A-72', 'Asset LIN/TAMCN': 'T-4' },
+        ],
+        { snapshotId: 'spelled', principalId: 'contract', batch: 0 },
+      );
+      expect(written.written).toBe(2);
+
+      // The commit is half the case on its own: it refreshes the view, and the
+      // view is where the verbatim alias lived. Against the old code this line
+      // threw `Refusing to use "Asset Id" as a SQL identifier`.
+      await subject.store.commit(def, 'spelled');
+
+      const read = await subject.store.read(def, [...SOURCE_SPELLED_FIELDS], {
+        page: 1,
+        size: 200,
+        sort: 'id',
+        dir: 'asc',
+      });
+      expect(read.total).toBe(2);
+
+      const [first, second] = read.rows;
+      // Out under the property's own name, with the value that went in. NULL
+      // here is the bug, and a store that silently dropped the field would fail
+      // on exactly this line.
+      expect(first?.['Asset Id']).toBe('A-71');
+      expect(first?.['Asset LIN/TAMCN']).toBe('T-9');
+      expect(second?.['Asset Id']).toBe('A-72');
+
+      // And the anti-case, pinned so nobody rebuilds the belief that caused all
+      // this: `columnName` does NOT redirect a read. `Renamed_Id` declares
+      // `columnName: 'Asset Id'`, the record above holds an `Asset Id` key, and
+      // the column is still empty — because the load looked for `Renamed_Id` and
+      // the record has no such field. That is the whole incident in one
+      // assertion.
+      expect(first?.Renamed_Id).toBeNull();
+    });
+
+    it('exposes that property to the SQL console under its cleaned name', async (context) => {
+      if (!isQueryStore(subject.store)) {
+        skipping(context, 'implements no CatalogQueryStore, so it serves no SQL console.');
+        return;
+      }
+      const store = subject.store;
+      const def = sourceSpelledType('ContractSpelledView');
+      await subject.publish(def);
+
+      await store.write(def, [{ id: 'a', 'Asset Id': 'A-71', 'Asset LIN/TAMCN': 'T-9' }], {
+        snapshotId: 'spelled-view',
+        principalId: 'contract',
+        batch: 0,
+      });
+      await store.commit(def, 'spelled-view');
+
+      // The schema panel first, because a console offers what this returns. A
+      // relation that advertised `Asset Id` would be offering an autocompletion
+      // that cannot be typed into a statement.
+      const relations = await store.queryRelations();
+      // Matched case-insensitively, because an adapter that answers this from
+      // the database rather than from a registry only has the lowercased table
+      // name to reconstruct the type from — a real difference between the two
+      // shipped stores, and not the one this case is about.
+      const current = relations.find(
+        (relation) =>
+          relation.kind === 'current' &&
+          relation.objectType.toLowerCase() === def.name.toLowerCase(),
+      );
+      expect(current).toBeDefined();
+      const columns = (current?.columns ?? []).map((column) => column.name);
+      expect(columns).toContain('Asset_Id');
+      expect(columns).toContain('Asset_LIN_TAMCN');
+
+      // And then the view itself, selected from by the name the panel just gave.
+      // Both engines quote with backticks, so one statement serves both.
+      const result = await store.runQuery({
+        sql: `SELECT \`Asset_Id\` FROM \`${current?.name}\``,
+      });
+      expect(result.rowCount).toBe(1);
+      expect(result.rows[0]?.Asset_Id).toBe('A-71');
     });
 
     it('serves an older snapshot when asked, and refuses to drop the one it is serving', async (context) => {

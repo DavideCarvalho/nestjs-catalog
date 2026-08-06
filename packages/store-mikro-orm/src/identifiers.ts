@@ -25,6 +25,19 @@ import { CATALOG_RESERVED_COLUMNS, assertSafeIdentifier } from '@dudousxd/nestjs
 export { UnsafeIdentifierError } from '@dudousxd/nestjs-catalog';
 
 /**
+ * The cleaning, and the name a read exposes, re-exported rather than declared.
+ *
+ * Both used to be private to this package and `physicalColumn` was private
+ * *twice* — one copy in `query.ts` deciding the view's columns, one in
+ * `mysql-warehouse.store.ts` deciding the table's. They are the same function
+ * for the same reason the refusal is: the publish-time check in the pipeline
+ * package now asks whether a name cleans to an identifier, so it has to be
+ * asking about the cleaning this adapter will actually perform, and a copy is a
+ * copy that can stop matching.
+ */
+export { outputAlias, physicalColumn } from '@dudousxd/nestjs-catalog';
+
+/**
  * Quote a value already known to be safe. Throws rather than sanitising.
  *
  * Backticks are this adapter's own business — MySQL's quoting is not the
@@ -36,11 +49,21 @@ export function ident(value: string): string {
 }
 
 /**
- * Turn a publisher's name into a column we can create.
+ * Turn any string into something that is definitely an identifier.
  *
- * Publishers name things for their own schema — `Asset NSN`, `Sub/Un Sub` — and
- * those cannot be columns here. The mapping is stored on the property row, so
- * the original is never lost and reads translate back.
+ * Distinct from `physicalColumn`, which is what this adapter actually applies to
+ * reach a column and is allowed to produce something unusable (`1 2 3` cleans to
+ * `1_2_3`). This one always succeeds: it strips the underscores off both ends
+ * and prefixes a letter when it has to. It is used to *suggest* a name in a
+ * refusal, never to decide where data goes.
+ *
+ * The mapping a publisher sends in `columnName` is stored on the property row as
+ * `sourceColumn` — for lineage, and only for lineage. **Reads do not translate
+ * back through it.** This docblock claimed they did, which is exactly the belief
+ * that cost thirteen loads: a publisher renamed `Asset Id` to `Asset_Id` and put
+ * the original in `columnName`, and every row went in NULL, because a load reads
+ * `row[property.name]` and the source's record was keyed `Asset Id`. A property
+ * may now simply be named `Asset Id` — see `outputAlias` in the core package.
  */
 export function toPhysicalName(value: string, prefix = 'c'): string {
   const cleaned = value
