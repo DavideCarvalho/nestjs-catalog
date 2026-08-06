@@ -2066,9 +2066,17 @@ function toNodeOutcome(raw: unknown): WorkflowNodeOutcome | undefined {
   // skipped by a failure, and the panel would report a healthy run as broken.
   const branch = Reflect.get(raw, 'branch');
   const skippedBecause = Reflect.get(raw, 'skippedBecause');
+  // The same hand-maintained list, one entry longer. Left `undefined` rather
+  // than defaulted to zero when it is absent, which is the whole reason the
+  // field is optional: a node that never reported an input count and a filter
+  // that was handed nothing are different facts, and defaulting would make every
+  // outcome stored before filters existed read as "given nothing, dropped
+  // nothing" on a panel that subtracts.
+  const rowsIn = Reflect.get(raw, 'rowsIn');
   return {
     status,
     rows: typeof rows === 'number' ? rows : 0,
+    rowsIn: typeof rowsIn === 'number' ? rowsIn : undefined,
     transformVersion: typeof transformVersion === 'number' ? transformVersion : undefined,
     branch: isWorkflowBranchLabel(branch) ? branch : undefined,
     skippedBecause: isWorkflowSkipReason(skippedBecause) ? skippedBecause : undefined,

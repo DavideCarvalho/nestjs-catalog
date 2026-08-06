@@ -5,6 +5,10 @@ import {
   type WorkflowBranchLabel,
   type WorkflowCallNode,
   type WorkflowEdge,
+  type WorkflowFilterNode,
+  type WorkflowFilterOperator,
+  type WorkflowFilterPredicate,
+  type WorkflowFilterValue,
   type WorkflowIfNode,
   type WorkflowIfPredicate,
   type WorkflowNode,
@@ -12,6 +16,8 @@ import {
   type WorkflowRunNode,
   type WorkflowSourceNode,
   nodeName,
+  unreachableFilterOperator,
+  unreachableFilterPredicateKind,
   unreachableNodeKind,
   unreachablePredicateKind,
 } from './model';
@@ -90,10 +96,125 @@ function subtitleFor(node: WorkflowNode, describe: NodeDescriptions): string {
   }
   if (node.kind === 'call') return callSubtitle(node);
   if (node.kind === 'if') return ifSubtitle(node);
+  if (node.kind === 'filter') return filterSubtitle(node);
   if (node.kind === 'transform') {
     return describe.transformName(node.transformId) ?? 'no transform chosen';
   }
   return unreachableNodeKind(node, 'subtitleFor');
+}
+
+/**
+ * How much a node's face will spend on a predicate before summarising it.
+ *
+ * A node is 224px wide and the subtitle is one truncated line, so a long
+ * predicate spelled out in full is an ellipsis and nothing else. Past this many
+ * leaves the face says how many conditions there are instead, which at least
+ * tells a reader there is something to open.
+ */
+const FILTER_FACE_LEAVES = 2;
+
+/**
+ * The test, on the face of the node — the reason this kind exists rather than a
+ * transform that returns a subset.
+ *
+ * "Keep the open orders" readable off the canvas is reason one of three on
+ * `WorkflowFilterNode`, so the subtitle is the feature and not decoration. It
+ * shows the *values* as well as the columns, which is a difference from
+ * `ifSubtitle` and a deliberate one: an if node stores the name of an
+ * environment variable and never its contents, because that is where a
+ * credential would be, while a filter's value is a business constant somebody
+ * typed into the graph and is already visible to anyone who can see the node.
+ *
+ * The predicate is read into a variable that admits `undefined` before it is
+ * narrowed, for the reason `ifSubtitle` gives: this draws whatever a server
+ * sent, and a canvas that throws while rendering a node is a screen nobody can
+ * use to fix that node.
+ */
+function filterSubtitle(node: WorkflowFilterNode): string {
+  const predicate: WorkflowFilterPredicate | undefined = node.predicate;
+  if (!predicate) return 'nothing to test';
+  const leaves = countFilterLeaves(predicate);
+  if (leaves > FILTER_FACE_LEAVES) return `keeps rows matching ${leaves} conditions`;
+  return `keeps ${describeFilterPredicate(predicate)}`;
+}
+
+/** How many comparisons a predicate is made of, groups not counted. */
+function countFilterLeaves(predicate: WorkflowFilterPredicate): number {
+  if (predicate.kind === 'all' || predicate.kind === 'any') {
+    let total = 0;
+    for (const child of predicate.children) total += countFilterLeaves(child);
+    return total;
+  }
+  return 1;
+}
+
+/**
+ * A predicate as a sentence.
+ *
+ * Shared by the node's face and by the inspector's summary, so the two cannot
+ * describe one filter differently — which on a screen whose whole job is making
+ * a drop visible would be worse than describing it badly.
+ *
+ * Groups are parenthesised whenever they are nested, and never at the top, so
+ * the common single-group predicate reads as a list rather than as a formula.
+ */
+export function describeFilterPredicate(
+  predicate: WorkflowFilterPredicate,
+  nested = false,
+): string {
+  if (predicate.kind === 'all' || predicate.kind === 'any') {
+    const joined = predicate.children
+      .map((child) => describeFilterPredicate(child, true))
+      .join(predicate.kind === 'all' ? ' and ' : ' or ');
+    return nested && predicate.children.length > 1 ? `(${joined})` : joined;
+  }
+  if (predicate.kind === 'present') {
+    return `${predicate.column} ${predicate.operator === 'isNull' ? 'is empty' : 'has a value'}`;
+  }
+  if (predicate.kind === 'oneOf') {
+    const values = predicate.values.map((value) => showFilterValue(value)).join(', ');
+    return `${predicate.column} ${predicate.operator === 'in' ? 'is one of' : 'is none of'} ${values}`;
+  }
+  if (predicate.kind === 'compare') {
+    return `${predicate.column} ${FILTER_OPERATOR_WORDS[predicate.operator]} ${showFilterValue(predicate.value)}`;
+  }
+  return unreachableFilterPredicateKind(predicate, 'describeFilterPredicate');
+}
+
+/**
+ * Each operator as the words a reader of the canvas would use.
+ *
+ * A `Record` keyed by the operator union, so an operator added to core without a
+ * phrase here is a build failure rather than a node whose subtitle silently says
+ * `undefined` — the same reason `BRANCH_STYLE` above is a record.
+ *
+ * Symbols rather than words for the four orderings, because `>` is unambiguous
+ * in every locale a column name is written in and "greater than" is three words
+ * of a line that has to fit in 224 pixels.
+ */
+const FILTER_OPERATOR_WORDS: Record<WorkflowFilterOperator, string> = {
+  equals: '=',
+  notEquals: '≠',
+  greaterThan: '>',
+  greaterThanOrEqual: '≥',
+  lessThan: '<',
+  lessThanOrEqual: '≤',
+  contains: 'contains',
+  notContains: 'does not contain',
+  startsWith: 'starts with',
+  notStartsWith: 'does not start with',
+};
+
+/**
+ * One value, quoted only when it is text.
+ *
+ * `status = "OPEN"` and `qty = 10` are different tests, and the quotes are the
+ * only thing on the face that says which — three-valued logic aside, a string
+ * `"10"` never equals a number `10` here, and that is exactly the mistake the
+ * run log has to report as an incomparable value.
+ */
+function showFilterValue(value: WorkflowFilterValue): string {
+  return typeof value === 'string' ? `"${value}"` : String(value);
 }
 
 /**
@@ -179,10 +300,38 @@ function ariaLabelFor(
       data.run.skippedBecause === 'branch-not-taken'
         ? ', because it is on the branch that was not taken, so it committed nothing'
         : '';
-    parts.push(`last run ${data.run.status}${branch}${because}`);
+    // The drop is in the spoken label as well as the tooltip, because a tooltip
+    // is a hover and this is the sentence a screen reader user gets instead of
+    // the whole canvas. A filter that dropped nine tenths of a load and said so
+    // only on hover would be invisible to exactly the reader who cannot check.
+    const dropped = describeDrop(data.run);
+    parts.push(`last run ${data.run.status}${branch}${because}${dropped ? `, ${dropped}` : ''}`);
   }
   for (const problem of data.problems) parts.push(problem.message);
   return parts.join('. ');
+}
+
+/**
+ * What a filter did to a run, as a phrase — or nothing, for every other node.
+ *
+ * Keyed off `rowsIn` being **present** rather than off the node's kind, which is
+ * the only check that stays right in both directions: a filter that ran before
+ * the server recorded an input count has no drop to report and must not claim
+ * one, and no other kind sets the field at all. Subtracting from a defaulted
+ * zero would make every historical node read as having dropped its whole output.
+ *
+ * Exported so the node badge and the aria label say the same sentence.
+ */
+export function describeDrop(run: WorkflowRunNode): string | undefined {
+  const given = run.rowsIn;
+  if (typeof given !== 'number' || typeof run.rows !== 'number') return undefined;
+  const dropped = given - run.rows;
+  if (dropped <= 0) return `${given} rows in, none dropped`;
+  // The percentage is what makes the number readable: "7,541,187 dropped" needs
+  // arithmetic before anybody can tell a working filter from a broken predicate,
+  // and "98.7%" does not.
+  const share = given === 0 ? 0 : Math.round((dropped / given) * 1000) / 10;
+  return `${given} rows in, ${run.rows} out — ${dropped} dropped (${share}%)`;
 }
 
 export function toFlowNodes(
@@ -239,6 +388,7 @@ export function defaultLabel(kind: WorkflowNodeKind): string {
   if (kind === 'sink') return 'Sink';
   if (kind === 'call') return 'Call';
   if (kind === 'if') return 'If';
+  if (kind === 'filter') return 'Filter';
   if (kind === 'transform') return 'Transform';
   return unreachableNodeKind(kind, 'defaultLabel');
 }

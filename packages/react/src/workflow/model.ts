@@ -28,6 +28,17 @@ export type {
   WorkflowEdge,
   WorkflowCallNode,
   WorkflowEnvPredicate,
+  WorkflowFilterAll,
+  WorkflowFilterAny,
+  WorkflowFilterComparison,
+  WorkflowFilterGroup,
+  WorkflowFilterNode,
+  WorkflowFilterOneOf,
+  WorkflowFilterOperator,
+  WorkflowFilterPredicate,
+  WorkflowFilterPredicateKind,
+  WorkflowFilterPresence,
+  WorkflowFilterValue,
   WorkflowGraph,
   WorkflowIfNode,
   WorkflowIfPredicate,
@@ -48,11 +59,27 @@ export {
   // something the rest of the system will not accept.
   callableWorkflowBlock,
   isWorkflowBranchLabel,
+  isWorkflowFilterOperator,
+  isWorkflowFilterPredicate,
+  isWorkflowFilterPredicateKind,
+  isWorkflowFilterValue,
   isWorkflowNodeKind,
   isWorkflowPredicateKind,
+  unreachableFilterOperator,
+  unreachableFilterPredicateKind,
   unreachableNodeKind,
   unreachablePredicateKind,
+  // Core's, not a copy, for the reason every other rule here is core's: the
+  // inspector has to offer exactly the acknowledgements `validateWorkflow`
+  // requires, and a screen that worked out its own list would offer a set the
+  // server then refuses — with the person having ticked a box to be told no.
+  workflowNarrowedTypes,
   WORKFLOW_BRANCH_LABELS,
+  WORKFLOW_FILTER_COLUMN_PATTERN,
+  WORKFLOW_FILTER_MAX_DEPTH,
+  WORKFLOW_FILTER_MAX_VALUES,
+  WORKFLOW_FILTER_OPERATORS,
+  WORKFLOW_FILTER_PREDICATE_KINDS,
   WORKFLOW_PREDICATE_KINDS,
   WORKFLOW_NODE_ID_PATTERN,
   WORKFLOW_NODE_KINDS,
@@ -201,6 +228,17 @@ export interface WorkflowRunNode {
    */
   skippedBecause?: WorkflowSkipReason;
   rows?: number;
+  /**
+   * What a filter node was handed, where {@link rows} is what it passed on.
+   *
+   * The pair is the whole reporting contract of a filter, and both halves have
+   * to reach the screen or the node's effect is invisible — which is how rows go
+   * missing quietly. Absent on every other kind, and absent on filters that ran
+   * before the server recorded it; a panel must therefore check for its presence
+   * rather than subtract from a defaulted zero, or every historical node would
+   * claim to have dropped everything it produced.
+   */
+  rowsIn?: number;
   error?: string;
   startedAt?: string;
   finishedAt?: string;

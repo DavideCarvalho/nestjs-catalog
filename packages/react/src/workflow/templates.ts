@@ -341,6 +341,17 @@ const NODE_FACTORIES: NodeFactories = {
   // wrong is a half of the graph that silently does not run, which is the one
   // failure this node had to be built not to have.
   if: (id, name, init) => ({ id, name, kind: 'if', ...init }),
+  // `filter` arrived third, and the map stopped the build a third time.
+  //
+  // Also unused by every template below, and this one is the clearest case of
+  // the three. A filter's content is a *column name and a value* — which are
+  // facts about one organisation's data, not about a pipeline shape — and a
+  // template that guessed `status = "OPEN"` would prefill a predicate that is
+  // wrong everywhere it is opened. Worse, a prefilled filter sitting in front of
+  // a sink is precisely the accident `WorkflowFilterNode.narrows` exists to make
+  // impossible: the template would be shipping a graph that shrinks a published
+  // type, with nobody having chosen it.
+  filter: (id, name, init) => ({ id, name, kind: 'filter', ...init }),
 };
 
 /* -------------------------------------------------------------------------- */

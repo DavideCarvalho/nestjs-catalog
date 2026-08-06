@@ -6,6 +6,7 @@ import {
   Code2,
   Database,
   ExternalLink,
+  Filter,
   GitBranch,
   Loader2,
   Plug,
@@ -15,7 +16,7 @@ import {
 import { type ReactNode, createContext, useContext } from 'react';
 import { cn } from '../cn';
 import { Tooltip } from '../ui/tooltip';
-import type { WorkflowFlowNode, WorkflowNodeData } from './graph';
+import { type WorkflowFlowNode, type WorkflowNodeData, describeDrop } from './graph';
 import type { WorkflowNodeKind } from './model';
 
 const RULE = 'border-zinc-200 dark:border-zinc-800';
@@ -104,6 +105,19 @@ const KIND_STYLE: Record<
     icon: GitBranch,
     noun: 'if',
   },
+  // Rose and a funnel. It is the only kind whose effect is *subtraction* — every
+  // other node either produces rows, reshapes them or decides which boxes run —
+  // and the whole reason it is a node rather than a transform returning a subset
+  // is that "rows are being dropped here" should be visible without opening
+  // anything. Deliberately not the fuchsia an `if` wears: both of them make a
+  // load smaller and they do it in completely different ways, so they are the
+  // two that must never be confused at a glance.
+  filter: {
+    accent: 'bg-rose-500',
+    chip: 'text-rose-700 dark:text-rose-300',
+    icon: Filter,
+    noun: 'filter',
+  },
 };
 
 /**
@@ -151,9 +165,14 @@ function RunBadge({ run }: { run: NonNullable<WorkflowNodeData['run']> }) {
             ? // The single most useful fact on a resumed run, and there is
               // nowhere else on the screen to read it from.
               'Replayed from a checkpoint — this step did not run again.'
-            : `${describeBranchTaken(run) ?? 'Ran'}${
-                typeof run.rows === 'number' ? `, ${run.rows} rows` : ''
-              }.`
+            : // A filter reports the pair rather than the total, and it is the
+              // one kind for which "42 rows" would be an actively misleading
+              // badge: the number that matters is what it *removed*, and a node
+              // that showed only its output would make a filter that dropped
+              // nine tenths of a load look identical to a source that read a
+              // tenth as much. `describeDrop` answers for filters and stays
+              // silent for everything else, so this stays one expression.
+              `${describeBranchTaken(run) ?? 'Ran'}${describeRunSize(run)}.`
         }
       >
         <span className="flex items-center">
@@ -179,6 +198,21 @@ function RunBadge({ run }: { run: NonNullable<WorkflowNodeData['run']> }) {
     );
   }
   return null;
+}
+
+/**
+ * How much data went through a node, in the terms that node is measured in.
+ *
+ * A filter reports the pair — in, out, and what that means as a share — because
+ * for a filter the number that matters is what it *removed*, and a badge showing
+ * only its output would make one that dropped nine tenths of a load look exactly
+ * like a source that read a tenth as much. Everything else reports what it
+ * produced, which is what "rows" has always meant on this badge.
+ */
+function describeRunSize(run: NonNullable<WorkflowNodeData['run']>): string {
+  const dropped = describeDrop(run);
+  if (dropped) return `: ${dropped}`;
+  return typeof run.rows === 'number' ? `, ${run.rows} rows` : '';
 }
 
 /** What an `if` node's badge says it decided. Absent on every other kind. */

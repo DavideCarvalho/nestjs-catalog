@@ -267,6 +267,17 @@ export type {
   WorkflowCallOutput,
   WorkflowEdge,
   WorkflowExecutionMode,
+  WorkflowFilterAll,
+  WorkflowFilterAny,
+  WorkflowFilterComparison,
+  WorkflowFilterGroup,
+  WorkflowFilterNode,
+  WorkflowFilterOneOf,
+  WorkflowFilterOperator,
+  WorkflowFilterPredicate,
+  WorkflowFilterPredicateKind,
+  WorkflowFilterPresence,
+  WorkflowFilterValue,
   WorkflowGraph,
   WorkflowEnvPredicate,
   WorkflowIfNode,
@@ -339,14 +350,38 @@ export {
   // makes a form missing one a build failure rather than a gate somebody can
   // save with nothing to decide on.
   WORKFLOW_PREDICATE_KINDS,
+  // The filter language, same argument again and for higher stakes: an
+  // inspector that offers an operator the runner cannot evaluate is a graph
+  // somebody saves and a step that throws mid-load, and one that quietly omits
+  // an operator is a filter nobody can express. The bounds travel with them
+  // because the form has to refuse a too-deep tree or a too-long list *before*
+  // the server does, and a second copy of the numbers is what drifts.
+  WORKFLOW_FILTER_COLUMN_PATTERN,
+  WORKFLOW_FILTER_MAX_DEPTH,
+  WORKFLOW_FILTER_MAX_VALUES,
+  WORKFLOW_FILTER_OPERATORS,
+  WORKFLOW_FILTER_PREDICATE_KINDS,
   WORKFLOW_SKIP_REASONS,
   isWorkflowBranchLabel,
+  isWorkflowFilterOperator,
+  isWorkflowFilterPredicate,
+  isWorkflowFilterPredicateKind,
+  isWorkflowFilterValue,
   isWorkflowIfPredicate,
   isWorkflowPredicateKind,
   isWorkflowSkipReason,
+  // The row test itself, so the inspector can describe — and a host can preview
+  // — exactly what a load will keep, from the function that decides it.
+  workflowFilterMatches,
+  // Which published types a filter stands in front of. The console has to offer
+  // the same acknowledgements the validator requires, and a canvas computing its
+  // own answer would offer a set the server then refuses.
+  workflowNarrowedTypes,
   // Exported so a screen can answer "would this node have run" from a recorded
   // run exactly the way the runner decided it, rather than approximating.
   workflowNodeRuns,
+  unreachableFilterOperator,
+  unreachableFilterPredicateKind,
   unreachableNodeKind,
   unreachablePredicateKind,
   // The draft/ready pair, for the same reason as the list above: a canvas that

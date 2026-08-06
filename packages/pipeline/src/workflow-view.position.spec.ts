@@ -39,6 +39,12 @@ const MINIMAL: Record<WorkflowNodeKind, Record<string, unknown>> = {
   // The fifth kind, added by somebody who had indeed never seen this file, and
   // sent here by the compile error the docblock above promised.
   if: { kind: 'if', predicate: { kind: 'env', envVar: 'CLICKHOUSE_URL' } },
+  // And the sixth, sent here the same way. The mechanism has now worked twice,
+  // which is the only evidence a claim like the one above ever gets.
+  filter: {
+    kind: 'filter',
+    predicate: { kind: 'compare', column: 'status', operator: 'equals', value: 'OPEN' },
+  },
 };
 
 const KINDS = Object.keys(MINIMAL) as WorkflowNodeKind[];

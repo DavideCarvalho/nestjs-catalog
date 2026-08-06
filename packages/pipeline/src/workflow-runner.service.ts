@@ -12,6 +12,7 @@ import {
   type WorkflowCallOutput,
   type WorkflowEnvPredicate,
   type WorkflowExecutionMode,
+  type WorkflowFilterNode,
   type WorkflowIfNode,
   type WorkflowNodeKind,
   type WorkflowNodeOutcome,
@@ -28,6 +29,7 @@ import {
   supportsWorkflows,
   unreachableNodeKind,
   unreachablePredicateKind,
+  workflowFilterMatches,
   workflowNodeRuns,
   workflowRunOrder,
 } from '@dudousxd/nestjs-catalog';
@@ -439,6 +441,9 @@ export class WorkflowRunnerService {
     if (node.kind === 'if') {
       return this.runIf(node, input, startedAt);
     }
+    if (node.kind === 'filter') {
+      return this.runFilter(node, input, startedAt);
+    }
     if (node.kind === 'call') {
       // Not executable from here, and refused rather than approximated.
       //
@@ -644,6 +649,11 @@ export class WorkflowRunnerService {
     progress.outcomes[node.id] = {
       status: 'succeeded',
       rows: output.rows,
+      // Carried through rather than recomputed, and left absent when the step
+      // did not report one: see `WorkflowNodeOutcome.rowsIn`, where absent and
+      // zero are different facts. A replayed filter folds back the drop its
+      // first attempt measured, because this comes off the step's checkpoint.
+      rowsIn: output.rowsIn,
       transformVersion: output.transformVersion,
       // The one field on an outcome that is a *decision* rather than a
       // measurement, and the reason it travels this way: it came off the step's
@@ -1041,7 +1051,7 @@ export class WorkflowRunnerService {
     }
   }
 
-  /* --- the three node kinds ------------------------------------------- */
+  /* --- the node kinds this service can execute ------------------------- */
 
   private async runSource(
     node: WorkflowSourceNode,
@@ -1252,6 +1262,119 @@ export class WorkflowRunnerService {
   }
 
   /**
+   * Drop the rows that fail the predicate — **one staged batch at a time**.
+   *
+   * ## Why the loop looks like this
+   *
+   * The obvious implementation is `readInputs()` followed by `.filter()`, and it
+   * is the one thing this node must not do. `readInputs` materialises the whole
+   * of a node's input in this process's heap — which is the transform contract
+   * and is honest there, because code that deduplicates or joins genuinely needs
+   * every record — and a single synchronous `.filter` over millions of objects
+   * holds the event loop for its entire duration. That is precisely the defect
+   * this project spent a day removing from the ingestion write path, and a filter
+   * over `obj_pribuybuylistdetail` is 7,637,391 objects of ~80 properties.
+   *
+   * So this reads one staged batch, tests it, and writes what survived: at most
+   * `BATCH_SIZE` rows are compared between two `await`s, and the heap holds one
+   * input batch plus one output batch rather than a dataset. Nothing here scales
+   * with the size of the load except the number of iterations.
+   *
+   * The survivors are **coalesced** into full batches rather than written one
+   * output batch per input batch. A filter keeping 1% would otherwise write
+   * fifteen thousand batches of five rows for seventy-six thousand rows, and the
+   * stage store would hold a row per batch. The carry buffer is capped at
+   * `BATCH_SIZE`, so the bound above still holds.
+   *
+   * Batch numbering is a running count of the batches actually written, which is
+   * a pure function of `input.inputs` and the predicate — both checkpointed —
+   * so a retried filter writes the same numbers over the same stage and each one
+   * replaces itself. The stale tail is cleared for the reason {@link stage}
+   * gives, through the same helper.
+   *
+   * ## The pushdown seam
+   *
+   * **This is the marked place.** Today the predicate is evaluated here, over
+   * rows that have already been fetched, staged and read back. The predicate is
+   * shaped so it could instead be compiled into a `WHERE` and handed to the
+   * source, and then these rows would never leave the database — the mechanism
+   * to reuse is `boundStatement` in `sources.ts`, which already wraps an
+   * author's SQL as `SELECT * FROM (…) AS … WHERE <quoted> > $1` with the
+   * identifier quoted per dialect and the value bound.
+   *
+   * Two things are actually in the way, and neither is the predicate:
+   *
+   * 1. `SourceFetcher` takes a connector, a secret, a watermark and a mode, and
+   *    knows nothing about the graph; `runSource` dispatches through
+   *    `SOURCES[connector.kind]`. The predicate would have to be resolved from
+   *    the graph in `executeNode` (which does hold the workflow), threaded
+   *    through `FetchContext`, refused by the four fetchers that cannot honour
+   *    it, and kept out of `describeSql`, which shares `sqlTarget` with the
+   *    fetch path.
+   * 2. A pushed-down filter cannot report `rowsIn`. The rows it removed were
+   *    never read, so the honest answer becomes "nothing was dropped" — deleting
+   *    the very reporting this node exists to provide — and recovering the number
+   *    means a second `COUNT(*)` over the unfiltered query, which is the scan the
+   *    pushdown was for.
+   *
+   * Both are decisions rather than typing, so they belong to the change that
+   * makes the move. What is *not* deferred is the part that would have made it
+   * impossible later: the predicate is closed, its columns are already
+   * constrained to the identifier pattern `boundStatement` requires, and every
+   * comparison follows SQL's three-valued logic (see `workflowFilterMatches`) so
+   * that pushing it down cannot change which rows a type ends up holding.
+   */
+  private async runFilter(
+    node: WorkflowFilterNode,
+    input: WorkflowNodeStepInput,
+    startedAt: number,
+  ): Promise<WorkflowNodeStepOutput> {
+    const store = this.requireStore();
+    const logs: string[] = [];
+
+    // Built once, outside the row loop, so testing a row allocates nothing. See
+    // `workflowFilterMatches` on what "incomparable" means and why such a row is
+    // dropped rather than kept.
+    const incomparable = new Map<string, number>();
+    const note = (column: string) => incomparable.set(column, (incomparable.get(column) ?? 0) + 1);
+
+    let rowsIn = 0;
+    let kept = 0;
+    let batches = 0;
+    const carry: Array<Record<string, unknown>> = [];
+    const flush = async (rows: Array<Record<string, unknown>>) => {
+      batches += 1;
+      await store.writeStage({ runId: input.runId, nodeId: node.id, batch: batches, rows });
+    };
+
+    for (const ref of input.inputs) {
+      for (let batch = 1; batch <= ref.batches; batch += 1) {
+        const rows = await store.readStage({ runId: ref.runId, nodeId: ref.nodeId, batch });
+        rowsIn += rows.length;
+        for (const row of rows) {
+          if (!workflowFilterMatches(node.predicate, row, note)) continue;
+          kept += 1;
+          carry.push(row);
+        }
+        while (carry.length >= BATCH_SIZE) await flush(carry.splice(0, BATCH_SIZE));
+      }
+    }
+    if (carry.length > 0) await flush(carry.splice(0, carry.length));
+
+    logs.push(...filterLogLines(node, { rowsIn, kept, incomparable }));
+    await this.clearStaleTail(input.runId, node.id, batches, logs);
+
+    return {
+      nodeId: node.id,
+      output: { runId: input.runId, nodeId: node.id, batches, rowCount: kept },
+      rows: kept,
+      rowsIn,
+      elapsedMs: Date.now() - startedAt,
+      logs: safeLogLines(logs, LOG_LINES_PER_NODE),
+    };
+  }
+
+  /**
    * The only node that writes, and the only node that commits.
    *
    * It publishes through `appendRowsAsSystem` and `commitAsSystem` — the same
@@ -1358,7 +1481,7 @@ export class WorkflowRunnerService {
     };
   }
 
-  /* --- the pieces the three kinds share -------------------------------- */
+  /* --- the pieces those kinds share ------------------------------------ */
 
   /**
    * Write a node's rows into the stage store, and clear whatever a longer
@@ -1400,6 +1523,31 @@ export class WorkflowRunnerService {
       });
     }
 
+    await this.clearStaleTail(runId, nodeId, batches, logs);
+
+    return { runId, nodeId, batches, rowCount: rows.length };
+  }
+
+  /**
+   * Empty whatever a longer previous attempt at this node left past its end.
+   *
+   * Lifted out of {@link stage} when the filter node turned out to need the
+   * identical sweep and could not use `stage` itself — a filter writes its
+   * batches as it goes rather than handing over a finished array, which is the
+   * whole point of it. Two copies of this loop would be two opinions about
+   * `STALE_TAIL_LIMIT` and about whether an emptied batch counts as cleared, and
+   * the one that drifted would leave orphaned rows under a node's name.
+   *
+   * The full argument for why the tail is emptied rather than deleted, and why
+   * it is bounded, is on {@link stage}.
+   */
+  private async clearStaleTail(
+    runId: string,
+    nodeId: string,
+    batches: number,
+    logs: string[],
+  ): Promise<void> {
+    const store = this.requireStore();
     let cleared = 0;
     for (let batch = batches + 1; batch <= batches + STALE_TAIL_LIMIT; batch += 1) {
       const stale = await store.readStage({ runId, nodeId, batch });
@@ -1412,8 +1560,6 @@ export class WorkflowRunnerService {
         `Cleared ${cleared} stale staged batches left by an earlier, longer attempt at this node.`,
       );
     }
-
-    return { runId, nodeId, batches, rowCount: rows.length };
   }
 
   /**
@@ -1777,6 +1923,54 @@ function branchSkipReason(
 }
 
 /** A fresh snapshot id for a run nobody supplied one for. */
+/**
+ * Everything a filter has to say about what it just did.
+ *
+ * A pure function of the counters, out of the loop that produced them, so the
+ * method above is the reading of rows and this is the accounting of them.
+ *
+ * The order is the order somebody reads them in: what happened, then why fewer
+ * rows survived than expected, then what it means for what is published.
+ */
+function filterLogLines(
+  node: WorkflowFilterNode,
+  counts: { rowsIn: number; kept: number; incomparable: ReadonlyMap<string, number> },
+): string[] {
+  const { rowsIn, kept, incomparable } = counts;
+  const lines = [
+    `"${node.name}" was given ${rowsIn} rows and passed ${kept}; ${rowsIn - kept} did not match and were dropped.`,
+  ];
+
+  for (const [column, count] of incomparable) {
+    // Said out loud, per column, because it is the one way a filter is wrong
+    // without being broken: the predicate is fine, the data is a different type
+    // from what it compares against, and every one of those rows silently failed
+    // the test. A number here turns "the load came out short" into "the load
+    // came out short because `qty` is text".
+    lines.push(
+      `${count} rows held a value in "${column}" that the test could not compare against — a different type from the value in the predicate — so they did not pass. Convert the column in a transform before filtering on it.`,
+    );
+  }
+
+  if (rowsIn > 0 && kept === 0) {
+    // The loudest thing this node can do short of failing, and it deliberately
+    // does not fail: a filter that matched nothing is a legitimate outcome for
+    // an incremental load with nothing new. What it must not be is *quiet* — a
+    // full sink downstream refuses to commit an empty snapshot, and that refusal
+    // names the sink rather than the filter that emptied it.
+    lines.push(
+      `"${node.name}" passed nothing at all. A full sink downstream will refuse to commit an empty snapshot rather than replace what is live; an incremental one will carry the previous rows forward unchanged.`,
+    );
+  }
+
+  for (const type of node.narrows ?? []) {
+    lines.push(
+      `This filter is acknowledged to narrow ${type}: the snapshot this run publishes for ${type} holds only the ${kept} rows that passed. The type's row-count bound still applies and can still refuse the commit.`,
+    );
+  }
+  return lines;
+}
+
 export function newSnapshotId(prefix: string): string {
   return `${prefix}-${randomUUID().slice(0, 8)}`;
 }

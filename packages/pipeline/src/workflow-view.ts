@@ -4,14 +4,18 @@ import {
   type ConnectorKind,
   type ConnectorRun,
   WORKFLOW_BRANCH_LABELS,
+  WORKFLOW_FILTER_MAX_DEPTH,
+  WORKFLOW_FILTER_MAX_VALUES,
   WORKFLOW_PREDICATE_KINDS,
   type WorkflowBranchLabel,
   type WorkflowEdge,
+  type WorkflowFilterPredicate,
   type WorkflowIfPredicate,
   type WorkflowNode,
   type WorkflowSkipReason,
   isConnectorKind,
   isWorkflowBranchLabel,
+  isWorkflowFilterPredicate,
   isWorkflowNodeKind,
   unreachableNodeKind,
   workflowRunOrder,
@@ -58,6 +62,17 @@ export interface CanvasWorkflowRunNode {
   nodeId: string;
   status: 'pending' | 'running' | 'succeeded' | 'failed' | 'skipped';
   rows?: number;
+  /**
+   * What a filter node was *given*, against `rows` above, which is what it let
+   * through. Absent on every other kind, and absent on filters that ran before
+   * this was recorded — see `WorkflowNodeOutcome.rowsIn` on why absent and zero
+   * must not be folded together.
+   *
+   * The panel subtracts to show what was dropped. It is carried out to the
+   * screen for the reason the whole node exists: a filter whose effect is
+   * invisible is how data goes missing without anybody noticing.
+   */
+  rowsIn?: number;
   /**
    * Which branch an `if` node took. The panel's answer to "why did nothing load
    * into X", and the only place a screen can read the decision from — it is a
@@ -190,6 +205,10 @@ function toNode(raw: unknown): WorkflowNode {
 
   if (kind === 'if') {
     return toIfNode(raw, { id, name, position });
+  }
+
+  if (kind === 'filter') {
+    return toFilterNode(raw, { id, name, position });
   }
 
   // Everything below is a source. Written as a refusal rather than as a fallthrough
@@ -353,6 +372,89 @@ function toRowCountPredicate(
 }
 
 /**
+ * A filter, refused at the boundary if its test or its acknowledgement is
+ * unreadable.
+ *
+ * Checked here for the reason {@link toCallNode} gives — a draft is stored
+ * without validating — and the stakes are the highest of the three. A gate
+ * saved with no test picks a branch nobody authored; a filter saved with a test
+ * this build cannot evaluate would throw inside a durable step halfway through a
+ * load, and one saved with a *silently repaired* test decides which rows a
+ * published type contains. So the whole predicate goes through the same guard
+ * the database read uses, and anything it will not accept is refused with the
+ * rules spelled out rather than patched into something runnable.
+ *
+ * `narrows` is read here rather than left to `validateWorkflow` for a sharper
+ * version of the same argument: it is the acknowledgement that a published
+ * snapshot is about to become a subset, and a value that arrived as a bare
+ * string — which is what a form field that forgot to wrap itself sends — must
+ * not be dropped, because dropping it turns an acknowledged graph into one that
+ * never was, and the refusal that follows would name a field somebody did fill
+ * in.
+ */
+function toFilterNode(
+  raw: unknown,
+  base: { id: string; name: string; position?: { x: number; y: number } },
+): WorkflowNode {
+  const narrows = readUnknown(raw, 'narrows');
+  if (
+    narrows !== undefined &&
+    narrows !== null &&
+    (!Array.isArray(narrows) || !narrows.every((type) => typeof type === 'string'))
+  ) {
+    throw new BadRequestException(
+      `Filter node "${base.name}" (${base.id}) says it narrows ${JSON.stringify(narrows)}, and that has to be a list of object type names. It is the record that this filter is allowed to shrink what those types publish, so a value nothing can read is refused rather than treated as no acknowledgement at all.`,
+    );
+  }
+
+  return {
+    ...base,
+    kind: 'filter',
+    predicate: toFilterPredicate(readUnknown(raw, 'predicate'), base),
+    // Trimmed and deduplicated, because the validator compares this against the
+    // set of types the graph says are narrowed and `[" Mvr", "Mvr"]` would fail
+    // that comparison over whitespace. Absent stays absent: an empty list and no
+    // list mean the same thing here, and storing `[]` would be a second spelling.
+    narrows: Array.isArray(narrows) ? readNarrowedTypes(narrows) : undefined,
+  };
+}
+
+/** The acknowledged types, trimmed, deduplicated, and `undefined` when there are none. */
+function readNarrowedTypes(narrows: readonly string[]): string[] | undefined {
+  const types: string[] = [];
+  for (const raw of narrows) {
+    const type = raw.trim();
+    if (type.length > 0 && !types.includes(type)) types.push(type);
+  }
+  return types.length === 0 ? undefined : types;
+}
+
+/**
+ * The test a filter arrived carrying, checked whole.
+ *
+ * One guard rather than a walk written a second time here. `isWorkflowFilterPredicate`
+ * is the same function the store narrows with and the same one the canvas runs,
+ * and a boundary that reimplemented the rules would be a fourth opinion about
+ * what an empty `all` means — which is the difference between a filter that
+ * keeps everything and one that keeps nothing.
+ *
+ * The message lists the rules rather than pointing at the offending node of the
+ * tree, and that is a deliberate limit: the guard answers yes or no, and making
+ * it answer *where* would mean it returned a diagnostic instead of narrowing a
+ * type. The console builds the predicate through a form that cannot produce most
+ * of these, so the reader of this message is somebody posting JSON.
+ */
+function toFilterPredicate(
+  raw: unknown,
+  base: { id: string; name: string },
+): WorkflowFilterPredicate {
+  if (isWorkflowFilterPredicate(raw)) return raw;
+  throw new BadRequestException(
+    `Filter node "${base.name}" (${base.id}) carries a test this service cannot run. A filter tests bare column names — letters, digits and underscore, starting with a letter or underscore — against plain strings, finite numbers or booleans, combined with "all" and "any". A group must hold at least one condition, a list at least one value and at most ${WORKFLOW_FILTER_MAX_VALUES}, and the tree may nest at most ${WORKFLOW_FILTER_MAX_DEPTH} deep. Nothing is repaired here: an "all" with no conditions keeps every row and an "any" with none drops every row, so a test that cannot be read is refused rather than guessed at.`,
+  );
+}
+
+/**
  * A run, node by node.
  *
  * The node list comes from the graph's own run order rather than from the keys
@@ -376,6 +478,7 @@ export function toRunView(workflow: CatalogWorkflow, run: ConnectorRun): CanvasW
       nodeId: entry.node.id,
       status: outcome.status,
       rows: outcome.rows,
+      rowsIn: outcome.rowsIn,
       branch: outcome.branch,
       skippedBecause: outcome.skippedBecause,
       error: outcome.error,
