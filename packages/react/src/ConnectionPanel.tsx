@@ -1,6 +1,5 @@
 import type {
   CatalogConnection,
-  CatalogConnector,
   ConnectionCheck,
   ConnectorKind,
 } from '@dudousxd/nestjs-catalog/client';
@@ -19,12 +18,19 @@ import {
 import type { ReactNode } from 'react';
 import { useState } from 'react';
 import { cn } from './cn';
-import { type ConnectionInput, catalogQueryKeys, useCatalogClient } from './context';
+import {
+  type ConnectionInput,
+  type ConnectionUse,
+  catalogQueryKeys,
+  useCatalogClient,
+} from './context';
 import { ConfirmDialog } from './ui/dialog';
 import { FieldGroup, TextField } from './ui/field';
 import { SelectField } from './ui/select';
 import { Switch } from './ui/switch';
 import { Tooltip } from './ui/tooltip';
+import { type CatalogWorkflow, nodeName } from './workflow/model';
+import { WORKFLOW_NAME } from './workflow/name';
 
 const MUTED = 'text-zinc-400 dark:text-zinc-500';
 const RULE = 'border-zinc-200 dark:border-zinc-800';
@@ -33,7 +39,7 @@ const PANEL = 'bg-white dark:bg-zinc-900';
 /**
  * The kinds worth naming once and reusing.
  *
- * Deliberately three of the five a connector can be, and the two that are
+ * Deliberately three of the five kinds a source node can be, and the two that are
  * missing are missing for the same reason the checker refuses to probe them: a
  * file's path and a set of pasted records belong to the load, not to a shared
  * address. A connection there would be a name with no address behind it, and a
@@ -87,6 +93,33 @@ export function describeConnection(connection: CatalogConnection): string {
   return text(config, 'url') || 'no URL configured';
 }
 
+/**
+ * Which pipelines read through a connection, derived from the graphs on screen.
+ *
+ * A hint, and the server's `connectionWorkflows` is the authority — it also
+ * folds in a source that names a connector in `config.connectorId` and inherits
+ * the connection from it, which nothing this console writes produces but an
+ * upgraded deployment can still hold. So this is what the card shows and the
+ * server's answer is what a refusal prints; the two can only disagree by this
+ * one under-reporting, which is why the delete dialog asks rather than deciding.
+ */
+function usersOf(workflows: CatalogWorkflow[], connectionId: string): ConnectionUse[] {
+  const uses: ConnectionUse[] = [];
+  for (const workflow of workflows) {
+    const node = workflow.nodes.find(
+      (candidate) => candidate.kind === 'source' && candidate.connectionId === connectionId,
+    );
+    if (!node) continue;
+    uses.push({
+      id: workflow.id,
+      name: workflow.name,
+      status: workflow.status,
+      through: `"${nodeName(node)}"`,
+    });
+  }
+  return uses;
+}
+
 export interface ConnectionPanelProps {
   /**
    * Hidden when the caller knows the viewer cannot write. The endpoints refuse
@@ -101,7 +134,7 @@ export interface ConnectionPanelProps {
  * The reason this screen is worth having at all is the test. Before it, the
  * only way to learn that a host was wrong, a credential missing or a bucket
  * spelled differently was to run a load and read the failure — which happens on
- * a schedule, hours after somebody typed it, and is attributed to a connector
+ * a schedule, hours after somebody typed it, and is attributed to the pipeline
  * rather than to the address it borrowed.
  */
 export function ConnectionPanel({ canEdit = true }: ConnectionPanelProps) {
@@ -119,17 +152,22 @@ export function ConnectionPanel({ canEdit = true }: ConnectionPanelProps) {
   });
 
   // One request for every card's "used by", rather than one per card. The
-  // connectors list is loaded by the sibling tab anyway, so this is usually a
-  // cache hit, and a per-card fetch would put N requests behind a screen whose
-  // whole job is to be quick to glance at.
-  const { data: connectors = [] } = useQuery({
-    queryKey: catalogQueryKeys.connectors,
-    queryFn: () => client.listConnectors(),
+  // pipelines list is loaded by the canvas anyway, so this is usually a cache
+  // hit, and a per-card fetch would put N requests behind a screen whose whole
+  // job is to be quick to glance at.
+  //
+  // Workflows and not connectors, because that is what a reader recognises and
+  // what a refusal has to name. There is also nothing else left to ask: a
+  // connector's `connectionId` describes what a graph's source node already
+  // says, and the graph is the thing somebody would go and change.
+  const { data: workflows = [] } = useQuery({
+    queryKey: catalogQueryKeys.workflows,
+    queryFn: () => client.listWorkflows(),
   });
 
   const invalidate = () => {
     queryClient.invalidateQueries({ queryKey: catalogQueryKeys.connections });
-    queryClient.invalidateQueries({ queryKey: catalogQueryKeys.connectors });
+    queryClient.invalidateQueries({ queryKey: catalogQueryKeys.workflows });
   };
 
   if (editing) {
@@ -193,7 +231,7 @@ export function ConnectionPanel({ canEdit = true }: ConnectionPanelProps) {
             MUTED,
           )}
         >
-          No connections yet. A connector can still carry its own address — a connection is worth
+          No connections yet. A source node can still carry its own address — a connection is worth
           making when more than one of them shares it.
         </p>
       )}
@@ -202,7 +240,7 @@ export function ConnectionPanel({ canEdit = true }: ConnectionPanelProps) {
         <ConnectionCard
           key={connection.id}
           connection={connection}
-          users={connectors.filter((c) => c.connectionId === connection.id)}
+          users={usersOf(workflows, connection.id)}
           canEdit={canEdit}
           onEdit={() => setEditing(connection)}
           onChanged={invalidate}
@@ -223,7 +261,7 @@ function ConnectionIdentity({
   users,
 }: {
   connection: CatalogConnection;
-  users: CatalogConnector[];
+  users: ConnectionUse[];
 }) {
   return (
     <div className="min-w-0">
@@ -235,7 +273,7 @@ function ConnectionIdentity({
         </span>
         {users.length > 0 && (
           <Tooltip
-            content={`Read through by ${users.map((c) => c.name).join(', ')}. Moving this address moves all of them at once, which is the point.`}
+            content={`Read through by ${users.map((use) => use.name).join(', ')}. Moving this address moves all of them at once, which is the point.`}
           >
             <span
               className={cn('flex cursor-help items-center gap-1 font-mono text-[10px]', MUTED)}
@@ -344,11 +382,15 @@ function LiveCheckResult({ result }: { result: ConnectionCheck }) {
  * asked after it refused; it outranks `remove.error`, which is only the generic
  * failure that came with it.
  */
-function deleteRefusalMessage(blockedBy: CatalogConnector[] | null, error: unknown): ReactNode {
+function deleteRefusalMessage(blockedBy: ConnectionUse[] | null, error: unknown): ReactNode {
   if (blockedBy && blockedBy.length > 0) {
     return (
       <>
-        Refused: still read through by {blockedBy.map((c) => c.name).join(', ')}. Point{' '}
+        Refused: still read through by{' '}
+        {/* The NODE as well as the graph, because that is what somebody has to
+            go and change — "Fleet readiness" names the tab to open and
+            `"Warehouse"` names the box on it. The sentence is the server's. */}
+        {blockedBy.map((use) => `${use.name} (${use.through})`).join(', ')}. Point{' '}
         {blockedBy.length === 1 ? 'it' : 'them'} elsewhere first.
       </>
     );
@@ -375,7 +417,7 @@ function ConnectionCardActions({
   onAskDelete,
 }: {
   connection: CatalogConnection;
-  users: CatalogConnector[];
+  users: ConnectionUse[];
   canEdit: boolean;
   testing: boolean;
   onTest: () => void;
@@ -412,7 +454,7 @@ function ConnectionCardActions({
           <Tooltip
             content={
               users.length > 0
-                ? `${users.length} connector${users.length === 1 ? '' : 's'} read through this. Deleting it is refused while that is true.`
+                ? `${users.length} ${users.length === 1 ? WORKFLOW_NAME.singular : WORKFLOW_NAME.plural} read through this. Deleting it is refused while that is true.`
                 : `Delete ${connection.name}`
             }
           >
@@ -432,14 +474,14 @@ function ConnectionCardActions({
 }
 
 /** What deleting would actually cost, named readers and all, before it is tried. */
-function deleteConsequence(users: CatalogConnector[]): ReactNode {
+function deleteConsequence(users: ConnectionUse[]): ReactNode {
   if (users.length === 0) {
-    return 'Nothing reads through it. The connectors that used to are unaffected; only this address and the name of its credential variable go.';
+    return 'Nothing reads through it. Anything that used to is unaffected; only this address and the name of its credential variable go.';
   }
   return (
     <>
-      {users.length} connector{users.length === 1 ? '' : 's'} read through this connection —{' '}
-      {users.map((c) => c.name).join(', ')}. Deleting it would leave{' '}
+      {users.length} {users.length === 1 ? WORKFLOW_NAME.singular : WORKFLOW_NAME.plural} read
+      through this connection — {users.map((use) => use.name).join(', ')}. Deleting it would leave{' '}
       {users.length === 1 ? 'it' : 'them'} without an address, and that is discovered on the next
       scheduled run rather than now. The server refuses while this is true.
     </>
@@ -454,7 +496,7 @@ function ConnectionCard({
   onChanged,
 }: {
   connection: CatalogConnection;
-  users: CatalogConnector[];
+  users: ConnectionUse[];
   canEdit: boolean;
   onEdit: () => void;
   onChanged: () => void;
@@ -462,7 +504,7 @@ function ConnectionCard({
   const client = useCatalogClient();
   const [confirming, setConfirming] = useState(false);
   /** Filled only when the server refuses a delete, with its own answer. */
-  const [blockedBy, setBlockedBy] = useState<CatalogConnector[] | null>(null);
+  const [blockedBy, setBlockedBy] = useState<ConnectionUse[] | null>(null);
 
   const check = useMutation({
     mutationFn: () => client.checkConnection(connection.id),
@@ -475,11 +517,12 @@ function ConnectionCard({
     mutationFn: async () => {
       const result = await client.deleteConnection(connection.id);
       if (!result.deleted) {
-        // The store refuses while connectors still read through it. Asking who
+        // The store refuses while anything still reads through it. Asking who
         // they are is the difference between "it would not delete" and a
-        // sentence somebody can act on — and it is the server's answer, not the
-        // list this page happened to load a minute ago.
-        setBlockedBy(await client.connectionConnectors(connection.id));
+        // sentence somebody can act on — and it is the server's answer, which
+        // sees a source reaching this connection through an inherited connector
+        // as well as one naming it outright. The card's own count does not.
+        setBlockedBy(await client.connectionWorkflows(connection.id));
         throw new Error('Still in use.');
       }
       return result;
@@ -600,7 +643,7 @@ function HttpFields({ draft, update }: { draft: ConnectionDraft; update: UpdateD
         value={draft.url}
         onChange={(url) => update({ url })}
         placeholder="https://api.example.mil/v1"
-        hint="The base the connectors reading through this will hang their paths off."
+        hint="The base every source reading through this will hang its path off."
       />
       <TextField
         label="Credential env var"
@@ -709,7 +752,7 @@ function ConnectionKindFields({
  *
  * The form carries the address and the credential variable and nothing about
  * any particular load — no query, no prefix, no path. That split is the whole
- * point of the concept: five connectors reading one database used to hold five
+ * point of the concept: five pipelines reading one database used to hold five
  * copies of its URL, and moving the database meant editing five rows nobody
  * could find.
  */
@@ -820,13 +863,17 @@ function ConnectionForm({
 }
 
 /**
- * The options a connector form offers for "read through".
+ * The options a source node offers for "read through".
  *
- * Exported because the connector form lives in another file and this list has
- * one rule that must not be duplicated: only connections of the same kind. A
- * connector reading S3 through a database connection is not a configuration
- * anybody meant, and it would fail at run time with an error about a missing
- * bucket rather than about the mistake.
+ * Exported because the canvas's source inspector lives in another file and this
+ * list has one rule that must not be duplicated: only connections of the same
+ * kind. A source reading S3 through a database connection is not a
+ * configuration anybody meant, and it would fail at run time with an error about
+ * a missing bucket rather than about the mistake.
+ *
+ * The hint is `describeConnection`, which is why this is here and not beside the
+ * other source fields: the address is the thing that distinguishes two
+ * connections with similar names, and it is the connection that knows it.
  */
 export function connectionOptionsFor(kind: ConnectorKind, connections: CatalogConnection[]) {
   return connections

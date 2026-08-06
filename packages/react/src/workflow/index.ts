@@ -22,3 +22,20 @@ export {
   type WorkflowFlowNode,
   type WorkflowNodeData,
 } from './graph';
+// What happens to a graph once it is drawn. Here rather than on the root entry
+// because a host reaching for these is already mounting the canvas — and here
+// rather than nowhere because `wasAdopted` and `refusedForShrink` are the two
+// judgements a host might want to make outside a canvas: "did anybody actually
+// draw this" and "was that failure the row-count bound".
+export {
+  AdoptionNote,
+  PublishControls,
+  refusedForShrink,
+  RunControls,
+  SchedulePanel,
+  ShrinkRefusalNote,
+  wasAdopted,
+  WORKFLOW_ADOPTION_ACTOR,
+  WorkflowStatusBadge,
+} from './lifecycle';
+export { RunsAsPanel } from './runs';

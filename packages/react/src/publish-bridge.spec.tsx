@@ -5,17 +5,25 @@
 // import above this line, Vitest stops finding the environment hint, and every test here fails in
 // `node` with `document is not defined`.
 /**
- * The two calls that let the console create a type from a source.
+ * The calls that moved when the connector stopped being an authored object.
  *
- * Schema discovery reports what a source's columns are; publishing is what
- * turns that report into an object type. Until both existed on the client the
- * panel was built and unreachable — it took a bridge as a prop and nothing
- * supplied one, and its "Create type" button had nowhere to go.
+ * Five methods on `CatalogClient` addressed routes that no longer exist —
+ * `saveConnector`, `deleteConnector`, `runConnector`, `discoverConnectorSchema`
+ * and `connectionConnectors` — and every one of them would have 404'd. Three of
+ * them had somewhere to go and this file pins where: discovery is per source
+ * NODE now, the acknowledgement that lets a shrinking load past the row-count
+ * bound rides on the workflow run, and "who reads through this connection" is a
+ * question about pipelines.
  *
- * Publishing is the only write here that does not go through the catalog's own
- * routes, and it is a `PUT` because it is an idempotent upsert of a whole
- * shape. The transport predates that, so `put` is optional — which makes the
- * refusal path the one worth pinning: a button that resolves without creating
+ * Asserting the path by shape rather than by "post was called" is deliberate:
+ * the two ends are in different packages and nothing else would notice them
+ * drifting apart. A wrong path is a 404 at run time with no compile error and
+ * nothing on screen but an empty list.
+ *
+ * Publishing a type is the only write here that does not go through the
+ * catalog's own routes, and it is a `PUT` because it is an idempotent upsert of
+ * a whole shape. The transport predates that, so `put` is optional — which makes
+ * the refusal path worth pinning: a button that resolves without creating
  * anything is exactly the failure the panel exists to prevent.
  */
 import { renderHook } from '@testing-library/react';
@@ -39,15 +47,119 @@ function clientOver(transport: Partial<CatalogTransport>) {
 }
 
 describe('discovering a source schema', () => {
-  it('asks about the connector, on the route the server actually serves', async () => {
-    // The path is the contract with `POST connectors/:id/discover`. Asserting it
-    // by shape rather than by "post was called" is deliberate: the two ends are
-    // in different packages and nothing else would notice them drifting apart.
+  it('asks about one source node of one graph, on the route the server serves', async () => {
     const { client, transport } = clientOver({});
 
-    await client.discoverConnectorSchema('mvr nightly');
+    await client.discoverSourceSchema('wf 1', 'src/1');
 
-    expect(transport.post).toHaveBeenCalledWith('/pipeline/connectors/mvr%20nightly/discover', {});
+    expect(transport.post).toHaveBeenCalledWith(
+      '/pipeline/workflows/wf%201/nodes/src%2F1/discover',
+      {},
+    );
+  });
+
+  it('carries no method that would address a removed connector route', () => {
+    // The five the server took away. Left on the client, each one is a button
+    // somewhere that 404s — or, worse, a call somebody wraps in a `catch` and
+    // turns into silence. Read off a widened record rather than named directly,
+    // because naming one no longer compiles and this has to survive a client
+    // whose object still carries a key its interface has stopped declaring.
+    const { client } = clientOver({});
+    const widened: Record<string, unknown> = { ...client };
+
+    for (const gone of [
+      'saveConnector',
+      'deleteConnector',
+      'runConnector',
+      'discoverConnectorSchema',
+      'connectionConnectors',
+    ]) {
+      expect(widened[gone]).toBeUndefined();
+    }
+  });
+});
+
+describe('what a connection is holding up', () => {
+  it('asks which pipelines read through it, not which connectors', async () => {
+    // The rename is the question actually being asked. An operator presses this
+    // before deleting a connection and needs the list of things that would
+    // break, which is a list of graphs — a connector's name is an
+    // implementation detail of one and names no screen anybody can open.
+    const { client, transport } = clientOver({ get: vi.fn().mockResolvedValue([]) });
+
+    await client.connectionWorkflows('c 1');
+
+    expect(transport.get).toHaveBeenCalledWith('/pipeline/connections/c%201/workflows');
+  });
+});
+
+describe('running a workflow', () => {
+  it('posts an empty body when nobody said anything about the load', async () => {
+    // `expectShrink` ABSENT is a third state, not a synonym for false: the
+    // server reads a body with no such key as "nobody said anything, let the
+    // bound decide", and a client that always sent the field would turn every
+    // ordinary run into one carrying an empty acknowledgement — which is
+    // refused with a 400.
+    const { client, transport } = clientOver({});
+
+    await client.runWorkflow('w1');
+
+    expect(transport.post).toHaveBeenCalledWith('/pipeline/workflows/w1/run', {});
+  });
+
+  it('carries the reason when somebody acknowledged a shrink', async () => {
+    // THE method that had to survive. `POST connectors/:id/run` is gone, and it
+    // was the only place this could be said — without it an operator's recourse
+    // for a refused load is raising `rowCount.maxShrink` in the type's policy,
+    // which stands the guard down for every future load of that type rather
+    // than for the one snapshot in front of them.
+    const { client, transport } = clientOver({});
+
+    await client.runWorkflow('w1', { expectShrink: 'Hurlburt left the feed on the 3rd.' });
+
+    expect(transport.post).toHaveBeenCalledWith('/pipeline/workflows/w1/run', {
+      expectShrink: 'Hurlburt left the feed on the 3rd.',
+    });
+  });
+
+  it('does not send a snapshot id nobody asked for', async () => {
+    const { client, transport } = clientOver({});
+
+    await client.runWorkflow('w1', { snapshotId: 's-7' });
+
+    expect(transport.post).toHaveBeenCalledWith('/pipeline/workflows/w1/run', {
+      snapshotId: 's-7',
+    });
+  });
+});
+
+describe('publishing and scheduling a graph', () => {
+  it('publishes and unpublishes on their own routes', async () => {
+    const { client, transport } = clientOver({});
+
+    await client.publishWorkflow('w1');
+    await client.unpublishWorkflow('w1');
+
+    expect(transport.post).toHaveBeenCalledWith('/pipeline/workflows/w1/publish', {});
+    expect(transport.post).toHaveBeenCalledWith('/pipeline/workflows/w1/unpublish', {});
+  });
+
+  it('PUTs a schedule, and refuses by name when the transport cannot', () => {
+    // Same shape as `publishType` below: `put` is optional so a transport
+    // written before it keeps compiling, and a screen handed one has to hear
+    // that rather than watch a cron silently not be stored.
+    const put = vi.fn().mockResolvedValue({});
+    const { client } = clientOver({ put });
+
+    client.scheduleWorkflow('w1', { schedule: '0 3 * * *', enabled: true });
+
+    expect(put).toHaveBeenCalledWith('/pipeline/workflows/w1/schedule', {
+      schedule: '0 3 * * *',
+      enabled: true,
+    });
+
+    const { client: cannot } = clientOver({});
+    expect(() => cannot.scheduleWorkflow('w1', { enabled: false })).toThrow(/cannot PUT/);
   });
 });
 

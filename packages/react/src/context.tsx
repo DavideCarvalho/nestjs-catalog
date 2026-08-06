@@ -177,21 +177,24 @@ export interface ConnectionInput {
   secretEnvVar?: string;
 }
 
-/** Same rule as {@link ConnectionInput}: authored fields only, never state. */
-export interface ConnectorInput {
-  id?: string;
-  name: string;
-  description?: string;
-  kind: CatalogConnector['kind'];
-  targetType: string;
-  config: Record<string, unknown>;
-  connectionId?: string;
-  secretEnvVar?: string;
-  transformId?: string;
-  schedule?: string;
-  mode?: 'full' | 'incremental';
-  enabled: boolean;
-}
+/*
+ * `ConnectorInput` used to be here, and its absence is the point.
+ *
+ * A connector is no longer something a person authors: it is what a published
+ * workflow runs as, minted by `POST workflows/:id/publish` and removed with the
+ * graph. There is no route that creates one, so a shape describing "what a
+ * caller may set on a connector" would be a form for a request that cannot be
+ * made — and it would be the second way to author a pipeline, which is exactly
+ * what the server removed.
+ *
+ * What replaced it is {@link WorkflowInput} plus `publishWorkflow`: the source's
+ * address, its credential reference, its read mode and the type it commits are
+ * all fields of nodes on the graph now, and the schedule is
+ * {@link CatalogClient.scheduleWorkflow}.
+ *
+ * A plain comment rather than a docblock, because there is no declaration left
+ * for one to attach to and a `/**` here would describe the interface below it.
+ */
 
 export interface TransformInput {
   id?: string;
@@ -199,6 +202,62 @@ export interface TransformInput {
   description?: string;
   language: TransformLanguage;
   code: string;
+}
+
+/**
+ * One pipeline that would break if a connection were deleted.
+ *
+ * A workflow rather than a connector, because that is the object somebody
+ * recognises. `through` is the server's sentence about WHICH source reaches it
+ * — `"Warehouse"`, or `"Warehouse" via connector abc` — so a refusal can point
+ * at a box on a canvas rather than at a row in a table nobody can see.
+ */
+export interface ConnectionUse {
+  id: string;
+  name: string;
+  status: CatalogWorkflow['status'];
+  through: string;
+}
+
+/**
+ * What a manual run may say about itself.
+ *
+ * Both fields are absent on the run the Run button sends, and both exist for
+ * the case where somebody is re-driving a load they already know something
+ * about. See {@link CatalogClient.runWorkflow} for why `expectShrink` had to
+ * survive the removal of the connector run route.
+ */
+export interface WorkflowRunOptions {
+  /** Re-drive under an identity that already exists, rather than minting one. */
+  snapshotId?: string;
+  /**
+   * Why this load is expected to lose rows, in a sentence.
+   *
+   * Sent only when somebody wrote one. The distinction between absent and
+   * present-but-empty is real and is the server's: absent means nobody said
+   * anything and the bound decides; empty means somebody claimed an
+   * acknowledgement and gave no reason, which is refused.
+   */
+  expectShrink?: string;
+}
+
+export interface WorkflowScheduleInput {
+  /** Cron-ish, interpreted by whatever schedules it. Empty means manual only. */
+  schedule?: string;
+  enabled?: boolean;
+}
+
+/**
+ * The stored graph, plus what the server thinks of the schedule on it.
+ *
+ * `warning` is `null` when the schedule will fire. It is a string when it will
+ * not — and that is the entire reason this call answers with more than the
+ * workflow: a cron stored on a draft, on a disabled graph, or in a syntax
+ * nothing can parse is a pipeline that looks scheduled and never runs, which is
+ * a failure with an incident behind it rather than a hypothetical.
+ */
+export interface ScheduledWorkflow extends CatalogWorkflow {
+  warning?: string | null;
 }
 
 /**
@@ -469,24 +528,39 @@ export interface CatalogClient {
    * system it names.
    */
   checkConnection(id: string): Promise<ConnectionCheck>;
-  /** Which connectors read through it. Named, so a refusal can say which. */
-  connectionConnectors(id: string): Promise<CatalogConnector[]>;
+  /**
+   * Which pipelines read through it. Named, so a refusal can say which.
+   *
+   * Workflows and not connectors, because that is the question somebody is
+   * actually asking before they delete a connection: what breaks. A connector
+   * is an implementation detail of a published graph and naming one in a
+   * refusal would send the reader looking for a screen that no longer exists.
+   *
+   * The server's answer, and it outranks anything a screen derives from the
+   * workflow list: a source node may reach a connection through a connector it
+   * names in `config.connectorId` rather than through its own `connectionId`,
+   * and only the server folds both in.
+   */
+  connectionWorkflows(id: string): Promise<ConnectionUse[]>;
   deleteConnection(id: string): Promise<{ deleted: boolean }>;
 
-  listConnectors(): Promise<CatalogConnector[]>;
-  saveConnector(input: ConnectorInput): Promise<CatalogConnector>;
-  deleteConnector(id: string): Promise<{ deleted: boolean }>;
-  runConnector(id: string): Promise<ConnectorRun>;
   /**
-   * What the source behind a connector looks like right now. Writes nothing.
+   * The connectors, read-only.
    *
-   * Typed loosely on purpose. The shape comes from
-   * `@dudousxd/nestjs-catalog-pipeline`, and this package must not import that
-   * one — it would drag a package built for a Node process, with database
-   * drivers behind optional imports, into a browser bundle. `PipelineCapabilities`
-   * above is mirrored for exactly the same reason.
+   * **There is deliberately no `saveConnector`, `deleteConnector` or
+   * `runConnector` on this client, because there are no such routes.** A
+   * connector is what a published workflow runs as: `publishWorkflow` mints
+   * one, `deleteWorkflow` takes it away, and `runWorkflow` is the only way to
+   * start one. A method here that posted to `pipeline/connectors` would 404,
+   * and one that quietly did nothing would be worse.
+   *
+   * This read stays because it answers what a graph cannot answer about itself:
+   * which id the run history and the incremental watermark are keyed on, and —
+   * on a deployment upgraded rather than built fresh — which rows have not been
+   * adopted into a workflow yet. `CatalogConnector.workflowId` is what joins one
+   * to the graph that runs it.
    */
-  discoverConnectorSchema(id: string): Promise<unknown>;
+  listConnectors(): Promise<CatalogConnector[]>;
   /**
    * Publish an object type's schema — create it, or update the shape of one
    * that exists.
@@ -565,13 +639,82 @@ export interface CatalogClient {
    */
   listWorkflows(): Promise<CatalogWorkflow[]>;
   saveWorkflow(input: WorkflowInput): Promise<CatalogWorkflow>;
+  /**
+   * Declare it finished, and mint the connector it runs as.
+   *
+   * Its own call rather than a field on the save, because publishing is a claim
+   * the server checks and a failed check owes an explanation naming the nodes —
+   * which an autosave has nowhere to put. A draft saves without validating;
+   * this is where the rules are answered for real.
+   */
+  publishWorkflow(id: string): Promise<CatalogWorkflow>;
+  /**
+   * Back to draft. Disables the connector, keeping its id, its run history and
+   * its watermark, so re-publishing resumes the same pipeline rather than
+   * starting a second one beside it.
+   */
+  unpublishWorkflow(id: string): Promise<CatalogWorkflow>;
+  /**
+   * Delete it, and the connector with it.
+   *
+   * The run history goes too, which is why the console asks first. It used to
+   * be refused while a connector still ran the graph; that check would now
+   * refuse every delete there is, since a published graph runs as exactly one
+   * connector — its own.
+   */
   deleteWorkflow(id: string): Promise<{ deleted: boolean }>;
   /**
    * Execute it. When a durable engine is available each node runs as its own
    * step, so a failure part-way resumes rather than restarts — see
    * `PipelineCapabilities.durable`, which is what the screen states.
+   *
+   * `expectShrink` is the escape hatch for a load the row-count bound refused,
+   * and it reaches the server **only through here** — `POST connectors/:id/run`
+   * carried it and that route is gone. Without it an operator's only recourse
+   * would be raising `rowCount.maxShrink` in the type's policy, which stands the
+   * guard down for every future load of that type instead of for one snapshot.
+   *
+   * It is a reason, not a flag: the string is written into the snapshot's
+   * `_expectShrink` label and is the only answer anybody will have in six
+   * months to "why was this load allowed to lose most of the data?". Sending it
+   * empty is refused with a 400 asking for one, which is why the console's
+   * dialog will not submit a blank box rather than sending it and hoping.
    */
-  runWorkflow(id: string): Promise<WorkflowRun>;
+  runWorkflow(id: string, options?: WorkflowRunOptions): Promise<WorkflowRun>;
+  /**
+   * Set when this graph runs, and whether it runs at all.
+   *
+   * Both fields are optional and an absent one means "leave it alone", so a
+   * screen rendering only the cron cannot silently re-enable a pipeline
+   * somebody turned off. The answer is the stored workflow plus `warning`,
+   * which is the server naming a schedule that will never fire — a draft, a
+   * disabled graph, an unparseable cron. A screen that dropped it would repeat
+   * the incident this route was written after: a scheduler announcing it was
+   * watching schedules while parsing nothing.
+   */
+  scheduleWorkflow(id: string, input: WorkflowScheduleInput): Promise<ScheduledWorkflow>;
+  /**
+   * What the system behind one source node looks like right now. Writes nothing.
+   *
+   * Takes a node and not a connector, and the swap is the whole of the move:
+   * this was `POST connectors/:id/discover`, which refused outright for any
+   * connector carrying a `workflowId` — and every connector carries one now, so
+   * the old shape would have refused every connector there is.
+   *
+   * **It answers on a draft, deliberately.** A sink cannot commit into a type
+   * that does not exist, so requiring a published graph would require publishing
+   * a graph whose target type cannot be created until it is published. What it
+   * does need is a graph that has been SAVED: the server reads the stored node,
+   * not the one on screen.
+   *
+   * Typed loosely on purpose. The shape comes from
+   * `@dudousxd/nestjs-catalog-pipeline`, and this package must not import that
+   * one — it would drag a package built for a Node process, with database
+   * drivers behind optional imports, into a browser bundle. `PipelineCapabilities`
+   * above is mirrored for exactly the same reason; `narrowDiscovery` in
+   * `schema-discovery.tsx` is what checks the answer at the seam.
+   */
+  discoverSourceSchema(workflowId: string, nodeId: string): Promise<unknown>;
 
   /**
    * Who may do what.
@@ -684,15 +827,10 @@ export function CatalogProvider({
       listConnections: () => transport.get(pipeline.connections()),
       saveConnection: (input) => transport.post<CatalogConnection>(pipeline.connections(), input),
       checkConnection: (id) => transport.post<ConnectionCheck>(pipeline.checkConnection(id), {}),
-      connectionConnectors: (id) => transport.get(pipeline.connectionConnectors(id)),
+      connectionWorkflows: (id) => transport.get(pipeline.connectionWorkflows(id)),
       deleteConnection: (id) => transport.delete<{ deleted: boolean }>(pipeline.connection(id)),
 
       listConnectors: () => transport.get(pipeline.connectors()),
-      saveConnector: (input) => transport.post<CatalogConnector>(pipeline.connectors(), input),
-      deleteConnector: (id) => transport.delete<{ deleted: boolean }>(pipeline.connector(id)),
-      runConnector: (id) => transport.post<ConnectorRun>(pipeline.runConnector(id), {}),
-      discoverConnectorSchema: (id) =>
-        transport.post<unknown>(pipeline.discoverConnectorSchema(id), {}),
       publishType: (name, schema) => {
         if (!transport.put) {
           throw new Error(
@@ -736,8 +874,36 @@ export function CatalogProvider({
 
       listWorkflows: () => transport.get(pipeline.workflows()),
       saveWorkflow: (input) => transport.post<CatalogWorkflow>(pipeline.workflows(), input),
+      publishWorkflow: (id) => transport.post<CatalogWorkflow>(pipeline.publishWorkflow(id), {}),
+      unpublishWorkflow: (id) =>
+        transport.post<CatalogWorkflow>(pipeline.unpublishWorkflow(id), {}),
       deleteWorkflow: (id) => transport.delete<{ deleted: boolean }>(pipeline.workflow(id)),
-      runWorkflow: (id) => transport.post<WorkflowRun>(pipeline.runWorkflow(id), {}),
+      // The two fields are spread conditionally rather than sent as
+      // `undefined`, and for `expectShrink` that is the whole contract: the
+      // server distinguishes a body with no such key — nobody said anything,
+      // let the bound decide — from one carrying an empty string, which is an
+      // acknowledgement with no reason behind it and is refused with a 400
+      // asking for one. A transport that serialises `undefined` as `null`, or
+      // one that drops it, would flatten those two into each other.
+      runWorkflow: (id, options) =>
+        transport.post<WorkflowRun>(pipeline.runWorkflow(id), {
+          ...(options?.snapshotId === undefined ? {} : { snapshotId: options.snapshotId }),
+          ...(options && 'expectShrink' in options && options.expectShrink !== undefined
+            ? { expectShrink: options.expectShrink }
+            : {}),
+        }),
+      scheduleWorkflow: (id, input) => {
+        if (!transport.put) {
+          throw new Error(
+            'This transport cannot PUT, so it cannot set a schedule. Implement `put` on the ' +
+              'transport you passed to CatalogProvider — a schedule is an idempotent upsert of ' +
+              'the fields it names, which is why the route is a PUT and not a POST.',
+          );
+        }
+        return transport.put<ScheduledWorkflow>(pipeline.workflowSchedule(id), input);
+      },
+      discoverSourceSchema: (workflowId, nodeId) =>
+        transport.post<unknown>(pipeline.discoverSourceSchema(workflowId, nodeId), {}),
 
       listPrincipals: () => transport.get(access.principals()),
       listPeople: (query) => transport.get(access.people(query)),
@@ -788,11 +954,16 @@ export const catalogQueryKeys = {
 
   /**
    * The pipeline keys are nested under one prefix so a host — or a screen that
-   * just ran a connector — can invalidate the whole of it at once. Running a
-   * connector changes the runs, the connector's own last-run fields, and the
-   * catalog snapshot the load wrote into, and invalidating them one by one is
-   * how a list ends up showing a run that finished next to a connector that
-   * still says it never has.
+   * just ran a pipeline — can invalidate the whole of it at once. Running one
+   * changes the runs, the connector's own last-run fields, and the catalog
+   * snapshot the load wrote into, and invalidating them one by one is how a
+   * screen ends up showing a run that finished next to a pipeline that still
+   * says it never has.
+   *
+   * `connectors` is still here and is still worth invalidating, even though
+   * nothing authors one any more: publishing a graph MINTS one, unpublishing
+   * disables it, and deleting takes it away — so the read that says which id a
+   * run history is keyed on goes stale on all three.
    */
   pipeline: ['nestjs-catalog', 'pipeline'] as const,
   capabilities: ['nestjs-catalog', 'pipeline', 'capabilities'] as const,

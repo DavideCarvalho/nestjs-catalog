@@ -47,23 +47,30 @@ import {
 } from 'lucide-react';
 import type { ReactNode } from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { connectionOptionsFor } from './ConnectionPanel';
 import { TransformEditor } from './TransformEditor';
 import { cn } from './cn';
-import { catalogQueryKeys, useCatalogClient } from './context';
+import { type WorkflowRunOptions, catalogQueryKeys, useCatalogClient } from './context';
 import {
-  CredentialField,
+  type ConnectorSchemaDiscovery,
+  type DiscoveredTypeDraft,
+  type SchemaDiscoveryBridge,
+  SchemaDiscoveryPanel,
+  narrowDiscovery,
+} from './schema-discovery';
+import {
   INLINE_CONNECTION,
   KIND_OPTIONS,
   ReadModeFields,
   type SourceDraft,
   SourceFields,
-  connectionOptions,
   readsIncrementally,
   sourceConfigFrom,
   sourceDraftFrom,
   toConnectorKind,
   usesConnection,
 } from './source-fields';
+import { Button } from './ui/button';
 import { ConfirmDialog } from './ui/dialog';
 import { TextField } from './ui/field';
 import { Select, SelectField, type SelectOption } from './ui/select';
@@ -83,6 +90,14 @@ import {
   toFlowNodes,
 } from './workflow/graph';
 import {
+  AdoptionNote,
+  PublishControls,
+  RunControls,
+  SchedulePanel,
+  ShrinkRefusalNote,
+  WorkflowStatusBadge,
+} from './workflow/lifecycle';
+import {
   type CatalogWorkflow,
   WORKFLOW_NODE_KINDS,
   type WorkflowEdge,
@@ -100,6 +115,7 @@ import {
 } from './workflow/model';
 import { WORKFLOW_NAME } from './workflow/name';
 import { WorkflowNodeProvider, workflowNodeTypes } from './workflow/nodes';
+import { RunsAsPanel } from './workflow/runs';
 import {
   type WorkflowProblem,
   type WorkflowProblemCode,
@@ -644,25 +660,42 @@ function saveHint(blocked: boolean, unfinished: string[]): string {
  */
 function CanvasActions({
   draft,
+  stored,
   canEdit,
   blocked,
   unfinished,
   saving,
   running,
   durabilityDetail,
+  acknowledging,
+  onAcknowledgingChange,
   onSave,
   onRun,
+  onLifecycleChange,
   onAskDelete,
 }: {
   draft: Draft;
+  /**
+   * The graph as the server last described it, when there is one.
+   *
+   * Separate from `draft` because publishing, scheduling and running all act on
+   * what is STORED — the status, the cron and the enabled flag are the server's
+   * answers, not fields of the thing being edited — and folding them into the
+   * draft would let a canvas full of unsaved edits claim a status it does not
+   * have.
+   */
+  stored: CatalogWorkflow | undefined;
   canEdit: boolean;
   blocked: boolean;
   unfinished: string[];
   saving: boolean;
   running: boolean;
   durabilityDetail: string;
+  acknowledging: boolean;
+  onAcknowledgingChange: (open: boolean) => void;
   onSave: () => void;
-  onRun: () => void;
+  onRun: (options?: WorkflowRunOptions) => void;
+  onLifecycleChange: (workflow: CatalogWorkflow) => void;
   onAskDelete: () => void;
 }) {
   return (
@@ -688,37 +721,37 @@ function CanvasActions({
           {draft.dirty ? 'Save' : 'Saved'}
         </button>
       </Tooltip>
-      <Tooltip
-        content={
-          draft.dirty
-            ? 'Save first — a run executes the stored graph, not what is on screen.'
-            : durabilityDetail
-        }
-      >
-        <button
-          type="button"
-          onClick={onRun}
-          disabled={!canEdit || !draft.id || draft.dirty || running}
-          className={cn(
-            'flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs disabled:opacity-40',
-            RULE,
-            'hover:bg-zinc-50 dark:hover:bg-zinc-800',
-          )}
-        >
-          {running ? <Loader2 size={12} className="animate-spin" /> : <Play size={12} />}
-          Run
-        </button>
-      </Tooltip>
+      {stored && (
+        <PublishControls
+          workflow={stored}
+          dirty={draft.dirty}
+          canEdit={canEdit}
+          onPublished={onLifecycleChange}
+        />
+      )}
+      <RunControls
+        workflowId={draft.id}
+        dirty={draft.dirty}
+        canEdit={canEdit}
+        running={running}
+        durabilityDetail={durabilityDetail}
+        acknowledging={acknowledging}
+        onAcknowledgingChange={onAcknowledgingChange}
+        onRun={onRun}
+      />
       {draft.id && canEdit && (
-        <Tooltip content={`Delete this ${WORKFLOW_NAME.singular}.`}>
-          <button
-            type="button"
+        <Tooltip
+          content={`Delete this ${WORKFLOW_NAME.singular}, and the connector it runs as with it.`}
+        >
+          <Button
+            variant="outline"
+            size="icon"
             onClick={onAskDelete}
             aria-label={`Delete this ${WORKFLOW_NAME.singular}`}
-            className={cn('rounded-md border p-1.5 text-zinc-400 hover:text-red-600', RULE)}
+            className="text-zinc-400 hover:text-red-600"
           >
             <Trash2 size={12} />
-          </button>
+          </Button>
         </Tooltip>
       )}
     </div>
@@ -1253,6 +1286,91 @@ function nodeMovesAndRemovals(changes: NodeChange<WorkflowFlowNode>[]): {
   return { positions, removed };
 }
 
+/**
+ * The transforms a graph actually names.
+ *
+ * Only these, because the run history's `code v3` can be turned into a
+ * comparison only when there is exactly one candidate: a run records ONE
+ * transform version, a graph may run three in a row, and picking whichever the
+ * screen loaded first would offer a diff against the wrong code.
+ */
+function transformsNamedBy(
+  nodes: WorkflowNode[],
+  transforms: CatalogTransform[],
+): CatalogTransform[] {
+  const named = new Set(
+    nodes.flatMap((node) =>
+      node.kind === 'transform' && node.transformId ? [node.transformId] : [],
+    ),
+  );
+  return transforms.filter((transform) => named.has(transform.id));
+}
+
+/**
+ * What a run did, said out loud once.
+ *
+ * Not "succeeded or failed": a graph may commit several types at several sinks,
+ * each independently, so the overall status is only the headline and the reader
+ * is sent to the per-sink list for what actually landed.
+ */
+function runAnnouncement(result: WorkflowRun): string {
+  if (result.status === 'succeeded') {
+    return 'The run finished. Check each sink below for what it committed.';
+  }
+  return `The run ${result.status}. ${result.error ?? ''}`;
+}
+
+/** What a publish or an unpublish changed, for somebody who cannot see the badge. */
+function lifecycleAnnouncement(saved: CatalogWorkflow): string {
+  return saved.status === 'ready'
+    ? 'Published. It is now ready, and runs as a connector of its own.'
+    : 'Back to draft. Nothing runs it until it is published again.';
+}
+
+/**
+ * The stored graph behind a draft, when the draft has been stored at all.
+ *
+ * A lookup rather than state of its own, so that publishing — which changes the
+ * status and mints the connector everything else is keyed on — reaches the
+ * badge, the schedule panel and the "Runs as" panel through one path instead of
+ * three copies going out of step.
+ */
+function storedWorkflow(
+  list: CatalogWorkflow[] | undefined,
+  id: string | undefined,
+): CatalogWorkflow | undefined {
+  if (!id) return undefined;
+  return list?.find((workflow) => workflow.id === id);
+}
+
+/**
+ * Whether a source node can be asked what its columns are, and why not.
+ *
+ * Discovery reads the node the SERVER has, so the two states it cannot run in
+ * are "never saved" and "saved, but not like this". **Neither of them is
+ * "unpublished"**, and that is the whole point of the route: a sink cannot
+ * commit into a type that does not exist, so requiring a published graph would
+ * require publishing a graph whose target type cannot be created until it is.
+ * The reasons therefore name saving and never publishing — a reader told to
+ * publish first would go and do it, and find they cannot.
+ */
+function discoveryTarget(
+  draft: Draft,
+): { workflowId: string } | { workflowId?: undefined; because: string } {
+  if (!draft.id) {
+    return {
+      because: `Save this ${WORKFLOW_NAME.singular} first — discovery reads the stored node, and there is nothing stored yet. It does not need to be published.`,
+    };
+  }
+  if (draft.dirty) {
+    return {
+      because:
+        'Save first — discovery reads the stored node, so it would describe the source as it was before these edits.',
+    };
+  }
+  return { workflowId: draft.id };
+}
+
 function Canvas({
   title = WORKFLOW_NAME.titlePlural,
   eyebrow = 'Ingestion',
@@ -1299,6 +1417,15 @@ function Canvas({
   const [editingCodeFor, setEditingCodeFor] = useState<string | null>(null);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [run, setRun] = useState<WorkflowRun | null>(null);
+  /**
+   * Whether the "this load is expected to shrink" dialog is open.
+   *
+   * Here rather than inside `RunControls` because there are two ways in and only
+   * one of them is a button in that row: the other is the refusal note under the
+   * canvas, which is where somebody who has just watched a load be turned away is
+   * actually looking.
+   */
+  const [acknowledging, setAcknowledging] = useState(false);
   /**
    * Nodes added in this session that nobody has done anything to yet.
    *
@@ -1586,7 +1713,13 @@ function Canvas({
   });
 
   const runIt = useMutation({
-    mutationFn: (id: string) => client.runWorkflow(id),
+    // The options are the run's, not the graph's, and `expectShrink` is the one
+    // that matters: it is the acknowledgement that lets a deliberately
+    // collapsing load past the row-count bound, it reaches the server only
+    // through this route, and it is stored nowhere — which is the only reliable
+    // way to keep a one-time acknowledgement from becoming a standing one.
+    mutationFn: ({ id, options }: { id: string; options: WorkflowRunOptions | undefined }) =>
+      client.runWorkflow(id, options),
     onSuccess: (result) => {
       setRun(result);
       // A run writes rows, so the catalog snapshot every other screen reads is
@@ -1594,13 +1727,24 @@ function Canvas({
       // showing yesterday's counts beside a run that just finished.
       queryClient.invalidateQueries({ queryKey: catalogQueryKeys.snapshot });
       queryClient.invalidateQueries({ queryKey: catalogQueryKeys.workflows });
-      setAnnouncement(
-        result.status === 'succeeded'
-          ? 'The run finished. Check each sink below for what it committed.'
-          : `The run ${result.status}. ${result.error ?? ''}`,
-      );
+      // The run is recorded against the connector, which is where the history
+      // and the last-run fields live. Left stale, the "Runs as" panel shows a
+      // pipeline that has never run beside a run that just finished.
+      queryClient.invalidateQueries({ queryKey: catalogQueryKeys.runs() });
+      queryClient.invalidateQueries({ queryKey: catalogQueryKeys.connectors });
+      setAnnouncement(runAnnouncement(result));
     },
   });
+
+  // `id` is narrowed by the controls, which are disabled without one — the empty
+  // string here is unreachable and is what keeps this a plain call rather than a
+  // second guard the button already applies.
+  const runNow = useCallback(
+    (options?: WorkflowRunOptions) => {
+      runIt.mutate({ id: draft.id ?? '', options });
+    },
+    [draft.id, runIt.mutate],
+  );
 
   /**
    * Write the first transform without leaving the canvas.
@@ -1762,12 +1906,53 @@ function Canvas({
     setUnstarted(new Set<string>());
     save.mutate();
   }, [save]);
+
+  /**
+   * The stored graph behind the draft on screen, when there is one.
+   *
+   * Read out of the list rather than held in state of its own, so that
+   * publishing — which changes `status`, and mints the connector everything
+   * else here is keyed on — reaches the badge, the schedule panel and the
+   * "Runs as" panel through one path instead of three copies going out of step.
+   *
+   * `loadedRef` is what makes this safe: the load effect returns early once the
+   * draft has been built for an id, so a fresher list arriving here cannot throw
+   * away nodes somebody has moved since.
+   */
+  const stored = useMemo(
+    () => storedWorkflow(workflows.data, draft.id),
+    [workflows.data, draft.id],
+  );
+
+  /**
+   * A publish, an unpublish or a schedule, written straight into the list.
+   *
+   * Written as well as invalidated, because the status badge is the whole
+   * feedback for those actions: waiting for a refetch means pressing Publish
+   * and watching nothing happen for as long as the round trip takes, which is
+   * exactly how somebody presses it twice.
+   */
+  const onLifecycleChange = useCallback(
+    (saved: CatalogWorkflow) => {
+      queryClient.setQueryData<CatalogWorkflow[]>(catalogQueryKeys.workflows, (current) =>
+        (current ?? []).map((workflow) => (workflow.id === saved.id ? saved : workflow)),
+      );
+      setAnnouncement(lifecycleAnnouncement(saved));
+    },
+    [queryClient],
+  );
+
   const inspectingNode = draft.nodes.find((node) => node.id === inspecting) ?? null;
   const editingNode = draft.nodes.find((node) => node.id === editingCodeFor);
   const editingTransform: CatalogTransform | undefined =
     editingNode?.kind === 'transform'
       ? transforms.find((transform) => transform.id === editingNode.transformId)
       : undefined;
+
+  const graphTransforms = useMemo(
+    () => transformsNamedBy(draft.nodes, transforms),
+    [draft.nodes, transforms],
+  );
 
   const typeOptions = useMemo<SelectOption[]>(
     () =>
@@ -1793,6 +1978,40 @@ function Canvas({
 
   const produces = producedTypes(draft.nodes);
 
+  /**
+   * Asking a source what its columns are, and creating the type from the answer.
+   *
+   * Built from the client rather than taken as a prop, and the prop that used to
+   * carry it is gone with the screen it lived on. Two calls, and the second is
+   * the only write: discovery reads and reports, `PUT /publish/:type/schema`
+   * creates. A pipeline that created the type it loads into would grow the
+   * catalog by accident, and the names it invented would come from the shape of
+   * a query rather than from somebody who meant them.
+   */
+  const discovery = useMemo<SchemaDiscoveryBridge>(
+    () => ({
+      discover: async (workflowId, nodeId): Promise<ConnectorSchemaDiscovery> =>
+        narrowDiscovery(await client.discoverSourceSchema(workflowId, nodeId)),
+      // `async` on purpose: `publishType` THROWS rather than rejecting when the
+      // transport cannot PUT, and a bridge whose method throws synchronously
+      // would escape the panel's error handling and take the screen with it.
+      createType: async (draftType: DiscoveredTypeDraft) =>
+        client.publishType(draftType.name, {
+          // Only what a person confirmed on screen. Everything else about a type
+          // — its label, its description, its units — is curation, and inventing
+          // any of it here would put words nobody chose into a catalog whose
+          // whole claim is that its names were chosen.
+          properties: draftType.properties.map((property) => ({
+            name: property.name,
+            columnName: property.columnName,
+            type: property.type,
+            nullable: property.nullable,
+          })),
+        }),
+    }),
+    [client],
+  );
+
   return (
     /*
      * The screen lives inside the viewport: a header sized to its content and a
@@ -1813,11 +2032,13 @@ function Canvas({
             {eyebrow}
           </p>
           <h1 className="text-xl font-semibold tracking-tight">{title}</h1>
+          {stored && <WorkflowStatusBadge workflow={stored} />}
           <CommitsBadge produces={produces} />
         </div>
         <p className="mt-0.5 max-w-3xl text-xs text-zinc-500 dark:text-zinc-400">{intro}</p>
 
         <DurabilityBanner durability={durability} />
+        {stored && <AdoptionNote workflow={stored} />}
 
         <div className="mt-2.5 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
           <SelectField
@@ -1840,20 +2061,35 @@ function Canvas({
           />
           <CanvasActions
             draft={draft}
+            stored={stored}
             canEdit={canEdit}
             blocked={blocked}
             unfinished={unfinished}
             saving={save.isPending}
             running={runIt.isPending}
             durabilityDetail={durability.detail}
+            acknowledging={acknowledging}
+            onAcknowledgingChange={setAcknowledging}
             onSave={saveNow}
-            onRun={() => draft.id && runIt.mutate(draft.id)}
+            onRun={runNow}
+            onLifecycleChange={onLifecycleChange}
             onAskDelete={() => setConfirmingDelete(true)}
           />
         </div>
 
         {save.error && <RefusalNote lead="The server refused it:" error={save.error} />}
         {runIt.error && <RefusalNote lead="The run could not start:" error={runIt.error} />}
+        {/*
+         * The row-count bound turning a load away, with the one control that
+         * answers it. Rendered from both surfaces because a refused sink can
+         * arrive either way: as a rejected request when the graph ran inline,
+         * or as a failed node on a run that otherwise returned.
+         */}
+        <ShrinkRefusalNote
+          run={run}
+          error={runIt.error}
+          onAcknowledge={() => setAcknowledging(true)}
+        />
       </div>
 
       {canEdit && (
@@ -1917,7 +2153,33 @@ function Canvas({
           canEdit={canEdit}
           onInspect={setInspecting}
           onDisconnect={disconnect}
-        />
+        >
+          {/*
+           * The two things that only exist once a graph is STORED, and that is
+           * why they are here rather than in the header: a schedule on nothing
+           * and a run history of nothing are both headings that would be empty
+           * for the whole of the time somebody spends drawing.
+           *
+           * Keyed by id so switching pipeline resets the cron and the enabled
+           * switch — held locally, and without the key one graph's schedule
+           * would appear inside another's.
+           */}
+          {stored && (
+            <>
+              <SchedulePanel
+                key={stored.id}
+                workflow={stored}
+                canEdit={canEdit}
+                onScheduled={onLifecycleChange}
+              />
+              <RunsAsPanel
+                workflowId={stored.id}
+                status={stored.status}
+                transforms={graphTransforms}
+              />
+            </>
+          )}
+        </WiringRail>
       </div>
 
       {/*
@@ -1940,6 +2202,8 @@ function Canvas({
         canEdit={canEdit}
         problems={problemsOf(problemsFor, inspectingNode)}
         pending={problemsOf(pendingFor, inspectingNode)}
+        discovery={discovery}
+        discoverable={discoveryTarget(draft)}
         onClose={() => setInspecting(null)}
         onChange={(next) => {
           // Editing any field is the clearest statement there is that somebody
@@ -2010,7 +2274,7 @@ function Canvas({
         open={confirmingDelete}
         onOpenChange={setConfirmingDelete}
         title={`Delete "${draft.name || WORKFLOW_NAME.singular}"?`}
-        description={`The graph goes with it. The transforms and connections it wired together are not touched — they are shared, and other ${WORKFLOW_NAME.plural} may use them.`}
+        description={`The connector it runs as goes with it, and the run history keyed on that connector goes too — including the incremental watermark, so anything rebuilt later reads its source from the beginning. The snapshots it already committed stay where they are. The transforms and connections it wired together are not touched: they are shared, and other ${WORKFLOW_NAME.plural} may use them.`}
         confirmLabel="Delete"
         pending={remove.isPending}
         error={remove.error instanceof Error ? remove.error.message : undefined}
@@ -2163,6 +2427,7 @@ function WiringRail({
   canEdit,
   onInspect,
   onDisconnect,
+  children,
 }: {
   draft: Draft;
   problems: WorkflowProblem[];
@@ -2171,6 +2436,13 @@ function WiringRail({
   canEdit: boolean;
   onInspect: (nodeId: string) => void;
   onDisconnect: (edge: WorkflowEdge) => void;
+  /**
+   * Whatever only makes sense for a graph the server has: its schedule, and the
+   * connector it runs as. A slot rather than props, because the rail has no
+   * opinion about either and taking them as props would make it the component
+   * that knows how a pipeline is published.
+   */
+  children?: ReactNode;
 }) {
   const label = (id: string) => {
     const node = draft.nodes.find((n) => n.id === id);
@@ -2225,6 +2497,8 @@ function WiringRail({
           </ul>
         )}
       </section>
+
+      {children}
 
       <PendingWork pending={pending} label={label} onInspect={onInspect} />
 
@@ -2663,6 +2937,8 @@ function NodeInspector({
   canEdit,
   problems,
   pending,
+  discovery,
+  discoverable,
   onClose,
   onChange,
   onConnect,
@@ -2680,6 +2956,8 @@ function NodeInspector({
   connections: CatalogConnection[];
   typeOptions: SelectOption[];
   canEdit: boolean;
+  discovery: SchemaDiscoveryBridge;
+  discoverable: { workflowId: string } | { workflowId?: undefined; because: string };
   problems: WorkflowProblem[];
   pending: WorkflowProblem[];
   onClose: () => void;
@@ -2813,6 +3091,8 @@ function NodeInspector({
               node={node}
               connections={connections}
               canEdit={canEdit}
+              discovery={discovery}
+              discoverable={discoverable}
               onChange={onChange}
             />
           )}
@@ -2948,16 +3228,28 @@ function SourceInspector({
   node,
   connections,
   canEdit,
+  discovery,
+  discoverable,
   onChange,
 }: {
   node: WorkflowSourceNode;
   connections: CatalogConnection[];
   canEdit: boolean;
+  discovery: SchemaDiscoveryBridge;
+  /**
+   * Whether this node can be asked about its source, and why not when it
+   * cannot.
+   *
+   * A pair rather than a boolean, because the two reasons a discovery is
+   * unavailable are completely different and only one of them is worth waiting
+   * for. `undefined` means press it.
+   */
+  discoverable: { workflowId: string } | { workflowId?: undefined; because: string };
   onChange: (node: WorkflowNode) => void;
 }) {
   const [source, setSource] = useState<SourceDraft>(() => sourceDraftFrom(node.config));
   const kind: ConnectorKind = toConnectorKind(node.sourceKind ?? 'http');
-  const options = connectionOptions(kind, connections);
+  const options = connectionOptionsFor(kind, connections);
   // A connection chosen for one kind is meaningless for another, so switching
   // the kind drops it rather than keeping an id the server would reject.
   const chosen = options.some((option) => option.value === node.connectionId)
@@ -3064,6 +3356,24 @@ function SourceInspector({
           not overwrite each other's position.
         </p>
       )}
+
+      {/*
+       * Under the address it reads from, which is where it belongs in the
+       * story: somebody has just said where this reads, and this is what
+       * answers "what is in there".
+       *
+       * It reaches the SERVER'S copy of this node, not the one on screen, which
+       * is why it says so when the two differ. It does not need the graph to be
+       * published, and that is the point of the route: a sink cannot commit into
+       * a type that does not exist, so the type has to be creatable while the
+       * graph is still a draft.
+       */}
+      <SchemaDiscoveryPanel
+        workflowId={discoverable.workflowId ?? ''}
+        nodeId={node.id}
+        bridge={discovery}
+        {...(discoverable.workflowId === undefined ? { disabledReason: discoverable.because } : {})}
+      />
     </div>
   );
 }

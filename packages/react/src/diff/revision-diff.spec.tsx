@@ -26,10 +26,17 @@
  * did, which is the single worst thing this screen could do, so each has its own test below and
  * each asserts on the ABSENCE of the "identical" sentence as well as on its own.
  *
- * The entry points are exercised through the real screens — `PipelineConsole`, `QueryConsole`,
+ * The entry points are exercised through the real screens — `RunsAsPanel`, `QueryConsole`,
  * `TransformEditor` — rather than by mounting the sheet, because a test that mounted it directly
  * would keep passing after the control that puts it on screen was removed. That is the same
  * argument `schema-discovery.spec.tsx` makes at the top of itself.
+ *
+ * `RunsAsPanel` is a panel and not a whole screen, and that is the one concession here. The
+ * control used to live on a connector card in `PipelineConsole`; a connector is not authored any
+ * more, so the run history moved beside the graph that produces it, on a canvas that needs React
+ * Flow's measurement APIs stubbed to mount at all. Mounting the panel keeps this file about the
+ * comparison; that the canvas actually renders the panel is `workflow-canvas.spec.tsx`'s job, and
+ * it holds it.
  *
  * `toBeChecked` / `toBeDisabled` are NOT available — this repo registers no jest-dom setup, and
  * they throw rather than fail. `toHaveProperty` is the equivalent that works. jsdom also does no
@@ -52,11 +59,11 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import type { ReactNode } from 'react';
 import { afterEach, describe, expect, it } from 'vitest';
 import { installCodeSurfaceDom } from '../../../../test/jsdom-code-surface';
-import { PipelineConsole } from '../PipelineConsole';
 import { QueryConsole } from '../QueryConsole';
 import { TransformEditor } from '../TransformEditor';
 import { CatalogProvider, type CatalogTransport } from '../context';
 import { codeEditorRoot } from '../ui/code-editor';
+import { RunsAsPanel } from '../workflow/runs';
 import { DiffBody, RevisionHistory } from './RevisionDiff';
 
 declare global {
@@ -89,13 +96,20 @@ const TRANSFORM: CatalogTransform = {
   updatedAt: '2026-01-01T00:00:00.000Z',
 };
 
+/**
+ * The connector a published graph runs as.
+ *
+ * `workflowId` is what joins it to the graph — it is how the panel finds this row at all, and it
+ * is the thing that made a connector stop being an authored object: nothing creates one, a publish
+ * mints it, and the run history stays keyed on its id through an unpublish and a re-publish.
+ */
 const CONNECTOR: CatalogConnector = {
   id: 'c1',
   name: 'Nightly fleet load',
   kind: 'sql',
   targetType: 'Mvr',
   config: { query: 'SELECT * FROM vehicles' },
-  transformId: 't1',
+  workflowId: 'wf1',
   enabled: true,
   createdBy: 'ana',
   createdAt: '2026-01-01T00:00:00.000Z',
@@ -397,14 +411,11 @@ describe('the history screen', () => {
 });
 
 describe('the ways in', () => {
-  it('makes the version on a connector run the way into the comparison', async () => {
+  it('makes the version on a run the way into the comparison', async () => {
     // Where somebody is standing when the question occurs to them. The run row already says
     // `code v3`; making that the control means the number does not have to be carried anywhere.
     const { transport, paths } = fakeTransport({
-      '/pipeline/capabilities': { languages: ['javascript'], pythonPackages: [] },
       '/pipeline/connectors': [CONNECTOR],
-      '/pipeline/transforms': [TRANSFORM],
-      '/pipeline/connections': [],
       '/pipeline/runs': [
         {
           id: 'run-1',
@@ -424,7 +435,15 @@ describe('the ways in', () => {
         revision(3, 'return records.map(oldRow)\n// three'),
       ],
     });
-    render(withCatalog(transport, <PipelineConsole />));
+    render(
+      withCatalog(
+        transport,
+        // One transform, because that is the condition under which `code v3` is unambiguous: a
+        // run records ONE version, and a graph running three transforms in a row has no single
+        // answer to which one the number names.
+        <RunsAsPanel workflowId="wf1" status="ready" transforms={[TRANSFORM]} />,
+      ),
+    );
 
     const control = await screen.findByRole('button', {
       name: /Compare the code that ran \(v3\) with the current code/,

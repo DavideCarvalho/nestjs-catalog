@@ -61,8 +61,8 @@ type Tab =
   | 'objects'
   | 'query'
   | 'dashboards'
-  | 'connectors'
   | 'workflows'
+  | 'connections'
   | 'lineage'
   | 'activity'
   | 'access';
@@ -72,8 +72,13 @@ const TABS: Array<{ id: Tab; label: string; icon: typeof Boxes }> = [
   { id: 'objects', label: 'Objects', icon: Database },
   { id: 'query', label: 'Query', icon: TerminalSquare },
   { id: 'dashboards', label: 'Dashboards', icon: LayoutGrid },
-  { id: 'connectors', label: 'Connectors', icon: Cable },
+  // One place to author a workflow, where there used to be two. `Connectors`
+  // and `Workflows` were two screens for one concept: a connector stopped being
+  // something anybody creates — it is what a published graph runs as — so the
+  // canvas absorbed the half of that screen which was authoring, and what is
+  // left of it is the addresses and the code a workflow borrows.
   { id: 'workflows', label: 'Workflows', icon: Workflow },
+  { id: 'connections', label: 'Connections', icon: Cable },
   // Renamed from "Flow". Two screens called the same thing while making
   // opposite claims about where truth lives — one inferring the graph from what
   // publishers did, one declaring it — is how somebody trusts the wrong one.
@@ -116,10 +121,25 @@ function isTab(value: string): value is Tab {
  * never landed. The search rows generate the same shape of link, so the same
  * split is what makes them land.
  */
+/**
+ * The route that used to exist, pointed at the screen that absorbed it.
+ *
+ * `#connectors` was bookmarkable and it was where somebody authored a load.
+ * Dropping it would send anybody holding a link — or a runbook quoting one — to
+ * the model screen, which is `routeFromHash`'s fallback and reads as a click
+ * that never landed. It lands on the canvas rather than on Connections, because
+ * authoring was what that screen was for; the connections it also held are one
+ * click away and named in the strip.
+ */
+const MOVED: Record<string, Tab> = {
+  connectors: 'workflows',
+};
+
 function routeFromHash(): Route {
   const route = window.location.hash.replace('#', '').split('?')[0] ?? '';
   if (route === SEARCH_ROUTE) return SEARCH_ROUTE;
-  return isTab(route) ? route : 'model';
+  if (isTab(route)) return route;
+  return MOVED[route] ?? 'model';
 }
 
 /** The parameters after the `?`, which live in the hash rather than in `search`. */
@@ -156,7 +176,7 @@ function useConsoleIdentity() {
  * In the nav rather than buried in a settings screen, and it reloads on change
  * rather than invalidating queries one by one: every cached answer on the
  * screen came from the previous environment, and a half-swapped console showing
- * dev's connectors beside production's row counts is worse than a blink.
+ * dev's workflows beside production's row counts is worse than a blink.
  */
 function EnvironmentPicker() {
   const current = getEnvironment();
@@ -388,11 +408,11 @@ export function App() {
                 onDashboardChange={(id) => nameInAddress('dashboards', 'dashboard', id)}
               />
             </TabsPanel>
-            <TabsPanel value="connectors" className="h-full overflow-hidden">
-              <PipelineConsole />
-            </TabsPanel>
             <TabsPanel value="workflows" className="h-full">
               <WorkflowCanvas />
+            </TabsPanel>
+            <TabsPanel value="connections" className="h-full overflow-hidden">
+              <PipelineConsole />
             </TabsPanel>
             <TabsPanel value="lineage" className="h-full">
               <FlowView />

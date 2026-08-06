@@ -135,22 +135,29 @@ export interface PipelineRoutes {
   connections(): string;
   connection(id: string): string;
   checkConnection(id: string): string;
-  /** Which connectors read through a connection. Named, so a refusal can say. */
-  connectionConnectors(id: string): string;
-  connectors(): string;
-  connector(id: string): string;
-  runConnector(id: string): string;
   /**
-   * What the source behind a connector looks like right now.
+   * Which pipelines read through a connection. Named, so a refusal can say.
    *
-   * A read that writes nothing: it runs the connector's own configured query
-   * with no rows asked for, and reports the columns. Here rather than on a
-   * generic "describe this database" route because the connector is what
-   * already holds the address, the credential reference and the statement —
-   * a route taking those as arguments would be a way to point the server at
-   * any database at all.
+   * `.../connectors` before, and the rename is the question actually being
+   * asked rather than a tidy-up: an operator presses this before deleting a
+   * connection, and what they need is the list of things that would break —
+   * which is a list of workflows, because a workflow is the only thing anybody
+   * authors and a connector's name is an implementation detail of one.
    */
-  discoverConnectorSchema(id: string): string;
+  connectionWorkflows(id: string): string;
+  /**
+   * The internal records, read-only.
+   *
+   * **The one connector path left, and it is a `GET`.** There is no `POST`, no
+   * `DELETE` and no `.../run`: a connector is what a published workflow runs
+   * as, minted by `workflows/:id/publish` and removed with the graph. A builder
+   * for a route that creates one would be this package advertising a second way
+   * to author a pipeline, which is the thing that was removed.
+   *
+   * It stays because it answers what a graph cannot answer about itself — which
+   * id the run history and the incremental watermark are keyed on.
+   */
+  connectors(): string;
   runs(): string;
   transforms(): string;
   transform(id: string): string;
@@ -182,7 +189,41 @@ export interface PipelineRoutes {
    */
   workflows(): string;
   workflow(id: string): string;
+  /**
+   * Declare a graph finished, which is also what mints the connector it runs
+   * as. Its own path rather than a field on the save, because publishing is a
+   * claim that gets checked and a check that fails owes an explanation.
+   */
+  publishWorkflow(id: string): string;
+  /** Back to draft. The connector keeps its id and its history, and stops. */
+  unpublishWorkflow(id: string): string;
+  /**
+   * Run it now. **The only run path there is** — `connectors/:id/run` is gone,
+   * and what it carried that this did not is `expectShrink`, which moved onto
+   * this one's body rather than being lost with it.
+   */
   runWorkflow(id: string): string;
+  /**
+   * When this graph runs, and whether it runs at all.
+   *
+   * A `PUT` of its own rather than fields on the save: a canvas autosaves, and
+   * a cron folded into every save a drag passes through is one a stale tab can
+   * silently revert.
+   */
+  workflowSchedule(id: string): string;
+  /**
+   * What the system behind one source node looks like right now. Writes nothing.
+   *
+   * `connectors/:id/discover` before. It had to move rather than be dropped —
+   * discovery is how a type gets its shape, and a sink cannot commit into a
+   * type that does not exist — and it deliberately answers on a **draft**:
+   * requiring a published graph would require publishing a graph whose target
+   * type cannot be created until it is published.
+   *
+   * Per node, not per graph, because a graph may have several sources and only
+   * a source has a shape to report.
+   */
+  discoverSourceSchema(id: string, nodeId: string): string;
   /**
    * Every per-type load expectation an operator has stored.
    *
@@ -217,11 +258,8 @@ export function pipelineRoutes(basePath: string = DEFAULT_PIPELINE_BASE_PATH): P
     connections: () => `${base}/connections`,
     connection: (id) => `${base}/connections/${encodeURIComponent(id)}`,
     checkConnection: (id) => `${base}/connections/${encodeURIComponent(id)}/check`,
-    connectionConnectors: (id) => `${base}/connections/${encodeURIComponent(id)}/connectors`,
+    connectionWorkflows: (id) => `${base}/connections/${encodeURIComponent(id)}/workflows`,
     connectors: () => `${base}/connectors`,
-    connector: (id) => `${base}/connectors/${encodeURIComponent(id)}`,
-    runConnector: (id) => `${base}/connectors/${encodeURIComponent(id)}/run`,
-    discoverConnectorSchema: (id) => `${base}/connectors/${encodeURIComponent(id)}/discover`,
     runs: () => `${base}/runs`,
     transforms: () => `${base}/transforms`,
     transform: (id) => `${base}/transforms/${encodeURIComponent(id)}`,
@@ -229,7 +267,12 @@ export function pipelineRoutes(basePath: string = DEFAULT_PIPELINE_BASE_PATH): P
     tryTransform: () => `${base}/transforms/try`,
     workflows: () => `${base}/workflows`,
     workflow: (id) => `${base}/workflows/${encodeURIComponent(id)}`,
+    publishWorkflow: (id) => `${base}/workflows/${encodeURIComponent(id)}/publish`,
+    unpublishWorkflow: (id) => `${base}/workflows/${encodeURIComponent(id)}/unpublish`,
     runWorkflow: (id) => `${base}/workflows/${encodeURIComponent(id)}/run`,
+    workflowSchedule: (id) => `${base}/workflows/${encodeURIComponent(id)}/schedule`,
+    discoverSourceSchema: (id, nodeId) =>
+      `${base}/workflows/${encodeURIComponent(id)}/nodes/${encodeURIComponent(nodeId)}/discover`,
     loadExpectations: () => expectations.expectations(),
     loadExpectation: (typeName) => expectations.expectation(typeName),
   };

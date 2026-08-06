@@ -1,4 +1,4 @@
-import type { CatalogConnection, ConnectorKind } from '@dudousxd/nestjs-catalog/client';
+import type { ConnectorKind } from '@dudousxd/nestjs-catalog/client';
 import { CONNECTOR_KINDS } from '@dudousxd/nestjs-catalog/client';
 import { cn } from './cn';
 import { FieldGroup, TextAreaField, TextField } from './ui/field';
@@ -223,27 +223,21 @@ export function sourceConfigFrom(
   return inlineConfig(draft);
 }
 
-/**
- * Whether there is enough here to read anything at all.
+/*
+ * `sourceIsIncomplete` and `connectionOptions` used to be here, and both went
+ * with the connector form that was their only caller.
  *
- * Only the fields without which there is nothing to attempt — a bucket cannot be
- * defaulted the way a prefix can. Everything else is the server's to judge.
+ * `sourceIsIncomplete` decided whether that form's Save button was pressable.
+ * A source node has no such gate and should not grow one: an unconfigured node
+ * is the normal state of a node somebody just added, `workflow/validate.ts`
+ * separates INCOMPLETE from WRONG for exactly that reason, and a second opinion
+ * held in this module would fire while the first is deliberately quiet.
+ *
+ * `connectionOptions` was the same filter as `connectionOptionsFor` in
+ * `ConnectionPanel.tsx` without the address hint. Two spellings of "connections
+ * of this kind" is how a rule ends up enforced on one screen; the one that is
+ * left is the one that can say which address it is offering.
  */
-export function sourceIsIncomplete(
-  kind: ConnectorKind,
-  draft: SourceDraft,
-  viaConnection: boolean,
-): boolean {
-  if (kind === 's3' && !viaConnection) return draft.bucket.trim().length === 0;
-  if (kind === 'http' && !viaConnection) return draft.url.trim().length === 0;
-  return false;
-}
-
-export function connectionOptions(kind: ConnectorKind, connections: CatalogConnection[]) {
-  return connections
-    .filter((connection) => connection.kind === kind)
-    .map((connection) => ({ value: connection.id, label: connection.name }));
-}
 
 /**
  * The address fields for one kind.

@@ -5,75 +5,108 @@
 // import above this line, Vitest stops finding the environment hint, and every test here fails in
 // `node` with `document is not defined`.
 /**
- * The schema-discovery panel, rendered for real inside the connector editor.
+ * The schema-discovery panel: where it is reached from now, and what it refuses to publish.
  *
  * WHAT THESE TESTS ARE ABOUT
  * --------------------------
- * One thing: that the screen never lets a guess become a type. Discovery reports columns it could
- * not type, and the console's job is to keep those visibly out of the proposal until a person says
+ * Two things.
+ *
+ * **1. That discovery survived the move, and works on a draft.** It used to be reached through the
+ * connectors tab and `POST connectors/:id/discover`; the connector stopped being an authored
+ * object and both went. The route is per source NODE now, and it deliberately answers before a
+ * graph is published — a sink cannot commit into a type that does not exist, so requiring a
+ * published graph would require publishing a graph whose target type cannot be created until it
+ * is. That ordering is the whole reason the route exists, so it is asserted through the canvas,
+ * against a graph whose status is `draft`, on the path the server actually serves.
+ *
+ * **2. That the screen never lets a guess become a type.** Discovery reports columns it could not
+ * type, and the console's job is to keep those visibly out of the proposal until a person says
  * what they are — so most of what is asserted below is the DISABLED state of the create button and
  * the reason printed beside it.
  *
- * The panel is reached the way a person reaches it, through the connectors tab and the editor,
- * rather than by rendering an internal component: what a host installs is `<PipelineConsole />`,
- * and a test that mounted the panel directly would keep passing after the wiring that puts it on
- * the screen was removed.
+ * WHY BOTH A CANVAS AND A DIRECT MOUNT
+ * ------------------------------------
+ * The wiring — that a source node offers this at all, that it asks about the node somebody opened,
+ * that it will not run against edits nobody has saved — can only be checked through the screen,
+ * because a test that mounted the panel itself would keep passing after the wiring was removed.
+ * The column table and the confirmation are rules of the panel, and the panel is an exported
+ * component a host may mount on its own inspector; driving those through a React Flow canvas would
+ * buy nothing and cost a canvas mount per assertion.
  *
  * Nothing here relies on layout. jsdom has none — no `getClientRects`, no canvas — so the panel
  * uses a native `<select>` and a native checkbox, which are real form controls a keyboard, a
  * screen reader and this test can all operate.
+ *
+ * `toBeChecked` / `toBeDisabled` are NOT available — this repo registers no jest-dom setup, and
+ * they throw rather than fail. `toHaveProperty('disabled', true)` is the equivalent that works.
  */
-import type { CatalogConnector, CatalogTransform } from '@dudousxd/nestjs-catalog/client';
+import type { CatalogSnapshot, CatalogWorkflow } from '@dudousxd/nestjs-catalog/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import type { ReactNode } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { installCodeSurfaceDom } from '../../../test/jsdom-code-surface';
+import { WorkflowCanvas } from './WorkflowCanvas';
+import { CatalogProvider, type CatalogTransport } from './context';
 import {
   type ConnectorSchemaDiscovery,
   type DiscoveredTypeDraft,
-  PipelineConsole,
   type SchemaDiscoveryBridge,
+  SchemaDiscoveryPanel,
   initialChoices,
   proposalFrom,
-} from './PipelineConsole';
-import { CatalogProvider, type CatalogTransport } from './context';
+} from './schema-discovery';
+
+// The canvas opens a transform node's code, and the editor is a real code surface: it needs canvas
+// metrics, a firing ResizeObserver and constructable stylesheets, none of which jsdom has. Without
+// the shim React throws `sheet.replaceSync is not a function` from inside `renderRootSync`, which
+// lands as an UNHANDLED rejection rather than a failed assertion — so vitest exits non-zero while
+// every test still reports green.
+installCodeSurfaceDom();
 
 declare global {
   var IS_REACT_ACT_ENVIRONMENT: boolean;
 }
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 
+/**
+ * The browser APIs React Flow and Base UI reach for that jsdom does not implement.
+ *
+ * All of them are measurement, and jsdom does no layout, so none can have an observable effect
+ * here — they are stubbed so the canvas mounts. Same set, and same reason, as
+ * `workflow-canvas.spec.tsx`.
+ */
+class NoopResizeObserver implements ResizeObserver {
+  observe(): void {}
+  unobserve(): void {}
+  disconnect(): void {}
+}
+globalThis.ResizeObserver = NoopResizeObserver;
+
+class FlatDOMMatrix {
+  m22 = 1;
+}
+Object.defineProperty(globalThis, 'DOMMatrixReadOnly', { value: FlatDOMMatrix, writable: true });
+Object.defineProperty(globalThis, 'DOMMatrix', { value: FlatDOMMatrix, writable: true });
+Object.defineProperties(globalThis.HTMLElement.prototype, {
+  offsetHeight: { get: () => 80, configurable: true },
+  offsetWidth: { get: () => 224, configurable: true },
+});
+Object.defineProperty(globalThis.SVGElement.prototype, 'getBBox', {
+  value: () => ({ x: 0, y: 0, width: 0, height: 0 }),
+  configurable: true,
+});
+
 // `screen` queries `document.body`, so a screen left mounted makes the NEXT test's queries
 // ambiguous — and the failure reads as a duplicate element rather than as a leak.
 afterEach(cleanup);
 
-const CONNECTOR: CatalogConnector = {
-  id: 'c1',
-  name: 'Nightly fleet load',
-  kind: 'sql',
-  targetType: 'Mvr',
-  config: { query: 'SELECT * FROM vehicles' },
-  transformId: 't1',
-  enabled: true,
-  createdBy: 'ana',
-  createdAt: '2026-01-01T00:00:00.000Z',
-  updatedAt: '2026-01-01T00:00:00.000Z',
-};
-
-const TRANSFORM: CatalogTransform = {
-  id: 't1',
-  name: 'Fleet mapper',
-  language: 'javascript',
-  code: 'return records',
-  version: 3,
-  createdBy: 'ana',
-  createdAt: '2026-01-01T00:00:00.000Z',
-  updatedAt: '2026-01-01T00:00:00.000Z',
-};
-
 function discovery(overrides: Partial<ConnectorSchemaDiscovery> = {}): ConnectorSchemaDiscovery {
   return {
-    connectorId: 'c1',
-    connectorName: 'Nightly fleet load',
+    workflowId: 'wf1',
+    nodeId: 'src_1',
+    nodeName: 'Feed',
+    kind: 'sql',
     targetType: 'Mvr',
     typeExists: false,
     basis: 'driver',
@@ -101,74 +134,7 @@ function discovery(overrides: Partial<ConnectorSchemaDiscovery> = {}): Connector
   };
 }
 
-/** A transport that answers the four reads the connectors tab makes, and nothing else. */
-function fakeTransport(extra: Record<string, unknown> = {}): CatalogTransport {
-  // The transport is generic on its response and a fixture map cannot be. Same seam, and same
-  // reason, as `screens.spec.tsx`.
-  // biome-ignore lint/suspicious/noExplicitAny: see above
-  const answers: Record<string, any> = {
-    '/pipeline/capabilities': { languages: ['javascript'], pythonPackages: [] },
-    '/pipeline/connectors': [CONNECTOR],
-    '/pipeline/transforms': [TRANSFORM],
-    '/pipeline/connections': [],
-    '/pipeline/runs': [],
-    ...extra,
-  };
-  const answer = (path: string) =>
-    path in answers
-      ? Promise.resolve(answers[path])
-      : Promise.reject(new Error(`No fake answer for ${path}`));
-
-  return {
-    get: (path) => answer(path),
-    post: (path) => answer(path),
-    patch: (path) => answer(path),
-    delete: (path) => answer(path),
-  };
-}
-
-function renderConsole(
-  schemaDiscovery?: SchemaDiscoveryBridge,
-  transportAnswers: Record<string, unknown> = {},
-) {
-  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
-    <QueryClientProvider client={queryClient}>
-      <CatalogProvider transport={fakeTransport(transportAnswers)}>
-        <PipelineConsole schemaDiscovery={schemaDiscovery} />
-      </CatalogProvider>
-    </QueryClientProvider>,
-  );
-}
-
-/**
- * Open the editor for the one connector, the way a person does.
- *
- * The card's route into the editor is its transform button, which is why the fixture carries a
- * transform — this is the existing shape of the screen, not something these tests arrange.
- */
-async function openEditor(
-  schemaDiscovery?: SchemaDiscoveryBridge,
-  transportAnswers: Record<string, unknown> = {},
-) {
-  renderConsole(schemaDiscovery, transportAnswers);
-  fireEvent.click(await screen.findByRole('button', { name: /Fleet mapper/ }));
-  return screen.findByPlaceholderText('Nightly fleet load');
-}
-
-/** Open the editor, press discover, and wait for the report. */
-async function discoverIn(bridge: SchemaDiscoveryBridge) {
-  await openEditor(bridge);
-  fireEvent.click(screen.getByRole('button', { name: 'Discover schema' }));
-  await screen.findByRole('table');
-}
-
-function bridgeFor(
-  value: ConnectorSchemaDiscovery,
-  createType?: (draft: DiscoveredTypeDraft) => Promise<unknown>,
-): SchemaDiscoveryBridge {
-  return { discover: () => Promise.resolve(value), ...(createType ? { createType } : {}) };
-}
+/* --- the rules, which need no DOM at all ---------------------------------- */
 
 describe('the proposal a set of choices makes', () => {
   // The single decision this file exists to protect: a column discovery could not type starts
@@ -235,78 +201,28 @@ describe('the proposal a set of choices makes', () => {
   });
 });
 
-describe('the connector editor', () => {
-  it('offers discovery without the host wiring anything', async () => {
-    // This used to assert the opposite, and the opposite used to be true: the
-    // panel took a bridge as a prop and nothing supplied one, so the feature
-    // was reachable only by a host that had read the source and written the two
-    // calls itself. The console builds the bridge from its own client now, and
-    // the prop is an override for a host routing discovery through a gateway of
-    // its own.
-    await openEditor();
-    expect(screen.getByRole('button', { name: 'Discover schema' })).toBeTruthy();
+/* --- the panel, mounted the way a host composing its own inspector would --- */
+
+function withQueries(children: ReactNode) {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
+  return <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>;
+}
 
-  it('prefers the bridge the host supplied over its own', async () => {
-    // The override has to actually override. A default that quietly won would
-    // send a host's gateway-routed discovery straight at the API it was wired
-    // to avoid.
-    const discover = vi.fn(() => Promise.resolve(discovery()));
-    await discoverIn({ discover });
-    expect(discover).toHaveBeenCalledTimes(1);
-  });
+function bridgeFor(
+  value: ConnectorSchemaDiscovery,
+  createType?: (draft: DiscoveredTypeDraft) => Promise<unknown>,
+): SchemaDiscoveryBridge {
+  return { discover: () => Promise.resolve(value), ...(createType ? { createType } : {}) };
+}
 
-  it('asks about the connector being edited, not about some other one', async () => {
-    const discover = vi.fn(() => Promise.resolve(discovery()));
-    await discoverIn({ discover });
-    expect(discover).toHaveBeenCalledWith('c1');
-  });
-
-  // A second discovery is a new column list, and choices made against the old one may name
-  // columns that no longer exist. Carrying them forward would silently confirm a schema nobody
-  // looked at.
-  it('drops the choices made against an earlier report when it runs again', async () => {
-    await discoverIn(bridgeFor(discovery()));
-    fireEvent.click(screen.getByLabelText('Include plate'));
-    expect(screen.getByLabelText('Include plate')).toHaveProperty('checked', false);
-
-    fireEvent.click(screen.getByRole('button', { name: 'Discover schema' }));
-    await waitFor(() =>
-      expect(screen.getByLabelText('Include plate')).toHaveProperty('checked', true),
-    );
-  });
-
-  it('says what the server said the report can prove', async () => {
-    await discoverIn(bridgeFor(discovery()));
-    expect(screen.getByText(/Read from the driver/)).toBeTruthy();
-  });
-
-  it('names a server answer it does not recognise, instead of crashing on it', async () => {
-    // The console mirrors a shape held in `@dudousxd/nestjs-catalog-pipeline`,
-    // which it cannot import — the package carries database drivers and must
-    // never enter a browser bundle. So a console talking to an older server
-    // gets a body it half understands, and without the guard the first thing
-    // that happens is `undefined.map` somewhere inside the column table: a
-    // stack trace naming a component, for a problem that is a version mismatch.
-    //
-    // Through the CLIENT path deliberately, with no bridge prop, because the
-    // guard only exists on the bridge the console builds for itself.
-    await openEditor(undefined, {
-      '/pipeline/connectors/c1/discover': { connectorId: 'c1', caveat: 'sure' },
-    });
-    fireEvent.click(screen.getByRole('button', { name: 'Discover schema' }));
-
-    expect(await screen.findByText(/does not recognise/)).toBeTruthy();
-  });
-
-  it('reports a source that could not be read, rather than an empty table', async () => {
-    await openEditor({
-      discover: () => Promise.reject(new Error('password authentication failed')),
-    });
-    fireEvent.click(screen.getByRole('button', { name: 'Discover schema' }));
-    expect(await screen.findByText(/password authentication failed/)).toBeTruthy();
-  });
-});
+/** Mount the panel, press discover, and wait for the report. */
+async function discoverIn(bridge: SchemaDiscoveryBridge) {
+  render(withQueries(<SchemaDiscoveryPanel workflowId="wf1" nodeId="src_1" bridge={bridge} />));
+  fireEvent.click(screen.getByRole('button', { name: 'Discover schema' }));
+  await screen.findByRole('table');
+}
 
 describe('the discovered columns', () => {
   it('lists every column the source reported', async () => {
@@ -357,6 +273,62 @@ describe('the discovered columns', () => {
     await discoverIn(bridgeFor(discovery()));
     expect(screen.getByText(/Nothing is mapped to Postgres type 1186/)).toBeTruthy();
   });
+
+  it('says what the server said the report can prove', async () => {
+    await discoverIn(bridgeFor(discovery()));
+    expect(screen.getByText(/Read from the driver/)).toBeTruthy();
+  });
+
+  // A second discovery is a new column list, and choices made against the old one may name
+  // columns that no longer exist. Carrying them forward would silently confirm a schema nobody
+  // looked at.
+  it('drops the choices made against an earlier report when it runs again', async () => {
+    await discoverIn(bridgeFor(discovery()));
+    fireEvent.click(screen.getByLabelText('Include plate'));
+    expect(screen.getByLabelText('Include plate')).toHaveProperty('checked', false);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Discover schema' }));
+    await waitFor(() =>
+      expect(screen.getByLabelText('Include plate')).toHaveProperty('checked', true),
+    );
+  });
+
+  it('reports a source that could not be read, rather than an empty table', async () => {
+    render(
+      withQueries(
+        <SchemaDiscoveryPanel
+          workflowId="wf1"
+          nodeId="src_1"
+          bridge={{
+            discover: () => Promise.reject(new Error('password authentication failed')),
+          }}
+        />,
+      ),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Discover schema' }));
+    expect(await screen.findByText(/password authentication failed/)).toBeTruthy();
+  });
+
+  it('says why it cannot be pressed, instead of hiding itself', async () => {
+    // A panel that vanished would leave somebody hunting for a button that was there a minute
+    // ago. The two reasons are both about the graph being STORED — never about it being
+    // published, which is the thing this route deliberately does not require.
+    render(
+      withQueries(
+        <SchemaDiscoveryPanel
+          workflowId="wf1"
+          nodeId="src_1"
+          bridge={bridgeFor(discovery())}
+          disabledReason="Save first — discovery reads the stored node."
+        />,
+      ),
+    );
+    expect(screen.getByRole('button', { name: 'Discover schema' })).toHaveProperty(
+      'disabled',
+      true,
+    );
+    expect(screen.getByText(/Save first — discovery reads the stored node/)).toBeTruthy();
+  });
 });
 
 describe('confirming', () => {
@@ -388,11 +360,10 @@ describe('confirming', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Create Mvr' }));
 
     await waitFor(() => expect(createType).toHaveBeenCalled());
-    // Read through the draft rather than off `mock.calls[0][0]`: the spy is
-    // declared with no argument types, so its calls are an empty tuple and
-    // indexing one is an error the spec typecheck now reports. Asserting the
-    // length first also means a spy that was never called fails HERE, naming
-    // that, instead of throwing on a property of undefined three lines down.
+    // Read through the draft rather than off `mock.calls[0][0]`: the spy is declared with no
+    // argument types, so its calls are an empty tuple and indexing one is an error the spec
+    // typecheck reports. Asserting the length first also means a spy that was never called fails
+    // HERE, naming that, instead of throwing on a property of undefined three lines down.
     const [draft] = createType.mock.lastCall ?? [];
     expect(draft).toBeDefined();
     expect(draft?.properties.map((property) => property.name)).toEqual(['seen_at']);
@@ -427,6 +398,17 @@ describe('confirming', () => {
     expect(screen.queryByRole('button', { name: 'Create Mvr' })).toBeNull();
     expect(screen.getByText(/PUT \/publish\/Mvr\/schema/)).toBeTruthy();
     expect(screen.getByText(/"columnName": "plate"/)).toBeTruthy();
+  });
+
+  // The draft case the route exists for, at its most awkward: a graph with a source and no sink
+  // yet. There is no type to create and nothing to compare against, and the honest thing is to
+  // say so — an empty `Create ` button would be a control naming nothing.
+  it('offers no type to create when no sink has said which one', async () => {
+    await discoverIn(bridgeFor(discovery({ targetType: '', typeExists: false })));
+    expect(screen.queryByRole('button', { name: /^Create/ })).toBeNull();
+    expect(screen.getByText(/no sink naming an object type yet/)).toBeTruthy();
+    // …and the columns are still reported, because knowing what is in there is the point.
+    expect(within(screen.getByRole('table')).getByText('plate')).toBeTruthy();
   });
 });
 
@@ -469,5 +451,207 @@ describe('drift against a type that already exists', () => {
   it('says there is nothing to compare against when the type does not exist yet', async () => {
     await discoverIn(bridgeFor(discovery()));
     expect(screen.getByText(/does not exist yet/)).toBeTruthy();
+  });
+});
+
+/* --- and the wiring, which only the screen can prove ---------------------- */
+
+/** A DRAFT graph, deliberately: discovery must not require a published one. */
+function draftWorkflow(overrides: Partial<CatalogWorkflow> = {}): CatalogWorkflow {
+  return {
+    id: 'wf1',
+    name: 'Fleet',
+    enabled: true,
+    version: 1,
+    status: 'draft',
+    graphHash: 'hash-1',
+    targetType: 'Mvr',
+    createdBy: 'ana',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+    nodes: [
+      {
+        id: 'src_1',
+        name: 'Feed',
+        kind: 'source',
+        sourceKind: 'sql',
+        config: { query: 'SELECT * FROM vehicles' },
+        position: { x: 0, y: 0 },
+      },
+      {
+        id: 'src_2',
+        name: 'Other feed',
+        kind: 'source',
+        sourceKind: 'http',
+        config: { url: 'https://example.test/other' },
+        position: { x: 0, y: 200 },
+      },
+      { id: 'snk_1', name: 'Out', kind: 'sink', targetType: 'Mvr', position: { x: 320, y: 0 } },
+    ],
+    edges: [
+      { from: 'src_1', to: 'snk_1' },
+      { from: 'src_2', to: 'snk_1' },
+    ],
+    ...overrides,
+  };
+}
+
+function snapshot(): CatalogSnapshot {
+  return {
+    version: 1,
+    generatedAt: '2026-01-01T00:00:00.000Z',
+    stats: { types: 1, properties: 0, relations: 0, enrichedTypes: 1 },
+    types: [
+      {
+        name: 'Mvr',
+        displayName: 'Vehicle',
+        pluralDisplayName: 'Vehicles',
+        tableName: 'mvr',
+        group: 'Fleet',
+        primaryKey: ['id'],
+        enriched: true,
+        properties: [],
+        relations: [],
+      },
+    ],
+  };
+}
+
+interface Posted {
+  path: string;
+  body: unknown;
+}
+
+function canvasTransport(extra: Record<string, unknown> = {}) {
+  const posts: Posted[] = [];
+  // biome-ignore lint/suspicious/noExplicitAny: the seam under test is generic over its response.
+  const answers: Record<string, any> = {
+    '/pipeline/workflows': [draftWorkflow()],
+    '/pipeline/transforms': [],
+    '/pipeline/connections': [],
+    '/pipeline/connectors': [],
+    '/pipeline/capabilities': { languages: ['javascript'], pythonPackages: [] },
+    '/catalog': snapshot(),
+    ...extra,
+  };
+  const answer = (path: string) => {
+    if (!(path in answers)) return Promise.reject(new Error(`No fake answer for ${path}`));
+    const value = answers[path];
+    const resolved = typeof value === 'function' ? value() : value;
+    return resolved instanceof Error ? Promise.reject(resolved) : Promise.resolve(resolved);
+  };
+
+  const transport: CatalogTransport = {
+    get: (path) => answer(path),
+    post: (path, body) => {
+      posts.push({ path, body });
+      return answer(path);
+    },
+    patch: (path) => answer(path),
+    delete: (path) => answer(path),
+    put: (path, body) => {
+      posts.push({ path, body });
+      return answer(path);
+    },
+  };
+
+  return { transport, posts };
+}
+
+async function openCanvas(transport: CatalogTransport) {
+  render(
+    withQueries(<CatalogProvider transport={transport}>{<WorkflowCanvas />}</CatalogProvider>),
+  );
+  await screen.findAllByText('Feed');
+}
+
+/** Open a stored node's inspector the way a pointer does: click the box. */
+async function inspect(nodeLabel: string) {
+  const node = document.querySelector(`.react-flow__node[aria-label^="${nodeLabel}"]`);
+  if (!node) throw new Error(`No canvas node whose description starts "${nodeLabel}"`);
+  fireEvent.click(
+    within(node instanceof HTMLElement ? node : document.body).getByRole('button', {
+      name: new RegExp(nodeLabel.split(', ')[1] ?? ''),
+    }),
+  );
+  return within(await screen.findByRole('dialog'));
+}
+
+describe('reaching discovery from a source node', () => {
+  it('asks about that node of that graph, on a graph nobody has published', async () => {
+    // THE assertion this whole move turns on. The status is `draft` and the route still answers:
+    // a sink cannot commit into a type that does not exist, so requiring a published graph would
+    // require publishing a graph whose target type cannot be created until it is.
+    const { transport, posts } = canvasTransport({
+      '/pipeline/workflows/wf1/nodes/src_1/discover': discovery(),
+    });
+    await openCanvas(transport);
+
+    const sheet = await inspect('source node, Feed');
+    fireEvent.click(sheet.getByRole('button', { name: 'Discover schema' }));
+
+    await waitFor(() => expect(screen.getByRole('table')).toBeTruthy());
+    expect(posts.map((post) => post.path)).toContain(
+      '/pipeline/workflows/wf1/nodes/src_1/discover',
+    );
+  });
+
+  it('asks about the node that was opened, not about the other source', async () => {
+    // A graph may have several sources — which the connector-shaped route could not express at
+    // all — so the node id is the part that has to be right.
+    const { transport, posts } = canvasTransport({
+      '/pipeline/workflows/wf1/nodes/src_2/discover': discovery({
+        nodeId: 'src_2',
+        nodeName: 'Other feed',
+      }),
+    });
+    await openCanvas(transport);
+
+    const sheet = await inspect('source node, Other feed');
+    fireEvent.click(sheet.getByRole('button', { name: 'Discover schema' }));
+
+    await waitFor(() => expect(screen.getByRole('table')).toBeTruthy());
+    expect(posts.map((post) => post.path)).toContain(
+      '/pipeline/workflows/wf1/nodes/src_2/discover',
+    );
+  });
+
+  it('names a server answer it does not recognise, instead of crashing on it', async () => {
+    // The console mirrors a shape held in `@dudousxd/nestjs-catalog-pipeline`, which it cannot
+    // import — that package carries database drivers and must never enter a browser bundle. So a
+    // console talking to an older server gets a body it half understands, and without the guard
+    // the first thing that happens is `undefined.map` somewhere inside the column table: a stack
+    // trace naming a component, for a problem that is a version mismatch.
+    const { transport } = canvasTransport({
+      '/pipeline/workflows/wf1/nodes/src_1/discover': { nodeId: 'src_1', caveat: 'sure' },
+    });
+    await openCanvas(transport);
+
+    const sheet = await inspect('source node, Feed');
+    fireEvent.click(sheet.getByRole('button', { name: 'Discover schema' }));
+
+    expect(await screen.findByText(/does not recognise/)).toBeTruthy();
+  });
+
+  it('will not discover against edits nobody has saved, and says so', async () => {
+    // Discovery reads the STORED node. Running it over a source somebody has just re-pointed
+    // would describe the address it used to have and report drift against the wrong thing — and
+    // the reason has to name saving rather than publishing, because publishing is exactly what
+    // this route does not require.
+    const { transport } = canvasTransport({
+      '/pipeline/workflows/wf1/nodes/src_1/discover': discovery(),
+    });
+    await openCanvas(transport);
+
+    const sheet = await inspect('source node, Feed');
+    fireEvent.change(sheet.getByLabelText(/^Name/), { target: { value: 'Renamed feed' } });
+
+    await waitFor(() =>
+      expect(sheet.getByRole('button', { name: 'Discover schema' })).toHaveProperty(
+        'disabled',
+        true,
+      ),
+    );
+    expect(sheet.getByText(/Save first — discovery reads the stored node/)).toBeTruthy();
   });
 });
