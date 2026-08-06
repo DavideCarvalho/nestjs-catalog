@@ -148,6 +148,9 @@ function vault(kms: CatalogKmsClient, overrides: Partial<{ ttl: number; name: st
 
 const CONNECTION_URL: SecretContext = { kind: 'connection', field: 'url' };
 const CONNECTION_URL_SAVED: SecretContext = { kind: 'connection', id: 'conn-1', field: 'url' };
+
+/** A connection URL, which is the shape this vault exists to keep out of a column. */
+const SECRET = 'postgres://user:pw@db.internal:5432/catalog';
 const CONNECTION_PASSWORD: SecretContext = { kind: 'connection', field: 'password' };
 const CONNECTOR_URL: SecretContext = { kind: 'connector', id: 'conn-1', field: 'url' };
 
@@ -247,15 +250,24 @@ describe('which key the sealed record names', () => {
 describe('the round trip, through real AES', () => {
   it('opens what it sealed', async () => {
     const subject = vault(new FakeKms());
-    const sealed = await subject.seal(
-      'postgres://user:pw@db.internal:5432/catalog',
-      CONNECTION_URL,
-    );
+    const sealed = await subject.seal(SECRET, CONNECTION_URL);
 
-    expect(sealed.ciphertext).not.toContain('pw');
-    await expect(subject.open(sealed, CONNECTION_URL)).resolves.toBe(
-      'postgres://user:pw@db.internal:5432/catalog',
-    );
+    // Decoded, not as base64, and against the WHOLE secret rather than a
+    // fragment of it.
+    //
+    // This assertion used to read `expect(sealed.ciphertext).not.toContain('pw')`,
+    // and it failed roughly two runs in five — because `p` and `w` are both in
+    // the base64 alphabet, so the pair turns up in random ciphertext by chance.
+    // A test that fails on a coin flip teaches people that red means nothing,
+    // which costs more than the assertion was ever worth.
+    //
+    // What it was reaching for is real and worth keeping: that the plaintext is
+    // not sitting inside what gets stored. Searching the decoded BYTES for the
+    // whole URL says exactly that, is deterministic, and would still fail if a
+    // future vault ever wrote the secret through unencrypted — which is the
+    // only bug this line can catch.
+    expect(Buffer.from(sealed.ciphertext, 'base64').includes(SECRET)).toBe(false);
+    await expect(subject.open(sealed, CONNECTION_URL)).resolves.toBe(SECRET);
   });
 
   it('opens a secret sealed before the row had an id', async () => {
