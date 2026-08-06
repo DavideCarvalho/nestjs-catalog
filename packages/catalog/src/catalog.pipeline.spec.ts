@@ -5,6 +5,7 @@ import {
   TRANSFORM_LANGUAGES,
   WORKFLOW_EXECUTION_MODES,
   WORKFLOW_NODE_KINDS,
+  type WorkflowCallNode,
   type WorkflowEdge,
   type WorkflowGraph,
   type WorkflowIssueCode,
@@ -19,6 +20,7 @@ import {
   isWorkflowExecutionMode,
   isWorkflowNode,
   isWorkflowNodeKind,
+  readWorkflowCallOutput,
   supportsWorkflowStages,
   supportsWorkflows,
   validateWorkflow,
@@ -39,6 +41,18 @@ function transform(
 
 function sink(id: string, overrides: Partial<WorkflowSinkNode> = {}): WorkflowSinkNode {
   return { id, name: id, kind: 'sink', targetType: 'Mvr', ...overrides };
+}
+
+function call(id: string, overrides: Partial<WorkflowCallNode> = {}): WorkflowCallNode {
+  return {
+    id,
+    name: id,
+    kind: 'call',
+    callName: 'billing.reconcile',
+    callVersion: '1',
+    config: {},
+    ...overrides,
+  };
 }
 
 function graph(nodes: WorkflowNode[], edges: Array<[string, string]>): WorkflowGraph {
@@ -354,6 +368,71 @@ describe('validateWorkflow', () => {
   });
 });
 
+describe('a node that calls another workflow', () => {
+  // The half people leave blank, and the half that decides which code runs.
+  it('refuses a call that names a workflow but no version', () => {
+    const issues = validateWorkflow(
+      graph([call('c', { callVersion: '' }), sink('out')], [['c', 'out']]),
+    );
+    expect(codes(issues)).toEqual(['call-not-named']);
+    expect(issues[0].message).toContain('version');
+    expect(issues[0].nodeIds).toEqual(['c']);
+  });
+
+  it('refuses a call that names no workflow at all', () => {
+    const issues = validateWorkflow(
+      graph([call('c', { callName: '' }), sink('out')], [['c', 'out']]),
+    );
+    expect(codes(issues)).toEqual(['call-not-named']);
+  });
+
+  // A called workflow may itself read from a system, so `call → sink` is a real
+  // pipeline. Reporting `no-source` on it would be false, and would send
+  // somebody to add a source node they do not need.
+  it('counts as something that reads, so it can be the start of a graph', () => {
+    expect(validateWorkflow(graph([call('c'), sink('out')], [['c', 'out']]))).toEqual([]);
+  });
+
+  // The other half of counting as a root: everything downstream of a call is
+  // reachable. Leaving calls out of the root set would flag a perfectly wired
+  // graph as unreachable at every node after the call.
+  it('makes what it feeds reachable', () => {
+    expect(
+      validateWorkflow(
+        graph(
+          [call('c'), transform('tx'), sink('out')],
+          [
+            ['c', 'tx'],
+            ['tx', 'out'],
+          ],
+        ),
+      ),
+    ).toEqual([]);
+  });
+
+  // What is NOT weakened: a graph still needs something that reads and
+  // something that commits.
+  it('does not make a graph of transforms alone runnable', () => {
+    expect(codes(validateWorkflow(graph([transform('tx'), sink('out')], [['tx', 'out']])))).toEqual(
+      ['no-source'],
+    );
+  });
+
+  it('may sit mid-graph, taking rows in and passing rows on', () => {
+    expect(
+      validateWorkflow(
+        graph(
+          [source('src'), call('c'), sink('out')],
+          [
+            ['src', 'c'],
+            ['c', 'out'],
+          ],
+        ),
+      ),
+    ).toEqual([]);
+  });
+});
+
 describe('workflowRunOrder', () => {
   // A partial order over a broken graph is a load that half-happens, which is
   // harder to recover from than one that never started.
@@ -555,6 +634,29 @@ describe('workflowGraphHash', () => {
     expect(workflowGraphHash(after)).not.toBe(workflowGraphHash(before));
   });
 
+  // The version a call pins is part of what the graph DOES, which is the
+  // opposite of the rule for a transform's version above — repointing a node
+  // at somebody else's newer code changes the load as surely as rewiring it
+  // does, and the run that used the old one has to stay identifiable.
+  it.each<[string, WorkflowNode]>([
+    ['name', call('c', { callName: 'billing.other' })],
+    ['version', call('c', { callVersion: '2' })],
+    ['parameters', call('c', { config: { region: 'gov-west' } })],
+  ])("changes when a call's %s changes", (_field, node) => {
+    const before = graph([call('c'), sink('out')], [['c', 'out']]);
+    const after = graph([node, sink('out')], [['c', 'out']]);
+    expect(workflowGraphHash(after)).not.toBe(workflowGraphHash(before));
+  });
+
+  it('does not change when a call node is merely renamed or moved', () => {
+    const before = graph([call('c'), sink('out')], [['c', 'out']]);
+    const after = graph(
+      [call('c', { name: 'Reconcile the ledger', position: { x: 40, y: 90 } }), sink('out')],
+      [['c', 'out']],
+    );
+    expect(workflowGraphHash(after)).toBe(workflowGraphHash(before));
+  });
+
   it('is the same on both sides of a serialisation round trip', () => {
     // The canvas hashes a draft and the server hashes what arrived; a hash that
     // depended on object identity or key insertion would disagree across JSON.
@@ -598,10 +700,30 @@ describe('the type guards over the exported vocabularies', () => {
 });
 
 describe('isWorkflowNode', () => {
-  it('accepts each of the three shapes', () => {
+  it('accepts each of the four shapes', () => {
     expect(isWorkflowNode(source('src'))).toBe(true);
     expect(isWorkflowNode(transform('tx'))).toBe(true);
     expect(isWorkflowNode(sink('out'))).toBe(true);
+    expect(isWorkflowNode(call('c'))).toBe(true);
+  });
+
+  // A stored call node missing its version would run whichever version is
+  // registered on the day, which is the substitution the pin exists to prevent.
+  // Narrowing it as valid and letting the empty string through would put that
+  // decision back where nobody can see it.
+  it.each([
+    ['a call with no name', { id: 'a', name: 'n', kind: 'call', callVersion: '1', config: {} }],
+    ['a call with no version', { id: 'a', name: 'n', kind: 'call', callName: 'w', config: {} }],
+    [
+      'a call whose version is a number',
+      { id: 'a', name: 'n', kind: 'call', callName: 'w', callVersion: 1, config: {} },
+    ],
+    [
+      'a call with no config',
+      { id: 'a', name: 'n', kind: 'call', callName: 'w', callVersion: '1' },
+    ],
+  ])('refuses %s', (_why, value) => {
+    expect(isWorkflowNode(value)).toBe(false);
   });
 
   // Dropping an unknown node silently changes what the workflow does, so a
@@ -625,6 +747,47 @@ describe('isWorkflowNode', () => {
     ['null', null],
   ])('refuses %s', (_why, value) => {
     expect(isWorkflowNode(value)).toBe(false);
+  });
+});
+
+describe('readWorkflowCallOutput', () => {
+  it('reads the two counts a callee reports for the rows it staged', () => {
+    expect(readWorkflowCallOutput({ batches: 3, rowCount: 1200 })).toEqual({
+      batches: 3,
+      rowCount: 1200,
+    });
+  });
+
+  it('ignores whatever else the callee happened to return alongside them', () => {
+    expect(readWorkflowCallOutput({ batches: 0, rowCount: 0, ok: true, took: '4s' })).toEqual({
+      batches: 0,
+      rowCount: 0,
+    });
+  });
+
+  // A workflow called for its effect answers however it likes, and that is an
+  // ordinary outcome rather than a fault. The caller says so in its logs and
+  // passes on nothing.
+  it.each([
+    ['nothing', undefined],
+    ['null', null],
+    ['a bare acknowledgement', { ok: true }],
+    ['a string', 'done'],
+    ['a number', 7],
+  ])('reads %s as a call that staged no rows', (_why, value) => {
+    expect(readWorkflowCallOutput(value)).toBeUndefined();
+  });
+
+  // Half a contract is a bug in the callee. Reading it as "no rows" would turn
+  // that bug into a load that quietly came out short.
+  it.each([
+    ['only one of the two counts', { batches: 2 }],
+    ['a row count with no batches', { rowCount: 10 }],
+    ['a fractional batch count', { batches: 1.5, rowCount: 10 }],
+    ['a negative row count', { batches: 1, rowCount: -1 }],
+    ['counts as strings', { batches: '1', rowCount: '10' }],
+  ])('refuses %s, naming what it saw', (_why, value) => {
+    expect(() => readWorkflowCallOutput(value)).toThrow(/batches=|rowCount=/);
   });
 });
 

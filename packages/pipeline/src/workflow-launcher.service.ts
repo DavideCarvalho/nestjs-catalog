@@ -203,6 +203,30 @@ export class WorkflowLauncher {
       );
     }
 
+    // Refused before a run row is opened, rather than at the node.
+    //
+    // A call node runs as a durable child run and there is nothing inline that
+    // resembles one, so this graph cannot run here at all. The node would say
+    // so itself — `executeNode` refuses it — but by then a run row is open, the
+    // nodes before it have staged their rows, and the failure reads as
+    // something that went wrong partway through a load rather than as a graph
+    // this pod was never able to run. Said up front, it is a sentence about the
+    // deployment.
+    const calls = workflow.nodes.filter((node) => node.kind === 'call');
+    if (calls.length > 0) {
+      throw new BadRequestException(
+        `"${workflow.name}" hands ${calls.length === 1 ? 'a step' : `${calls.length} steps`} to another workflow (${calls
+          .map((node) =>
+            node.kind === 'call'
+              ? `"${node.name}" → ${node.callName}@${node.callVersion}`
+              : node.name,
+          )
+          .join(
+            ', ',
+          )}), which runs as a durable child run. ${durability.detail} There is nothing to start a child with, so this run is refused rather than started and failed partway.`,
+      );
+    }
+
     this.logger.log(`Running "${workflow.name}" inline as ${snapshotId}: ${durability.detail}`);
     return this.runner.runInline({
       workflow,

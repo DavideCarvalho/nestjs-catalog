@@ -1050,7 +1050,7 @@ export function createPipelineController(
       }
       if (node.kind !== 'source') {
         throw new BadRequestException(
-          `Node "${node.name}" is a ${node.kind} node. Only a source reads from a system, so it is the only kind with a shape to discover — a transform's output shape is whatever its code returns, and the way to see that is to try it.`,
+          `Node "${node.name}" is a ${node.kind} node. A source is the only kind whose shape this server can go and ask for — a transform's output shape is whatever its code returns, and the way to see that is to try it, and a call node's is whatever the workflow it hands off to decides to stage, which lives in another codebase and possibly another language. The way to see either is to run the graph.`,
         );
       }
 
@@ -1219,22 +1219,27 @@ function reachesConnection(
  * one answer to "what counts as a secret in a config", and a rule added there
  * reaches source nodes without anybody remembering to come here.
  *
- * Only source nodes carry a `config`; the union makes that a narrowing rather
- * than a hopeful property check, which is why a transform or sink node is
- * returned as-is rather than spread.
+ * Source and **call** nodes carry a `config`; the union makes that a narrowing
+ * rather than a hopeful property check, which is why a transform or sink node
+ * is returned as-is rather than spread. A call node is in the list because the
+ * store seals and opens its config exactly as it does a source's — this is the
+ * read side of that decision, and leaving it out would hand back in plaintext
+ * what the write side had refused to store in plaintext.
  */
 function redactWorkflow(workflow: CatalogWorkflow): CatalogWorkflow {
   return {
     ...workflow,
     nodes: workflow.nodes.map((node) =>
-      node.kind === 'source' ? { ...node, config: redactConfigSecrets(node.config) } : node,
+      node.kind === 'source' || node.kind === 'call'
+        ? { ...node, config: redactConfigSecrets(node.config) }
+        : node,
     ),
   };
 }
 
 /**
- * Put back every source credential the caller was only ever shown a redaction
- * of, node by node.
+ * Put back every credential the caller was only ever shown a redaction of, node
+ * by node — on a source node and on a call node alike.
  *
  * Matched on node id and nothing else. Position in the array is not identity — a
  * canvas re-orders freely — and neither is the name, which is documented as
@@ -1247,9 +1252,9 @@ function redactWorkflow(workflow: CatalogWorkflow): CatalogWorkflow {
  * a fresh plaintext password may be written. That is exactly the `stored`-absent
  * branch of {@link restoreRedactedSecrets}, one level up.
  *
- * A node whose id matches something that is no longer a source — the id reused
- * for a sink, say — also passes through: there is no config on the other side to
- * have shown anybody.
+ * A node whose id matches something that is no longer of the same kind — the id
+ * reused for a sink, say — also passes through: there is no config on the other
+ * side to have shown anybody.
  */
 function restoreWorkflowSecrets(
   nodes: WorkflowNode[],
@@ -1258,9 +1263,9 @@ function restoreWorkflowSecrets(
   if (!stored) return nodes;
   const previous = new Map(stored.nodes.map((node) => [node.id, node]));
   return nodes.map((node) => {
-    if (node.kind !== 'source') return node;
+    if (node.kind !== 'source' && node.kind !== 'call') return node;
     const was = previous.get(node.id);
-    if (was?.kind !== 'source') return node;
+    if (was?.kind !== node.kind) return node;
     return { ...node, config: restoreRedactedSecrets(node.config, was.config) };
   });
 }

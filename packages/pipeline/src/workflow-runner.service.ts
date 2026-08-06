@@ -8,6 +8,7 @@ import {
   type CatalogWorkflowStore,
   type ConnectorRun,
   SubprocessTransformRunner,
+  type WorkflowCallOutput,
   type WorkflowExecutionMode,
   type WorkflowNodeKind,
   type WorkflowNodeOutcome,
@@ -18,6 +19,7 @@ import {
   type WorkflowStageRef,
   type WorkflowTransformNode,
   emitCatalog,
+  readWorkflowCallOutput,
   supportsWorkflowStages,
   supportsWorkflows,
   workflowRunOrder,
@@ -143,6 +145,25 @@ export interface WorkflowPlanEntry {
   kind: WorkflowNodeKind;
   /** Upstream node ids **in edge order** — see `workflowRunOrder`. */
   inputs: string[];
+  /**
+   * Present on a `call` node, and only there: which workflow it hands off to.
+   *
+   * On the plan for the same reason `kind` is. The workflow body is what makes
+   * the child call — `ctx.child` is a decision recorded in the run's history,
+   * and a step cannot make one — so the body needs the name, the version and
+   * the parameters, and reading them out of the database from a body is the one
+   * thing a replayable body must not do. The plan is a checkpoint, so a graph
+   * repointed at another version between two nodes cannot change what a
+   * half-finished run calls.
+   */
+  call?: WorkflowCallTarget;
+}
+
+/** What a `call` node was authored to call. See {@link WorkflowPlanEntry.call}. */
+export interface WorkflowCallTarget {
+  name: string;
+  version: string;
+  config: Record<string, unknown>;
 }
 
 /** What the planning step hands the durable workflow body. Ids and counters. */
@@ -337,6 +358,14 @@ export class WorkflowRunnerService {
         name: entry.node.name,
         kind: entry.node.kind,
         inputs: entry.inputs,
+        call:
+          entry.node.kind === 'call'
+            ? {
+                name: entry.node.callName,
+                version: entry.node.callVersion,
+                config: entry.node.config,
+              }
+            : undefined,
       })),
     };
   }
@@ -370,7 +399,86 @@ export class WorkflowRunnerService {
     if (node.kind === 'transform') {
       return this.runTransform(node, input, startedAt);
     }
+    if (node.kind === 'call') {
+      // Not executable from here, and refused rather than approximated.
+      //
+      // A call node runs as a tracked child of the durable run, which is a
+      // decision the *workflow body* records in the run's history — `ctx.child`
+      // — and a step has no ctx to record one with. The alternative on offer
+      // was to start a detached run from inside this step and poll it, and that
+      // is a worse thing than an unsupported node: the run would not be a child
+      // of anything, so cancelling the parent would leave it running, the
+      // parent would burn a worker slot polling, and none of it would appear in
+      // the run tree. So the durable path branches in the body (see
+      // `CatalogWorkflowRunWorkflow.run`) and the inline path says this.
+      throw new BadRequestException(
+        `Node "${node.name}" (${node.id}) calls the workflow "${node.callName}@${node.callVersion}", which runs as a durable child run — and this run has no durable engine to start one with. Point this deployment at a durable engine, or replace the call with a transform.`,
+      );
+    }
     return this.runSink(node, workflow, input, startedAt);
+  }
+
+  /**
+   * A finished child call, in the shape the rest of the run accounts in.
+   *
+   * Here rather than in the workflow body because it is arithmetic and
+   * narrowing, and the body is where the *decisions* live: the body starts the
+   * child and awaits it, and hands the answer here to be turned into the same
+   * `{nodeId, output, rows, logs}` every other node produces. That is what lets
+   * `record` treat a call node like any other and keeps one accounting of a
+   * run's numbers rather than two.
+   *
+   * Pure, and it must stay pure: the durable body calls it, and anything
+   * reaching a database from there would be a read on the replay path.
+   */
+  callOutput(input: {
+    nodeId: string;
+    nodeName: string;
+    runId: string;
+    target: WorkflowCallTarget;
+    childRunId: string;
+    /** Whatever the child returned. Narrowed here, never trusted. */
+    result: unknown;
+    elapsedMs: number;
+  }): WorkflowNodeStepOutput {
+    const called = `${input.target.name}@${input.target.version}`;
+    let staged: WorkflowCallOutput | undefined;
+    try {
+      staged = readWorkflowCallOutput(input.result);
+    } catch (error) {
+      // Rethrown with the call on the front of it. `readWorkflowCallOutput`
+      // knows what it saw and nothing about whose graph saw it, and a message
+      // that names neither the node nor the workflow sends its reader to the
+      // wrong repository.
+      throw new BadRequestException(
+        `Call node "${input.nodeName}" (${input.nodeId}) ran ${called} as child run ${input.childRunId}, and cannot read what it returned. ${say(error)}`,
+      );
+    }
+
+    const logs = staged
+      ? [
+          `Called ${called} as child run ${input.childRunId}; it staged ${staged.rowCount} rows in ${staged.batches} batches.`,
+        ]
+      : [
+          // Said out loud on every call that produced nothing, because the
+          // alternative is a node that reports zero rows with no explanation —
+          // and "the workflow I called returned nothing to read" and "the
+          // workflow I called is broken" would look identical.
+          `Called ${called} as child run ${input.childRunId}; it returned nothing this graph can read rows from, so this node passes on 0 rows.`,
+        ];
+
+    return {
+      nodeId: input.nodeId,
+      output: {
+        runId: input.runId,
+        nodeId: input.nodeId,
+        batches: staged?.batches ?? 0,
+        rowCount: staged?.rowCount ?? 0,
+      },
+      rows: staged?.rowCount ?? 0,
+      elapsedMs: input.elapsedMs,
+      logs: safeLogLines(logs, LOG_LINES_PER_NODE),
+    };
   }
 
   /**
@@ -503,6 +611,13 @@ export class WorkflowRunnerService {
     progress.logs = safeLogLines([...progress.logs, ...output.logs], LOG_LINES_PER_RUN);
     // What a *source* read is what "fetched" has always meant on a run, and a
     // graph with two sources fetched the sum of both.
+    //
+    // A `call` node is deliberately not counted here even when it originates
+    // the graph's rows. `fetched` is this service's own statement about what it
+    // read out of a system, and a called workflow's rows arrive already staged
+    // by somebody else's code — folding them in would make a number that means
+    // "what the catalog fetched" quietly mean "what reached the graph". The
+    // rows are on the node's own outcome, where the run panel reads them.
     if (node.kind === 'source') progress.fetched += output.rows;
     if (output.committed) progress.written = output.rows;
   }

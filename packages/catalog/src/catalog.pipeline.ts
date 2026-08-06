@@ -632,12 +632,13 @@ export interface WorkflowNodeOutcome {
 /**
  * What a node can be.
  *
- * Three kinds, and they are exactly the three verbs the existing connector
- * runner already performs in sequence: fetch, transform, publish. Nothing here
- * is a kind this service cannot execute, which is the same rule
- * {@link CONNECTOR_KINDS} follows — a kind that exists in the type and throws
- * at run time is worse than one that is absent, because the first looks
- * supported in a palette.
+ * The first three are exactly the three verbs the existing connector runner
+ * already performs in sequence: fetch, transform, publish. The fourth hands a
+ * position in the graph to a durable workflow that already exists in the
+ * deployment. Nothing here is a kind this service cannot execute, which is the
+ * same rule {@link CONNECTOR_KINDS} follows — a kind that exists in the type
+ * and throws at run time is worse than one that is absent, because the first
+ * looks supported in a palette.
  *
  * The kinds that were considered and rejected, since a small vocabulary is only
  * defensible if the omissions are:
@@ -655,6 +656,15 @@ export interface WorkflowNodeOutcome {
  *   A `merge` kind would have had to carry a strategy field whose values the
  *   runner would have to implement one by one, and an unimplemented strategy in
  *   a dropdown is the failure this list exists to avoid.
+ * - **call a durable *step*** — the sibling of {@link WorkflowCallNode} that
+ *   somebody will eventually come looking for, and it cannot be built. A
+ *   durable step has no global identity: it is dispatched by a routing name
+ *   that a worker subscribes to, and within a run it is addressed by its `seq`
+ *   — a position in one workflow's history. There is no "run step X" entry
+ *   point on the engine to call, no lifecycle of its own to await, and nothing
+ *   to cancel. A workflow is the smallest thing that is addressable from
+ *   outside a run, which is why `call` names one and not a step. If a step is
+ *   what you want, the thing to call is a one-step workflow wrapping it.
  */
 export const WORKFLOW_NODE_KINDS = [
   /** Reads records out of a system. The roots of the graph. */
@@ -663,6 +673,8 @@ export const WORKFLOW_NODE_KINDS = [
   'transform',
   /** Writes into an object type and commits. Exactly one per workflow. */
   'sink',
+  /** Hands this position to an existing durable workflow. See {@link WorkflowCallNode}. */
+  'call',
 ] as const;
 
 export type WorkflowNodeKind = (typeof WORKFLOW_NODE_KINDS)[number];
@@ -759,12 +771,81 @@ export interface WorkflowSinkNode extends WorkflowNodeBase {
 }
 
 /**
+ * Hands this position in the graph to a durable workflow that already exists.
+ *
+ * The node the canvas cannot write the body of: the work happens in a workflow
+ * somebody else registered, possibly in another SDK, and this node is the wire
+ * from a graph to it. It runs as a **tracked child run** of the catalog's own
+ * durable run — `ctx.startChild` then `ctx.child` — so the child has its own
+ * lifetime, its own retries and its own history, and the catalog's run is
+ * suspended at zero compute while it goes.
+ *
+ * ## Why the version is stored and not resolved
+ *
+ * A call names {@link callName} **and** {@link callVersion}, and the pair is
+ * part of the graph fingerprint. Storing only the name would mean the person
+ * who owns that workflow can change what your load does by registering a new
+ * version — a behaviour change in your pipeline with nothing in your diff to
+ * point at. So the version is authored, and a run that would have used a
+ * different one is refused rather than silently run: see
+ * `WorkflowRunSteps.checkCall`, which is where the pin is actually enforced,
+ * and which documents exactly how strong the enforcement is.
+ *
+ * ## What crosses the boundary
+ *
+ * The same thing that crosses every other boundary here: **handles, never
+ * rows.** The child receives a {@link WorkflowCallEnvelope} — the run id, this
+ * node's id, and the {@link WorkflowStageRef}s of its inputs — and reads the
+ * rows out of the stage store itself if it wants them. A child that produces
+ * rows for the graph writes them into the stage store under *this node's* id
+ * and returns their shape, which {@link readWorkflowCallOutput} narrows.
+ *
+ * There is no shared type between a catalog node and an arbitrary durable
+ * workflow, and this model does not pretend there is. What it does instead is
+ * make the mismatch loud: the envelope is one documented shape, the accepted
+ * answers are two documented shapes, and anything else fails the node naming
+ * the workflow, the version and the child run id.
+ *
+ * ## `config` is not a credential store
+ *
+ * Named `config` rather than `input` so it travels the same path a source
+ * node's config does — sealed under `encryptCredentials`, refused in plaintext
+ * without it — because a parameter bag that reaches a worker over a queue is
+ * exactly the shape a password ends up in. Prefer naming an env var the callee
+ * already reads.
+ */
+export interface WorkflowCallNode extends WorkflowNodeBase {
+  kind: 'call';
+  /**
+   * The workflow's registered name, on the wire — the string `engine.start`
+   * takes. A class reference is unavailable by construction: the point of this
+   * node is calling something the catalog does not compile against, including a
+   * body that lives in Python.
+   */
+  callName: string;
+  /**
+   * The registered **version**, as the durable engine spells it: a string, and
+   * `'1'` for anything registered without one.
+   *
+   * Not to be confused with {@link CatalogWorkflow.version}, which counts edits
+   * to *this* graph and is a number. This one identifies somebody else's code.
+   */
+  callVersion: string;
+  /** Parameters the author typed, handed to the child under `input`. */
+  config: Record<string, unknown>;
+}
+
+/**
  * A discriminated union, so narrowing a node is `node.kind === "sink"` and
  * never a type assertion. This is why the kind list is not simply a string on
  * one node shape with every field optional: that shape lets a source node carry
  * a `transformId` and nothing catches it.
  */
-export type WorkflowNode = WorkflowSourceNode | WorkflowTransformNode | WorkflowSinkNode;
+export type WorkflowNode =
+  | WorkflowSourceNode
+  | WorkflowTransformNode
+  | WorkflowSinkNode
+  | WorkflowCallNode;
 
 /**
  * One wire.
@@ -1051,6 +1132,136 @@ export interface WorkflowNodeStepOutput {
   logs: string[];
 }
 
+/**
+ * The number in {@link WorkflowCallEnvelope.contract}.
+ *
+ * A version on the *shape the catalog sends*, separate from the version of the
+ * workflow being called, because the two change for different reasons and a
+ * callee written against one has to be able to say which. A callee that reads
+ * this and does not recognise it should refuse rather than guess — a failed
+ * child is a failed node with a name attached, and a guess is a load nobody can
+ * account for.
+ */
+export const WORKFLOW_CALL_CONTRACT = 1;
+
+/**
+ * What a {@link WorkflowCallNode} hands its child.
+ *
+ * One documented shape, and the whole of what the catalog promises a callee.
+ * Everything the catalog knows sits under `catalog`, and everything the author
+ * typed sits under `input`, so a parameter called `runId` cannot ever shadow
+ * the run id — which is the kind of collision that only shows up in production
+ * on somebody else's graph.
+ *
+ * Handles, never rows: `inputs` names the stages this node's inbound edges
+ * produced, in edge order, and the rows themselves stay in the stage store
+ * addressed by `(runId, nodeId, batch)` — one row per batch, keyed
+ * `runId#nodeId#batch`. A callee in another SDK reads them from there. Passing
+ * the rows would write the whole intermediate dataset into
+ * `durable_step_checkpoints` as the child's input, once per call and again on
+ * every replay, which is the measurement {@link WorkflowStageRef} exists for.
+ */
+export interface WorkflowCallEnvelope {
+  catalog: {
+    /** {@link WORKFLOW_CALL_CONTRACT} at the time the call was made. */
+    contract: number;
+    /** The catalog run, which is also the snapshot id and the stage key. */
+    runId: string;
+    /** The calling node. Also the id any rows for the graph must be staged under. */
+    nodeId: string;
+    workflowId: string;
+    /** The **graph's** version, not the callee's. See {@link WorkflowCallNode.callVersion}. */
+    workflowVersion: number;
+    principalId: string;
+    /** The stages this node reads, in inbound-edge order. Empty for a call with no input. */
+    inputs: WorkflowStageRef[];
+  };
+  /** {@link WorkflowCallNode.config}, verbatim. Opaque to the catalog. */
+  input: Record<string, unknown>;
+}
+
+/** What a called workflow may say it staged. Both counts, or neither. */
+export interface WorkflowCallOutput {
+  /** Batches written under `(runId, nodeId, 1..batches)`. */
+  batches: number;
+  rowCount: number;
+}
+
+/**
+ * Read a child's return value as staged rows — or as nothing, or refuse it.
+ *
+ * Three answers rather than two, because a call has two legitimate purposes and
+ * they must not be confused with a bug:
+ *
+ * - `undefined` — the child returned nothing this graph can read rows from. A
+ *   perfectly ordinary outcome for a workflow called for its effect, and the
+ *   node reports zero rows, out loud, in its logs. It is not silently treated
+ *   as success-with-data: a full sink that then receives nothing refuses to
+ *   commit an empty snapshot, which is the loud end of this path.
+ * - a {@link WorkflowCallOutput} — the child staged rows for this node.
+ * - a **throw** — the child answered with `batches`/`rowCount` that are not
+ *   usable counts. Half a contract is a bug in the callee, and reading it as
+ *   "no rows" would turn that bug into a load that quietly came out short.
+ *
+ * The catalog cannot check any of this before the graph runs; there is no
+ * schema for a workflow's output anywhere in the durable contract, and no way
+ * to reach one if there were. So the check is here, at the one moment the
+ * answer exists, and it names what it saw.
+ */
+export function readWorkflowCallOutput(value: unknown): WorkflowCallOutput | undefined {
+  if (typeof value !== 'object' || value === null) return undefined;
+  const batches = Reflect.get(value, 'batches');
+  const rowCount = Reflect.get(value, 'rowCount');
+  if (batches === undefined && rowCount === undefined) return undefined;
+  if (!isCount(batches) || !isCount(rowCount)) {
+    throw new Error(
+      `It answered with batches=${describeCount(batches)} and rowCount=${describeCount(
+        rowCount,
+      )}. A workflow that stages rows for a call node returns both as whole numbers of at least zero; returning one of them, or a value that is not a count, would leave this node to guess how much of the stage to read.`,
+    );
+  }
+  return { batches, rowCount };
+}
+
+function isCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0;
+}
+
+function describeCount(value: unknown): string {
+  return value === undefined ? 'nothing' : JSON.stringify(value);
+}
+
+/**
+ * One workflow a call node could name.
+ *
+ * Declared here with nothing producing it yet, and that is deliberate rather
+ * than premature: a picker needs a list, and **no such list exists**. The
+ * durable engine can answer `workflowBody(name, version)` for the process
+ * asking and nothing more — and a missing body is ambiguous, since it equally
+ * means a body registered in another SDK through `registerRemote` or a group
+ * resolved by convention against a live worker. Inferring the list from what
+ * one pod happens to know would produce a picker that omits exactly the
+ * cross-SDK workflows this node exists to call.
+ *
+ * So the node takes a name and a version as authored text today, and this is
+ * the shape a canvas should be handed the day a deployment can announce its
+ * registrations. One entry per **version**, never per name: a picker that
+ * listed names and resolved the version for you would undo the pin.
+ */
+export interface CallableWorkflowRef {
+  name: string;
+  version: string;
+  /** What it does, if the deployment publishes one. Shown beside the name. */
+  description?: string;
+  /**
+   * The worker group its turns are dispatched to, when it has one. The signal
+   * that says "this one's body is not in this process" — a Python workflow, or
+   * a separate TS worker — which is precisely what a caller cannot otherwise
+   * tell from a missing body.
+   */
+  group?: string;
+}
+
 /** Every way a graph can be refused. Exported so a canvas can key off the code. */
 export const WORKFLOW_ISSUE_CODES = [
   'empty',
@@ -1068,6 +1279,7 @@ export const WORKFLOW_ISSUE_CODES = [
   'unreachable',
   'dead-end',
   'transform-not-named',
+  'call-not-named',
 ] as const;
 
 export type WorkflowIssueCode = (typeof WORKFLOW_ISSUE_CODES)[number];
@@ -1125,11 +1337,11 @@ export function validateWorkflow(graph: WorkflowGraph): WorkflowValidationIssue[
   if (issues.length > 0) return issues;
 
   const { outgoing, incoming } = buildAdjacency(nodes, edges);
-  const sources = nodes.filter((node) => node.kind === 'source');
+  const originators = nodes.filter(originatesRows);
   const sinks = nodes.filter((node): node is WorkflowSinkNode => node.kind === 'sink');
 
   checkNodeWiring(nodes, incoming, outgoing, issues);
-  checkEndpoints(sources, sinks, issues);
+  checkEndpoints(originators, sinks, issues);
 
   const looped = findCycle(nodes, incoming, outgoing);
   if (looped) {
@@ -1143,9 +1355,28 @@ export function validateWorkflow(graph: WorkflowGraph): WorkflowValidationIssue[
     return issues;
   }
 
-  checkReachability(nodes, sources, sinks, incoming, outgoing, issues);
+  checkReachability(nodes, originators, sinks, incoming, outgoing, issues);
 
   return issues;
+}
+
+/**
+ * Whether a node can produce rows without anything wired into it.
+ *
+ * A source obviously can. A **call** node can too, and this is the one rule the
+ * `call` kind changes rather than extends: the workflow it hands off to may
+ * itself read from a system, so a graph of `call → sink` is a real pipeline and
+ * refusing it for having "no source" would be false. What is not weakened is
+ * that a graph still needs *something* that originates rows and *something*
+ * that commits them — a graph of transforms alone is still refused.
+ *
+ * Every call node counts, not only the ones with no inbound edge, and that is
+ * the conservative direction: it makes this the root set for reachability too,
+ * so a mid-graph call node cannot make everything downstream of it look
+ * unreachable when its own upstream is fine.
+ */
+function originatesRows(node: WorkflowNode): boolean {
+  return node.kind === 'source' || node.kind === 'call';
 }
 
 /**
@@ -1265,14 +1496,48 @@ function checkNodeWiring(
         message: `Sink "${node.name}" (${node.id}) has an outbound edge. The sink commits the snapshot, so nothing can run after it.`,
       });
     }
-    if (node.kind === 'transform' && node.transformId.length === 0) {
-      issues.push({
-        code: 'transform-not-named',
-        nodeIds: [node.id],
-        message: `Transform node "${node.name}" (${node.id}) names no transform, so there is no code for it to run.`,
-      });
-    }
+    const unconfigured = nodeIsUnconfigured(node);
+    if (unconfigured) issues.push(unconfigured);
   }
+}
+
+/**
+ * A node that names none of the thing it exists to run.
+ *
+ * The two kinds that point at something outside themselves — a transform at
+ * stored code, a call at a registered workflow — and both are reported the same
+ * way because they are the same mistake: a box on the canvas with nothing
+ * behind it, which looks finished and fails at run time.
+ */
+function nodeIsUnconfigured(node: WorkflowNode): WorkflowValidationIssue | undefined {
+  if (node.kind === 'transform' && node.transformId.length === 0) {
+    return {
+      code: 'transform-not-named',
+      nodeIds: [node.id],
+      message: `Transform node "${node.name}" (${node.id}) names no transform, so there is no code for it to run.`,
+    };
+  }
+  if (node.kind === 'call') return callIsUnnamed(node);
+  return undefined;
+}
+
+/**
+ * A call that names half of what it needs, or nothing at all.
+ *
+ * Both halves, checked separately, because the version is the one people leave
+ * blank: a call that named only a workflow would run whichever version happens
+ * to be registered on the day the load runs, which is the single thing this
+ * node is built not to do.
+ */
+function callIsUnnamed(node: WorkflowCallNode): WorkflowValidationIssue | undefined {
+  if (node.callName.length > 0 && node.callVersion.length > 0) return undefined;
+  return {
+    code: 'call-not-named',
+    nodeIds: [node.id],
+    message: `Call node "${node.name}" (${node.id}) does not name ${
+      node.callName.length === 0 ? 'a workflow to call' : 'a version of the workflow it calls'
+    }. A call pins a name and a version together — without the version it would run whichever one is registered when the load happens, and somebody else's deploy would change what this graph does.`,
+  };
 }
 
 /**
@@ -1288,16 +1553,16 @@ function checkNodeWiring(
  * leaves nothing to say which of them the readers should get.
  */
 function checkEndpoints(
-  sources: readonly WorkflowNode[],
+  originators: readonly WorkflowNode[],
   sinks: readonly WorkflowSinkNode[],
   issues: WorkflowValidationIssue[],
 ): void {
-  if (sources.length === 0) {
+  if (originators.length === 0) {
     issues.push({
       code: 'no-source',
       nodeIds: [],
       message:
-        'This workflow has no source node, so nothing would ever be read and the sink would commit an empty snapshot.',
+        'This workflow has nothing that reads: no source node, and no call node handing off to a workflow that reads. Nothing would ever be fetched and the sink would commit an empty snapshot.',
     });
   }
 
@@ -1391,17 +1656,17 @@ function peelTails(leftover: Set<string>, outgoing: ReadonlyMap<string, string[]
   return leftover;
 }
 
-/** Nodes that no source reaches, and nodes that reach no sink. */
+/** Nodes that nothing reading reaches, and nodes that reach no sink. */
 function checkReachability(
   nodes: readonly WorkflowNode[],
-  sources: readonly WorkflowNode[],
+  originators: readonly WorkflowNode[],
   sinks: readonly WorkflowSinkNode[],
   incoming: Map<string, string[]>,
   outgoing: Map<string, string[]>,
   issues: WorkflowValidationIssue[],
 ): void {
   const reachableFromSources = walk(
-    sources.map((node) => node.id),
+    originators.map((node) => node.id),
     outgoing,
   );
   const reachesASink = walk(
@@ -1410,7 +1675,7 @@ function checkReachability(
   );
 
   for (const node of nodes) {
-    if (sources.length > 0 && !reachableFromSources.has(node.id)) {
+    if (originators.length > 0 && !reachableFromSources.has(node.id)) {
       issues.push({
         code: 'unreachable',
         nodeIds: [node.id],
@@ -1548,6 +1813,22 @@ function canonicalNode(node: WorkflowNode): string {
     // changed when it did not.
     return JSON.stringify([node.id, node.kind, node.transformId]);
   }
+  if (node.kind === 'call') {
+    // The called version IS in here, and that is the opposite choice from a
+    // transform above — for the reason the two differ. A transform's version is
+    // this catalog's own record of an edit somebody made here; a call's version
+    // is a different piece of code entirely. Repointing a node from `foo@1` to
+    // `foo@2` changes what the load does as surely as rewiring it does, so it
+    // is a new version of the graph and the run that used the old one stays
+    // identifiable.
+    return JSON.stringify([
+      node.id,
+      node.kind,
+      node.callName,
+      node.callVersion,
+      sortedEntries(node.config),
+    ]);
+  }
   return JSON.stringify([node.id, node.kind, node.targetType, node.mode ?? 'full']);
 }
 
@@ -1591,6 +1872,20 @@ export function isWorkflowNode(value: unknown): value is WorkflowNode {
   }
   if (kind === 'sink') {
     return typeof Reflect.get(value, 'targetType') === 'string';
+  }
+  if (kind === 'call') {
+    // Both strings, and the config object, exactly as strictly as a source's:
+    // a stored call node missing its version is a node that would run whatever
+    // is registered today, which is the failure the pin exists to remove — and
+    // a graph that half-narrows is a load that runs nine nodes of ten.
+    const config = Reflect.get(value, 'config');
+    return (
+      typeof Reflect.get(value, 'callName') === 'string' &&
+      typeof Reflect.get(value, 'callVersion') === 'string' &&
+      typeof config === 'object' &&
+      config !== null &&
+      !Array.isArray(config)
+    );
   }
   const sourceKind = Reflect.get(value, 'sourceKind');
   const config = Reflect.get(value, 'config');

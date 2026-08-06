@@ -236,3 +236,78 @@ describe('run', () => {
     expect(engine.started[0]?.runId).toBe('wf-already-open');
   });
 });
+
+describe('a graph that calls another workflow, on a pod that cannot', () => {
+  /** The same stub, over a graph whose first node hands off to another workflow. */
+  function callingRunner() {
+    const calls: { inline: number } = { inline: 0 };
+    const graph: CatalogWorkflow = {
+      ...workflow,
+      nodes: [
+        {
+          id: 'c',
+          name: 'Reconcile',
+          kind: 'call',
+          callName: 'billing.reconcile',
+          callVersion: '2',
+          config: {},
+        },
+        { id: 'out', name: 'Sink', kind: 'sink', targetType: 'Mvr' },
+      ],
+      edges: [{ from: 'c', to: 'out' }],
+    };
+    const service: WorkflowRunnerService = Object.assign(Object.create(null), {
+      requireWorkflow: async () => graph,
+      attributionFor: async () => 'conn-1',
+      runInline: async (input: { snapshotId: string }) => {
+        calls.inline += 1;
+        return finished(input.snapshotId);
+      },
+      findRun: async (_connectorId: string, snapshotId: string) => finished(snapshotId),
+    });
+    return { service, calls };
+  }
+
+  // Refused before a run row is opened. The node would refuse it too, but by
+  // then the load looks like something that went wrong partway through rather
+  // than like a graph this pod was never able to run.
+  it('refuses the run rather than starting one that will fail at the node', async () => {
+    const { service, calls } = callingRunner();
+
+    await expect(
+      new WorkflowLauncher(service).run({ workflowId: 'wf-1', principalId: 'p-1' }),
+    ).rejects.toThrow(/durable child run/);
+
+    expect(calls.inline).toBe(0);
+  });
+
+  it('names the node and the workflow it would have called', async () => {
+    const { service } = callingRunner();
+
+    await expect(
+      new WorkflowLauncher(service).run({ workflowId: 'wf-1', principalId: 'p-1' }),
+    ).rejects.toThrow(/"Reconcile" → billing\.reconcile@2/);
+  });
+
+  it('says why this pod cannot, in the words durability() used', async () => {
+    const { service } = callingRunner();
+
+    await expect(
+      new WorkflowLauncher(service).run({ workflowId: 'wf-1', principalId: 'p-1' }),
+    ).rejects.toThrow(/No durable engine resolved in this process/);
+  });
+
+  // The refusal is about the engine, not about the shape of the graph: with one
+  // the same workflow starts normally.
+  it('starts normally on a pod that has an engine', async () => {
+    const engine = new FakeEngine();
+    const { service } = callingRunner();
+
+    await new WorkflowLauncher(service, asEngine(engine)).run({
+      workflowId: 'wf-1',
+      principalId: 'p-1',
+    });
+
+    expect(engine.started).toHaveLength(1);
+  });
+});
