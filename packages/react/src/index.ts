@@ -64,40 +64,53 @@ export {
   useTraceSource,
 } from './TraceExplorer';
 
-// Getting data in: connections, connectors and the code that reshapes what they
-// fetch. These used to live in the consuming app, which meant any other host
-// installing this package got a console with no way to manage a load.
+// Getting data in: the addresses a pipeline reads through and the code that
+// reshapes what it fetches. These used to live in the consuming app, which meant
+// any other host installing this package got a console with no way to manage a
+// load.
+//
+// There is deliberately no connector screen here any more. A connector is what a
+// published workflow runs as — nothing authors one — so authoring a pipeline is
+// `WorkflowCanvas`, on the `/workflow` subpath, and this is the two shared
+// objects it borrows.
 export {
   ConnectionPanel,
   type ConnectionPanelProps,
   connectionOptionsFor,
   describeConnection,
 } from './ConnectionPanel';
+export {
+  PipelineConsole,
+  type PipelineConsoleProps,
+} from './PipelineConsole';
 // The schema-discovery seam, whole.
 //
-// `PipelineConsoleProps['schemaDiscovery']` is a bridge the HOST implements —
-// this package cannot ask a connector for its columns, only render the answer —
-// and every one of these was reachable from that prop's type and from nowhere
-// else. So the only way to write the bridge with its signature spelled out was
-// to name it through an indexed access on a component's props, or to deep-import
-// a file inside `dist/`. Both are the caller paying for a list that fell behind.
+// `SchemaDiscoveryBridge` is a bridge a HOST may implement — this package cannot
+// ask a source for its columns, only render the answer — and every one of these
+// was once reachable only through an indexed access on a component's props, or
+// by deep-importing a file inside `dist/`. Both are the caller paying for a list
+// that fell behind.
 //
 // `initialChoices` and `proposalFrom` come with them because they are the rules
 // that decide whether a schema somebody ticked is one the publish route will
 // accept — pure and deliberately outside the panel, per their own docblocks, and
 // worth nothing there if the only way to run them is to render it.
+//
+// `SchemaDiscoveryPanel` is exported for the same reason it stopped living
+// inside a screen: the canvas mounts it from behind the `/workflow` subpath, and
+// a host assembling its own source inspector should be able to do the same.
 export {
   type ColumnChoice,
   type ConnectorSchemaDiscovery,
   type DiscoveredColumn,
   type DiscoveredTypeDraft,
   initialChoices,
-  PipelineConsole,
-  type PipelineConsoleProps,
+  narrowDiscovery,
   proposalFrom,
   type SchemaDiscoveryBridge,
+  SchemaDiscoveryPanel,
   type SchemaDrift,
-} from './PipelineConsole';
+} from './schema-discovery';
 export { TransformEditor, type TransformEditorProps } from './TransformEditor';
 
 // Why one load came out different from the last one.
@@ -210,7 +223,10 @@ export {
   type CatalogProviderProps,
   type CatalogTransport,
   type ConnectionInput,
-  type ConnectorInput,
+  // What `connectionWorkflows` answers with: the pipelines that would break if a
+  // connection went. `ConnectorInput` used to sit here and is gone with the
+  // routes that took one — see the note where it was declared.
+  type ConnectionUse,
   catalogQueryKeys,
   // The load-expectation shapes. Mirrored from the pipeline package for the
   // reason `PipelineCapabilities` is — see their docblocks in context.tsx —
@@ -225,7 +241,15 @@ export {
   type PersonInput,
   type PersonUpsertResult,
   type PipelineCapabilities,
+  // What a stored schedule came back as, and what a manual run may say about
+  // itself — including the acknowledgement that lets a deliberately collapsing
+  // load past the row-count bound. Named here because they are arguments and
+  // answers of `CatalogClient`, and a host driving it directly cannot type
+  // either otherwise.
+  type ScheduledWorkflow,
   type TransformInput,
+  type WorkflowRunOptions,
+  type WorkflowScheduleInput,
   useCatalogClient,
 } from './context';
 

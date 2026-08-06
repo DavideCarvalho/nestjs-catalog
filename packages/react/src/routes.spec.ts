@@ -53,10 +53,8 @@ describe('pipelineRoutes', () => {
       connections: routes.connections(),
       connection: routes.connection('c1'),
       checkConnection: routes.checkConnection('c1'),
-      connectionConnectors: routes.connectionConnectors('c1'),
+      connectionWorkflows: routes.connectionWorkflows('c1'),
       connectors: routes.connectors(),
-      connector: routes.connector('k1'),
-      runConnector: routes.runConnector('k1'),
       runs: routes.runs(),
       transforms: routes.transforms(),
       transform: routes.transform('t1'),
@@ -64,7 +62,11 @@ describe('pipelineRoutes', () => {
       tryTransform: routes.tryTransform(),
       workflows: routes.workflows(),
       workflow: routes.workflow('w1'),
+      publishWorkflow: routes.publishWorkflow('w1'),
+      unpublishWorkflow: routes.unpublishWorkflow('w1'),
       runWorkflow: routes.runWorkflow('w1'),
+      workflowSchedule: routes.workflowSchedule('w1'),
+      discoverSourceSchema: routes.discoverSourceSchema('w1', 'src_1'),
       loadExpectations: routes.loadExpectations(),
       loadExpectation: routes.loadExpectation('Mvr'),
     }).toEqual({
@@ -72,10 +74,8 @@ describe('pipelineRoutes', () => {
       connections: '/api/pipeline/connections',
       connection: '/api/pipeline/connections/c1',
       checkConnection: '/api/pipeline/connections/c1/check',
-      connectionConnectors: '/api/pipeline/connections/c1/connectors',
+      connectionWorkflows: '/api/pipeline/connections/c1/workflows',
       connectors: '/api/pipeline/connectors',
-      connector: '/api/pipeline/connectors/k1',
-      runConnector: '/api/pipeline/connectors/k1/run',
       runs: '/api/pipeline/runs',
       transforms: '/api/pipeline/transforms',
       transform: '/api/pipeline/transforms/t1',
@@ -83,10 +83,37 @@ describe('pipelineRoutes', () => {
       tryTransform: '/api/pipeline/transforms/try',
       workflows: '/api/pipeline/workflows',
       workflow: '/api/pipeline/workflows/w1',
+      publishWorkflow: '/api/pipeline/workflows/w1/publish',
+      unpublishWorkflow: '/api/pipeline/workflows/w1/unpublish',
       runWorkflow: '/api/pipeline/workflows/w1/run',
+      workflowSchedule: '/api/pipeline/workflows/w1/schedule',
+      discoverSourceSchema: '/api/pipeline/workflows/w1/nodes/src_1/discover',
       loadExpectations: '/api/pipeline/expectations',
       loadExpectation: '/api/pipeline/expectations/Mvr',
     });
+  });
+
+  it('has no builder for a connector route that was removed', () => {
+    // The four that went with `POST connectors`, `DELETE connectors/:id`,
+    // `POST connectors/:id/run` and `POST connectors/:id/discover`. A builder left behind is a
+    // path a screen can still ask for, and asking for it is a 404 that reads as an empty list —
+    // which is exactly the failure this file's header describes. `connectors()` stays: the GET is
+    // still served, and is where a run history and a watermark are keyed.
+    //
+    // Read through an index signature rather than off the interface, because the interface no
+    // longer declares them and naming one directly would not compile — which is the point, and
+    // is also why that alone is not enough: an implementation may still carry a key its type has
+    // stopped mentioning.
+    const routes: Record<string, unknown> = { ...pipelineRoutes() };
+
+    for (const gone of [
+      'connector',
+      'runConnector',
+      'discoverConnectorSchema',
+      'connectionConnectors',
+    ]) {
+      expect(routes[gone]).toBeUndefined();
+    }
   });
 
   it('hands back exactly what the catalog client builds for the expectation paths', () => {

@@ -63,6 +63,7 @@ const BARREL = read('index.ts');
  */
 const SEAMS: Array<[specifier: string, file: string]> = [
   ['./PipelineConsole', 'PipelineConsole.tsx'],
+  ['./schema-discovery', 'schema-discovery.tsx'],
   ['./context', 'context.tsx'],
   ['./routes', 'routes.ts'],
   ['./workflow/model', 'workflow/model.ts'],
@@ -116,9 +117,15 @@ describe('the React package barrel', () => {
 
   it('carries the schema-discovery bridge by name, not only through a props lookup', () => {
     // Spelled out as well as covered by the sweep above, because this is the list a host writes
-    // down to implement `PipelineConsoleProps['schemaDiscovery']`, and it is the list that fell
-    // behind. A rename should fail here rather than in somebody else's build.
-    const exported = reExportedFrom('./PipelineConsole');
+    // down to implement `SchemaDiscoveryBridge`, and it is the list that fell behind. A rename
+    // should fail here rather than in somebody else's build.
+    //
+    // It moved out of `PipelineConsole` when the connector stopped being an authored object:
+    // discovery is per source node now, and the canvas — which is behind its own entry point,
+    // because it imports React Flow — has to be able to mount the panel. So the module the barrel
+    // must re-export these from moved with it, and this test moving is the point rather than
+    // collateral.
+    const exported = reExportedFrom('./schema-discovery');
 
     for (const name of [
       'SchemaDiscoveryBridge',

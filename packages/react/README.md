@@ -44,13 +44,14 @@ Requires a `QueryClientProvider` from `@tanstack/react-query` above it.
   snapshots, saved queries, and cards built from them.
 - **`<GovernanceTimeline />`**, **`<TraceExplorer />`** — what happened, flat and
   grouped into causal stories.
-- **`<PipelineConsole />`** — connections, connectors and transforms on one
-  screen, including a **Test connection** button that reports what actually
-  answered: a server version, a bucket and whether anything sits under the
-  prefix, an HTTP status.
-- **`<WorkflowCanvas />`** — a drag-and-drop canvas for wiring transforms to
-  each other. On its own subpath (see [Workflows](#workflows)) because it needs
-  an optional peer.
+- **`<PipelineConsole />`** — the two things a workflow borrows: connections and
+  transforms. Includes a **Test connection** button that reports what actually
+  answered — a server version, a bucket and whether anything sits under the
+  prefix, an HTTP status. It is deliberately **not** where a pipeline is
+  authored; there is no connector screen, because nothing authors a connector.
+- **`<WorkflowCanvas />`** — the one place a workflow is authored: sources wired
+  through transforms into sinks, published, scheduled and run. On its own subpath
+  (see [Workflows](#workflows)) because it needs an optional peer.
 - **`<AccessConsole />`** — which applications may touch what, and which people
   sign in through them.
 - **`<CoverageLedger />`**, **`<EditableField />`**, and the vendored primitives
@@ -120,13 +121,36 @@ as the theme the app is actually in.
 
 ### What it asks of the server
 
-Three routes on top of the pipeline base path, listed by `pipelineRoutes()`:
+These routes on top of the pipeline base path, listed by `pipelineRoutes()`:
 
 | Route | Purpose |
 | --- | --- |
 | `GET/POST {base}/workflows` | list; create or update |
-| `DELETE {base}/workflows/:id` | delete |
-| `POST {base}/workflows/:id/run` | execute |
+| `DELETE {base}/workflows/:id` | delete, taking the connector and its history with it |
+| `POST {base}/workflows/:id/publish` | declare it finished, and mint the connector it runs as |
+| `POST {base}/workflows/:id/unpublish` | back to draft; the connector is disabled and keeps its id |
+| `POST {base}/workflows/:id/run` | execute, optionally carrying `expectShrink` |
+| `PUT {base}/workflows/:id/schedule` | set the cron and whether it runs at all |
+| `POST {base}/workflows/:id/nodes/:nodeId/discover` | ask one source what its columns are |
+
+**A connector is not one of them.** It is what a published graph runs as: minted
+by `publish`, disabled by `unpublish`, removed with the graph, and there is no
+route that creates one. `GET {base}/connectors` stays as a read, because that id
+is what the run history and the incremental watermark are keyed on, and the
+canvas shows it under "Runs as".
+
+**`discover` answers on a draft, deliberately.** A sink cannot commit into an
+object type that does not exist, so requiring a published graph would require
+publishing a graph whose target type cannot be created until it is published.
+What it does need is a graph that has been *saved* — it reads the stored node.
+
+**`expectShrink` on `run` is the escape hatch for a load the row-count bound
+refused**, and this is the only route that accepts it. It is a reason rather than
+a flag: the sentence is written into the snapshot's `_expectShrink` label, an
+empty one is refused with a 400, and it stands the bound down for that snapshot
+alone. The alternative an operator reaches for without it is raising
+`rowCount.maxShrink` in the type's policy, which stands the guard down for every
+future load of that type.
 
 …plus one optional field on `GET {base}/capabilities`:
 
@@ -165,9 +189,11 @@ What the server checks that the canvas cannot:
   as they commit different types — and a refusal names each type it turned
   down. The same check runs again on `POST /workflows/:id/run`, because a graph
   saved by somebody who held the grant can be run by somebody who does not, and
-  the run is what actually commits. `POST /connectors` and
-  `POST /connectors/:id/run` are checked the same way, against the connector's
-  own target type *and* the sinks of any workflow it is attached to.
+  the run is what actually commits. `POST /workflows/:id/publish`,
+  `PUT /workflows/:id/schedule` and `POST /workflows/:id/nodes/:nodeId/discover`
+  are checked the same way — discovery included, because without it a principal
+  with `catalog:write` and no grants could press it against somebody else's graph
+  and read back the column names of a database they were never allowed near.
 
 These routes now require a principal: they read grants, not just a name to
 attribute the write to, so a deployment that mounts the pipeline without a

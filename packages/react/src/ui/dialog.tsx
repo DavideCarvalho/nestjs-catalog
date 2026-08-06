@@ -24,6 +24,17 @@ export function ConfirmDialog({
   confirmLabel,
   onConfirm,
   pending,
+  /**
+   * Held back for a reason that is not "a request is in flight".
+   *
+   * Separate from `pending` because the two look different and mean different
+   * things: `pending` spins, and this simply does not act. A dialog whose
+   * description contains a field the action needs — the acknowledgement a
+   * shrinking load has to carry a reason for — would otherwise have to fake it
+   * by passing `pending`, which puts a spinner beside an empty box and implies
+   * something is happening.
+   */
+  confirmDisabled,
   error,
   /** Set for anything unrecoverable. Colours the action, and nothing else. */
   destructive = true,
@@ -35,6 +46,7 @@ export function ConfirmDialog({
   confirmLabel: string;
   onConfirm: () => void;
   pending?: boolean;
+  confirmDisabled?: boolean;
   error?: ReactNode;
   destructive?: boolean;
 }) {
@@ -84,7 +96,7 @@ export function ConfirmDialog({
             <button
               type="button"
               onClick={onConfirm}
-              disabled={pending}
+              disabled={pending || confirmDisabled}
               className={cn(
                 'flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs text-white disabled:opacity-40',
                 destructive
