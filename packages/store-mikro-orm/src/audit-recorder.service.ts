@@ -142,6 +142,50 @@ export { CATALOG_LIB };
  */
 const CLOCK_RESOLUTION_MS = 1;
 
+// -----------------------------------------------------------------------------
+// Retention, and why there still is none.
+//
+// Nothing prunes `catalog_audit_event`, and this change does not add anything
+// that does. Written down here because the read path is where the consequence
+// shows up, and because the shape of the answer is a decision for whoever runs
+// a deployment rather than something a library should quietly take.
+//
+// ## Why a `LIMIT` is not the fix
+//
+// The obvious move — cap the window this query looks at — makes the screen lie.
+// A page that silently truncates reads as "this is everything", and this is the
+// governance surface: the whole reason the trail exists is to answer "who
+// changed this, and when" about a month nobody is thinking about today. A
+// screen that shows six weeks and says nothing about the year behind it is
+// worse than a slow one, because a slow screen is obviously slow.
+//
+// So the paging above is bounded but the *history* is not: `total` is the real
+// number of matching traces, `offset` reaches all of it, and a caller that
+// wants a window asks for one with `since`.
+//
+// ## The shape retention should take
+//
+// Three tables grow without bound and they do not deserve the same policy:
+//
+// - `catalog_audit_event` — the trail. Prune by **age**, and only ever
+//   whole traces: deleting the middle of a load leaves a story with pages torn
+//   out that still renders as whole, which is the exact failure the scope CTEs
+//   exist to prevent. So the unit is a `snapshot_id` whose *last* event is
+//   older than the window, plus the unlinked events older than it.
+// - `catalog_connector_run` — the run log. Prune by **count per connector**,
+//   not by age: "the last 200 runs of this connector" stays useful on a
+//   connector that runs monthly, where an age window empties it.
+// - `catalog_snapshot` — **not on a timer at all.** A snapshot row names data
+//   a type may still be serving; `pruneSnapshots(type, keep)` in the ClickHouse
+//   store already argues this, and dropping one by age is how a published type
+//   comes to point at nothing.
+//
+// Whatever runs it should be the host's, not this library's, and it should log
+// what it removed. A deployment that discovers its audit trail is shorter than
+// it thought, from a job it did not know was running, has lost the thing the
+// trail was for.
+// -----------------------------------------------------------------------------
+
 const DEFAULT_TRACE_LIMIT = 25;
 const MAX_TRACE_LIMIT = 200;
 /** Enough to show that unlinked events exist without paging a second list. */
@@ -166,6 +210,68 @@ const PHASE_CASE = `CASE e.event ${Object.entries(CATALOG_EVENT_PHASE)
  * whole table to render one page, and gets slower in exact proportion to how
  * long the deployment has been keeping records, which is to say it works
  * perfectly until the first time anyone needs it.
+ *
+ * ## What a page costs
+ *
+ * Stated per request, because this screen sits inside somebody else's
+ * application and a catalog that stalls the pool it borrows is a catalog that
+ * gets removed.
+ *
+ * Without an outcome filter — which is what the explorer asks on load — a page
+ * costs **one index-only pass to choose the page, then work proportional to the
+ * page**: a `GROUP BY snapshot_id` over
+ * `(snapshot_id, occurred_at)` alone, which MySQL answers as a covering skip
+ * scan and never touches a row for, followed by aggregation and a span join
+ * over the ≤ {@link MAX_TRACE_LIMIT} traces that survived. The `detail` column —
+ * the widest one in the table, and the only one that has to be parsed — is read
+ * for the page's spans and for nothing else.
+ *
+ * With an outcome filter it costs **a pass over every matching trace**, and
+ * that is not a shortcoming of the statement. An outcome is `CASE ... END` over
+ * `JSON_EXTRACT(detail, '$.status')` and a count of open connector frames; no
+ * index can answer "which traces failed" while the answer lives inside a JSON
+ * document, so the filter cannot be applied before the grading it is derived
+ * from. `since` is what bounds it — the conditions reach `(occurred_at)`, and
+ * the pass is over the window rather than over the table. Telescope's panels
+ * all pass one (`catalog-trace-providers.ts`); the explorer's outcome chips
+ * (`TraceExplorer.tsx`) do not, so clicking one is still the expensive read on
+ * this screen and is the next thing worth fixing here.
+ *
+ * ## Why it is not simply "add an index"
+ *
+ * It was not an index. The four this table carries are the right four, and
+ * before this the trace query could not use any of them: every filter was
+ * written against a `scoped` CTE — the whole linked half of the table, `detail`
+ * included, spooled into a temporary table — rather than against
+ * `catalog_audit_event`, so the optimiser had nothing indexed left to reason
+ * about. `EXPLAIN ANALYZE` on a 187k-row table showed it read three times and
+ * sorted once to return 144 span rows. Reading the base table in every CTE is
+ * what lets the existing indexes do their job, and is why this change adds no
+ * DDL: an `@Index` added here would never reach an already-booted database
+ * anyway, because the schema fingerprint in `schema.ts` is built from column
+ * names, types and nullability and does not move when an index does.
+ *
+ * ## One thing a deployment should run
+ *
+ * No DDL, but `ANALYZE TABLE catalog_audit_event` once, if this table was
+ * loaded in bulk — a restored dump, a backfill — rather than grown a row at a
+ * time.
+ *
+ * Choosing the page is unaffected either way; it is a covering skip scan and
+ * needs no statistics. The two span joins are what turn on them. With current
+ * statistics MySQL looks each trace's spans up on `(snapshot_id, occurred_at)`,
+ * 50 lookups for a 50-trace page. With statistics it has never gathered it
+ * prices a full scan of the table at a cost of `0.102`, hash-joins instead, and
+ * reads every row twice — measured on a 173k-row table, 138ms against 415ms for
+ * the identical statement. A trail that grew normally gets this from
+ * `innodb_stats_auto_recalc` and needs nothing; a trail that was restored has
+ * never been sampled and will not be until it changes by 10%.
+ *
+ * ## And it still cannot be fast forever
+ *
+ * See the retention note near the top of this section. Nothing prunes this
+ * table, so the outcome path grows without bound even though the default path
+ * no longer does.
  */
 @Injectable()
 export class MySqlCatalogTraceStore implements CatalogTraceStore {
@@ -180,23 +286,36 @@ export class MySqlCatalogTraceStore implements CatalogTraceStore {
   async listTraces(query: TraceQuery): Promise<CatalogTraceList> {
     const limit = clamp(query.limit ?? DEFAULT_TRACE_LIMIT, 1, MAX_TRACE_LIMIT);
     const offset = Math.max(Math.floor(Number(query.offset) || 0), 0);
+    const graded = gradesBeforePaging(query);
 
-    const [rows, unlinked] = await Promise.all([
+    const [rows, unlinked, counted] = await Promise.all([
       this.fetchSpanRows(query, limit, offset),
       // Bounded by its own constant rather than by the caller's `limit`, which
       // belongs to the traces. This copy exists to show that changes happened
       // alongside the loads; a caller that wants to page them asks
       // `listUnlinked` and says how many it wants.
       this.fetchUnlinked(query, UNLINKED_LIMIT),
+      // Only when the page was chosen before grading. The other statement
+      // already carries a truthful total on every row, and a second count
+      // would be a second pass over the same traces to learn what it just
+      // computed.
+      graded ? undefined : this.countTraces(query),
     ]);
 
     const traces = assembleTraces(rows);
     return {
       traces,
-      // `COUNT(*) OVER ()` is evaluated before the LIMIT, so it is the real
-      // number of matching traces. It only reaches us on a row, though: an
-      // empty page carries no total, and zero is the only truthful answer then.
-      total: rows.length > 0 ? toNumber(rows[0].total) : 0,
+      // Two truthful answers, from whichever statement was in a position to
+      // give one.
+      //
+      // When grading came first, `COUNT(*) OVER ()` is evaluated before the
+      // LIMIT, so it is the real number of matching traces — but it only
+      // reaches us on a row, so an empty page carries no total and zero is all
+      // that can be claimed. When paging came first the count is its own
+      // statement over the same filter, which is strictly better: a page past
+      // the end of the list now still reports how many traces there are,
+      // instead of answering an out-of-range offset with "there are none".
+      total: graded ? (rows.length > 0 ? toNumber(rows[0].total) : 0) : (counted ?? 0),
       limit,
       offset,
       unlinked: unlinked.map(toAuditEvent),
@@ -215,49 +334,105 @@ export class MySqlCatalogTraceStore implements CatalogTraceStore {
   }
 
   /**
-   * One round trip: group into traces, page them, then join every span of the
-   * traces that survived paging back on.
+   * One round trip: name the traces on this page, grade them, then join every
+   * span of the ones that survived back on.
    *
    * The join deliberately re-reads all spans of a matched trace and not just
    * the ones the filter hit. A trace shown with only its `failed` events would
    * be a story with the middle torn out that still rendered as whole, which is
    * the failure mode this whole screen exists to prevent.
+   *
+   * `STRAIGHT_JOIN`, and that is not decoration. Left to choose, MySQL builds a
+   * hash join with `catalog_audit_event` as the build side and scans the whole
+   * table to find the spans of at most {@link MAX_TRACE_LIMIT} traces — it does
+   * this even having just estimated the page at nothing, so the hint is not
+   * making up for a missing statistic. Naming the order forces the only sane
+   * plan: walk the page, and look each trace's spans up on
+   * `(snapshot_id, occurred_at)`. Measured on 622k rows it is the difference
+   * between 1452ms and 949ms, and the gap widens with the table because the bad
+   * plan is the one that grows with it.
+   *
+   * The db spec asserts the plan rather than the timing, so this stays honest:
+   * dropping the hint puts `Table scan on e` back and fails there.
    */
   private fetchSpanRows(
     query: TraceQuery & { traceId?: string },
     limit: number,
     offset: number,
   ): Promise<SpanRow[]> {
-    const { conditions, params } = spanConditions(query);
-    const outcome = outcomeClause(query);
+    const graded = gradesBeforePaging(query);
 
     // `limit` and `offset` are interpolated, not bound: both have already been
     // clamped to integers by the caller above, and every driver in this stack
     // treats a bound LIMIT differently enough to be worth not relying on.
+    const page = graded
+      ? (() => {
+          // Grading has to happen first, so the LIMIT lands after it and
+          // `COUNT(*) OVER ()` can say how many traces matched.
+          const scope = matchedScope(query);
+          const outcome = outcomeClause(query);
+          return {
+            sql: `${gradedTraces(scope.sql)},
+              page AS (
+                SELECT g.*, COUNT(*) OVER () AS total
+                FROM graded g
+                WHERE ${outcome.sql}
+                ORDER BY g.started_at DESC, g.snapshot_id DESC
+                LIMIT ${limit} OFFSET ${offset}
+              )`,
+            params: [...scope.params, ...outcome.params],
+          };
+        })()
+      : (() => {
+          // Nothing here needs a grade, so the LIMIT lands before the grading
+          // and everything after it is bounded by the page.
+          const scope = pagedScope(query, limit, offset);
+          return {
+            sql: `${gradedTraces(scope.sql)},
+              page AS (SELECT g.* FROM graded g)`,
+            params: scope.params,
+          };
+        })();
+
     const sql = `
-      ${gradedTraces(conditions)},
-      page AS (
-        SELECT g.*, COUNT(*) OVER () AS total
-        FROM graded g
-        WHERE ${outcome.sql}
-        ORDER BY g.started_at DESC, g.snapshot_id DESC
-        LIMIT ${limit} OFFSET ${offset}
-      )
+      ${page.sql}
       SELECT
         p.snapshot_id, p.started_at, p.last_at, p.event_count, p.type_name,
         p.principal_id, p.connector_id, p.connector_name, p.rows_committed,
-        p.failures, p.outcome, p.total,
-        s.id AS span_id, s.event AS span_event, s.type_name AS span_type_name,
-        s.principal_id AS span_principal_id, s.detail AS span_detail,
-        s.occurred_at AS span_at
+        p.failures, p.outcome, ${graded ? 'p.total,' : ''}
+        e.id AS span_id, e.event AS span_event, e.type_name AS span_type_name,
+        e.principal_id AS span_principal_id, e.detail AS span_detail,
+        e.occurred_at AS span_at
       FROM page p
-      JOIN scoped s ON s.snapshot_id = p.snapshot_id
+      STRAIGHT_JOIN catalog_audit_event e ON e.snapshot_id = p.snapshot_id
       ORDER BY
         p.started_at DESC, p.snapshot_id DESC,
-        s.occurred_at ASC, s.phase ASC, s.id ASC
+        e.occurred_at ASC, ${PHASE_CASE} ASC, e.id ASC
     `;
 
-    return this.em.getConnection().execute<SpanRow[]>(sql, [...params, ...outcome.params]);
+    return this.em.getConnection().execute<SpanRow[]>(sql, page.params);
+  }
+
+  /**
+   * How many traces the filter matches, when the page did not have to be
+   * graded to be chosen.
+   *
+   * `COUNT(DISTINCT snapshot_id)` over the filter directly, which is the same
+   * set {@link matchedScope} would have named and is answered from
+   * `(snapshot_id, occurred_at)` without reading a row. The conditions apply to
+   * spans and a trace counts once if any of its spans match — the same rule
+   * {@link spanConditions} describes, and the reason this is a `DISTINCT` count
+   * rather than a count of rows.
+   */
+  private async countTraces(query: TraceQuery & { traceId?: string }): Promise<number> {
+    const { conditions, params } = spanConditions(query, 'e');
+    const rows = await this.em.getConnection().execute<Array<{ total: unknown }>>(
+      `SELECT COUNT(DISTINCT e.snapshot_id) AS total
+         FROM catalog_audit_event e
+        WHERE e.snapshot_id IS NOT NULL${conditions.map((each) => ` AND ${each}`).join('')}`,
+      params,
+    );
+    return toNumber(rows[0]?.total);
   }
 
   /**
@@ -273,19 +448,25 @@ export class MySqlCatalogTraceStore implements CatalogTraceStore {
    * for a trace that never committed and `SUM` skips NULLs, so a load that moved
    * no data contributes no term — the same distinction
    * {@link CatalogTrace.rowsCommitted} makes by being absent rather than zero.
+   *
+   * Grades every matching trace and always will: both numbers it returns are
+   * over the whole matched set rather than over a page, so there is no page to
+   * bound the work with. It costs what the outcome-filtered branch of
+   * {@link listTraces} costs, for the same reason — see that class docblock,
+   * and pass `since`.
    */
   async traceTotals(query: TraceQuery): Promise<CatalogTraceTotals> {
-    const { conditions, params } = spanConditions(query);
+    const scope = matchedScope(query);
     const outcome = outcomeClause(query);
 
     const rows = await this.em
       .getConnection()
       .execute<Array<{ traces: unknown; rows_committed: unknown }>>(
-        `${gradedTraces(conditions)}
+        `${gradedTraces(scope.sql)}
        SELECT COUNT(*) AS traces, COALESCE(SUM(g.rows_committed), 0) AS rows_committed
          FROM graded g
         WHERE ${outcome.sql}`,
-        [...params, ...outcome.params],
+        [...scope.params, ...outcome.params],
       );
 
     const row = rows[0];
@@ -368,53 +549,156 @@ export class MySqlCatalogTraceStore implements CatalogTraceStore {
 }
 
 /**
+ * Whether the traces have to be graded before the page can be chosen.
+ *
+ * Exactly when the caller filtered by outcome, and the whole shape of the
+ * statement turns on it. An outcome is not stored — it is derived from
+ * `JSON_EXTRACT(detail, '$.status')` and from counting open connector frames —
+ * so "the newest 50 failed traces" cannot be known until every candidate has
+ * been graded. Nothing else the filter can ask has that property: a type, a
+ * principal, an event name and a time are all columns, and a page selected on
+ * them is a page selected from an index.
+ */
+function gradesBeforePaging(query: TraceQuery): boolean {
+  return traceOutcomeFilter(query.outcome) !== undefined;
+}
+
+/**
+ * What the page is: the ids of at most `limit` traces, chosen without grading
+ * any of them.
+ *
+ * This is the change that made the screen usable. Ordering is by
+ * `MIN(occurred_at)` per snapshot id — the identical key `graded.started_at`
+ * carries, so the page this picks is the page the tail displays and page two
+ * cannot repeat or skip a trace — and that key is the *leading pair* of
+ * `(snapshot_id, occurred_at)`. MySQL answers it as a covering skip scan: no
+ * row is read, no `detail` is parsed, and nothing is grouped a second time.
+ * Everything downstream then joins against at most {@link MAX_TRACE_LIMIT} ids.
+ *
+ * The `IN` is present only when the caller filtered, and the reason it is a
+ * semijoin rather than a `WHERE` on this aggregate is the thing that would
+ * otherwise be subtly wrong. The conditions select *spans*; the ordering key is
+ * `MIN` over the *whole* trace. Filtering the rows this aggregate sees would
+ * order by the earliest **matching** span instead — so `?event=connector.run.finished`
+ * would page by when each load finished while displaying when it started, and
+ * the two orders disagree exactly often enough to lose traces between pages.
+ */
+function pagedScope(
+  query: TraceQuery & { traceId?: string },
+  limit: number,
+  offset: number,
+): Scope {
+  // Under `f`, because these conditions go inside a subquery that reads the
+  // same table a second time. Asked for rather than rewritten out of the `e`
+  // form: search-and-replacing an alias across generated SQL is the kind of
+  // thing that works until a condition mentions a literal containing `e.`.
+  const { conditions, params } = spanConditions(query, 'f');
+  const narrow =
+    conditions.length > 0
+      ? `AND e.snapshot_id IN (
+             SELECT DISTINCT f.snapshot_id
+               FROM catalog_audit_event f
+              WHERE f.snapshot_id IS NOT NULL
+                AND ${conditions.join(' AND ')}
+           )`
+      : '';
+
+  return {
+    sql: `
+      scope AS (
+        SELECT e.snapshot_id, MIN(e.occurred_at) AS ordered_at
+        FROM catalog_audit_event e
+        WHERE e.snapshot_id IS NOT NULL
+        ${narrow}
+        GROUP BY e.snapshot_id
+        ORDER BY ordered_at DESC, e.snapshot_id DESC
+        LIMIT ${limit} OFFSET ${offset}
+      )`,
+    params,
+  };
+}
+
+/** A CTE naming which traces to grade, and what it binds. */
+interface Scope {
+  /** `undefined` for "every trace there is" — see {@link gradedTraces}. */
+  sql: string | undefined;
+  params: unknown[];
+}
+
+/**
+ * What the page is drawn from when an outcome was asked for: every trace with a
+ * matching span, unbounded, because none of them can be excluded before it has
+ * been graded.
+ *
+ * Reads `catalog_audit_event` rather than a CTE over it, which is the whole
+ * difference from what this used to do. The conditions land on the base table,
+ * so `type_name`, `principal_id` and `occurred_at` reach their indexes and a
+ * `since` window costs a range scan instead of a table scan.
+ *
+ * Absent entirely when there are no conditions, which is the case an outcome
+ * filter on its own produces — an outcome is not a span condition. The join it
+ * would produce is the identity, since every trace matches, so what it buys is
+ * a `DISTINCT` pass over the whole index and a join that excludes nothing.
+ * `gradedTraces` drops the join rather than writing it out as `1 = 1` in CTE
+ * form, because a join MySQL still has to execute is not free for being
+ * pointless.
+ */
+function matchedScope(query: TraceQuery & { traceId?: string }): Scope {
+  const { conditions, params } = spanConditions(query, 'e');
+  if (conditions.length === 0) return { sql: undefined, params: [] };
+  return {
+    sql: `
+      scope AS (
+        SELECT DISTINCT e.snapshot_id
+        FROM catalog_audit_event e
+        WHERE e.snapshot_id IS NOT NULL
+          AND ${conditions.join(' AND ')}
+      )`,
+    params,
+  };
+}
+
+/**
  * The grouping and grading half of the trace query, shared by everything that
  * needs it.
  *
  * A string builder rather than a view or a stored routine because it closes
  * over the caller's filter, and because the alternative — each entry point
- * writing its own copy of these four CTEs — is how a page and the total printed
+ * writing its own copy of these CTEs — is how a page and the total printed
  * above it come to be computed by two statements that agree until they do not.
+ *
+ * `scope` names which traces to aggregate — {@link pagedScope} for a page
+ * chosen up front, {@link matchedScope} for everything the filter matched — or
+ * is `undefined` for "every trace there is", in which case the join is dropped
+ * rather than written as an identity.
  *
  * Ends with the `graded` CTE and no trailing `SELECT`, so a caller appends
  * either another CTE or its own tail. Every parameter it takes comes from
  * {@link spanConditions}, in that order.
  */
-function gradedTraces(conditions: string[]): string {
+function gradedTraces(scope: string | undefined): string {
   return `
-      WITH scoped AS (
-        SELECT
-          e.id, e.snapshot_id, e.event, e.type_name, e.principal_id,
-          e.detail, e.occurred_at,
-          ${PHASE_CASE} AS phase
-        FROM catalog_audit_event e
-        WHERE e.snapshot_id IS NOT NULL
-      ),
-      matched AS (
-        SELECT DISTINCT s.snapshot_id
-        FROM scoped s
-        ${conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''}
-      ),
+      WITH ${scope === undefined ? '' : `${scope.trim()},`}
       summary AS (
         SELECT
-          s.snapshot_id,
-          MIN(s.occurred_at) AS started_at,
-          MAX(s.occurred_at) AS last_at,
+          e.snapshot_id,
+          MIN(e.occurred_at) AS started_at,
+          MAX(e.occurred_at) AS last_at,
           COUNT(*) AS event_count,
-          MAX(s.type_name) AS type_name,
-          MAX(s.principal_id) AS principal_id,
-          MAX(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.connectorId'))) AS connector_id,
-          MAX(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.connectorName'))) AS connector_name,
-          MAX(CASE WHEN s.event = 'snapshot.committed'
-                   THEN CAST(JSON_EXTRACT(s.detail, '$.rowCount') AS UNSIGNED)
+          MAX(e.type_name) AS type_name,
+          MAX(e.principal_id) AS principal_id,
+          MAX(JSON_UNQUOTE(JSON_EXTRACT(e.detail, '$.connectorId'))) AS connector_id,
+          MAX(JSON_UNQUOTE(JSON_EXTRACT(e.detail, '$.connectorName'))) AS connector_name,
+          MAX(CASE WHEN e.event = 'snapshot.committed'
+                   THEN CAST(JSON_EXTRACT(e.detail, '$.rowCount') AS UNSIGNED)
               END) AS rows_committed,
-          SUM(s.event = 'connector.run.started') AS starts,
-          SUM(s.event = 'connector.run.finished') AS finishes,
+          SUM(e.event = 'connector.run.started') AS starts,
+          SUM(e.event = 'connector.run.finished') AS finishes,
           -- COALESCE before the comparison, because a payload without a status
           -- makes the whole OR null, SUM of nulls is null, and a null failure
           -- count reads downstream as zero failures.
-          SUM(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.status')), '') = 'failed'
-              OR JSON_EXTRACT(s.detail, '$.error') IS NOT NULL) AS failures,
+          SUM(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(e.detail, '$.status')), '') = 'failed'
+              OR JSON_EXTRACT(e.detail, '$.error') IS NOT NULL) AS failures,
           -- The last terminal marker, as one character per terminal event in
           -- lifecycle order. GROUP_CONCAT skips the nulls, so this string holds
           -- only the events that could end a trace, and RIGHT() takes the one
@@ -423,9 +707,9 @@ function gradedTraces(conditions: string[]): string {
           -- would be needed to truncate it, and the alternative — a correlated
           -- subquery per group — is a second scan of an unindexed column.
           RIGHT(GROUP_CONCAT(
-            CASE s.event
+            CASE e.event
               WHEN 'connector.run.finished' THEN
-                CASE COALESCE(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.status')), '')
+                CASE COALESCE(JSON_UNQUOTE(JSON_EXTRACT(e.detail, '$.status')), '')
                   WHEN 'failed' THEN 'F'
                   WHEN 'succeeded' THEN 'S'
                   -- A finish with no status at all is not a success. Guessing
@@ -437,11 +721,15 @@ function gradedTraces(conditions: string[]): string {
               WHEN 'snapshot.committed' THEN 'C'
               WHEN 'snapshot.dropped' THEN 'D'
             END
-            ORDER BY s.occurred_at, s.phase, s.id SEPARATOR ''
+            -- The lifecycle rank, inline rather than read off a CTE column. It
+            -- is the reason a trace does not read finished, written, committed,
+            -- started -- a load that lands inside one millisecond has nothing
+            -- but this to order it by.
+            ORDER BY e.occurred_at, ${PHASE_CASE}, e.id SEPARATOR ''
           ), 1) AS last_terminal
-        FROM scoped s
-        JOIN matched m ON m.snapshot_id = s.snapshot_id
-        GROUP BY s.snapshot_id
+        FROM catalog_audit_event e
+        ${scope === undefined ? 'WHERE e.snapshot_id IS NOT NULL' : 'JOIN scope k ON k.snapshot_id = e.snapshot_id'}
+        GROUP BY e.snapshot_id
       ),
       graded AS (
         SELECT
@@ -463,12 +751,20 @@ function gradedTraces(conditions: string[]): string {
 /**
  * The filter, as conditions over one span row and the parameters they bind.
  *
- * Applied inside `matched`, which keeps every span of a trace that has one
- * matching event — never as a filter on the spans themselves. A trace returned
- * with only its `failed` events would be a story with the middle torn out that
- * still rendered as whole.
+ * Applied to choose *which traces*, never to choose which spans of them come
+ * back. A trace returned with only its `failed` events would be a story with
+ * the middle torn out that still rendered as whole.
+ *
+ * `alias` is which copy of `catalog_audit_event` these read, because two of the
+ * three callers put them in a subquery beside a second copy of the table. It is
+ * a parameter rather than a fixed prefix so that the alias is chosen where the
+ * SQL around it is written, instead of being patched into finished SQL
+ * afterwards.
  */
-function spanConditions(query: TraceQuery & { traceId?: string }): {
+function spanConditions(
+  query: TraceQuery & { traceId?: string },
+  alias: string,
+): {
   conditions: string[];
   params: unknown[];
 } {
@@ -476,23 +772,23 @@ function spanConditions(query: TraceQuery & { traceId?: string }): {
   const params: unknown[] = [];
 
   if (query.traceId) {
-    conditions.push('s.snapshot_id = ?');
+    conditions.push(`${alias}.snapshot_id = ?`);
     params.push(query.traceId);
   }
   if (query.typeName) {
-    conditions.push('s.type_name = ?');
+    conditions.push(`${alias}.type_name = ?`);
     params.push(query.typeName);
   }
   if (query.principalId) {
-    conditions.push('s.principal_id = ?');
+    conditions.push(`${alias}.principal_id = ?`);
     params.push(query.principalId);
   }
   if (query.event) {
-    conditions.push('s.event = ?');
+    conditions.push(`${alias}.event = ?`);
     params.push(query.event);
   }
   if (query.since) {
-    conditions.push('s.occurred_at >= ?');
+    conditions.push(`${alias}.occurred_at >= ?`);
     params.push(new Date(query.since));
   }
 
@@ -502,7 +798,7 @@ function spanConditions(query: TraceQuery & { traceId?: string }): {
 /**
  * The outcome filter, applied after grading.
  *
- * After, rather than as another `matched` condition, because an outcome is a
+ * After, rather than as another scope condition, because an outcome is a
  * property of the whole trace and no single row carries it.
  *
  * Three cases, and the third is the one worth writing down. No filter is
@@ -535,7 +831,13 @@ interface SpanRow {
   rows_committed: unknown;
   failures: unknown;
   outcome: unknown;
-  total: unknown;
+  /**
+   * Present only when grading came before paging, which is the only case that
+   * can put a total on a row: `COUNT(*) OVER ()` counts the graded traces, and
+   * a page chosen before grading never graded the ones it left behind.
+   * {@link MySqlCatalogTraceStore.countTraces} answers for the other case.
+   */
+  total?: unknown;
   span_id: string;
   span_event: string;
   span_type_name: string | null;
