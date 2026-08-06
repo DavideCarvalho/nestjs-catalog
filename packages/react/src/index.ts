@@ -207,6 +207,50 @@ export {
   type WorkflowProblemLevel,
   wouldCycle,
 } from './workflow/validate';
+// The prefilled graphs, on this entry point rather than on `/workflow` because
+// they import no React Flow: a template produces nodes, edges, transform bodies
+// and expectation payloads, and a host should be able to build one — or check
+// what it would decide — without installing a canvas to do it. Whether a screen
+// then draws the result is the canvas's business, not the template's.
+export {
+  attachTransformIds,
+  buildWorkflowTemplate,
+  type EnrichOptions,
+  enrichWithLookup,
+  fanOutTypes,
+  type FanOutOptions,
+  type FanOutTarget,
+  FILE_DROP_KINDS,
+  type FileDropOptions,
+  joinSources,
+  type JoinOptions,
+  loadFileDrop,
+  type PeriodicFullReloadOptions,
+  periodicFullReload,
+  planIsRunnable,
+  planToWorkflowInput,
+  refuseUnusableColumnNames,
+  RELOAD_CADENCE_IDS,
+  RELOAD_CADENCES,
+  type ReloadCadence,
+  replicateTable,
+  type ReplicateTableOptions,
+  SOURCE_KINDS,
+  type TemplateDeclaration,
+  type TemplateExpectation,
+  type TemplateOutcome,
+  type TemplatePlan,
+  type TemplateRefusal,
+  type TemplateRefusalCode,
+  type TemplateRequest,
+  type TemplateSchedule,
+  type TemplateTransformRequest,
+  withinMsFor,
+  WORKFLOW_TEMPLATE_IDS,
+  WORKFLOW_TEMPLATES,
+  type WorkflowTemplateId,
+  type WorkflowTemplateMeta,
+} from './workflow/templates';
 
 export {
   type CatalogClient,

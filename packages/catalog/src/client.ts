@@ -111,6 +111,28 @@ export type {
 } from './catalog.filters';
 export type { SnapshotRef } from './catalog.store';
 
+/**
+ * Whether a name can be written into SQL, shipped to the browser deliberately.
+ *
+ * The second exception to "types only" on this entry point, and it is made for
+ * the same reason `validateWorkflow` is the first: the answer has to be the
+ * same one the server will give, and the only way to guarantee that is for both
+ * to run this function.
+ *
+ * A property `name` is what the warehouse looks every field up by —
+ * `row[property.name]` — and it is written verbatim as the view's output column
+ * and as the alias of every read, so publishing refuses one that is not an
+ * identifier. A console proposing to replicate a table therefore has to be able
+ * to ask, *before* it draws anything, whether the source's own column spellings
+ * could be property names. When they cannot, the graph that looks obvious —
+ * source straight into sink — writes null into every one of those columns on
+ * every run and reports success. That is not a hypothesis; it is what happened
+ * to six types in one evening.
+ *
+ * Safe to export because `catalog.identifiers.ts` imports nothing at all.
+ */
+export { isSafeIdentifier, UnsafeIdentifierError } from './catalog.identifiers';
+
 /** What a tier-0 edit to a type may change. */
 export interface TypePatch {
   displayName?: string;
