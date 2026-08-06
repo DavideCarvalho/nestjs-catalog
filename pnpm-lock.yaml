@@ -173,10 +173,10 @@ importers:
         version: link:../store-mikro-orm
       '@dudousxd/nestjs-durable':
         specifier: 0.39.1
-        version: 0.39.1(@dudousxd/nestjs-durable-core@0.62.1(cron-parser@5.7.0)(reflect-metadata@0.2.2)(zod@3.25.76))(@nestjs/common@11.1.19(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.1.19)(reflect-metadata@0.2.2)(zod@3.25.76)
+        version: 0.39.1(@dudousxd/nestjs-durable-core@0.65.0(cron-parser@5.7.0)(reflect-metadata@0.2.2)(zod@3.25.76))(@nestjs/common@11.1.19(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.1.19)(reflect-metadata@0.2.2)(zod@3.25.76)
       '@dudousxd/nestjs-durable-core':
-        specifier: 0.62.1
-        version: 0.62.1(cron-parser@5.7.0)(reflect-metadata@0.2.2)(zod@3.25.76)
+        specifier: 0.65.0
+        version: 0.65.0(cron-parser@5.7.0)(reflect-metadata@0.2.2)(zod@3.25.76)
       '@mikro-orm/core':
         specifier: 7.0.17
         version: 7.0.17
@@ -811,8 +811,8 @@ packages:
       reflect-metadata:
         optional: true
 
-  '@dudousxd/nestjs-durable-core@0.62.1':
-    resolution: {integrity: sha512-XvfeTlmahJZ8esYF8tZ+TFbPGriF2lsxgCZnuE0nDJrV9DGD37tXq5Gqk7chJbu9zPWnPLBm2LXfXaY+4teHCw==}
+  '@dudousxd/nestjs-durable-core@0.65.0':
+    resolution: {integrity: sha512-YZpc1ag4g+rzuFxRRVqeU7bMX31I32h/HjMvbNoOxfXgfsxtpCs86ixb5uY6XmKcF6HjypIxzzw3baqt0yZWfQ==}
     peerDependencies:
       cron-parser: ^4.0.0 || ^5.0.0
       reflect-metadata: ^0.2.0
@@ -5213,16 +5213,16 @@ snapshots:
       '@nestjs/core': 11.1.19(@nestjs/common@11.1.19(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/platform-express@11.1.19)(reflect-metadata@0.2.2)(rxjs@7.8.2)
       reflect-metadata: 0.2.2
 
-  '@dudousxd/nestjs-durable-core@0.62.1(cron-parser@5.7.0)(reflect-metadata@0.2.2)(zod@3.25.76)':
+  '@dudousxd/nestjs-durable-core@0.65.0(cron-parser@5.7.0)(reflect-metadata@0.2.2)(zod@3.25.76)':
     dependencies:
       reflect-metadata: 0.2.2
       zod: 3.25.76
     optionalDependencies:
       cron-parser: 5.7.0
 
-  '@dudousxd/nestjs-durable@0.39.1(@dudousxd/nestjs-durable-core@0.62.1(cron-parser@5.7.0)(reflect-metadata@0.2.2)(zod@3.25.76))(@nestjs/common@11.1.19(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.1.19)(reflect-metadata@0.2.2)(zod@3.25.76)':
+  '@dudousxd/nestjs-durable@0.39.1(@dudousxd/nestjs-durable-core@0.65.0(cron-parser@5.7.0)(reflect-metadata@0.2.2)(zod@3.25.76))(@nestjs/common@11.1.19(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.1.19)(reflect-metadata@0.2.2)(zod@3.25.76)':
     dependencies:
-      '@dudousxd/nestjs-durable-core': 0.62.1(cron-parser@5.7.0)(reflect-metadata@0.2.2)(zod@3.25.76)
+      '@dudousxd/nestjs-durable-core': 0.65.0(cron-parser@5.7.0)(reflect-metadata@0.2.2)(zod@3.25.76)
       '@nestjs/common': 11.1.19(reflect-metadata@0.2.2)(rxjs@7.8.2)
       '@nestjs/core': 11.1.19(@nestjs/common@11.1.19(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/platform-express@11.1.19)(reflect-metadata@0.2.2)(rxjs@7.8.2)
       reflect-metadata: 0.2.2

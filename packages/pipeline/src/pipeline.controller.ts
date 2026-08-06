@@ -162,6 +162,39 @@ export function createPipelineController(
     }
 
     /**
+     * What a call node could be pointed at, as the live fleet reports it.
+     *
+     * Its own route rather than a field on `capabilities`, and the reason is
+     * cache lifetime rather than tidiness. `capabilities` reports what resolved
+     * in this process — which languages the image can execute, whether a durable
+     * engine is wired up — none of which can change without a redeploy, so the
+     * console caches it forever and is right to. This answer is a snapshot of
+     * live workers with a resolution of about one heartbeat: a worker that dies
+     * drops off it within half a minute. Folded into the cached-forever payload
+     * it would be a list of workers that were alive when the tab was opened,
+     * presented as the fleet.
+     *
+     * Read on demand, and nothing here holds it between calls. The engine's own
+     * `announcedWorkflows` is one advertisement scan per call by design, and a
+     * cache in front of it would reintroduce exactly the staleness the TTL on
+     * the descriptor keys exists to bound.
+     *
+     * `catalog:read`, like every other read on this controller. It exposes what
+     * a deployment's workers announce about themselves — names, versions, worker
+     * groups — which is the same class of operational fact `connectors` and
+     * `capabilities` already answer with, and it starts nothing.
+     *
+     * **A literal segment, so it is declared with the other literals** and above
+     * anything that could capture it. There is no `:param` route at this
+     * position today; `pipeline.route-order.spec.ts` is what keeps that true.
+     */
+    @Get('callable-workflows')
+    @RequireScopes('catalog:read')
+    callableWorkflows() {
+      return this.launcher.callableWorkflows();
+    }
+
+    /**
      * Every expectation an operator has stored, and every type this deployment
      * has pinned in code.
      *

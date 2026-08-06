@@ -1,4 +1,5 @@
 import type {
+  CallableWorkflowRef,
   CatalogAuditEvent,
   CatalogConnection,
   CatalogConnector,
@@ -127,6 +128,38 @@ export interface PipelineCapabilities {
    * engine — is the exact promise this project keeps having to remove.
    */
   durable?: WorkflowDurability;
+}
+
+/**
+ * What a call node could be pointed at, and whether the question was answerable.
+ *
+ * Mirrored here for the reason {@link PipelineCapabilities} is: naming the
+ * server's own declaration would mean importing
+ * `@dudousxd/nestjs-catalog-pipeline`, a package built for a Node process with
+ * database drivers behind optional imports. `CallableWorkflowRef` itself is
+ * re-exported from `@dudousxd/nestjs-catalog/client` and is NOT copied — the
+ * entries are the contract, and a second copy of those would drift.
+ *
+ * `supported` is the field that stops the list being misread, and it exists
+ * because an empty list means two opposite things. With `supported: true` it
+ * says the fleet announces nothing — every callable workflow is unregistered or
+ * its workers are down. With `supported: false` it says nobody could be asked:
+ * this deployment has no durable engine, or the engine could not read the
+ * announcements. A screen that rendered "no workflows found" over both would be
+ * asserting the first when it was told the second, which is the shape of claim
+ * this codebase keeps having to take back out.
+ */
+export interface CallableWorkflowList {
+  supported: boolean;
+  workflows: CallableWorkflowRef[];
+  /**
+   * When the fleet was asked, ISO-8601. Rendered, because this is a snapshot
+   * with a resolution of about one worker heartbeat and showing it without a
+   * time would present a moment as a standing fact.
+   */
+  observedAt: string;
+  /** Why, in a full sentence. Rendered verbatim under the picker. */
+  detail: string;
 }
 
 /**
@@ -518,6 +551,17 @@ export interface CatalogClient {
    */
   pipelineCapabilities(): Promise<PipelineCapabilities>;
 
+  /**
+   * Every workflow the live fleet announces it can execute — what a call node's
+   * picker offers.
+   *
+   * A separate call from {@link pipelineCapabilities} rather than a field on it,
+   * because the two have opposite lifetimes. Capabilities cannot change without
+   * a redeploy, so the canvas caches them forever. This is a snapshot of live
+   * workers with a resolution of about one heartbeat, so it must not be.
+   */
+  listCallableWorkflows(): Promise<CallableWorkflowList>;
+
   listConnections(): Promise<CatalogConnection[]>;
   saveConnection(input: ConnectionInput): Promise<CatalogConnection>;
   /**
@@ -824,6 +868,7 @@ export function CatalogProvider({
       listTraces: (query) => transport.get(catalogRoutes.traces(), { ...query }),
 
       pipelineCapabilities: () => transport.get(pipeline.capabilities()),
+      listCallableWorkflows: () => transport.get(pipeline.callableWorkflows()),
 
       listConnections: () => transport.get(pipeline.connections()),
       saveConnection: (input) => transport.post<CatalogConnection>(pipeline.connections(), input),
@@ -968,6 +1013,15 @@ export const catalogQueryKeys = {
    */
   pipeline: ['nestjs-catalog', 'pipeline'] as const,
   capabilities: ['nestjs-catalog', 'pipeline', 'capabilities'] as const,
+  /**
+   * What the live fleet announces it can execute.
+   *
+   * Its own key rather than a slice of `capabilities`, because the two are
+   * cached on opposite terms — `capabilities` is stale-forever and this is stale
+   * in about a heartbeat — and one key cannot hold two staleTimes. A host
+   * invalidating the whole `pipeline` prefix still reaches both.
+   */
+  callableWorkflows: ['nestjs-catalog', 'pipeline', 'callable-workflows'] as const,
   connections: ['nestjs-catalog', 'pipeline', 'connections'] as const,
   connectors: ['nestjs-catalog', 'pipeline', 'connectors'] as const,
   transforms: ['nestjs-catalog', 'pipeline', 'transforms'] as const,

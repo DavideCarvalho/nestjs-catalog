@@ -50,6 +50,7 @@ describe('pipelineRoutes', () => {
 
     expect({
       capabilities: routes.capabilities(),
+      callableWorkflows: routes.callableWorkflows(),
       connections: routes.connections(),
       connection: routes.connection('c1'),
       checkConnection: routes.checkConnection('c1'),
@@ -71,6 +72,7 @@ describe('pipelineRoutes', () => {
       loadExpectation: routes.loadExpectation('Mvr'),
     }).toEqual({
       capabilities: '/api/pipeline/capabilities',
+      callableWorkflows: '/api/pipeline/callable-workflows',
       connections: '/api/pipeline/connections',
       connection: '/api/pipeline/connections/c1',
       checkConnection: '/api/pipeline/connections/c1/check',

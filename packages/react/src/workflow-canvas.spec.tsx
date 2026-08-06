@@ -271,6 +271,15 @@ function answersFor(
       pythonPackages: [],
       durable: { available: true },
     },
+    // The shape a deployment whose workers announce nothing answers with, which
+    // is also the shape every test that is not about the picker wants: the call
+    // node's two typed fields, and a sentence saying why there is no list.
+    '/pipeline/callable-workflows': {
+      supported: false,
+      workflows: [],
+      observedAt: '2026-01-01T00:00:00.000Z',
+      detail: 'No durable engine resolved in this process.',
+    },
     '/catalog': snapshot(),
     ...extra,
   };
@@ -885,9 +894,14 @@ describe('a transform node on a catalog with no transforms', () => {
  *
  * What is worth testing here is the pair of fields and nothing about how they look: the version is
  * the half that decides which code runs, and a canvas that let it be left blank would store a node
- * that silently follows whatever gets deployed next. There is deliberately no picker to test — see
- * `CallInspector` — so the assertions are that both fields are typed, that both are demanded, and
- * that what is typed reaches the save.
+ * that silently follows whatever gets deployed next. So the assertions are that both fields are
+ * typed, that both are demanded, and that what is typed reaches the save.
+ *
+ * There USED to be no picker to test, because nothing could enumerate a deployment's
+ * registrations. `announcedWorkflows()` (durable 0.65.0) changed that, and the picker's own tests
+ * are in the describe below this one — with the manual fields still tested here, because a
+ * deployment whose workers have not been upgraded announces nothing and a picker that became the
+ * only path would make this node unusable there.
  */
 describe('a node that calls another workflow', () => {
   it('asks for the version as well as the name, and says why on the node', async () => {
@@ -1003,6 +1017,450 @@ describe('a node that calls another workflow', () => {
     expect(panel('Problems').getByText(/Nothing to flag here/)).toBeDefined();
   });
 });
+
+/**
+ * The two searchable fields over the pair above.
+ *
+ * WHY THIS BLOCK EXISTS
+ * ---------------------
+ * The call node shipped without a picker on purpose, and the reason was written into it: nothing
+ * could enumerate a deployment's registrations, because `workflowBody(name, version)` answers only
+ * for the process asking and a missing body reads identically to "registered through
+ * `registerRemote` in another SDK" and to "a group resolved by convention against a live worker".
+ * Durable 0.65.0's `announcedWorkflows()` replaced that inference with a statement live workers
+ * publish about themselves, and `GET pipeline/callable-workflows` serves it.
+ *
+ * The FIRST picker built on it was one select of combined `name@version` keys with the two text
+ * fields still underneath, and it was wrong three ways: no search, so a real fleet is a scroll; one
+ * question asked as two, so the name list was as long as the version count; and three controls for
+ * two values. It is now two `Combobox`es — searchable, and typeable past what is on the list.
+ *
+ * Every test here is about the picker NOT being tidier than the thing it renders:
+ *
+ * - Choosing a NAME writes the version as well, whenever the fleet leaves no choice. Splitting one
+ *   select into two is what made that possible to get wrong: a node with a name and no version
+ *   looks configured and runs whatever is newest on the day it runs, which is the exact failure
+ *   the pin exists to prevent. Where the fleet does NOT leave a single answer, the version is left
+ *   blank on purpose — visible, said out loud, and refused by the save.
+ * - An entry two live workers claim from two different groups is SHOWN and cannot be chosen.
+ *   Nobody can say which queue such a run would land on, so picking one would be acting on a claim
+ *   nobody made; dropping it from the list would be the "picker that hides what you are looking
+ *   for" the original docblock refused to build.
+ * - A bare, unversioned announcement — what an un-upgraded worker of any SDK publishes — is
+ *   likewise offered and refused, because a name with no version cannot satisfy the pin.
+ * - Both fields take text nobody announced, including when there is no list at all.
+ *
+ * There is deliberately nothing here about STEPS. `announcedWorkflows()` covers workflows only,
+ * and durable says why in its own source: a step is identified by its `(runId, seq)` position
+ * inside one run's history, `ctx.step` is callable only from a replaying body, and no engine entry
+ * point starts one. "Call this step" is not an operation that exists, so a field offering steps
+ * would be offering something nothing could then run.
+ */
+describe('choosing a workflow a live worker announces', () => {
+  /** The route's answer, with the fleet speaking with one voice unless told otherwise. */
+  function fleet(workflows: unknown[], supported = true) {
+    return {
+      supported,
+      workflows,
+      observedAt: '2026-01-01T00:00:00.000Z',
+      detail: 'Every workflow a live worker announces it can execute, read just now.',
+    };
+  }
+
+  async function openCallInspector(fleetAnswer: unknown) {
+    const fixture = fakeTransport(
+      answersFor([wholeWorkflow()], { '/pipeline/callable-workflows': fleetAnswer }),
+      { '/pipeline/workflows': wholeWorkflow() },
+    );
+    await openCanvas(fixture.transport);
+    addNodeOfKind('call');
+    await waitFor(() => expect(panel('Still to do')).toBeDefined());
+    return fixture;
+  }
+
+  it('offers one row per NAME, and the versions in the field below it', async () => {
+    // The split this pair of fields exists to make. A single list of `name@version` keys answers
+    // the version question inside the name question, and a workflow with eight versions takes
+    // eight rows of a list somebody is scanning for a name.
+    await openCallInspector(
+      fleet([
+        { name: 'billing.reconcile', version: '1', group: 'billing', workers: 2 },
+        { name: 'billing.reconcile', version: '2', group: 'billing', workers: 2 },
+        { name: 'orders.sync', version: '4', group: 'orders', workers: 1 },
+      ]),
+    );
+
+    await openField('Workflow');
+    expect(offered()).toEqual(['billing.reconcile', 'orders.sync']);
+    await close();
+
+    await openField('Version');
+    // Nothing is named yet, so there is nothing to list versions OF — and the popup says that
+    // rather than showing every version in the fleet under a name nobody picked.
+    expect(offered()).toEqual([]);
+    expect(screen.getByText(/Name a workflow first/)).toBeDefined();
+  });
+
+  it('narrows the list to what is typed, which is the whole point of a search', async () => {
+    // A fleet announcing three hundred workflows renders three hundred rows, and the only gesture
+    // over a plain popup is "scroll until you see it".
+    await openCallInspector(
+      fleet([
+        { name: 'billing.reconcile', version: '1', group: 'billing', workers: 1 },
+        { name: 'orders.sync', version: '4', group: 'orders', workers: 1 },
+        { name: 'orders.reconcile', version: '1', group: 'orders', workers: 1 },
+      ]),
+    );
+
+    await openField('Workflow');
+    fireEvent.change(field('Workflow'), { target: { value: 'reconcile' } });
+
+    await waitFor(() => expect(offered()).toEqual(['billing.reconcile', 'orders.reconcile']));
+  });
+
+  it('finds a workflow by its group, which is how somebody looks for the Python half', async () => {
+    // The group is the one signal a missing `workflowBody` could never give, so it is also the
+    // thing people search by when they do not yet know the name.
+    await openCallInspector(
+      fleet([
+        { name: 'billing.reconcile', version: '1', group: 'ts-billing', workers: 1 },
+        { name: 'fleet.posture', version: '1', group: 'python-analytics', workers: 1 },
+      ]),
+    );
+
+    await openField('Workflow');
+    fireEvent.change(field('Workflow'), { target: { value: 'python' } });
+
+    await waitFor(() => expect(offered()).toEqual(['fleet.posture']));
+  });
+
+  it('writes the version with the name when the fleet announces exactly one', async () => {
+    // THE LOAD-BEARING ONE. `engine.start` resolves `latest.get(name)` unless a version is passed,
+    // so a name committed on its own would silently run whatever is newest. One announced version
+    // means there is nothing to choose between, so the common case stays ONE action.
+    const { lastPostTo } = await openCallInspector(
+      fleet([{ name: 'billing.reconcile', version: '2', group: 'billing', workers: 1 }]),
+    );
+
+    await choose('Workflow', 'billing.reconcile');
+
+    await waitFor(() => expect(field('Version')).toHaveProperty('value', '2'));
+    expect(field('Workflow')).toHaveProperty('value', 'billing.reconcile');
+
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(lastPostTo('/pipeline/workflows')).toBeDefined());
+    expect(readCallNodes(lastPostTo('/pipeline/workflows')?.body)).toEqual([
+      { callName: 'billing.reconcile', callVersion: '2', config: {} },
+    ]);
+  });
+
+  it('leaves the version blank when there is a choice, says so, and still refuses the save', async () => {
+    // The failure two fields can have that one combined select could not: a name committed alone.
+    // Blank is deliberate — guessing between 1 and 2 is precisely what the pin exists to stop —
+    // and it must be VISIBLE as unfinished rather than merely absent.
+    await openCallInspector(
+      fleet([
+        { name: 'billing.reconcile', version: '1', group: 'billing', workers: 2 },
+        { name: 'billing.reconcile', version: '2', group: 'billing', workers: 2 },
+      ]),
+    );
+
+    await choose('Workflow', 'billing.reconcile');
+
+    await waitFor(() => expect(field('Workflow')).toHaveProperty('value', 'billing.reconcile'));
+    expect(field('Version')).toHaveProperty('value', '');
+    expect(screen.getByText(/announces more than one version/)).toBeDefined();
+
+    // Touching the save is the statement "I think this is done", so the check gets its full
+    // wording and the button stops looking like an ordinary one.
+    await waitFor(() =>
+      expect(
+        screen.getAllByText(/does not name a version of the workflow it calls/).length,
+      ).toBeGreaterThan(0),
+    );
+    expect(saveButton().className).toContain('bg-amber-600');
+  });
+
+  it('lists that name’s versions in the second field, and finishing it saves both', async () => {
+    const { lastPostTo } = await openCallInspector(
+      fleet([
+        { name: 'billing.reconcile', version: '1', group: 'billing', workers: 2 },
+        { name: 'billing.reconcile', version: '2', group: 'billing', workers: 2 },
+        { name: 'orders.sync', version: '9', group: 'orders', workers: 1 },
+      ]),
+    );
+
+    await choose('Workflow', 'billing.reconcile');
+    await waitFor(() => expect(field('Workflow')).toHaveProperty('value', 'billing.reconcile'));
+
+    await openField('Version');
+    // `orders.sync`'s 9 is not here: this field answers "which version of THIS", not "which
+    // version in the fleet".
+    expect(offered()).toEqual(['1', '2']);
+    await close();
+
+    await choose('Version', '2');
+
+    await waitFor(() => expect(field('Version')).toHaveProperty('value', '2'));
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(lastPostTo('/pipeline/workflows')).toBeDefined());
+    expect(readCallNodes(lastPostTo('/pipeline/workflows')?.body)).toEqual([
+      { callName: 'billing.reconcile', callVersion: '2', config: {} },
+    ]);
+  });
+
+  it('does not disturb a version the fleet still announces for the name re-picked', async () => {
+    await openCallInspector(
+      fleet([
+        { name: 'billing.reconcile', version: '1', group: 'billing', workers: 1 },
+        { name: 'billing.reconcile', version: '2', group: 'billing', workers: 1 },
+      ]),
+    );
+
+    fireEvent.change(field('Version'), { target: { value: '1' } });
+    await choose('Workflow', 'billing.reconcile');
+
+    await waitFor(() => expect(field('Workflow')).toHaveProperty('value', 'billing.reconcile'));
+    expect(field('Version')).toHaveProperty('value', '1');
+  });
+
+  it('drops a version that was the OLD name’s, because it is now a pin nobody announced', async () => {
+    // `billing.reconcile@2` is real; `orders.sync@2` is not, and leaving the 2 behind would look
+    // exactly like a pin somebody chose.
+    await openCallInspector(
+      fleet([
+        { name: 'billing.reconcile', version: '2', group: 'billing', workers: 1 },
+        { name: 'orders.sync', version: '8', group: 'orders', workers: 1 },
+        { name: 'orders.sync', version: '9', group: 'orders', workers: 1 },
+      ]),
+    );
+
+    await choose('Workflow', 'billing.reconcile');
+    await waitFor(() => expect(field('Version')).toHaveProperty('value', '2'));
+
+    await choose('Workflow', 'orders.sync');
+
+    await waitFor(() => expect(field('Workflow')).toHaveProperty('value', 'orders.sync'));
+    expect(field('Version')).toHaveProperty('value', '');
+  });
+
+  it('leaves alone a version somebody typed that the fleet never offered', async () => {
+    // The inverse of the test above, and the reason it is not simply "clear it": a version nobody
+    // announced was never this field's to give, so it is not this field's to take away.
+    await openCallInspector(
+      fleet([
+        { name: 'billing.reconcile', version: '1', group: 'billing', workers: 1 },
+        { name: 'billing.reconcile', version: '2', group: 'billing', workers: 1 },
+      ]),
+    );
+
+    fireEvent.change(field('Version'), { target: { value: '7' } });
+    await choose('Workflow', 'billing.reconcile');
+
+    await waitFor(() => expect(field('Workflow')).toHaveProperty('value', 'billing.reconcile'));
+    expect(field('Version')).toHaveProperty('value', '7');
+  });
+
+  it('shows an entry two groups claim, and refuses to let it be chosen', async () => {
+    await openCallInspector(
+      fleet([
+        {
+          name: 'billing.reconcile',
+          version: '2',
+          workers: 2,
+          disagreements: [{ axis: 'group', values: ['billing', 'billing-legacy'] }],
+        },
+      ]),
+    );
+
+    // Shown, not hidden: an option silently dropped is the failure the old docblock was about.
+    // And both groups are named in full under the fields, where nothing truncates them.
+    await screen.findByText(/2 different groups \(billing, billing-legacy\)/);
+
+    // The NAME is refused too, because every announcement under it is — but it is still listed.
+    await openField('Workflow');
+    const name = screen.getByRole('option', { name: /billing\.reconcile/ });
+    expect(name.getAttribute('aria-disabled')).toBe('true');
+    fireEvent.click(name);
+    expect(field('Workflow')).toHaveProperty('value', '');
+    await close();
+
+    // And so is the version, reached the other way: by typing the name the fleet does announce and
+    // opening the field that lists what it announces for it.
+    fireEvent.change(field('Workflow'), { target: { value: 'billing.reconcile' } });
+    await openField('Version');
+    const version = screen.getByRole('option', { name: /^2/ });
+    expect(version.getAttribute('aria-disabled')).toBe('true');
+    fireEvent.click(version);
+
+    await waitFor(() => expect(field('Version')).toHaveProperty('value', ''));
+  });
+
+  it('shows a bare, unversioned announcement and refuses that too', async () => {
+    // What an un-upgraded worker of any SDK publishes: a name, no version, no group. Offering it
+    // as though it could satisfy the pin would be a lie the node then carries.
+    await openCallInspector(fleet([{ name: 'legacy.sweep', workers: 1 }]));
+
+    await screen.findByText(/without saying which version it runs/);
+
+    fireEvent.change(field('Workflow'), { target: { value: 'legacy.sweep' } });
+    await openField('Version');
+
+    // Present, greyed, and labelled as what it is — rather than absent, which would leave the
+    // sentence under the field disagreeing with the list above it.
+    const row = screen.getByRole('option', { name: /no version announced/ });
+    expect(row.getAttribute('aria-disabled')).toBe('true');
+    fireEvent.click(row);
+
+    await waitFor(() => expect(field('Version')).toHaveProperty('value', ''));
+  });
+
+  it('names the group, which is the one signal a missing body could never give', async () => {
+    await openCallInspector(
+      fleet([{ name: 'billing.reconcile', version: '2', group: 'python-billing', workers: 1 }]),
+    );
+
+    await openField('Workflow');
+    expect(
+      within(screen.getByRole('option', { name: /billing\.reconcile/ })).getByText(
+        /group python-billing/,
+      ),
+    ).toBeDefined();
+  });
+
+  it('says when it looked, rather than presenting a snapshot as a standing fact', async () => {
+    await openCallInspector(
+      fleet([{ name: 'billing.reconcile', version: '2', group: 'billing', workers: 1 }]),
+    );
+
+    expect(inspector().getByText(/a worker that stops beating drops off it/)).toBeDefined();
+  });
+
+  it('confirms a pin the fleet actually announces, and not one it does not', async () => {
+    await openCallInspector(
+      fleet([{ name: 'billing.reconcile', version: '2', group: 'billing', workers: 1 }]),
+    );
+
+    fireEvent.change(field('Workflow'), { target: { value: 'billing.reconcile' } });
+    fireEvent.change(field('Version'), { target: { value: '2' } });
+    await screen.findByText(/This exact pin is announced right now/);
+
+    // A version nobody announced gets no confirmation. It is still perfectly saveable — it is just
+    // not something the fleet said, and the line would be claiming that it was.
+    fireEvent.change(field('Version'), { target: { value: '7' } });
+    await waitFor(() =>
+      expect(screen.queryByText(/This exact pin is announced right now/)).toBeNull(),
+    );
+  });
+
+  it('does not confirm a half-filled node beside a bare announcement of its name', async () => {
+    // The refusal arriving by a different door. A node with a name and no version yet, beside a
+    // bare announcement of that name, must not read as though the fleet had confirmed a pin —
+    // there is no version to have confirmed.
+    await openCallInspector(fleet([{ name: 'legacy.sweep', workers: 1 }]));
+
+    fireEvent.change(field('Workflow'), { target: { value: 'legacy.sweep' } });
+
+    await waitFor(() => expect(field('Workflow')).toHaveProperty('value', 'legacy.sweep'));
+    expect(screen.queryByText(/This exact pin is announced right now/)).toBeNull();
+  });
+
+  it('keeps both fields usable when nobody could be asked, and says why', async () => {
+    // A deployment with no durable engine announces nothing. The fields are text boxes first and
+    // lists second, so there is nothing to fall back to — and the popup carries the server's own
+    // sentence instead of being an empty promise of a choice.
+    const { lastPostTo } = await openCallInspector({
+      supported: false,
+      workflows: [],
+      observedAt: '2026-01-01T00:00:00.000Z',
+      detail: 'No durable engine resolved in this process, so nothing here can read the fleet.',
+    });
+
+    await openField('Workflow');
+    expect(offered()).toEqual([]);
+    expect(screen.getByText(/No durable engine resolved in this process/)).toBeDefined();
+    await close();
+
+    fireEvent.change(field('Workflow'), { target: { value: 'legacy.sweep' } });
+    fireEvent.change(field('Version'), { target: { value: '7' } });
+    fireEvent.click(saveButton());
+
+    await waitFor(() => expect(lastPostTo('/pipeline/workflows')).toBeDefined());
+    expect(readCallNodes(lastPostTo('/pipeline/workflows')?.body)).toEqual([
+      { callName: 'legacy.sweep', callVersion: '7', config: {} },
+    ]);
+  });
+
+  it('lets a name the fleet is not announcing be typed over the list', async () => {
+    // The list is a suggestion over a text box, not a gate in front of one. A workflow served by a
+    // worker too old to announce its registrations is missing from it and perfectly callable.
+    const { lastPostTo } = await openCallInspector(
+      fleet([{ name: 'billing.reconcile', version: '2', group: 'billing', workers: 1 }]),
+    );
+
+    fireEvent.change(field('Workflow'), { target: { value: 'legacy.sweep' } });
+    fireEvent.change(field('Version'), { target: { value: '7' } });
+    fireEvent.click(saveButton());
+
+    await waitFor(() => expect(lastPostTo('/pipeline/workflows')).toBeDefined());
+    expect(readCallNodes(lastPostTo('/pipeline/workflows')?.body)).toEqual([
+      { callName: 'legacy.sweep', callVersion: '7', config: {} },
+    ]);
+  });
+});
+
+/** One of the call inspector's two comboboxes, by its visible label. */
+function field(label: 'Workflow' | 'Version') {
+  return inspector().getByLabelText(new RegExp(`^${label}`));
+}
+
+/**
+ * Open a combobox's popup the way a pointer does.
+ *
+ * Four events rather than one, and none is optional: Base UI opens on the pointer sequence, not on
+ * `click`, and jsdom dispatches no pointer pipeline of its own. A bare `fireEvent.click` leaves the
+ * popup shut, and every assertion then fails on "no options" — which reads like a filtering bug
+ * and is not one.
+ */
+async function openField(label: 'Workflow' | 'Version') {
+  const input = field(label);
+  fireEvent.focus(input);
+  fireEvent.pointerDown(input, { pointerType: 'mouse', button: 0 });
+  fireEvent.mouseDown(input, { button: 0 });
+  fireEvent.click(input);
+  await waitFor(() => expect(screen.getByRole('listbox')).toBeDefined());
+}
+
+/** Shut it again, so the NEXT `getByRole('option')` is not answered by the last popup. */
+async function close() {
+  const list = screen.queryByRole('listbox');
+  if (list) fireEvent.keyDown(list, { key: 'Escape' });
+  await waitFor(() => expect(screen.queryAllByRole('option').length).toBe(0));
+}
+
+/**
+ * The row LABELS currently on offer, in order.
+ *
+ * Read from the `title` the label carries for truncation rather than from `textContent`, which
+ * would fold the hint line in behind it and turn every assertion into a substring match against a
+ * sentence that is allowed to change.
+ */
+function offered() {
+  return screen
+    .queryAllByRole('option')
+    .map((option) => option.querySelector('[title]')?.getAttribute('title') ?? '');
+}
+
+/**
+ * Open a combobox and commit one row.
+ *
+ * A click on the row, which is what Base UI's `Autocomplete.Item` fires its `onClick` on — the
+ * same handler <kbd>Enter</kbd> reaches when the row is highlighted.
+ */
+async function choose(label: 'Workflow' | 'Version', option: string) {
+  await openField(label);
+  fireEvent.click(screen.getByRole('option', { name: new RegExp(`^${option}`) }));
+}
 
 /* --- narrowing helpers, so nothing here needs an `as` --------------------- */
 

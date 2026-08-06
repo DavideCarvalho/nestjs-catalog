@@ -252,9 +252,15 @@ describe('CatalogPipelineModule.forRoot (integration)', () => {
     const pipeline = routes.filter((route) => route.includes('/api/catalog-service/pipeline'));
     const publish = routes.filter((route) => route.includes('/api/catalog-service/publish'));
 
-    // 26 + 4. Pinned as a total rather than route-by-route so that a route which
+    // 27 + 4. Pinned as a total rather than route-by-route so that a route which
     // moves prefix — the failure mode this whole file is about — cannot be
     // mistaken for a route that was merely renamed.
+    //
+    // 26 -> 27 with `GET callable-workflows`, which serves what the live fleet
+    // announces it can execute — the list behind the call node's picker. Its own
+    // route rather than a field on `capabilities` because the two are cached on
+    // opposite terms: capabilities cannot change without a redeploy, and this is
+    // a snapshot about one worker heartbeat wide.
     //
     // It went 29 -> 26 when the workflow became the only thing anybody authors.
     // Five connector routes left — `POST connectors`, `DELETE connectors/:id`,
@@ -265,7 +271,7 @@ describe('CatalogPipelineModule.forRoot (integration)', () => {
     // how a type gets its shape and had to survive the move rather than be
     // rebuilt afterwards. `GET connections/:id/connectors` became
     // `GET connections/:id/workflows`, which is a rename and not a count change.
-    expect(pipeline).toHaveLength(26);
+    expect(pipeline).toHaveLength(27);
     expect(publish).toHaveLength(4);
 
     // The workflow routes named explicitly, because they are the whole authoring

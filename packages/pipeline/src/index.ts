@@ -64,7 +64,11 @@ export {
 export { createPublishController } from './publish.controller';
 export { PublishService, type PublishedType } from './publish.service';
 export { AbandonedRunReconciler, CATALOG_RECONCILE_RUNS } from './run-reconciler.service';
-export { WorkflowLauncher, type WorkflowDurability } from './workflow-launcher.service';
+export {
+  WorkflowLauncher,
+  type CallableWorkflowList,
+  type WorkflowDurability,
+} from './workflow-launcher.service';
 export {
   toGraph,
   toRunView,
