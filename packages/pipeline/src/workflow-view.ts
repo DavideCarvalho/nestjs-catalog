@@ -148,7 +148,13 @@ function toNode(raw: unknown): WorkflowNode {
         `Sink "${name}" (${id}) writes no object type, so there would be nothing for the run to commit into.`,
       );
     }
-    return { id, name, kind, targetType: type, mode: readMode(raw) };
+    // `position` like every other kind. Its absence here meant a sink could not
+    // be placed at all — by any route. Drag one on the canvas, save, reload, and
+    // it is back where the automatic layout puts it; a `POST` carrying explicit
+    // coordinates answers 201 and drops them. The read is already done above for
+    // every node, so this was one branch forgetting to hand it back rather than
+    // a decision about sinks.
+    return { id, name, kind, targetType: type, mode: readMode(raw), position };
   }
 
   const config = readRecord(raw, 'config');
