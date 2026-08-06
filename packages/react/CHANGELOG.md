@@ -1,5 +1,415 @@
 # @dudousxd/nestjs-catalog-react
 
+## 0.18.0
+
+### Minor Changes
+
+- 2d115cd: A workflow node that hands its step to a durable workflow that already exists.
+
+  A graph could do three things — read, transform, commit — and every one of them had to be written
+  here. A deployment that already runs durable workflows, including ones whose body is in Python, had
+  no way to put one in a pipeline. `call` is a fourth node kind: it names a registered workflow and a
+  version, and runs it as a **tracked child** of the catalog's own durable run.
+
+  - **The version is pinned, and pinned means checked.** A node stores `callName` _and_ `callVersion`,
+    and both are part of the graph fingerprint, so repointing a node at `foo@2` is a new version of
+    the graph. The honest limit is written down where it applies: `engine.start` resolves the newest
+    registered version and takes no version argument, so the child is started and then **checked** —
+    `catalog.workflow.call-check` reads the child's run row, and a mismatch cancels the child and
+    fails the node naming both versions. A wrong version is stopped, not prevented. The step refuses
+    outright when the process running it has no engine to check against, because "unchecked" and
+    "checked and fine" must not read the same.
+  - **Handles cross the boundary, never rows.** The child receives one documented envelope —
+    `{catalog: {contract, runId, nodeId, workflowId, workflowVersion, principalId, inputs}, input}` —
+    where `inputs` names the stages its inbound edges wrote, addressed by `(runId, nodeId, batch)` as
+    everything else in a run is. A child that produces rows for the graph stages them under the
+    calling node's id and returns `{batches, rowCount}`. There is no shared type between a catalog
+    node and an arbitrary workflow and none is pretended: `readWorkflowCallOutput` reads those two
+    counts, reads their absence as "called for its effect, no rows" and says so in the run log, and
+    **refuses half of them** rather than turning a callee's bug into a load that came out short.
+  - **Nothing validates the callee's input at save time, because nothing can.** `register()` takes
+    `validateInput` and `searchAttributesSchema`, but neither is reachable: the registry is private
+    and no public method hands a registration out. What does happen is that `engine.start` runs the
+    callee's own `validateInput`, and a refused start is delivered to the parent as a failed child —
+    so a bad wiring fails at the node, naming the node, the workflow, the version and the child run.
+  - **A busy callee waits rather than failing.** A singleton with `maxQueueDepth` refuses a start once
+    its backlog is full, which is contention and not a fault; the node retries five times over about
+    seven and a half minutes, suspended at zero compute, each attempt with its own child id, and then
+    fails saying it was contention and quoting the engine. Skipping was rejected: a node that quietly
+    produced nothing is the failure this service exists to remove.
+  - **Failure and cancellation, stated:** a failed child fails the node, everything downstream is
+    `skipped`, and the load is failed. Cancelling the parent cascades to the child; letting the parent
+    hit its `executionTimeout` does **not**, because that sweep marks the run cancelled without going
+    through `cancel`. The parent's own execution timeout is still what stops a hung child holding a
+    connector's singleton slot for ever — admission counts `suspended` runs, and a timed-out parent is
+    no longer one. A called workflow should carry its own `executionTimeout`; `ctx.child` takes none.
+  - **Serialisation belongs to the callee, and is weaker across SDKs.** Calling a workflow does not
+    lend it the caller's singleton. On the convention/`attach` path a cross-SDK body is reached by,
+    the synthesised registration carries no singleton, timeout or validator at all. The canvas says so
+    rather than implying otherwise.
+  - **`expectShrink` reaches every node step and no callee.** The acknowledgement on
+    `POST workflows/:id/run` stands the row-count bound down for one snapshot, and the bound is
+    applied at the sink — so a call node does not forward it. Handing a one-time acknowledgement to
+    an arbitrary workflow would put it somewhere nothing on this side can account for what was done
+    with it.
+  - **A `call` node counts as something that reads**, so `call → sink` is a valid graph and
+    `no-source` is no longer raised on one. A graph of transforms alone is still refused.
+  - **On a pod with no durable engine the run is refused up front**, naming the node and the workflow,
+    instead of opening a run row and failing at the node.
+  - The canvas gains a Call node with a workflow field, a version field and a JSON parameter box, in
+    the same node inspector that authors a source or a sink — the one screen a pipeline is now
+    published, scheduled and run from, so a call node is drawn, saved and published exactly like the
+    rest of the graph rather than through a surface of its own.
+    **Deliberately no picker**: nothing can enumerate a deployment's workflows — `workflowBody` answers
+    only for the asking process, and a missing body equally means a `registerRemote` body in another
+    SDK or a group resolved against a live worker — so a list inferred from it would silently omit the
+    cross-SDK workflows this node exists to call. `CallableWorkflowRef` is the shape to hand it the day
+    a deployment can announce its registrations: one entry per name **and** version.
+  - A call node's `config` travels the same credential path a source node's does — sealed under
+    `encryptCredentials`, refused in plaintext without it, redacted on the way out and restored on the
+    way back in — which is why it carries the same field name.
+
+  **Calling a durable _step_ is not offered, and cannot be.** A step has no global identity: it is
+  routed by a name a worker subscribes to and addressed within a run by its `seq`, so there is nothing
+  to start, await or cancel. Wrap it in a one-step workflow. This is written into `WORKFLOW_NODE_KINDS`
+  beside the other rejected kinds rather than left to be rediscovered.
+
+- 70f5e0b: The canvas can tell you a source does not supply the columns its sink writes, before the load does.
+
+  Every check on the workflow canvas was topological — a sink with no type, two sinks on one type, a
+  node nothing reaches. All of them pass a graph whose source supplies not one of the columns its
+  sink writes, because nothing in a graph says what the columns _are_. The load then succeeds,
+  commits, reports its row count, and the rows are null.
+
+  That is not hypothetical. `subwo` has 84 columns, 73 of them spelled in ways SQL cannot use as an
+  identifier, and the mismatch was found after a run reported `fetched=6905, written=6905`. Thirteen
+  types were published the same way and six came out with most of their columns null, 313,833 rows of
+  the largest. `property-names.ts` moved _its_ half of that problem to publish time for exactly this
+  reason; this moves the other half to design time, where everything needed to answer it is already on
+  screen.
+
+  ## What is compared, and against which of the two names
+
+  A published property has two names and they are not interchangeable:
+
+  - **`name`** is what the load looks the field up by — `row[property.name]` — and nothing on the
+    write path consults anything else.
+  - **`columnName`** is lineage: how the source spells the field, recorded when the property ended up
+    called something else.
+
+  A source with no transform between it and the sink hands its records over exactly as they arrive,
+  keyed by the source's own spelling. So the record has `Asset Id`, the store asks for `Asset_Id`,
+  and the answer is `undefined` — written as null in every row of every run, forever, while the load
+  reports success.
+
+  So the comparison is `column.name` against `property.name`. Matching on `columnName` instead —
+  which _is_ the field that agrees with the source — reports "fits" on precisely the graph that wrote
+  the 6,905 rows. `columnName` is still read, but only to explain a miss: a source column matching a
+  property's `columnName` and not its `name` is the split-name case, and saying so is the difference
+  between "this column is missing" and "these two are the same field under two names".
+
+  The repair the message offers changed with the release that relaxed the publish check. Publishing
+  used to refuse any property name that was not a SQL identifier, so publishers renamed the property
+  to `Asset_Id` and put the source's spelling in `columnName` — which is the type that loads nulls.
+  Both aliases now go through `outputAlias`, so `Asset Id` is a perfectly good property name and the
+  type can simply be renamed to what the source calls the field. The message says that first, and
+  names a transform second, for the narrower set of names that cannot become a column even cleaned.
+
+  ## Three outcomes, not two
+
+  Discovery says how it knows what it knows, and against a real deployment it answered
+  `basis: "driver"` with `sampled: 0` — the driver described the result set and not one row was read.
+  There are questions this genuinely cannot settle, and pretending otherwise in either direction is
+  the failure:
+
+  - **fits** — nothing is reported.
+  - **does not fit** — `level: "error"`, so Save is coloured as refused and the wire is drawn red.
+    Reserved for what the two schemas decide between them and nothing else can change: a column the
+    source does not produce under the name the store will ask for (`shape-source-spelling` when the
+    source has it under its own spelling, `shape-missing-column` when it does not have it at all).
+  - **not known well enough to say** — `level: "warning"` (`shape-unproven`, `shape-not-checked`). It
+    blocks nothing, colours nothing and paints no wire, and it names the basis it is unsure from.
+
+  The third one uses the `level` distinction `WorkflowProblem` already had rather than a new one, and
+  that is the load-bearing part rather than a detail. `coerce` in the warehouse store is total: it
+  stringifies for a `string`, parses a `date` and gives up as null, returns null for a number that is
+  not finite. A `string` column arriving at a `number` property therefore loads perfectly when every
+  value happens to be numeric and writes nulls when one is not — a fact about the rows, and there
+  were no rows. Calling that "does not fit" would refuse graphs that load correctly every night, and
+  a panel that shouts about what it could not prove is a panel people stop reading, which is the
+  failure `workflow/validate.ts` opens by describing.
+
+  Also warnings, for the same reason: a column discovery reached no conclusion about (`type: null` is
+  the absence of a decision, not the `unknown` scalar), and the two sides disagreeing about
+  nullability — the type saying a field is never null while the source says its column may be. Both
+  are declarations. Neither is a row.
+
+  ## Anything that computes its rows is said out loud
+
+  What a transform emits is whatever its TypeScript returns, and knowing that means compiling and
+  running it. A `call` node is further out of reach still: what it emits is decided by a durable
+  workflow this graph does not own, possibly written in another language, and the graph holds nothing
+  but its name and a pinned version. So a sink fed through either gets `shape-not-checked` naming the
+  node, and no error and no silence — silence would read as "these columns fit", which is a claim
+  nothing here is in a position to make.
+
+  The branch is on "not a source" rather than on the kind, so a kind added to the vocabulary tomorrow
+  lands in the honest answer by default instead of falling through the comparison as though a source
+  had produced its rows.
+
+  ## Where nobody asked, nothing is said
+
+  If no source feeding a sink has a discovered shape, this reports nothing at all — not even "could
+  not check". A deployment that has never run discovery would otherwise carry a permanent amber line
+  on every graph, which is the same noise by another route.
+
+  That is also the default. `ValidateOptions.shapes` is optional and **absent, not empty**: a caller
+  with nothing to offer has not learned that every graph is fine, it has not asked. Every existing
+  caller of `validateWorkflow` is unaffected.
+
+  ## Wiring: no new prop
+
+  `WorkflowCanvas` answers this for itself. Both halves are already on the screen: the types come from
+  the catalog snapshot it reads, and the columns come from `POST workflows/:id/nodes/:nodeId/discover`
+  — the route the source node's inspector already calls. `SchemaDiscoveryPanel` gained an
+  `onDiscovered` callback and the canvas keeps what came back, keyed by node id.
+
+  Kept by the canvas rather than by the panel because the panel is unmounted with the inspector sheet,
+  and the rail that has something to say about the columns is on the other side of it. Not fetched by
+  the canvas on load, either: discovery is a read of a live source behind a `POST`, and a graph with
+  four source nodes would open four database connections nobody asked for. So the check speaks about
+  the nodes somebody asked about, which is exactly the silence the section above is built on.
+
+  A shape is dropped when the node is pointed somewhere else — its kind, its connection, its read mode
+  or its config — because columns read from one address say nothing about another. Renaming the node
+  keeps them: a name is not an address.
+
+  `checkShapes` and its input types (`ShapeKnowledge`, `SourceShape`, `SourceColumn`, `TargetShape`,
+  `TargetProperty`) are exported, because the comparison is pure and a host may want it somewhere
+  other than the canvas — a pre-flight before a scheduled run. `ConnectorSchemaDiscovery` already
+  satisfies `SourceShape`, so such a caller has one for free.
+
+- adf4cfe: One place to author a pipeline, and no client method that 404s
+
+  The server half of this landed already: a connector stopped being an authored
+  object and became what a published workflow runs as. It shipped with five client
+  methods pointing at routes that no longer exist, and two screens for one concept.
+  This is the other half.
+
+  **`#connectors` and `#workflows` are one screen.** The canvas is where a workflow
+  is authored, end to end — draw it, save it, publish it, schedule it, run it, and
+  ask a source what its columns are. What is left of the old connectors screen is
+  `<PipelineConsole />`, which keeps the two objects a workflow _borrows_ and does
+  not author: connections, which are the credential and address boundary somebody
+  manages independently of any graph, and transforms, which are code several graphs
+  may name. Its title, its tabs and its docblock all say so. The dashboard's tabs
+  are `Workflows` and `Connections`, and `#connectors` still resolves — to the
+  canvas, because authoring is what that screen was for.
+
+  **Every dead client method is gone rather than quietly broken.**
+
+  - `saveConnector`, `deleteConnector` — removed with the connector form. Authoring
+    is `saveWorkflow` plus the new `publishWorkflow`; the fields those took are
+    fields of nodes now. `ConnectorInput` went with them.
+  - `runConnector` — replaced by `runWorkflow(id, options)`.
+  - `discoverConnectorSchema(id)` — replaced by
+    `discoverSourceSchema(workflowId, nodeId)`.
+  - `connectionConnectors(id)` — replaced by `connectionWorkflows(id)`, which is
+    the question actually being asked before somebody deletes a connection.
+
+  New on `CatalogClient`: `publishWorkflow`, `unpublishWorkflow`,
+  `scheduleWorkflow`, `connectionWorkflows`, `discoverSourceSchema`, and a second
+  argument on `runWorkflow`. `pipelineRoutes()` gains the matching builders and
+  loses the four that addressed removed routes — a builder left behind is a path a
+  screen can still ask for.
+
+  **Discovery works before publication, which is the whole point of the route.** A
+  sink cannot commit into an object type that does not exist, so requiring a
+  published graph would require publishing a graph whose target type cannot be
+  created until it is. The panel lives on the source node's inspector, it is
+  enabled on a draft, and when it cannot run it says so — naming _saving_, never
+  publishing, because a reader told to publish first would go and find they cannot.
+  `SchemaDiscoveryPanel` moved out of `PipelineConsole` into its own module so both
+  entry points can mount it, and is exported.
+
+  **`expectShrink` is reachable, and says what it does where it is used.** It is
+  the acknowledgement that lets a deliberately collapsing load past the row-count
+  bound, it now exists on exactly one route, and without a way to reach it an
+  operator's only recourse is raising `rowCount.maxShrink` in the type's policy —
+  which stands the guard down for every future load of that type instead of for one
+  snapshot. So it is a control beside Run, it opens a dialog that states that
+  trade-off, it will not submit a blank reason, and a refused load grows a
+  "Re-run, acknowledging the shrink" button in the refusal itself.
+
+  **Adoption is said out loud.** A connector wrapped into a graph at boot is
+  published as `ready` without a person declaring it finished. An `adopted` badge
+  and a note on the canvas say where the graph came from and that "ready" here
+  means "it validated", not "somebody looked at it" — matched on `createdBy`, so a
+  connector that carried its own description is covered too.
+
+  Also: a `Runs as` panel showing the connector id the run history and watermark
+  are keyed on (and never its config — the server redacts, so the screen does not
+  render it at all); a `Schedule` panel that prints the server's warning when a
+  stored cron will never fire; `ConfirmDialog` gains `confirmDisabled`; the delete
+  dialog now says the connector and its history go too.
+
+  Nothing here changes what the canvas says about an unfinished node: a freshly
+  added node still reports its checks as work rather than as failure, and a graph
+  that would never run still cannot be saved quietly.
+
+- e21d113: Workflow templates: the graphs people actually draw, with the decisions already made.
+
+  Thirteen types were loaded into a dev catalog in one evening by hand-building one pipeline per
+  type. Six came out with **every renamed column 100% null** — `Subwo` has 313,833 rows and 73 of its
+  84 columns empty. Nothing caught it: the loads committed, the row counts were right, the runs were
+  green. The same wrong decision about property naming was simply made six times, because it was
+  being re-derived per type by somebody trying to get data in.
+
+  So a template here is not sugar. It is the place a decision that is easy to get wrong is made once,
+  by somebody who thought about it, and written down where it gets reviewed. Every template states
+  what it **assumes** and what it **declares** on the operator's behalf, and both travel with the plan
+  so a screen shows them rather than burying them.
+
+  ## The five that shipped
+
+  - **Replicate a table** — SQL straight into a type. Two nodes and one edge, and the entire value is
+    the refusal described below.
+  - **Load a file drop** — a CSV/NDJSON/JSON drop from a path or a bucket. Structurally the same and
+    separate on purpose: a spreadsheet header is the likeliest place to meet a column headed with a
+    year.
+  - **Fan one source into several types** — one expensive read, a transform _per branch_, a sink per
+    type. Per branch because both successors of a source read the same rows, so one shared transform
+    would commit identical wide rows into every type.
+  - **Join two sources into one type** — two reads joined inside one transform.
+  - **Enrich against a lookup table** — the same graph and the same code with one flag flipped, and
+    it is a separate template because that flag _is_ the decision: an unmatched row is kept when
+    enriching and dropped when joining. Dropping it from an enrichment means a load silently loses
+    every record the dictionary has not caught up with — a run that succeeds, reports a plausible
+    count, and is missing data.
+  - **Periodic full reload** — a full read on a schedule, with the matching `periodic-full-reload`
+    declaration derived from the **same** cadence, so the two cannot disagree.
+
+  ## The naming problem, and why two templates refuse rather than guess
+
+  The warehouse matches records to properties **by property name** — `row[property.name]`. So on a
+  graph with no transform on the path, where a record arrives keyed by the source's own spelling, the
+  property has to be named that spelling exactly. `columnName` is display metadata and is never a
+  lookup key, so recording the source's spelling there redirects nothing.
+
+  That used to make an entire class of columns unloadable, because the name was also written verbatim
+  as the view's output column and as the alias of every read, both through `ident`, which refuses
+  rather than escapes. `Asset Id` could be neither kept (publishing refused the name) nor renamed to
+  `Asset_Id` (the record still arrives keyed `Asset Id`, the store asks for `Asset_Id`, gets
+  `undefined`, and writes null into every row of every run while reporting success). The second is the
+  naive fix and is exactly what produced the six null types.
+
+  **`fix/view-alias-sanitised` has since landed and closed the first door.** Both alias sites go
+  through `outputAlias`, so a property keeps the source's spelling end to end: `Asset Id` is a
+  perfectly good name, lands in `Asset_Id`, and reads back as `Asset Id`. `Asset LIN/TAMCN` likewise.
+  These templates no longer refuse them — doing so would send an operator off to perform the exact
+  rename that caused the incident.
+
+  **What survived is narrower and is still a trap.** The publish-time refusal asks whether a name
+  _cleans_ to an identifier, not whether it is one, and a name can still fail that: `2024 Total`
+  cleans to `2024_Total`, and no store will quote a column starting with a digit. For those columns
+  both doors are still shut in the old way. So "Replicate a table" and "Load a file drop" still
+  **refuse**, on precisely that set, and name every offending column together with what it cleans to.
+  The check is `isSafeIdentifier(physicalColumn(name))` — the same two calls, in the same order, that
+  the publish-time refusal and the DDL make.
+
+  A column list nobody has discovered is _also_ still a refusal. That set shrank and did not empty: an
+  undiscovered `2024 Total` still ends as a property renamed to `2024_Total`, loading null into every
+  row and reporting success. Proceeding on silence is asserting the names are fine because nobody
+  looked, which is how the six were built.
+
+  ## What every template obeys
+
+  - **It does not hide the decision.** A plan is plain nodes, edges, transform bodies and expectation
+    payloads — no template object survives into the saved workflow, and every declaration carries a
+    `changeAt` saying where to undo it.
+  - **It does not claim a mode it cannot justify.** Nothing offers `incremental`: it is refused
+    outright without a delete declaration and needs a watermark column no template can know.
+  - **It does not restate a list.** Source kinds are a `Record` over `ConnectorKind`, starter code a
+    `Record` over `TransformLanguage`, node construction a mapped type over `WorkflowNodeKind`. A kind
+    or language added to the library without a line here is a compile error, not a template that
+    quietly stops covering it.
+
+  The templates are shipped by the library rather than stored per deployment, deliberately: they are
+  decisions, and decisions belong in code where they are reviewed and carry their reasoning.
+  Per-deployment templates are a store concern and a separate change.
+
+  ## Also here
+
+  The whole naming rule — `isSafeIdentifier`, `assertSafeIdentifier`, `UnsafeIdentifierError`,
+  `physicalColumn` and `outputAlias` — moved into a dependency-free `catalog.identifiers.ts` and is now
+  exported from `@dudousxd/nestjs-catalog/client` as well as the package root. It used to sit in
+  `catalog.store.ts`, which imports `@nestjs/common` at module scope, so a browser could not reach any
+  of it without dragging NestJS along — and a canvas that answered "can this be a property name?" from
+  its own copy of the pattern would be a fresh definition of a rule whose own docblock says one
+  definition is the guarantee and two identical ones are a habit.
+
+  `physicalColumn` had to travel with `isSafeIdentifier` rather than being left behind, because the
+  question a publisher is refused on is the _composition_ of the two. A browser holding only half of it
+  would answer the obsolete, stricter question and refuse graphs the server would accept.
+
+  Every existing import path still works; `catalog.store.ts` re-exports all five.
+
+  ## Not shipped
+
+  Reading an already-published catalog type as a source — to build a derived or aggregate type — is
+  **not reachable**. `CONNECTOR_KINDS` is `http`, `sql`, `file`, `s3`, `inline`, and none of them reads
+  the catalog's own warehouse. It is the natural next template and it needs a connector kind first.
+
+### Patch Changes
+
+- 4aaf82a: A tall query can be scrolled to the bottom
+
+  **The bug.** "tentei scrollar e não foi" — the SQL box on `#query` would not
+  scroll. Reproduced in Chrome with a 61-line body in the `h-56` box: a real wheel
+  event dispatched over the editor moved `window.scrollY` from 0 to 270 and left
+  the editor on line 1. The PAGE scrolled; the code did not.
+
+  **The cause, which is the previous fix's blind spot.** `overflow: 'scroll'` is an
+  option about WRAPPING, and it buys one axis. Inside the shadow root
+  `@pierre/diffs` puts `overflow-x: scroll` on its `[data-code]` element, pairs it
+  with `overflow-y: clip`, and lets that element size to the whole document — 1230px
+  of it inside a 224px box. Nothing in the library scrolls vertically: `File` is
+  the non-virtualised renderer and owns no viewport, and the one escape hatch it
+  exposes, `--diffs-overflow-override`, substitutes into the X component alone. So
+  the overflow landed on the first ancestor with an opinion, which was
+  `CodeEditor`'s own wrapper wearing `overflow-hidden` — clipping, by definition,
+  without offering any way to scroll. Walking every element from the last line up
+  to `<html>` found not one with a user-scrollable Y axis. Only the browser's own
+  caret-into-view scrolling could reach line 61, which is why typing to the bottom
+  appeared to work and dragging never did.
+
+  **The change.** The wrapper is now `overflow-x-hidden overflow-y-auto`: it
+  becomes the vertical viewport the dependency declines to be. `overflow-x-hidden`
+  is load-bearing rather than tidy — an `overflow-x` left `visible` beside a
+  scrolling Y axis computes to `auto`, stacking a second, permanently empty
+  scrollbar on the real one inside the shadow root.
+
+  Nothing about the horizontal axis moves, and the selection bug that
+  `overflow: 'scroll'` exists to prevent does not come back. Verified in Chrome
+  after the change, on the same 61-line body: a wheel down takes the wrapper's
+  `scrollTop` from 0 to 1013 with `window.scrollY` still 0, a drag on the 15px
+  scrollbar takes it to 636, `PageDown` and the arrows keep the caret in view,
+  typing past the bottom edge scrolls one line to follow it, and a horizontal wheel
+  still moves the 1463px first line inside its 657px box. Every line box is exactly
+  one line-height tall, and `Shift+End` from offset 7 of that first line still
+  selects to the end of the LOGICAL line.
+
+  The query console (`h-56`), both transform panes (`h-72`, `h-32`) and the
+  workflow canvas's code sheet were all affected and are all fixed by the one
+  change. The history sheet's diff never was: `MultiFileDiff` is given no fixed
+  height there, so it grows to its content and the page scrolls it.
+
+  **Known, and not fixable from outside the shadow root.** The horizontal scrollbar
+  belongs to `[data-code]`, which is document-height, so it is drawn at the bottom
+  of the DOCUMENT rather than at the bottom of the visible box. A horizontal wheel
+  or trackpad swipe works from anywhere in the box; the scrollbar itself only comes
+  into view once you have scrolled to the end.
+
 ## 0.17.0
 
 ### Minor Changes

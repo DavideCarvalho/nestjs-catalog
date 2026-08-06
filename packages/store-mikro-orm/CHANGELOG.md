@@ -1,5 +1,275 @@
 # @dudousxd/nestjs-catalog-store-mikro-orm
 
+## 0.11.0
+
+### Minor Changes
+
+- cbab48c: A property may be named the way its source spells it, and the publish check refuses only what
+  genuinely cannot become a column.
+
+  A store matches a source's record to a property by property NAME — it reads `row[property.name]` —
+  and nothing on the write path consults `columnName`. But the name was also written _verbatim_ as the
+  output alias of the committed view and of every read, through an `ident` that refuses rather than
+  escapes, so a property could not be called `Asset Id` at all. Publishers therefore did what the
+  refusal told them to do: renamed the property to `Asset_Id` and put the source's spelling in
+  `columnName`. Thirteen types were loaded that way and six came out with most of their columns NULL —
+  73 of 84 on the largest, across 313,833 rows — with every run green, every row count right, and
+  nothing visible short of opening a cell.
+
+  - **The view's output alias and the read's alias now go through `outputAlias`**, in both shipped
+    adapters (`query.ts` and the store in each of `store-mikro-orm` and `store-clickhouse`). A name
+    SQL cannot take is cleaned to its physical column; **a name SQL can take is kept byte for byte**,
+    so no view that resolves today changes shape. The two names that would otherwise have moved — one
+    whose doubled underscores would collapse, one over 60 characters — are pinned by tests.
+  - **The publish-time refusal asks the question it actually needs to**: does this name _clean_ to an
+    identifier? `Asset Id` does and is accepted; `2024 Total` does not, because `2024_Total` starts
+    with a digit, and is still refused before a single row exists. The refused value named in the
+    message is the cleaned one, which is exactly the string `ident` would refuse, so publish-time and
+    DDL-time still say one sentence about one string. Length alone can no longer refuse a name, since
+    the cleaning cuts at 60 and the rule allows 63.
+  - **The refusal message now says what a rename costs.** Taking the suggested name means the load
+    looks up `row[<new name>]` in records the source still keys by the old one, so the message names
+    `row[name]` and says a transform has to go with it. That sentence is the one whose absence turned
+    a correct refusal into six empty tables.
+  - **`physicalColumn` moved to `@dudousxd/nestjs-catalog`** and is re-exported by both adapters
+    unchanged. It was three byte-identical private copies — two of them inside `store-mikro-orm`, one
+    deciding the view's columns and one deciding the table's — and it is now what decides whether a
+    published name can work at all, so the publish check and the DDL run the same function rather than
+    copies of it. `outputAlias` lives beside it. Both are new named exports; nothing was removed.
+
+  **What an existing deployment sees: nothing.** Every property name stored today is a SQL identifier,
+  because the old publish check demanded one, and `outputAlias` returns such a name unchanged — so
+  every view keeps every column it has, `read()` still returns rows keyed by the property's own name,
+  and no migration or republish is needed. What changes is what a _new_ publish may say, and one
+  repair: a type that picked up a name like `Asset Id` before the publish check existed used to fail
+  at every commit and be warned about on every publish. It now cleans to a column like any other, so
+  it works and the warning correctly stops.
+
+- 2d115cd: A workflow node that hands its step to a durable workflow that already exists.
+
+  A graph could do three things — read, transform, commit — and every one of them had to be written
+  here. A deployment that already runs durable workflows, including ones whose body is in Python, had
+  no way to put one in a pipeline. `call` is a fourth node kind: it names a registered workflow and a
+  version, and runs it as a **tracked child** of the catalog's own durable run.
+
+  - **The version is pinned, and pinned means checked.** A node stores `callName` _and_ `callVersion`,
+    and both are part of the graph fingerprint, so repointing a node at `foo@2` is a new version of
+    the graph. The honest limit is written down where it applies: `engine.start` resolves the newest
+    registered version and takes no version argument, so the child is started and then **checked** —
+    `catalog.workflow.call-check` reads the child's run row, and a mismatch cancels the child and
+    fails the node naming both versions. A wrong version is stopped, not prevented. The step refuses
+    outright when the process running it has no engine to check against, because "unchecked" and
+    "checked and fine" must not read the same.
+  - **Handles cross the boundary, never rows.** The child receives one documented envelope —
+    `{catalog: {contract, runId, nodeId, workflowId, workflowVersion, principalId, inputs}, input}` —
+    where `inputs` names the stages its inbound edges wrote, addressed by `(runId, nodeId, batch)` as
+    everything else in a run is. A child that produces rows for the graph stages them under the
+    calling node's id and returns `{batches, rowCount}`. There is no shared type between a catalog
+    node and an arbitrary workflow and none is pretended: `readWorkflowCallOutput` reads those two
+    counts, reads their absence as "called for its effect, no rows" and says so in the run log, and
+    **refuses half of them** rather than turning a callee's bug into a load that came out short.
+  - **Nothing validates the callee's input at save time, because nothing can.** `register()` takes
+    `validateInput` and `searchAttributesSchema`, but neither is reachable: the registry is private
+    and no public method hands a registration out. What does happen is that `engine.start` runs the
+    callee's own `validateInput`, and a refused start is delivered to the parent as a failed child —
+    so a bad wiring fails at the node, naming the node, the workflow, the version and the child run.
+  - **A busy callee waits rather than failing.** A singleton with `maxQueueDepth` refuses a start once
+    its backlog is full, which is contention and not a fault; the node retries five times over about
+    seven and a half minutes, suspended at zero compute, each attempt with its own child id, and then
+    fails saying it was contention and quoting the engine. Skipping was rejected: a node that quietly
+    produced nothing is the failure this service exists to remove.
+  - **Failure and cancellation, stated:** a failed child fails the node, everything downstream is
+    `skipped`, and the load is failed. Cancelling the parent cascades to the child; letting the parent
+    hit its `executionTimeout` does **not**, because that sweep marks the run cancelled without going
+    through `cancel`. The parent's own execution timeout is still what stops a hung child holding a
+    connector's singleton slot for ever — admission counts `suspended` runs, and a timed-out parent is
+    no longer one. A called workflow should carry its own `executionTimeout`; `ctx.child` takes none.
+  - **Serialisation belongs to the callee, and is weaker across SDKs.** Calling a workflow does not
+    lend it the caller's singleton. On the convention/`attach` path a cross-SDK body is reached by,
+    the synthesised registration carries no singleton, timeout or validator at all. The canvas says so
+    rather than implying otherwise.
+  - **`expectShrink` reaches every node step and no callee.** The acknowledgement on
+    `POST workflows/:id/run` stands the row-count bound down for one snapshot, and the bound is
+    applied at the sink — so a call node does not forward it. Handing a one-time acknowledgement to
+    an arbitrary workflow would put it somewhere nothing on this side can account for what was done
+    with it.
+  - **A `call` node counts as something that reads**, so `call → sink` is a valid graph and
+    `no-source` is no longer raised on one. A graph of transforms alone is still refused.
+  - **On a pod with no durable engine the run is refused up front**, naming the node and the workflow,
+    instead of opening a run row and failing at the node.
+  - The canvas gains a Call node with a workflow field, a version field and a JSON parameter box, in
+    the same node inspector that authors a source or a sink — the one screen a pipeline is now
+    published, scheduled and run from, so a call node is drawn, saved and published exactly like the
+    rest of the graph rather than through a surface of its own.
+    **Deliberately no picker**: nothing can enumerate a deployment's workflows — `workflowBody` answers
+    only for the asking process, and a missing body equally means a `registerRemote` body in another
+    SDK or a group resolved against a live worker — so a list inferred from it would silently omit the
+    cross-SDK workflows this node exists to call. `CallableWorkflowRef` is the shape to hand it the day
+    a deployment can announce its registrations: one entry per name **and** version.
+  - A call node's `config` travels the same credential path a source node's does — sealed under
+    `encryptCredentials`, refused in plaintext without it, redacted on the way out and restored on the
+    way back in — which is why it carries the same field name.
+
+  **Calling a durable _step_ is not offered, and cannot be.** A step has no global identity: it is
+  routed by a name a worker subscribes to and addressed within a run by its `seq`, so there is nothing
+  to start, await or cancel. Wrap it in a one-step workflow. This is written into `WORKFLOW_NODE_KINDS`
+  beside the other rejected kinds rather than left to be rediscovered.
+
+- 688becb: Stream the CSV export, and stop a cell in it executing when somebody opens the file.
+
+  `GET saved-queries/:id/export.csv` ran the query, held the result, built the whole CSV string and
+  then answered. That is the same shape that stopped a 981,469-row connector load ever finishing, and
+  it is worse on an export, because an export has no row cap by design: the point of it is to take
+  everything.
+
+  - **Rows are written to the response as they arrive.** `CatalogQueryStore` gains an optional
+    `streamQuery`, `csvLines` turns an async row source into CSV a line at a time, and the handler
+    returns a `StreamableFile` over it. `@Res({ passthrough: true })` is unchanged and still correct —
+    what changed is the returned value, because the express adapter answers a _string_ body with
+    `res.send()`, which sets a `content-length` on a body nobody has counted. The response is now
+    chunked and carries none. Back-pressure runs the whole way: the pipe stops when the socket is full,
+    the readable stops pulling, and the generator stops asking the store — so a slow client slows the
+    database read rather than filling this process. A client that abandons the download tears the
+    readable down, which runs the generator's `finally`.
+  - **The export is no longer capped or cached** on a store that streams. `maxQueryRows` bounds a
+    screen's page; a capped export is a prefix handed over as a complete file. The cache is skipped in
+    both directions — it holds a capped page, and filling it from an export would put the whole result
+    in the object the cache exists to avoid. No statement timeout is applied either: an export of a
+    large table legitimately runs for minutes, and the bound that matters for it is that no stage holds
+    more than a row.
+  - **`MySqlWarehouseStore` implements `streamQuery`**, on MikroORM v7's Kysely-backed
+    `connection.stream()` inside a real `READ ONLY` transaction handle — passing the handle matters,
+    since a stream executed on some other pooled connection would be protected by nothing. The rollback
+    is in the generator's `finally`, so it runs when a consumer stops early. `FanoutCatalogStore`
+    forwards it when its primary has it; `RoutingCatalogStore` forwards it per environment.
+  - **A store that cannot stream keeps the capped buffered read**, and the truncation is logged.
+    Lifting the cap there would not make the export complete, it would move the failure into a driver
+    that has no cap to report. `ClickHouseWarehouseStore` is in this group today.
+  - **A cell whose value would be read as a formula is neutralised.** `=`, `+`, `-` and `@` all start
+    an expression in Excel and Sheets, including through leading blank the importer strips first and
+    including a leading tab or carriage return, and the values here come from whatever the queried
+    source contained. Such a cell is prefixed with `'`. **A value that is plainly a number is exempt**,
+    so `-42` still reads back as `-42` for a machine: a spreadsheet evaluates `-42` to the number it
+    already was, so there is nothing there to defend against, and the apostrophe is a real cost —
+    outside a spreadsheet the cell now carries a character the database did not have. The guard runs
+    before the CSV quoting, so a value that needed both comes out as `"'=1+1,x"`, escaped once.
+
+  `toCsv` keeps its name, its signature and its bytes, and moves from `catalog.query-cache` to
+  `catalog.csv` alongside `csvLines`, `csvCell` and `guardFormula`; the package entry point exports all
+  four. Its output changes only where the formula guard applies.
+
+- dd79c42: The workflow is the only thing anybody authors
+
+  A connector stops being an authored object. It becomes what a published workflow
+  runs as: minted by `publishWorkflow`, removed with the graph, with no route to
+  create one directly. `minor` and not `major` on purpose — this is 0.x, and the
+  project versions on that basis rather than on whether a route was removed.
+
+  **Routes gone.** `POST connectors`, `DELETE connectors/:id`,
+  `POST connectors/:id/run`, `POST connectors/:id/discover`, and
+  `GET workflows/:id/connectors`. `GET connectors` stays, as a read: it is where a
+  run history and a watermark are actually keyed, and an internal record no route
+  exposes is one an operator debugs by opening the database.
+
+  **Routes arrived.** `PUT workflows/:id/schedule`, because a schedule is a
+  statement about a pipeline and a pipeline is a graph; and
+  `POST workflows/:id/nodes/:nodeId/discover`, because discovery is how a type gets
+  its shape before anything can be published into it. `GET connections/:id/connectors`
+  became `GET connections/:id/workflows`, which is the question an operator is
+  actually asking before they delete one.
+
+  **Three things had to move rather than be dropped, and each was load-bearing.**
+
+  _Discovery._ `discoverConnectorSchema` refused any connector carrying a
+  `workflowId`, telling the caller to discover from the graph's source node
+  instead — correct advice pointing at something that did not exist. Every
+  connector carries one now, so the old shape would have refused every connector
+  there is. It takes a `DiscoverySource` and resolves through
+  `WorkflowRunnerService.resolveSourceNode`, the same method a run resolves with,
+  so a discovery cannot describe a source the load never touches. It answers on a
+  **draft**, deliberately: a sink cannot commit into a type that does not exist, so
+  requiring a published graph would require publishing a graph whose target type
+  cannot be created until it is published.
+
+  _The schedule._ Authored on `CatalogWorkflow` now, and `ConnectorScheduler` reads
+  workflows. The connector keeps a copy for evidence and nothing reads it. Every
+  way a schedule can exist and not fire — a draft, a disabled graph, an unparseable
+  cron, a ready graph with no connector — is now logged by name rather than skipped:
+  this loop once announced it was watching schedules every 30000ms while parsing
+  nothing, and a silent skip is that failure wearing a different cause.
+
+  _`expectShrink`._ The acknowledgement that lets a deliberately collapsing load
+  past the row-count bound reached it only through `POST connectors/:id/run`.
+  Removing that route without moving this would have left an operator unable to
+  re-drive a refused load at all, which pushes them to raise the bound in policy —
+  standing the guard down for every future load of the type rather than for one
+  snapshot. It is on `POST workflows/:id/run`, carried through the durable step
+  input, and a scheduled window still has no field for it.
+
+  **Existing connectors are migrated, not frozen.** `ConnectorAdoption` wraps every
+  connector that predates workflows into the graph it always was — one source,
+  optionally one transform, one sink — at boot, idempotently, and loudly. It keeps
+  the connector **id**, so the run history, the singleton mutex key and the
+  watermark stay attached to the same pipeline; **re-keys the watermark** under the
+  new source node, so the first run after the upgrade does not re-read an
+  incremental source from the beginning; and moves the schedule onto the graph. A
+  connector whose wrap does not validate is refused and keeps running exactly as it
+  was. Turn it off with `adoptConnectors: false`, and be aware of the consequence:
+  those connectors keep loading and no route can edit them.
+
+  **Unpublishing and deleting a workflow now cascade.** Both used to refuse while a
+  connector still ran the graph, on the reasoning that "point them elsewhere first"
+  was advice somebody could act on. It no longer is — a published graph runs as
+  exactly one connector, its own — so the old check would refuse every unpublish
+  there has ever been. Unpublishing **disables** the connector, keeping the id and
+  the history so re-publishing resumes the same pipeline; deleting removes it,
+  which takes the run history with it.
+
+  **Not included: the console.** `#connectors` and `#workflows` are still two
+  screens, and `CatalogClient.saveConnector`, `deleteConnector`, `runConnector`,
+  `discoverConnectorSchema` and `connectionConnectors` still address routes this
+  release removes, so those actions 404. Merging the two screens into one place to
+  author a pipeline is the other half of this work and is deliberately not
+  half-done here.
+
+### Patch Changes
+
+- 9ad4883: The second a write lands in is not the second it was written in
+
+  `stored-registry.staleness.db.spec.ts` — the only place two real
+  `StoredCatalogRegistry` instances meet one real MySQL, and so the only evidence
+  that a replica heals itself — failed ten runs in twenty, every one of them the
+  case that asserts a replica which nothing has written to does **not** rebuild.
+
+  The cause is a difference between how MySQL stores a timestamp and how it reports
+  the time. `updated_at` is a `DATETIME(0)`, and MySQL **rounds** a fractional
+  second into it rather than truncating; mysql2 sends the millisecond the row was
+  written, so a write at `…:32.600` is stored as `…:33` — up to half a second ahead
+  of the instant it happened. `NOW()` truncates. `settledAt` compares the two, so a
+  write stays "inside the second the database is still in" for up to 1.5s, not 1s.
+  The spec waited a flat 1,100ms before opening its second registry, which is
+  enough only when the write's millisecond happens to be below .500; above it, the
+  sibling's watermark was recorded as untrustworthy and the replica correctly
+  rebuilt on every check for the rest of that second, which is exactly what that
+  case exists to say must not happen. Caught in the act: `type_at` came back
+  `03:45:57` from the same statement whose `db_now` was `03:45:56`.
+
+  The engine was right and the test was guessing. Nothing in the file waits a
+  chosen duration for the database any more — it asks the database the same
+  question `settledAt` asks, and proceeds when the answer is yes, which is exact
+  under rounding, under a cold container's slow first statements and under clock
+  skew between the process and the server. No timeout was widened and no assertion
+  was weakened: mutating the registry so it never re-reads its watermark still
+  turns four of the five cases red.
+
+  `settledAt`'s docblock is corrected along with it. It claimed the provisional
+  window cost "at most one extra rebuild per write, because the following check
+  happens at least `staleAfterMs` later and the second has closed by then". Under
+  rounding it has not necessarily closed, and at the default `staleAfterMs` of 1000
+  the real bound is two. Still bounded, still per write rather than per request —
+  but the reasoning as written was wrong, and it is the reasoning this flake was
+  hiding behind.
+
 ## 0.10.0
 
 ### Minor Changes

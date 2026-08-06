@@ -1,6 +1,6 @@
 {
   "name": "@dudousxd/nestjs-catalog-secrets-aws",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "AWS KMS secret vault for @dudousxd/nestjs-catalog: envelope encryption with a per-secret data key, the secret's kind and field bound as KMS encryption context, and the resolved key ARN recorded on every row.",
   "license": "MIT",
   "author": "Davide Carvalho",
