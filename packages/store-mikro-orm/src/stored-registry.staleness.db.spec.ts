@@ -26,6 +26,18 @@ import { type CatalogDatabase, openCatalogDatabase, startMySql } from '../test/m
  * it uses, because they touch different tables and that is exactly the point:
  * a publish writes the type row, a curation edit writes only a property row, and
  * a committed load writes neither directly.
+ *
+ * **Nothing here waits a chosen number of milliseconds for the database.** The
+ * four cases that watch a replica notice something poll until it has; the one
+ * step that has to happen *before* a replica opens — letting the second of the
+ * previous write close, so the replica's watermark is one it trusts — asks the
+ * database whether it has, in {@link settle}. That is not fussiness. A constant
+ * lived there, and it made this file flake in the fourth case for a reason worth
+ * keeping written down: MySQL **rounds** into a `DATETIME(0)`, so a row written
+ * at `…:32.600` is stored as `…:33` while `NOW()` is still `…:32`, and a wait
+ * measured from the writer's clock is measuring the wrong second. The engine is
+ * the thing that knows; the whole point of a `.db.spec.ts` is that it is here to
+ * be asked.
  */
 
 let container: StartedMySqlContainer;
@@ -74,18 +86,80 @@ function sibling(): StoredCatalogRegistry {
 }
 
 /**
- * Wait until the second of the last write has closed.
+ * The registry's `settledAt` condition, asked of the database rather than
+ * guessed: how many whole seconds `NOW()` is ahead of the newest `updated_at`
+ * across the two model tables. One or more means a watermark read now is one the
+ * registry will record.
  *
- * Not padding. `updated_at` is a `DATETIME`, so a watermark read inside the
- * second of its own newest write is provisional and the registry declines to
- * record it — which means a sibling that opened during that second would reload
- * on its next check whether or not anything had moved, and the case would prove
- * nothing about the aggregates. Waiting first makes the sibling's watermark one
- * it actually trusts, so the only thing that can make it look again is the write
- * the case then makes.
+ * `COALESCE` because `catalog_property.updated_at` is nullable and is genuinely
+ * all-NULL for part of this file — the upgrade case drops the column and puts it
+ * back — and `GREATEST` of anything with NULL is NULL, which would make this
+ * report nothing rather than report the type table's age.
  */
-function settle(): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, 1_100));
+const SETTLED_SQL = `SELECT TIMESTAMPDIFF(
+         SECOND,
+         GREATEST(
+           COALESCE((SELECT MAX(updated_at) FROM catalog_object_type), '1970-01-01'),
+           COALESCE((SELECT MAX(updated_at) FROM catalog_property),    '1970-01-01')
+         ),
+         NOW()
+       ) AS age`;
+
+/**
+ * Wait until the second of the last write has closed — **as the database counts
+ * it**, which is not the same as waiting a second and a bit.
+ *
+ * Not padding, and the reason is the one `settledAt` gives: `updated_at` is a
+ * `DATETIME`, so a watermark read inside the second of its own newest write is
+ * provisional and the registry declines to record it. A sibling that opened
+ * during that second would then reload on its next check whether or not anything
+ * had moved, and the case would prove nothing about the aggregates. Waiting first
+ * makes the sibling's watermark one it actually trusts, so the only thing that
+ * can make it look again is the write the case then makes.
+ *
+ * This used to sleep 1,100ms, and that is what made this file flake — ten runs in
+ * twenty when it was last measured, every one of them the case below that asserts
+ * a replica does *not* rebuild, and none of the other four.
+ *
+ * **MySQL rounds a fractional-second timestamp into a `DATETIME(0)`; it does not
+ * truncate it.** mysql2 sends the millisecond the row was written, so a write at
+ * `…:32.600` is *stored* as `…:33` — up to half a second in its own future —
+ * while `NOW()` truncates and stays at `…:32`. The second that has to close is
+ * the second of the stored value, so the honest sleep was never 1,100ms but
+ * 1,500ms plus however long the write took, and the write's millisecond decided
+ * which side of that a run landed on. Observed directly: `type_at` came back
+ * `03:45:57` from a statement whose own `db_now` was `03:45:56`.
+ *
+ * So nothing here sleeps a chosen duration any more. It asks the database the
+ * question the registry asks, and returns when the answer is yes — which is
+ * exact under rounding, under a cold container's slow first statements, and under
+ * any clock skew between this process and the server, none of which a constant
+ * can be right about at once.
+ */
+async function settle(): Promise<void> {
+  await vi.waitFor(
+    async () => {
+      const [row] = rowsOf(await db.execute(SETTLED_SQL));
+      expect(ageOf(row)).toBeGreaterThanOrEqual(1);
+    },
+    { timeout: 20_000, interval: 25 },
+  );
+}
+
+/**
+ * The `age` out of {@link SETTLED_SQL}, or -1 when the row cannot be read as one.
+ *
+ * A guard rather than a cast, for the reason the store's own row helpers give:
+ * `TIMESTAMPDIFF` arrives as a number or as a string depending on the driver's
+ * big-number settings, and -1 for anything else fails the wait loudly instead of
+ * letting an unreadable answer count as settled.
+ */
+function ageOf(row: unknown): number {
+  if (typeof row !== 'object' || row === null) return -1;
+  const age = Reflect.get(row, 'age');
+  if (typeof age === 'number') return age;
+  if (typeof age === 'string' || typeof age === 'bigint') return Number(age);
+  return -1;
 }
 
 /** How long a sibling is given to notice. Generously more than its window. */
