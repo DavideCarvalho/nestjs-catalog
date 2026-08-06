@@ -190,8 +190,13 @@ describe('what every template produces', () => {
     // The second rule: no template offers a mode it cannot justify. An
     // incremental load is refused outright without a delete declaration and
     // needs a watermark column no template can know.
+    // Narrowed on the FIELD rather than on a list of kinds. `if (kind ===
+    // 'transform') continue` said the same thing until a fourth kind arrived
+    // with no `mode` at all, and it would have to be edited again for a fifth —
+    // which is the hand-maintained list this file's own factory map exists to
+    // refuse. Asking whether a node has a mode is the question being tested.
     for (const node of planFor(id).nodes) {
-      if (node.kind === 'transform') continue;
+      if (!('mode' in node)) continue;
       expect(node.mode).toBe('full');
     }
   });
