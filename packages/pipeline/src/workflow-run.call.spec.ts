@@ -607,6 +607,11 @@ describe('the plan a call node is executed from', () => {
       name: 'Reconcile',
       kind: 'call',
       inputs: [],
+      // Empty, and asserted rather than left off: this is what says the node's
+      // inbound wires carry no branch label, which is what makes it run
+      // unconditionally. A plan that lost this map would make every node with a
+      // labelled inbound wire look unconditional too.
+      inputBranches: {},
       call: { name: 'billing.reconcile', version: '2', config: { region: 'gov-west' } },
     });
   });

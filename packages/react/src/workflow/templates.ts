@@ -331,6 +331,16 @@ const NODE_FACTORIES: NodeFactories = {
   // deployment's registrations to offer a choice from. The factory is complete
   // so that a template CAN build one the day a case is worth prefilling.
   call: (id, name, init) => ({ id, name, kind: 'call', ...init }),
+  // `if` arrived the same way `call` did, and the map stopped the build again.
+  //
+  // Also unused by every template below, for a reason of its own: which
+  // environment variable tells one deployment apart from another is the entire
+  // content of a gate, and it is knowledge about a *deployment* rather than
+  // about a pipeline shape. A template that guessed one would prefill a decision
+  // that is wrong everywhere except where it was written — and a branch that is
+  // wrong is a half of the graph that silently does not run, which is the one
+  // failure this node had to be built not to have.
+  if: (id, name, init) => ({ id, name, kind: 'if', ...init }),
 };
 
 /* -------------------------------------------------------------------------- */

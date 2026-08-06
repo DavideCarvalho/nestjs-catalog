@@ -161,6 +161,19 @@ export class CatalogWorkflowRunWorkflow {
 
     for (let index = 0; index < plan.order.length; index += 1) {
       const entry = plan.order[index];
+      // Before the step is dispatched, and decided **only** from what earlier
+      // nodes recorded in `progress.outcomes` — which on this path came out of
+      // their own checkpoints. No predicate is evaluated here, which is the
+      // whole point: on a replay this loop reads the branch the first attempt
+      // took and reproduces exactly the same decision, on whichever pod happens
+      // to be running the turn. A body that asked the environment itself would
+      // be a body whose control flow depends on where it woke up, and the
+      // engine would report it as non-determinism two nodes later.
+      //
+      // Skipping is also what keeps a skipped sink from committing: `ctx.step`
+      // is never reached for it, so `runSink` never runs, so nothing repoints
+      // the live view of its type.
+      if (this.runner.skipUnlessLive(progress, entry, plan.order)) continue;
       try {
         // In edge order, because that is the order `plan.order[].inputs`
         // preserved from the graph's edge array — never the iteration order of
@@ -212,12 +225,10 @@ export class CatalogWorkflowRunWorkflow {
         if (isWorkflowControlFlowSignal(error)) throw error;
         const message = error instanceof Error ? error.message : String(error);
         this.runner.recordFailure(progress, entry.nodeId, message);
-        for (const later of plan.order.slice(index + 1)) {
-          // Everything downstream is `skipped`, not `failed`: it did not run,
-          // and recording nothing at all would read the same as a node nobody
-          // has looked at yet.
-          progress.outcomes[later.nodeId] = { status: 'skipped', rows: 0 };
-        }
+        // Everything downstream is `skipped`, not `failed`, and carries no
+        // reason — see `strandRemaining`, which is where that omission is
+        // argued and which the inline path calls too.
+        this.runner.strandRemaining(progress, plan.order, index);
         // Recorded through a step, so the failure survives this process dying
         // the moment after it happened — and then rethrown, because a step (or
         // a workflow) that returns is one that succeeded, and a scheduled load

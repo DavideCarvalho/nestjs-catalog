@@ -36,6 +36,9 @@ const MINIMAL: Record<WorkflowNodeKind, Record<string, unknown>> = {
   transform: { kind: 'transform', transformId: 't1' },
   sink: { kind: 'sink', targetType: 'Widget' },
   call: { kind: 'call', callName: 'billing.reconcile', callVersion: '1' },
+  // The fifth kind, added by somebody who had indeed never seen this file, and
+  // sent here by the compile error the docblock above promised.
+  if: { kind: 'if', envVar: 'CLICKHOUSE_URL' },
 };
 
 const KINDS = Object.keys(MINIMAL) as WorkflowNodeKind[];

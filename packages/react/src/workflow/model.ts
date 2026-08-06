@@ -24,12 +24,15 @@ export type {
   CallableWorkflowDisagreement,
   CallableWorkflowRef,
   CatalogWorkflow,
+  WorkflowBranchLabel,
   WorkflowEdge,
   WorkflowCallNode,
   WorkflowGraph,
+  WorkflowIfNode,
   WorkflowNode,
   WorkflowNodeKind,
   WorkflowSinkNode,
+  WorkflowSkipReason,
   WorkflowSourceNode,
   WorkflowTransformNode,
 } from '@dudousxd/nestjs-catalog/client';
@@ -40,12 +43,20 @@ export {
   // same list, and two copies of that rule is a picker that eventually offers
   // something the rest of the system will not accept.
   callableWorkflowBlock,
+  isWorkflowBranchLabel,
   isWorkflowNodeKind,
+  unreachableNodeKind,
+  WORKFLOW_BRANCH_LABELS,
   WORKFLOW_NODE_ID_PATTERN,
   WORKFLOW_NODE_KINDS,
 } from '@dudousxd/nestjs-catalog/client';
 
-import { WORKFLOW_NODE_ID_PATTERN, type WorkflowNode } from '@dudousxd/nestjs-catalog/client';
+import {
+  WORKFLOW_NODE_ID_PATTERN,
+  type WorkflowBranchLabel,
+  type WorkflowNode,
+  type WorkflowSkipReason,
+} from '@dudousxd/nestjs-catalog/client';
 
 /**
  * What a caller may set.
@@ -168,6 +179,20 @@ export interface WorkflowRunNode {
    * nowhere else to read it from.
    */
   replayed?: boolean;
+  /** Which branch an `if` node took on this run. See {@link WorkflowIfNode}. */
+  branch?: WorkflowBranchLabel;
+  /**
+   * Why a `skipped` node did not run, when a branch is the reason rather than a
+   * failure above it.
+   *
+   * The distinction a run panel exists to draw for a **sink**: skipped by a
+   * branch means it committed nothing *and was right not to*, so the snapshot
+   * that was live before the run is still live. Skipped with no reason means the
+   * run fell over before reaching it. Rendering the two identically would answer
+   * "why is there no fresh data in X" with the same shrug for a healthy run and
+   * a broken one.
+   */
+  skippedBecause?: WorkflowSkipReason;
   rows?: number;
   error?: string;
   startedAt?: string;

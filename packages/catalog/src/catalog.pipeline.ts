@@ -708,18 +708,65 @@ export interface ConnectorRun {
   nodeOutcomes?: Record<string, WorkflowNodeOutcome>;
 }
 
+/**
+ * Why a `skipped` node did not run, when there is more to say than "the run
+ * stopped".
+ *
+ * **One entry, and the omission is the point.** `skipped` already meant one
+ * thing before branches existed — the run failed upstream and never reached
+ * this node — and every outcome ever stored records that meaning by *not*
+ * carrying a reason. Adding `run-stopped` to this list would not describe those
+ * rows, it would leave them describing an unknown reason, so the pre-existing
+ * meaning stays the absent one and this names only the new fact: the node is on
+ * a branch an {@link WorkflowIfNode} did not take.
+ *
+ * The distinction is not cosmetic. A sink skipped by a branch **committed
+ * nothing and left the live snapshot alone**, which is a correct, successful
+ * outcome; a sink skipped by a failure is part of a load that went wrong. A run
+ * panel that rendered both as "did not run" would answer "why is there no data
+ * in X" with the same shrug in both cases.
+ */
+export const WORKFLOW_SKIP_REASONS = ['branch-not-taken'] as const;
+
+export type WorkflowSkipReason = (typeof WORKFLOW_SKIP_REASONS)[number];
+
+/** Same reason as {@link isConnectorKind}: one list, no second copy to drift. */
+export function isWorkflowSkipReason(value: unknown): value is WorkflowSkipReason {
+  return WORKFLOW_SKIP_REASONS.some((reason) => reason === value);
+}
+
 /** What one node did during a run. Small by construction — counters, not rows. */
 export interface WorkflowNodeOutcome {
   /**
    * `skipped` exists for the nodes downstream of a failure. Without it, a
    * ten-node graph that died at node seven records three nodes with no entry at
    * all, which reads the same as three nodes nobody has looked at yet.
+   *
+   * It now carries a second, legitimate meaning as well — a node on the branch
+   * an `if` did not take — and {@link skippedBecause} is what tells the two
+   * apart.
    */
   status: 'succeeded' | 'failed' | 'skipped';
   /** Rows this node produced, or committed if it is the sink. */
   rows: number;
   /** For a transform node: which version of its code ran. */
   transformVersion?: number;
+  /**
+   * For an {@link WorkflowIfNode}: the branch this run took.
+   *
+   * **Written once, on the first evaluation, and read back on every replay.**
+   * This is the record the durable path replays from rather than re-evaluating:
+   * a predicate reads the environment, and an environment is pod-local, so a
+   * replay landing on another pod could otherwise take the other branch halfway
+   * through a run and load through a shape nobody chose. See
+   * `WorkflowRunnerService.runIf`.
+   *
+   * It is also the answer to "why did nothing load into X", which is the
+   * question a branch makes askable and nothing else on a run can answer.
+   */
+  branch?: WorkflowBranchLabel;
+  /** See {@link WORKFLOW_SKIP_REASONS}. Absent means the run stopped short. */
+  skippedBecause?: WorkflowSkipReason;
   elapsedMs?: number;
   error?: string;
 }
@@ -765,9 +812,12 @@ export interface WorkflowNodeOutcome {
  *   It needs no new execution path, only a different body, and adding the kind
  *   would mean two ways to drop rows and two places to look when rows go
  *   missing.
- * - **branch / split** — already expressible: a node with two outbound edges is
- *   read by both successors, each of which filters differently. There is
- *   nothing for a branch node to *do*.
+ * - **branch / split (unconditional)** — already expressible, and still is: a
+ *   node with two outbound edges is read by both successors, each of which
+ *   filters differently. There is nothing for an *unconditional* split to do.
+ *   {@link WorkflowIfNode} is the conditional one, and it earns its kind by
+ *   doing something no wiring can express — deciding that one of those
+ *   successors, and everything only it feeds, does not run at all.
  * - **merge / join** — a node with several inbound edges receives its inputs
  *   concatenated in edge order (see {@link WorkflowEdge}). A keyed join is then
  *   ordinary code inside the transform, which can already see every record.
@@ -793,6 +843,8 @@ export const WORKFLOW_NODE_KINDS = [
   'sink',
   /** Hands this position to an existing durable workflow. See {@link WorkflowCallNode}. */
   'call',
+  /** Sends the rows down one of its outbound branches. See {@link WorkflowIfNode}. */
+  'if',
 ] as const;
 
 export type WorkflowNodeKind = (typeof WORKFLOW_NODE_KINDS)[number];
@@ -800,6 +852,34 @@ export type WorkflowNodeKind = (typeof WORKFLOW_NODE_KINDS)[number];
 /** Same reason as {@link isConnectorKind}: one list, no second copy to drift. */
 export function isWorkflowNodeKind(value: unknown): value is WorkflowNodeKind {
   return WORKFLOW_NODE_KINDS.some((kind) => kind === value);
+}
+
+/**
+ * The kind that never compiles quietly.
+ *
+ * Every place that decides something *per kind* ends in a call to this, so a
+ * kind added to {@link WORKFLOW_NODE_KINDS} without a branch there is a type
+ * error naming the file rather than a graph that saves, validates, draws and
+ * then does the wrong thing. This codebase has been bitten by exactly that
+ * shape — a `toGraph` branch forgetting a field, a node-kind map missing a kind
+ * — and the fix each time was to make the omission impossible rather than to
+ * remember harder.
+ *
+ * It throws as well as failing to compile, because the narrowing that reaches
+ * it is over data that arrives as JSON: a node whose `kind` passed
+ * {@link isWorkflowNodeKind} in an older build and reaches a newer one is
+ * possible, and returning a default for it would be the silent path this exists
+ * to close.
+ */
+export function unreachableNodeKind(node: never, where: string): never {
+  // Takes either the node or its kind, because the call sites differ: a
+  // narrowing chain over a union hands it the node, while one over the kind
+  // string — which is what a boundary reading JSON has before it has a node —
+  // hands it the string.
+  const kind = typeof node === 'string' ? node : Reflect.get(Object(node), 'kind');
+  throw new Error(
+    `${where} does not handle a workflow node of kind ${JSON.stringify(kind)}. The kind list and every decision made per kind are meant to move together.`,
+  );
 }
 
 /**
@@ -954,6 +1034,71 @@ export interface WorkflowCallNode extends WorkflowNodeBase {
 }
 
 /**
+ * Sends the rows down one of its two outbound branches, and skips the other.
+ *
+ * The node the maintainer asked for, and the reason it is a node rather than a
+ * flag on an edge: a deployment that has a ClickHouse and a deployment that does
+ * not are the *same graph*, and the difference between them is one decision made
+ * at run time. Modelling it as two workflows means two things to keep in step;
+ * modelling it as an edge flag means the decision has nowhere to be recorded and
+ * nothing on the canvas to open.
+ *
+ * ## What it does to the rows: nothing
+ *
+ * An `if` is a gate, not a stage. It passes its input through untouched — its
+ * output ref *is* its input's ref — so a branch costs no copy of the dataset and
+ * no second write into the stage store. That is also why it takes **exactly one
+ * inbound edge**: a node hands its successors one {@link WorkflowStageRef}, so a
+ * gate fed by two inputs could only either copy the rows to merge them (paying
+ * for the whole dataset to make a decision that reads none of it) or silently
+ * drop one. Merging is what a transform is for; put one in front.
+ *
+ * ## The predicate is declarative, and that is the safety property
+ *
+ * It names an **environment variable**, never a value and never code. Three
+ * reasons, in order of how much they cost to get wrong:
+ *
+ * 1. **Replay.** The durable engine replays a run, possibly on another pod. A
+ *    predicate is by definition the thing whose answer decides which half of the
+ *    graph exists, so an answer that can differ between the run and its replay
+ *    is a run that loads through a shape nobody chose — and it would show up as
+ *    a non-determinism error two nodes later, naming neither the branch nor the
+ *    variable. The outcome is therefore recorded on first evaluation
+ *    ({@link WorkflowNodeOutcome.branch}) and read back afterwards, and the
+ *    declarative form is what keeps that record small enough to be a checkpoint.
+ * 2. **A predicate is not a place for a secret.** A name is stored; a value
+ *    never is. This is the same rule {@link WorkflowSourceNode.secretEnvVar}
+ *    follows and for the same reason.
+ * 3. **Code would need a context to read, and this node does not own it.** What
+ *    code-bearing nodes may see — allow-listed variables, a `catalog` object —
+ *    is a question being answered elsewhere. A `code` predicate is additive the
+ *    day it lands: it becomes another shape here, and everything that reads a
+ *    branch reads it off the recorded outcome exactly as it does now.
+ *
+ * To invert the test, swap which successor is on `then` and which is on `else`.
+ * There is deliberately no `negate` flag: two ways to say one thing is two
+ * places to look when a load takes the branch you did not expect.
+ */
+export interface WorkflowIfNode extends WorkflowNodeBase {
+  kind: 'if';
+  /**
+   * The name of the environment variable to read on the machine that runs the
+   * node. **The name, never the value** — nothing about a credential is stored
+   * in a catalog.
+   */
+  envVar: string;
+  /**
+   * What it has to equal for the `then` branch to be taken.
+   *
+   * Absent means "is it set to anything non-empty", which is the ClickHouse
+   * case: a deployment that has one has the URL, a deployment that does not has
+   * nothing. Present means an exact string comparison, which is the
+   * `DEPLOY_ENV = local` case.
+   */
+  equals?: string;
+}
+
+/**
  * A discriminated union, so narrowing a node is `node.kind === "sink"` and
  * never a type assertion. This is why the kind list is not simply a string on
  * one node shape with every field optional: that shape lets a source node carry
@@ -963,7 +1108,35 @@ export type WorkflowNode =
   | WorkflowSourceNode
   | WorkflowTransformNode
   | WorkflowSinkNode
-  | WorkflowCallNode;
+  | WorkflowCallNode
+  | WorkflowIfNode;
+
+/**
+ * Which side of an {@link WorkflowIfNode} a wire leaves by.
+ *
+ * **Two closed values rather than free-form labels**, which was the other design
+ * and is worse in the one way that matters here: an unlabelled branch is a
+ * branch that never runs, and a *misspelled* branch is one too. With a free
+ * string, `thn` is a subtree that silently never executes and a graph that
+ * validates perfectly; with these, it is refused at the boundary and is a type
+ * error in the console. The failure a branch introduces is "nothing loaded and
+ * nothing complained", so the vocabulary is the place to make it impossible.
+ *
+ * An N-way `switch` node was considered and is deliberately not this: it would
+ * have to carry its own case list plus a default, the cases would have to be
+ * validated against the labels, and an unmatched value would need a rule. That
+ * is a different node, and it can be added later without changing this one —
+ * because a boolean question is what a predicate answers, and an `if` is exactly
+ * the shape of a boolean question.
+ */
+export const WORKFLOW_BRANCH_LABELS = ['then', 'else'] as const;
+
+export type WorkflowBranchLabel = (typeof WORKFLOW_BRANCH_LABELS)[number];
+
+/** Same reason as {@link isConnectorKind}: one list, no second copy to drift. */
+export function isWorkflowBranchLabel(value: unknown): value is WorkflowBranchLabel {
+  return WORKFLOW_BRANCH_LABELS.some((label) => label === value);
+}
 
 /**
  * One wire.
@@ -981,6 +1154,22 @@ export type WorkflowNode =
 export interface WorkflowEdge {
   from: string;
   to: string;
+  /**
+   * Which branch of an {@link WorkflowIfNode} this wire leaves by.
+   *
+   * **Optional, and absent on every edge that existed before branches did.** An
+   * edge with no label is a plain wire that always carries rows when its source
+   * ran — which is what every stored edge is, so nothing about an existing graph
+   * changes, including its fingerprint. The label is *required* on an edge
+   * leaving an `if` and *refused* on any other, both by `validateWorkflow`: a
+   * label on a wire nothing branches at would look like a decision and be
+   * ignored, and an unlabelled wire out of an `if` has no branch to belong to.
+   *
+   * Several wires may share a label. An `if` whose `then` side fans out to two
+   * nodes is ordinary fan-out that happens to be conditional; what is refused is
+   * two wires between the *same pair*, which was already refused as a duplicate.
+   */
+  branch?: WorkflowBranchLabel;
 }
 
 /** Just the executable part of a workflow, for validating a canvas draft. */
@@ -1237,6 +1426,17 @@ export interface WorkflowNodeStepOutput {
   committed?: { snapshotId: string; rowCount: number };
   /** Which transform version ran, for a transform node. */
   transformVersion?: number;
+  /**
+   * Which branch an `if` node took, for an `if` node.
+   *
+   * **On the step's output, which is the whole mechanism.** A step's output is
+   * what the durable engine checkpoints and hands back on replay without running
+   * the step again, so putting the evaluated branch here means the decision is
+   * made exactly once, in the run's own history, and every later turn reads the
+   * recorded one. A body that asked the predicate itself would be re-evaluating
+   * a pod-local fact on a pod that may not be the same one.
+   */
+  branch?: WorkflowBranchLabel;
   rows: number;
   elapsedMs: number;
   /**
@@ -1509,6 +1709,10 @@ export const WORKFLOW_ISSUE_CODES = [
   'dead-end',
   'transform-not-named',
   'call-not-named',
+  'if-not-named',
+  'if-needs-one-input',
+  'branch-not-labelled',
+  'branch-on-plain-edge',
 ] as const;
 
 export type WorkflowIssueCode = (typeof WORKFLOW_ISSUE_CODES)[number];
@@ -1571,6 +1775,7 @@ export function validateWorkflow(graph: WorkflowGraph): WorkflowValidationIssue[
 
   checkNodeWiring(nodes, incoming, outgoing, issues);
   checkEndpoints(originators, sinks, issues);
+  checkBranches(edges, byId, issues);
 
   const looped = findCycle(nodes, incoming, outgoing);
   if (looped) {
@@ -1725,8 +1930,60 @@ function checkNodeWiring(
         message: `Sink "${node.name}" (${node.id}) has an outbound edge. The sink commits the snapshot, so nothing can run after it.`,
       });
     }
+    // Exactly one, not "at least one". A gate hands its successors the ref of
+    // the stage it was given rather than staging a copy — see `WorkflowIfNode`
+    // — and one output ref cannot name two inputs, so a second inbound edge
+    // would be silently dropped. Zero is caught by `unreachable` instead, which
+    // points at the same fix with the better message.
+    if (node.kind === 'if' && (incoming.get(node.id)?.length ?? 0) > 1) {
+      issues.push({
+        code: 'if-needs-one-input',
+        nodeIds: [node.id],
+        message: `If "${node.name}" (${node.id}) has ${incoming.get(node.id)?.length} inbound edges, and it can only carry one through. An if node is a gate: it passes the rows it is given straight down whichever branch it takes, so it has one output to hand on and cannot merge. Wire those inputs into a transform and gate the transform instead.`,
+      });
+    }
     const unconfigured = nodeIsUnconfigured(node);
     if (unconfigured) issues.push(unconfigured);
+  }
+}
+
+/**
+ * Every wire out of an `if` names a branch, and no other wire does.
+ *
+ * Both halves, because the two failures are opposite and both are silent. An
+ * unlabelled wire out of an `if` belongs to no branch, so nothing would ever
+ * take it and the subtree behind it would be skipped on every run of every
+ * deployment — a graph that draws correctly and quietly does half its work. A
+ * label on a wire whose source does not branch is the reverse: a decision
+ * somebody wrote down that nothing reads, which is worse than no decision
+ * because the canvas draws it.
+ *
+ * Run after the structural checks, so `byId` has every endpoint and this cannot
+ * report a wire whose real problem is that it points at a node that was deleted.
+ */
+function checkBranches(
+  edges: readonly WorkflowEdge[],
+  byId: ReadonlyMap<string, WorkflowNode>,
+  issues: WorkflowValidationIssue[],
+): void {
+  for (const edge of edges) {
+    const from = byId.get(edge.from);
+    if (!from) continue;
+    if (from.kind === 'if' && edge.branch === undefined) {
+      issues.push({
+        code: 'branch-not-labelled',
+        nodeIds: [edge.from, edge.to],
+        message: `The wire from "${from.name}" (${from.id}) to "${byId.get(edge.to)?.name ?? edge.to}" does not say which branch it is on. Every wire out of an if node belongs to "then" or to "else", because that is what decides whether it runs — an unlabelled one would never be taken, and everything only it feeds would be skipped on every run with nothing to say why.`,
+      });
+      continue;
+    }
+    if (from.kind !== 'if' && edge.branch !== undefined) {
+      issues.push({
+        code: 'branch-on-plain-edge',
+        nodeIds: [edge.from, edge.to],
+        message: `The wire from "${from.name}" (${from.id}) is labelled "${edge.branch}", but "${from.name}" is a ${from.kind} node and does not branch. A label nothing decides on is a decision that is drawn and never read; remove it, or put an if node where the choice is meant to be made.`,
+      });
+    }
   }
 }
 
@@ -1747,6 +2004,16 @@ function nodeIsUnconfigured(node: WorkflowNode): WorkflowValidationIssue | undef
     };
   }
   if (node.kind === 'call') return callIsUnnamed(node);
+  // The third of the same mistake: a gate that reads nothing. It would have to
+  // pick a branch anyway, and whichever one it picked would be a decision the
+  // graph appears to make and nobody authored.
+  if (node.kind === 'if' && node.envVar.trim().length === 0) {
+    return {
+      code: 'if-not-named',
+      nodeIds: [node.id],
+      message: `If "${node.name}" (${node.id}) names no environment variable, so there is nothing for it to decide on. It reads the *name* of a variable on the machine that runs the load — that is how a graph tells a deployment with a ClickHouse apart from one without.`,
+    };
+  }
   return undefined;
 }
 
@@ -1950,9 +2217,7 @@ function walk(roots: string[], adjacency: Map<string, string[]>): Set<string> {
  * order over a broken graph is a load that half-happens, which is harder to
  * recover from than one that never started.
  */
-export function workflowRunOrder(
-  graph: WorkflowGraph,
-): Array<{ node: WorkflowNode; inputs: string[] }> {
+export function workflowRunOrder(graph: WorkflowGraph): WorkflowRunOrderEntry[] {
   const issues = validateWorkflow(graph);
   if (issues.length > 0) {
     throw new Error(
@@ -1961,6 +2226,7 @@ export function workflowRunOrder(
   }
 
   const byId = new Map(graph.nodes.map((node) => [node.id, node]));
+  const labels = branchLabels(graph.edges);
   // The same adjacency the validator walks, from the same builder. Two copies of
   // "what is wired into what" is exactly how a graph that validated comes out
   // executing differently, which is the thing this function's contract rules out.
@@ -1970,7 +2236,7 @@ export function workflowRunOrder(
   );
 
   const ready = graph.nodes.filter((node) => indegree.get(node.id) === 0).map((node) => node.id);
-  const order: Array<{ node: WorkflowNode; inputs: string[] }> = [];
+  const order: WorkflowRunOrderEntry[] = [];
   while (ready.length > 0) {
     const id = ready.shift();
     if (id === undefined) break;
@@ -1980,7 +2246,8 @@ export function workflowRunOrder(
     // from, and it is part of the fingerprint precisely because it is visible in
     // the output. `buildAdjacency` fills `incoming` by walking the edges in
     // order, so that is what this already is.
-    order.push({ node, inputs: [...(incoming.get(id) ?? [])] });
+    const inputs = [...(incoming.get(id) ?? [])];
+    order.push({ node, inputs, inputBranches: labelsInto(id, inputs, labels) });
     for (const next of outgoing.get(id) ?? []) {
       const remaining = (indegree.get(next) ?? 0) - 1;
       indegree.set(next, remaining);
@@ -1988,6 +2255,110 @@ export function workflowRunOrder(
     }
   }
   return order;
+}
+
+/** One position in the order: which node, what feeds it, and on which branches. */
+export interface WorkflowRunOrderEntry {
+  node: WorkflowNode;
+  /** Upstream node ids, in inbound-edge order. */
+  inputs: string[];
+  /**
+   * The branch label of each inbound edge that has one, keyed by the upstream
+   * node id.
+   *
+   * A record rather than an array positionally aligned with {@link inputs},
+   * which was the obvious shape and is unsafe for one specific reason: this
+   * travels through a durable checkpoint as JSON, and `JSON.stringify` turns an
+   * `undefined` hole in an array into `null`. A plain wire would come back from
+   * a replay as `null` rather than absent, `null !== 'then'` would be false, and
+   * the node would be treated as dead — the graph would silently stop running
+   * half of itself on resumed runs only. A key that is simply not there
+   * round-trips exactly. The key is unique because duplicate edges are refused.
+   */
+  inputBranches: Record<string, WorkflowBranchLabel>;
+}
+
+/** Every labelled wire, keyed by the pair it joins. */
+function branchLabels(edges: readonly WorkflowEdge[]): Map<string, WorkflowBranchLabel> {
+  const labels = new Map<string, WorkflowBranchLabel>();
+  for (const edge of edges) {
+    if (edge.branch === undefined) continue;
+    labels.set(`${edge.from}\0${edge.to}`, edge.branch);
+  }
+  return labels;
+}
+
+/** The labels on the wires into one node, with the unlabelled ones left out. */
+function labelsInto(
+  to: string,
+  inputs: readonly string[],
+  labels: ReadonlyMap<string, WorkflowBranchLabel>,
+): Record<string, WorkflowBranchLabel> {
+  const into: Record<string, WorkflowBranchLabel> = {};
+  for (const from of inputs) {
+    const label = labels.get(`${from}\0${to}`);
+    if (label !== undefined) into[from] = label;
+  }
+  return into;
+}
+
+/**
+ * Whether a node runs, given what the nodes before it did.
+ *
+ * ## The rule
+ *
+ * A node runs when **at least one wire into it is live**, where a wire is live
+ * if its source ran and — when the wire carries a branch label — the source is
+ * an `if` that took that branch. A node with no inbound wires always runs, which
+ * is every source and every originating call.
+ *
+ * ## Why the obvious rule is wrong
+ *
+ * The naive version is "mark everything downstream of the untaken edge as
+ * skipped", and it is wrong on the shape branches are most often drawn in:
+ *
+ * ```
+ *      ┌ then → A ┐
+ * if ──┤          ├→ C → sink
+ *      └ else → B ┘
+ * ```
+ *
+ * `C` is downstream of `B`. Take the `then` branch and the naive rule walks from
+ * the untaken `else` edge, reaches `B`, reaches `C`, and skips it — so the sink
+ * never runs and the load silently commits nothing, on a graph whose whole
+ * purpose was that both branches converge. Reachability from the **taken** edges
+ * gets it right: `C` is reached through `A`, so it runs, and `B` — reached only
+ * through the untaken edge — does not. `C` then sees an empty stage ref for `B`,
+ * which is exactly what `stageRefsFor` already does for an upstream that
+ * produced nothing, so the positions a merge reads stay aligned with the wires
+ * that were drawn.
+ *
+ * It is evaluated incrementally rather than as a graph walk because the answers
+ * arrive as the run goes: `workflowRunOrder` is topological, so by the time a
+ * node is reached every node feeding it has an outcome. That also means this
+ * reads **only** what was recorded — no predicate is re-evaluated here, which is
+ * the property the whole branch feature rests on.
+ */
+export function workflowNodeRuns(
+  entry: {
+    inputs: readonly string[];
+    inputBranches?: Readonly<Record<string, WorkflowBranchLabel>>;
+  },
+  outcomes: Readonly<Record<string, WorkflowNodeOutcome>>,
+): boolean {
+  if (entry.inputs.length === 0) return true;
+  return entry.inputs.some((from) => {
+    const upstream = outcomes[from];
+    // Anything other than a clean success means this wire carried nothing: a
+    // skipped upstream is not on a live path, and a failed one aborts the run
+    // before this is ever asked.
+    if (upstream?.status !== 'succeeded') return false;
+    const label = entry.inputBranches?.[from];
+    // A plain wire. Live because its source ran, which is what every graph
+    // drawn before branches existed relies on.
+    if (label === undefined) return true;
+    return upstream.branch === label;
+  });
 }
 
 /**
@@ -2015,7 +2386,14 @@ export function workflowGraphHash(graph: WorkflowGraph): string {
   const nodes = [...graph.nodes]
     .sort((left, right) => (left.id < right.id ? -1 : left.id > right.id ? 1 : 0))
     .map((node) => canonicalNode(node));
-  const edges = graph.edges.map((edge) => `${edge.from}>${edge.to}`);
+  // The branch is appended only when there is one, so every edge drawn before
+  // branches existed hashes to exactly the string it always did. Adding a graph
+  // to this file must not renumber the versions of graphs that did not change.
+  const edges = graph.edges.map((edge) =>
+    edge.branch === undefined
+      ? `${edge.from}>${edge.to}`
+      : `${edge.from}>${edge.to}:${edge.branch}`,
+  );
   const canonical = JSON.stringify({ nodes, edges });
   return `${fnv1a(canonical, 0x811c9dc5)}${fnv1a(canonical, 0x01000193)}`;
 }
@@ -2058,7 +2436,17 @@ function canonicalNode(node: WorkflowNode): string {
       sortedEntries(node.config),
     ]);
   }
-  return JSON.stringify([node.id, node.kind, node.targetType, node.mode ?? 'full']);
+  if (node.kind === 'if') {
+    // Both halves of the predicate, because both decide which branch runs.
+    // `equals` being absent is a *different* test from `equals` being the empty
+    // string — "set to anything" against "set to nothing" — so the two must not
+    // canonicalise to the same string.
+    return JSON.stringify([node.id, node.kind, node.envVar, node.equals ?? null]);
+  }
+  if (node.kind === 'sink') {
+    return JSON.stringify([node.id, node.kind, node.targetType, node.mode ?? 'full']);
+  }
+  return unreachableNodeKind(node, 'workflowGraphHash');
 }
 
 function sortedEntries(config: Record<string, unknown>): Array<[string, unknown]> {
@@ -2116,13 +2504,46 @@ export function isWorkflowNode(value: unknown): value is WorkflowNode {
       !Array.isArray(config)
     );
   }
-  const sourceKind = Reflect.get(value, 'sourceKind');
-  const config = Reflect.get(value, 'config');
-  return isConnectorKind(sourceKind) && typeof config === 'object' && config !== null;
+  if (kind === 'if') {
+    // The variable name is required and its expected value is not, exactly as
+    // the type says: an absent `equals` is the "is it set at all" test, so a
+    // stored node without one is complete rather than half-narrowed.
+    const equals = Reflect.get(value, 'equals');
+    return (
+      typeof Reflect.get(value, 'envVar') === 'string' &&
+      (equals === undefined || typeof equals === 'string')
+    );
+  }
+  if (kind === 'source') {
+    const sourceKind = Reflect.get(value, 'sourceKind');
+    const config = Reflect.get(value, 'config');
+    return isConnectorKind(sourceKind) && typeof config === 'object' && config !== null;
+  }
+  return isWorkflowNodeKindUnhandled(kind);
+}
+
+/**
+ * The narrowing counterpart of {@link unreachableNodeKind}.
+ *
+ * A guard cannot take a `never` — `kind` here is a string that
+ * {@link isWorkflowNodeKind} already accepted — so exhaustiveness is bought by
+ * assigning it to one, which is the compile error a new kind has to answer, and
+ * refusing the value at run time, which is what a build that skipped this file
+ * would do to a node it has no rule for.
+ */
+function isWorkflowNodeKindUnhandled(kind: never): false {
+  void kind;
+  return false;
 }
 
 export function isWorkflowEdge(value: unknown): value is WorkflowEdge {
   if (typeof value !== 'object' || value === null) return false;
+  // A `branch` that is present and unrecognised is refused rather than dropped,
+  // for the reason `isWorkflowNode` refuses an unknown node: an edge silently
+  // read back without its label is a wire that stops belonging to a branch, and
+  // everything behind it stops running with nothing to point at.
+  const branch = Reflect.get(value, 'branch');
+  if (branch !== undefined && !isWorkflowBranchLabel(branch)) return false;
   return (
     typeof Reflect.get(value, 'from') === 'string' && typeof Reflect.get(value, 'to') === 'string'
   );

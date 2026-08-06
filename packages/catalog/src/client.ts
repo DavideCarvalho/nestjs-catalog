@@ -261,17 +261,21 @@ export type {
   TransformLanguage,
   TransformResult,
   CallableWorkflowRef,
+  WorkflowBranchLabel,
   WorkflowCallEnvelope,
   WorkflowCallNode,
   WorkflowCallOutput,
   WorkflowEdge,
   WorkflowExecutionMode,
   WorkflowGraph,
+  WorkflowIfNode,
   WorkflowIssueCode,
   WorkflowNode,
   WorkflowNodeKind,
   WorkflowNodeOutcome,
+  WorkflowRunOrderEntry,
   WorkflowSinkNode,
+  WorkflowSkipReason,
   WorkflowSourceNode,
   WorkflowStageRef,
   WorkflowTransformNode,
@@ -320,6 +324,18 @@ export {
   WORKFLOW_ISSUE_CODES,
   WORKFLOW_NODE_ID_PATTERN,
   WORKFLOW_NODE_KINDS,
+  // The branch vocabulary, for the same reason as the kinds beside it: a canvas
+  // that has to draw a then and an else must read the two labels from here, or
+  // it keeps a copy and the copy is what eventually spells one of them wrong —
+  // which is a subtree that silently never runs.
+  WORKFLOW_BRANCH_LABELS,
+  WORKFLOW_SKIP_REASONS,
+  isWorkflowBranchLabel,
+  isWorkflowSkipReason,
+  // Exported so a screen can answer "would this node have run" from a recorded
+  // run exactly the way the runner decided it, rather than approximating.
+  workflowNodeRuns,
+  unreachableNodeKind,
   // The draft/ready pair, for the same reason as the list above: a canvas that
   // cannot see it restates it, and the copy is what drifts. Without this the
   // editor could not tell a graph it is allowed to store from one the server

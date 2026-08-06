@@ -34,6 +34,7 @@ import {
   Code2,
   Database,
   ExternalLink,
+  GitBranch,
   LayoutGrid,
   Link2,
   Loader2,
@@ -102,9 +103,12 @@ import {
   type CallableWorkflowBlock,
   type CallableWorkflowRef,
   type CatalogWorkflow,
+  WORKFLOW_BRANCH_LABELS,
   WORKFLOW_NODE_KINDS,
+  type WorkflowBranchLabel,
   type WorkflowCallNode,
   type WorkflowEdge,
+  type WorkflowIfNode,
   type WorkflowNode,
   type WorkflowNodeKind,
   type WorkflowRun,
@@ -113,10 +117,12 @@ import {
   type WorkflowTransformNode,
   callableWorkflowBlock,
   describeDurability,
+  isWorkflowBranchLabel,
   isWorkflowNodeKind,
   newLocalId,
   nodeName,
   producedTypes,
+  unreachableNodeKind,
 } from './workflow/model';
 import { WORKFLOW_NAME } from './workflow/name';
 import { WorkflowNodeProvider, workflowNodeTypes } from './workflow/nodes';
@@ -336,7 +342,49 @@ function newNodeOfKind(
     // version 1 in whatever deployment this graph is promoted into.
     return { id, name, kind: 'call', callName: '', callVersion: '', config: {}, position };
   }
-  return { id, name, kind: 'sink', targetType: '', position };
+  if (kind === 'if') {
+    // No variable, so the graph is invalid until somebody names one. There is
+    // nothing to guess: which variable tells this deployment apart from another
+    // is the entire content of the node, and a default would be a decision the
+    // graph appears to make and nobody authored.
+    return { id, name, kind: 'if', envVar: '', position };
+  }
+  if (kind === 'sink') {
+    return { id, name, kind: 'sink', targetType: '', position };
+  }
+  return unreachableNodeKind(kind, 'newNodeOfKind');
+}
+
+/**
+ * A wire, with its branch already decided when it leaves an `if`.
+ *
+ * Assigned here rather than left blank for somebody to fill in, because a blank
+ * one is refused by `validateWorkflow` and the refusal would fire on the very
+ * first wire out of a node somebody just created — the premature-error problem
+ * `partitionProblems` exists to describe, arrived at from a different direction.
+ *
+ * The first wire out of a gate is the `then`, the second is the `else`, and
+ * after that it is `then` again. That ordering is not arbitrary: those are the
+ * two somebody is drawing when they draw a gate, in that order, and a third wire
+ * is fan-out on a side they then choose in the inspector. Every one of them is
+ * editable there, so this is a default and never a decision.
+ */
+function newEdge(nodes: WorkflowNode[], edges: WorkflowEdge[], from: string, to: string) {
+  const source = nodes.find((node) => node.id === from);
+  if (source?.kind !== 'if') return { from, to };
+  const taken = edges.filter((edge) => edge.from === from).map((edge) => edge.branch);
+  const free = WORKFLOW_BRANCH_LABELS.find((label) => !taken.includes(label));
+  return { from, to, branch: free ?? 'then' };
+}
+
+/** The same graph with one wire moved onto the other side of its gate. */
+function edgeOnBranch(
+  edges: WorkflowEdge[],
+  moving: WorkflowEdge,
+  branch: WorkflowBranchLabel,
+): WorkflowEdge[] {
+  const id = edgeId(moving);
+  return edges.map((edge) => (edgeId(edge) === id ? { ...edge, branch } : edge));
 }
 
 /**
@@ -604,6 +652,10 @@ const TODO_FOR: Partial<Record<WorkflowProblemCode, string>> = {
   'missing-transform': 'choose a transform that still exists',
   'source-has-input': 'unwire whatever feeds it — a source reads, it is not fed',
   'sink-has-output': 'unwire what it feeds — nothing runs after a sink',
+  'if-not-named': 'name the environment variable it decides on',
+  'if-needs-one-input': 'leave it one input — a gate carries one stream through',
+  'branch-not-labelled': 'say whether that wire is the "then" or the "else"',
+  'branch-on-plain-edge': 'remove the branch label — only an if node branches',
 };
 
 function todoFor(problem: WorkflowProblem): string {
@@ -825,6 +877,12 @@ function AddNodeBar({
         hint="Hands this step to a durable workflow that already exists, by name and pinned version. It runs as a child of this load, with its own retries."
         onClick={() => onAdd('call')}
       />
+      <AddButton
+        icon={GitBranch}
+        label="If"
+        hint="Sends the rows down one of two branches, depending on an environment variable where the load runs. The other branch is skipped — a sink on it commits nothing and leaves what is published alone."
+        onClick={() => onAdd('if')}
+      />
       <Tooltip content="Lay the nodes out left to right by dependency, with every sink in the last column.">
         <button
           type="button"
@@ -882,6 +940,10 @@ function miniMapColor(data: { kind?: unknown } | undefined): string {
   // The same amber the node itself draws (see `KIND_STYLE`), so the overview
   // and the canvas agree about which boxes are somebody else's workflow.
   if (kind === 'call') return '#f59e0b';
+  // Fuchsia-500, the gate's own accent, and deliberately not the violet a
+  // transform gets: the overview is where somebody looks to find the branch in
+  // a graph too big to read, so it is the one place the two must not blur.
+  if (kind === 'if') return '#d946ef';
   return '#8b5cf6';
 }
 
@@ -1766,6 +1828,28 @@ function Canvas({
     [edit, markStarted],
   );
 
+  /**
+   * Put a wire on the other side of its gate.
+   *
+   * Announced, like every other wiring change on this screen, because the only
+   * visible effect is a word on a line the reader may not be looking at — and
+   * moving a wire from `then` to `else` is one of the largest changes anybody
+   * can make here: it inverts which half of the pipeline runs.
+   */
+  const setBranch = useCallback(
+    (edge: WorkflowEdge, branch: WorkflowBranchLabel) => {
+      edit((current) => ({ ...current, edges: edgeOnBranch(current.edges, edge, branch) }));
+      markStarted(edge.from, edge.to);
+      setAnnouncement(
+        `${nodeLabelIn(draft.nodes, edge.to)} is now on the "${branch}" branch of ${nodeLabelIn(
+          draft.nodes,
+          edge.from,
+        )}.`,
+      );
+    },
+    [draft.nodes, edit, markStarted],
+  );
+
   const connect = useCallback(
     (from: string, to: string) => {
       const verdict = canConnect(draft.nodes, draft.edges, from, to);
@@ -1776,7 +1860,10 @@ function Canvas({
       // Appended rather than inserted anywhere else: a node with several inbound
       // edges receives its inputs in the order the edges appear in this array,
       // and that order is part of what the graph produces.
-      edit((current) => ({ ...current, edges: [...current.edges, { from, to }] }));
+      edit((current) => ({
+        ...current,
+        edges: [...current.edges, newEdge(current.nodes, current.edges, from, to)],
+      }));
       markStarted(from, to);
       setAnnouncement(
         `${nodeLabelIn(draft.nodes, from)} now feeds ${nodeLabelIn(draft.nodes, to)}.`,
@@ -1993,7 +2080,7 @@ function Canvas({
       edit((current) => ({
         ...current,
         nodes: [...current.nodes, node],
-        edges: [...current.edges, { from: fromId, to: node.id }],
+        edges: [...current.edges, newEdge(current.nodes, current.edges, fromId, node.id)],
       }));
       setUnstarted((current) => new Set([...current, node.id]));
       menu.close();
@@ -2377,6 +2464,7 @@ function Canvas({
         onConnect={connect}
         onConnectToNew={connectToNew}
         onDisconnect={disconnect}
+        onBranch={setBranch}
         onCreateTransform={(nodeId) => createTransform.mutate(nodeId)}
         creatingTransform={createTransform.isPending}
         createTransformError={createTransform.error}
@@ -2914,6 +3002,7 @@ function WiringList({
   describeRemoval,
   canEdit,
   onDisconnect,
+  onBranch,
   children,
 }: {
   title: string;
@@ -2922,6 +3011,12 @@ function WiringList({
   describeRemoval: (name: string) => string;
   canEdit: boolean;
   onDisconnect: (edge: WorkflowEdge) => void;
+  /**
+   * Move a wire onto the other side of its gate. Supplied only for the outgoing
+   * list of an `if` node; absent everywhere else, which is what keeps a branch
+   * control off the wires that have no branch to be on.
+   */
+  onBranch?: (edge: WorkflowEdge, branch: WorkflowBranchLabel) => void;
   children?: ReactNode;
 }) {
   return (
@@ -2934,6 +3029,29 @@ function WiringList({
           {edges.map((edge) => (
             <li key={edgeId(edge)} className="flex items-center gap-1.5 text-[11px]">
               <span className="truncate">{otherEnd(edge)}</span>
+              {onBranch && (
+                // Beside the wire it belongs to rather than as two lists headed
+                // "Then" and "Else", because the branch is a property of the
+                // wire: splitting the list would mean a wire changing sides has
+                // to move between two controls, and the order the wires were
+                // drawn in — which is what the canvas draws — would be lost.
+                <div className="ml-auto w-28 shrink-0">
+                  <Select
+                    ariaLabel={`Which branch feeds ${otherEnd(edge)}`}
+                    value={edge.branch ?? ''}
+                    onValueChange={(branch) => {
+                      if (!isWorkflowBranchLabel(branch)) return;
+                      onBranch(edge, branch);
+                    }}
+                    options={WORKFLOW_BRANCH_LABELS.map((label) => ({
+                      value: label,
+                      label,
+                    }))}
+                    placeholder="branch?"
+                    disabled={!canEdit}
+                  />
+                </div>
+              )}
               {canEdit && (
                 <Tooltip content="Remove this connection.">
                   <button
@@ -3670,6 +3788,96 @@ function readTime(observedAt: string | undefined): string {
   const at = new Date(observedAt);
   return Number.isNaN(at.getTime()) ? observedAt : at.toLocaleTimeString();
 }
+/**
+ * What this gate decides on, and what the decision costs.
+ *
+ * ## Two fields and no picker, for a different reason than the call node's
+ *
+ * A call node has no picker because nothing can enumerate the workflows. This
+ * one has no picker because the list would be *wrong*: the variables that matter
+ * are the ones this deployment has and the other one does not, so a list built
+ * from what the console's own process can see would offer exactly the wrong set
+ * — the ones present everywhere — and quietly omit the one somebody is looking
+ * for. Text, and the graph is refused until it is filled in.
+ *
+ * ## What is said out loud here and nowhere else
+ *
+ * That the value never leaves the machine, because somebody typing
+ * `CLICKHOUSE_URL` into a form is entitled to know whether they have just put a
+ * password on a screen. That the test runs where the *load* runs rather than
+ * here, because a variable set in the console's pod and not in the worker's is
+ * the way this goes wrong. And that the branch is decided once and recorded, so
+ * a resumed run cannot change its mind — which is the sentence that makes the
+ * run panel's "took the then branch" trustworthy.
+ */
+function IfInspector({
+  node,
+  canEdit,
+  onChange,
+}: {
+  node: WorkflowIfNode;
+  canEdit: boolean;
+  onChange: (node: WorkflowNode) => void;
+}) {
+  // Whether to compare against a value at all is a *mode*, not an empty text
+  // box: `equals: ''` is a real test ("set, but blank") and `equals: undefined`
+  // is a different one ("set to anything"), and a single field could not express
+  // both — clearing the box would silently switch which question is being asked.
+  const comparing = node.equals !== undefined;
+
+  return (
+    <div className="space-y-3">
+      <TextField
+        label="Environment variable"
+        value={node.envVar}
+        onChange={(envVar) => onChange({ ...node, envVar })}
+        placeholder="CLICKHOUSE_URL"
+        disabled={!canEdit}
+        hint="The name of a variable on the machine that runs the load — not on this one. Only its name is stored, and only “set” or “not set” is ever written to the run log, so naming one that holds a credential is safe."
+      />
+      <SelectField
+        label="Test"
+        ariaLabel="What this gate tests the variable for"
+        value={comparing ? 'equals' : 'set'}
+        onValueChange={(mode) =>
+          onChange(mode === 'equals' ? { ...node, equals: '' } : { ...node, equals: undefined })
+        }
+        options={[
+          { value: 'set', label: 'Is set to anything' },
+          { value: 'equals', label: 'Equals a particular value' },
+        ]}
+        disabled={!canEdit}
+        hint="“Is set” is the deployment test: a deployment that has a ClickHouse has its URL and one that does not has nothing. Compare against a value when the variable exists everywhere and only its contents differ."
+      />
+      {comparing && (
+        <TextField
+          label="Equals"
+          value={node.equals ?? ''}
+          onChange={(equals) => onChange({ ...node, equals })}
+          placeholder="local"
+          disabled={!canEdit}
+          hint="Compared exactly, with no trimming. An empty value here means “set, but blank”, which is a different test from “is set to anything”."
+        />
+      )}
+      <p className={cn('text-[11px] leading-relaxed', MUTED)}>
+        The wires out of this node are labelled <strong>then</strong> and <strong>else</strong>,
+        under “Feeds” below. To invert the test, swap which one is which — there is no “not”,
+        because two ways to say one thing is two places to look when a load goes the way you did not
+        expect.
+      </p>
+      <p className={cn('text-[11px] leading-relaxed', MUTED)}>
+        Everything reachable only through the branch that is not taken is <em>skipped</em>, never
+        failed. A sink on that side commits nothing, so whatever it publishes stays exactly as it
+        was — that is the point, and the run panel says so rather than leaving a blank.
+      </p>
+      <p className={cn('text-[11px] leading-relaxed', MUTED)}>
+        The branch is decided once, at the moment this node runs, and recorded on the run. A load
+        that is resumed after a crash reads the decision back instead of asking again, so it cannot
+        take one branch on the way in and the other on the way back.
+      </p>
+    </div>
+  );
+}
 
 /**
  * The parameter box's two directions, kept together because they are inverses.
@@ -3785,15 +3993,25 @@ function KindInspector({
     // being pointed at a different node.
     return <CallInspector key={node.id} node={node} canEdit={canEdit} onChange={onChange} />;
   }
-  return (
-    <SinkInspector
-      node={node}
-      typeOptions={typeOptions}
-      canEdit={canEdit}
-      modelHref={modelHref}
-      onChange={onChange}
-    />
-  );
+  if (node.kind === 'if') {
+    return <IfInspector key={node.id} node={node} canEdit={canEdit} onChange={onChange} />;
+  }
+  if (node.kind === 'sink') {
+    return (
+      <SinkInspector
+        node={node}
+        typeOptions={typeOptions}
+        canEdit={canEdit}
+        modelHref={modelHref}
+        onChange={onChange}
+      />
+    );
+  }
+  // The chain ends in a refusal rather than a fallthrough, so a kind added to
+  // core without a form here is a type error naming this file — which is the
+  // whole reason the docblock above says a missing branch shows up as "a node
+  // with a name and nothing to configure". It no longer can.
+  return unreachableNodeKind(node, 'KindInspector');
 }
 
 function NodeInspector({
@@ -3814,6 +4032,7 @@ function NodeInspector({
   onConnect,
   onConnectToNew,
   onDisconnect,
+  onBranch,
   onDelete,
   onEditCode,
   onCreateTransform,
@@ -3839,6 +4058,7 @@ function NodeInspector({
   onConnect: (from: string, to: string) => void;
   onConnectToNew: (from: string, kind: WorkflowNodeKind) => void;
   onDisconnect: (edge: WorkflowEdge) => void;
+  onBranch: (edge: WorkflowEdge, branch: WorkflowBranchLabel) => void;
   onDelete: (nodeId: string) => void;
   onEditCode: (nodeId: string) => void;
   onCreateTransform: (nodeId: string) => void;
@@ -3983,6 +4203,10 @@ function NodeInspector({
             describeRemoval={(name) => `Stop this node feeding ${name}`}
             canEdit={canEdit}
             onDisconnect={onDisconnect}
+            // Only a gate's wires have a side to be on. `validateWorkflow`
+            // refuses a label on any other wire, so offering the control there
+            // would be offering a change the server will not take.
+            onBranch={node.kind === 'if' ? onBranch : undefined}
           >
             {canEdit && (
               <div className="mt-2 flex items-end gap-2">

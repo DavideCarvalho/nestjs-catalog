@@ -8,8 +8,10 @@ import {
   type CatalogWorkflowStore,
   type ConnectorRun,
   SubprocessTransformRunner,
+  type WorkflowBranchLabel,
   type WorkflowCallOutput,
   type WorkflowExecutionMode,
+  type WorkflowIfNode,
   type WorkflowNodeKind,
   type WorkflowNodeOutcome,
   type WorkflowNodeStepInput,
@@ -22,6 +24,8 @@ import {
   readWorkflowCallOutput,
   supportsWorkflowStages,
   supportsWorkflows,
+  unreachableNodeKind,
+  workflowNodeRuns,
   workflowRunOrder,
 } from '@dudousxd/nestjs-catalog';
 import {
@@ -159,6 +163,29 @@ export interface WorkflowPlanEntry {
   kind: WorkflowNodeKind;
   /** Upstream node ids **in edge order** — see `workflowRunOrder`. */
   inputs: string[];
+  /**
+   * The branch label on each inbound edge that has one, keyed by upstream id.
+   *
+   * On the plan for the reason `kind` is: deciding whether a node runs must not
+   * read the database, because the answer would be re-derived from a graph that
+   * may have been edited since. See `workflowNodeRuns` for the rule, and
+   * `WorkflowRunOrderEntry.inputBranches` for why it is a record and not an
+   * array.
+   *
+   * Optional so that a run whose plan was checkpointed before branches existed
+   * replays through here. An absent map means every wire is plain, which is
+   * exactly what those graphs are.
+   */
+  inputBranches?: Record<string, WorkflowBranchLabel>;
+  /**
+   * The object type a sink node commits, and absent on every other kind.
+   *
+   * Here so that a skipped sink can say *what* it did not commit. "Nothing
+   * loaded into Mvr because the else branch was not taken" is the sentence the
+   * whole feature has to be able to produce, and a plan entry that knew only the
+   * node's name could not produce it.
+   */
+  commits?: string;
   /**
    * Present on a `call` node, and only there: which workflow it hands off to.
    *
@@ -373,23 +400,7 @@ export class WorkflowRunnerService {
       workflowVersion: workflow.version,
       targetType: workflow.targetType,
       notes: opened.notes,
-      // `workflowRunOrder` rather than a second traversal here: it enforces the
-      // same wiring rules `validateWorkflow` does, and two implementations of
-      // one rule is how a graph that validated comes out executing differently.
-      order: workflowRunOrder(workflow).map((entry) => ({
-        nodeId: entry.node.id,
-        name: entry.node.name,
-        kind: entry.node.kind,
-        inputs: entry.inputs,
-        call:
-          entry.node.kind === 'call'
-            ? {
-                name: entry.node.callName,
-                version: entry.node.callVersion,
-                config: entry.node.config,
-              }
-            : undefined,
-      })),
+      order: workflowPlanEntries(workflow),
     };
   }
 
@@ -422,6 +433,9 @@ export class WorkflowRunnerService {
     if (node.kind === 'transform') {
       return this.runTransform(node, workflow, input, startedAt);
     }
+    if (node.kind === 'if') {
+      return this.runIf(node, input, startedAt);
+    }
     if (node.kind === 'call') {
       // Not executable from here, and refused rather than approximated.
       //
@@ -438,7 +452,10 @@ export class WorkflowRunnerService {
         `Node "${node.name}" (${node.id}) calls the workflow "${node.callName}@${node.callVersion}", which runs as a durable child run — and this run has no durable engine to start one with. Point this deployment at a durable engine, or replace the call with a transform.`,
       );
     }
-    return this.runSink(node, workflow, input, startedAt);
+    if (node.kind === 'sink') {
+      return this.runSink(node, workflow, input, startedAt);
+    }
+    return unreachableNodeKind(node, 'WorkflowRunnerService.executeNode');
   }
 
   /**
@@ -530,7 +547,9 @@ export class WorkflowRunnerService {
     expectShrink?: string;
   }): Promise<ConnectorRun> {
     const { workflow, connectorId, principalId, snapshotId } = input;
-    const order = workflowRunOrder(workflow);
+    // The same plan the durable path checkpoints, built by the same function.
+    // See `workflowPlanEntries`.
+    const order = workflowPlanEntries(workflow);
     const opened = await this.beginRun({
       workflow,
       connectorId,
@@ -548,26 +567,29 @@ export class WorkflowRunnerService {
 
     for (let index = 0; index < order.length; index += 1) {
       const entry = order[index];
+      // Asked before the node is touched, and answered purely from what earlier
+      // nodes recorded — see `workflowNodeRuns`, which is also where the reason
+      // the naive "skip every descendant" rule is wrong is written down. A node
+      // that is not on a live path is recorded as skipped and **not executed**,
+      // which is the only mechanism keeping a skipped sink from committing: the
+      // sink is not a sink that ran and found nothing, it is a sink that was
+      // never called, so nothing repoints the live view.
+      if (this.skipUnlessLive(progress, entry, order)) continue;
       try {
         const output = await this.executeNode({
           workflowId: workflow.id,
           workflowVersion: workflow.version,
           runId: snapshotId,
-          nodeId: entry.node.id,
+          nodeId: entry.nodeId,
           principalId,
           inputs: stageRefsFor(entry.inputs, progress.stages, snapshotId),
           expectShrink: input.expectShrink,
         });
-        this.record(progress, entry.node, output);
+        this.record(progress, { id: entry.nodeId, kind: entry.kind }, output);
       } catch (error) {
         const message = say(error);
-        this.recordFailure(progress, entry.node.id, message);
-        for (const later of order.slice(index + 1)) {
-          // `skipped`, not `failed`. Without the distinction a ten-node graph
-          // that died at node seven records three nodes with no entry at all,
-          // which reads exactly like three nodes nobody has looked at yet.
-          progress.outcomes[later.node.id] = { status: 'skipped', rows: 0 };
-        }
+        this.recordFailure(progress, entry.nodeId, message);
+        this.strandRemaining(progress, order, index);
         return this.finish({
           runRowId: run.id,
           snapshotId,
@@ -580,7 +602,7 @@ export class WorkflowRunnerService {
           fetched: progress.fetched,
           written: progress.written,
           logs: progress.logs,
-          error: `Node "${entry.node.name}" (${entry.node.id}) failed: ${message}`,
+          error: `Node "${entry.name}" (${entry.nodeId}) failed: ${message}`,
           nodeOutcomes: progress.outcomes,
         });
       }
@@ -620,6 +642,11 @@ export class WorkflowRunnerService {
       status: 'succeeded',
       rows: output.rows,
       transformVersion: output.transformVersion,
+      // The one field on an outcome that is a *decision* rather than a
+      // measurement, and the reason it travels this way: it came off the step's
+      // output, which the durable engine checkpointed, so a replay folds the
+      // recorded branch back in rather than asking the predicate again.
+      branch: output.branch,
       elapsedMs: output.elapsedMs,
     };
     // Bounded and redacted here rather than only at the store, because these
@@ -647,6 +674,92 @@ export class WorkflowRunnerService {
 
   recordFailure(progress: NodeProgress, nodeId: string, error: string): void {
     progress.outcomes[nodeId] = { status: 'failed', rows: 0, error };
+  }
+
+  /**
+   * Skip a node that no live branch reaches, and say so; or report that it runs.
+   *
+   * The one place either executor decides this. Both loops ask it at the top of
+   * every node and neither of them re-derives the rule, because the durable body
+   * and the inline loop skipping different sets would be a graph that loads
+   * different data depending on whether a Redis was reachable — the exact
+   * property {@link WorkflowRunnerService} exists to hold.
+   *
+   * Pure, and it must stay pure: the durable body calls it, so anything reaching
+   * a database from here would be a read on the replay path.
+   */
+  skipUnlessLive(
+    progress: NodeProgress,
+    entry: WorkflowPlanEntry,
+    order: readonly WorkflowPlanEntry[],
+  ): boolean {
+    if (workflowNodeRuns(entry, progress.outcomes)) return false;
+    this.recordBranchSkip(progress, entry, branchSkipReason(entry, order, progress.outcomes));
+    return true;
+  }
+
+  /**
+   * Mark everything after a failed node as never having run.
+   *
+   * `skipped`, not `failed`: a ten-node graph that died at node seven records
+   * three nodes with no entry at all otherwise, which reads exactly like three
+   * nodes nobody has looked at yet.
+   *
+   * **No `skippedBecause`**, and that is the load-bearing omission. Absent is the
+   * meaning `skipped` has always had — the run stopped short — and every outcome
+   * stored before branches existed records it that way. Writing a reason here
+   * would relabel a broken run as a branch, which is the single confusion the
+   * field exists to remove.
+   *
+   * Shared by both executors, like everything else on this service that writes
+   * into `progress`, and extracted from them for the same reason: it is the same
+   * loop twice, and the durable body's copy of it was the one that pushed that
+   * method past what the linter will hold in one head.
+   */
+  strandRemaining(
+    progress: NodeProgress,
+    order: readonly WorkflowPlanEntry[],
+    afterIndex: number,
+  ): void {
+    for (const later of order.slice(afterIndex + 1)) {
+      progress.outcomes[later.nodeId] = { status: 'skipped', rows: 0 };
+    }
+  }
+
+  /**
+   * Write down that a node was never reached because a branch was not taken.
+   *
+   * **Not the same thing as the skip a failure produces.** A node skipped by a
+   * branch is part of a run that is going perfectly well; a node skipped by a
+   * failure is downstream of something broken. `skippedBecause` is what tells a
+   * run panel — and anybody reading the stored outcomes — which it is looking at.
+   *
+   * A **sink** additionally says so in the run's own log, because that is where
+   * somebody looks when a type they expected to be refreshed was not. A sink
+   * that never ran committed nothing, which means the snapshot that was live
+   * before this run is still live and still serving; that is the correct
+   * outcome, and it is indistinguishable from a silent bug unless it is stated.
+   */
+  private recordBranchSkip(
+    progress: NodeProgress,
+    entry: WorkflowPlanEntry,
+    because: string,
+  ): void {
+    progress.outcomes[entry.nodeId] = {
+      status: 'skipped',
+      rows: 0,
+      skippedBecause: 'branch-not-taken',
+    };
+    if (entry.kind !== 'sink') return;
+    progress.logs = safeLogLines(
+      [
+        ...progress.logs,
+        `Sink "${entry.name}" (${entry.nodeId}) did not run: ${because}. Nothing was committed${
+          entry.commits ? ` for ${entry.commits}` : ''
+        }, so whatever snapshot was live before this run is still live and still serving. This is not a failure — an empty snapshot committed here is what would have destroyed it.`,
+      ],
+      LOG_LINES_PER_RUN,
+    );
   }
 
   /**
@@ -1074,6 +1187,84 @@ export class WorkflowRunnerService {
   }
 
   /**
+   * Decide which branch runs, once, and hand the rows straight on.
+   *
+   * ## Three things it deliberately does not do
+   *
+   * It does not **read the rows**. The output it returns is the ref of the stage
+   * its input already occupies, so a gate costs no copy of the dataset and the
+   * successors on the taken branch read the upstream node's batches directly.
+   * (`validateWorkflow` guarantees exactly one inbound edge; the empty ref below
+   * is for a graph that reached here without one, which would be a bug in the
+   * validator rather than a shape to support.)
+   *
+   * It does not **skip anything itself**. Which nodes are skipped is decided by
+   * the two loops that walk the plan, from the branch recorded here, using one
+   * shared rule (`workflowNodeRuns`). A node that also worked out the skip set
+   * would be a second implementation of it, and the two would eventually
+   * disagree about a diamond.
+   *
+   * It does not **re-decide on a replay**. This method is only ever reached
+   * inside a durable step or inline, and a durable step's output is
+   * checkpointed: a resumed run reads the branch back out of its own history and
+   * never arrives here again. That is what makes it safe for the predicate to
+   * read something as pod-local as an environment variable.
+   *
+   * ## The seam
+   *
+   * `readPredicateEnv` is the single point where this node touches the
+   * environment. A richer context for code-bearing nodes — an allow-list, a
+   * `catalog` object — is being built elsewhere; when it lands, that function is
+   * what it replaces, and everything else here is unaffected because the
+   * decision is recorded rather than recomputed.
+   */
+  private async runIf(
+    node: WorkflowIfNode,
+    input: WorkflowNodeStepInput,
+    startedAt: number,
+  ): Promise<WorkflowNodeStepOutput> {
+    const name = node.envVar.trim();
+    if (name.length === 0) {
+      // A graph that validated cannot reach this, so reaching it means the
+      // graph was edited under the run or stored by something that skipped the
+      // validator. Guessing a branch would be a decision nobody authored.
+      throw new BadRequestException(
+        `If node "${node.name}" (${node.id}) names no environment variable, so there is nothing for it to decide on and no honest branch to take.`,
+      );
+    }
+
+    const value = readPredicateEnv(name);
+    const matched =
+      node.equals === undefined ? value !== undefined && value.length > 0 : value === node.equals;
+    const branch: WorkflowBranchLabel = matched ? 'then' : 'else';
+
+    // Says what was tested and what was found, and never the value itself: a
+    // variable holding a ClickHouse URL holds a password, and a run log is read
+    // at `catalog:read`. "set" and "not set" is the whole of what decided this.
+    const tested =
+      node.equals === undefined
+        ? `${name} is ${value !== undefined && value.length > 0 ? 'set' : 'not set'}`
+        : `${name} ${value === node.equals ? 'matches' : 'does not match'} the expected value`;
+    const passed = input.inputs[0];
+
+    return {
+      nodeId: node.id,
+      // The input's ref, unchanged. Its `nodeId` names the upstream node, which
+      // is where the rows actually are — this node stages nothing.
+      output: passed ?? { runId: input.runId, nodeId: node.id, batches: 0, rowCount: 0 },
+      branch,
+      rows: passed?.rowCount ?? 0,
+      elapsedMs: Date.now() - startedAt,
+      logs: safeLogLines(
+        [
+          `"${node.name}" checked the deployment: ${tested}, so the "${branch}" branch runs and everything reached only through "${matched ? 'else' : 'then'}" is skipped. This decision is recorded on the run and replayed rather than asked again.`,
+        ],
+        LOG_LINES_PER_NODE,
+      ),
+    };
+  }
+
+  /**
    * The only node that writes, and the only node that commits.
    *
    * It publishes through `appendRowsAsSystem` and `commitAsSystem` — the same
@@ -1374,6 +1565,38 @@ export class WorkflowRunnerService {
 }
 
 /**
+ * The graph, flattened into the plan both executors iterate.
+ *
+ * One derivation, two callers, for the reason the docblock on
+ * {@link WorkflowRunnerService} gives about node execution: the durable path
+ * checkpoints this and the inline path holds it in memory, and two mappings of a
+ * graph into a plan would let the same workflow run in a different order, or
+ * skip a different set of nodes, depending on whether a Redis was reachable.
+ *
+ * `workflowRunOrder` rather than a traversal here: it enforces the same wiring
+ * rules `validateWorkflow` does, and two implementations of one rule is how a
+ * graph that validated comes out executing differently.
+ */
+export function workflowPlanEntries(workflow: CatalogWorkflow): WorkflowPlanEntry[] {
+  return workflowRunOrder(workflow).map((entry) => ({
+    nodeId: entry.node.id,
+    name: entry.node.name,
+    kind: entry.node.kind,
+    inputs: entry.inputs,
+    inputBranches: entry.inputBranches,
+    commits: entry.node.kind === 'sink' ? entry.node.targetType : undefined,
+    call:
+      entry.node.kind === 'call'
+        ? {
+            name: entry.node.callName,
+            version: entry.node.callVersion,
+            config: entry.node.config,
+          }
+        : undefined,
+  }));
+}
+
+/**
  * The refs a node reads, in the order its inbound edges appear.
  *
  * A node whose upstream produced nothing gets an empty ref rather than being
@@ -1386,6 +1609,82 @@ export function stageRefsFor(
   runId: string,
 ): WorkflowStageRef[] {
   return inputs.map((nodeId) => stages.get(nodeId) ?? { runId, nodeId, batches: 0, rowCount: 0 });
+}
+
+/**
+ * What an `if` node's predicate reads, and the one impure read in the branch.
+ *
+ * One function, one line, and a name worth grepping for, because this is the
+ * only place in the workflow runner that consults the process environment on
+ * behalf of something an author typed.
+ *
+ * ## Where it is called from, which is the whole safety argument
+ *
+ * From `runIf`, and `runIf` is only ever reached from `executeNode` — which the
+ * durable path calls **inside a step** (`WorkflowRunSteps.runNode`) and the
+ * inline path calls in one process with no replay to worry about. A step's
+ * output is checkpointed, so the branch this decides is written into the run's
+ * history once and handed back verbatim on every later turn. The workflow body
+ * never calls this and never evaluates a predicate: it reads
+ * `progress.outcomes[...].branch`, which came off that checkpoint. A body that
+ * asked the environment itself would be a body whose control flow depends on
+ * which pod it woke up on, and the engine would report it as non-determinism
+ * two nodes later, naming neither the branch nor the variable.
+ *
+ * ## Why this does *not* go through the code allow-list
+ *
+ * `@dudousxd/nestjs-catalog`'s `CatalogCodeContext` bounds what **user code**
+ * may see, with an allow-list that admits nothing by default. A predicate is not
+ * user code, and routing it through that list would be worse rather than safer:
+ * branching on whether a ClickHouse exists means testing the variable that holds
+ * its URL, and that URL holds a password — so allow-listing it would put a
+ * credential in reach of every transform in the deployment in order to answer a
+ * yes/no question that never needed the value at all.
+ *
+ * What is true instead, and is what makes that defensible: the value never
+ * leaves this module. `runIf` reduces it to "set"/"not set" or "matches"/"does
+ * not match" and records only that, so nothing derived from a credential reaches
+ * a run log, a checkpoint, or the run panel. A predicate has strictly less reach
+ * than a transform, and is bounded by construction rather than by a list.
+ *
+ * When a `code` predicate is eventually wanted — a real one, running user code —
+ * it is a second shape on `WorkflowIfNode` and it *does* belong under the
+ * allow-list, resolved into a `CatalogCodeContext` inside this same step so the
+ * checkpoint carries it. Nothing about how a branch is recorded, propagated or
+ * replayed would change, because none of that reads the predicate.
+ */
+function readPredicateEnv(name: string): string | undefined {
+  return process.env[name];
+}
+
+/**
+ * Why this node is being skipped, in words, for the run's log.
+ *
+ * Derived from the recorded outcomes rather than from the graph, so it says what
+ * actually happened on *this* run — and so it stays available on the durable
+ * path, where the body has the plan and the outcomes and no graph at all.
+ *
+ * It names the gate whose decision cut this node off. With several gates it
+ * names the first one found among this node's own feeders, which is the nearest
+ * one and therefore the one somebody would look at first; a chain of them still
+ * leads there one hop at a time. Falling back to a plain sentence rather than to
+ * nothing: a node can also be cut off by a feeder that was itself skipped, and
+ * "an earlier branch" is the honest description of that.
+ */
+function branchSkipReason(
+  entry: WorkflowPlanEntry,
+  order: readonly WorkflowPlanEntry[],
+  outcomes: Readonly<Record<string, WorkflowNodeOutcome>>,
+): string {
+  for (const from of entry.inputs) {
+    const label = entry.inputBranches?.[from];
+    const upstream = outcomes[from];
+    if (label === undefined || upstream?.status !== 'succeeded') continue;
+    if (upstream.branch === label) continue;
+    const gate = order.find((candidate) => candidate.nodeId === from);
+    return `"${gate?.name ?? from}" took its "${upstream.branch}" branch, and this is on its "${label}" branch`;
+  }
+  return 'nothing on a branch that ran feeds it';
 }
 
 /** A fresh snapshot id for a run nobody supplied one for. */

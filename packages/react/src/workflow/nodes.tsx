@@ -2,9 +2,11 @@ import { Handle, type NodeProps, Position } from '@xyflow/react';
 import {
   CircleAlert,
   CircleCheck,
+  CircleSlash,
   Code2,
   Database,
   ExternalLink,
+  GitBranch,
   Loader2,
   Plug,
   Repeat,
@@ -92,6 +94,16 @@ const KIND_STYLE: Record<
     icon: ExternalLink,
     noun: 'call',
   },
+  // Violet and a fork, because an if is the only node whose effect is on the
+  // *graph* rather than on the rows: everything else here does something to
+  // data, and this one decides which boxes exist for this run. It should not
+  // read as another step in the line.
+  if: {
+    accent: 'bg-fuchsia-500',
+    chip: 'text-fuchsia-700 dark:text-fuchsia-300',
+    icon: GitBranch,
+    noun: 'if',
+  },
 };
 
 /**
@@ -139,7 +151,9 @@ function RunBadge({ run }: { run: NonNullable<WorkflowNodeData['run']> }) {
             ? // The single most useful fact on a resumed run, and there is
               // nowhere else on the screen to read it from.
               'Replayed from a checkpoint — this step did not run again.'
-            : `Ran${typeof run.rows === 'number' ? `, ${run.rows} rows` : ''}.`
+            : `${describeBranchTaken(run) ?? 'Ran'}${
+                typeof run.rows === 'number' ? `, ${run.rows} rows` : ''
+              }.`
         }
       >
         <span className="flex items-center">
@@ -148,7 +162,44 @@ function RunBadge({ run }: { run: NonNullable<WorkflowNodeData['run']> }) {
       </Tooltip>
     );
   }
+  // Drawn rather than left blank, which is what this was.
+  //
+  // A skipped node used to render nothing at all, which was defensible while
+  // `skipped` meant only "the run stopped before here" — the failed node beside
+  // it carried the story. It is not defensible now that a node can be skipped by
+  // a branch on a run that went perfectly: a sink that quietly shows no badge is
+  // exactly the "nothing loaded and nothing said so" this feature has to avoid.
+  if (run.status === 'skipped') {
+    return (
+      <Tooltip content={describeSkip(run)}>
+        <span className="flex items-center">
+          <CircleSlash size={11} className="text-zinc-400" />
+        </span>
+      </Tooltip>
+    );
+  }
   return null;
+}
+
+/** What an `if` node's badge says it decided. Absent on every other kind. */
+function describeBranchTaken(run: WorkflowNodeData['run']): string | undefined {
+  if (!run?.branch) return undefined;
+  return `Took the "${run.branch}" branch`;
+}
+
+/**
+ * The two meanings of `skipped`, told apart.
+ *
+ * The branch wording deliberately says what did **not** happen to the data,
+ * because for a sink that is the whole question: a node that never ran committed
+ * nothing, so whatever was published before this run is still published. A
+ * reader who is not told that assumes the load emptied it.
+ */
+function describeSkip(run: NonNullable<WorkflowNodeData['run']>): string {
+  if (run.skippedBecause === 'branch-not-taken') {
+    return 'Skipped: this is on the branch that was not taken. It did not run, so it wrote nothing and committed nothing — anything it publishes is still whatever was there before this run.';
+  }
+  return 'Skipped: the run stopped before reaching this step.';
 }
 
 export function WorkflowNodeBody({ id, data, selected }: NodeProps<WorkflowFlowNode>) {

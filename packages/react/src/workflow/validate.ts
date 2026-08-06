@@ -343,6 +343,18 @@ export function canConnect(
     };
   }
 
+  // Refused a moment before core would, exactly like every other rule here. An
+  // if node hands its successors the stage it was given rather than a copy, so
+  // it carries one stream and one only; a second inbound wire would be silently
+  // dropped, which is the failure mode this screen exists to make visible while
+  // somebody is still dragging.
+  if (target.kind === 'if' && edges.some((edge) => edge.to === to)) {
+    return {
+      ok: false,
+      reason: `"${nodeName(target)}" already has something feeding it. An if node is a gate — it passes one stream straight down whichever branch it takes — so it cannot merge two. Wire both into a transform and gate that instead.`,
+    };
+  }
+
   if (wouldCycle(edges, from, to)) {
     return {
       ok: false,

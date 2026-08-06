@@ -2,13 +2,16 @@ import { workflowRunOrder } from '@dudousxd/nestjs-catalog/client';
 import type { Edge, Node } from '@xyflow/react';
 import { MarkerType } from '@xyflow/react';
 import {
+  type WorkflowBranchLabel,
   type WorkflowCallNode,
   type WorkflowEdge,
+  type WorkflowIfNode,
   type WorkflowNode,
   type WorkflowNodeKind,
   type WorkflowRunNode,
   type WorkflowSourceNode,
   nodeName,
+  unreachableNodeKind,
 } from './model';
 import { type WorkflowProblem, edgeId } from './validate';
 
@@ -84,7 +87,26 @@ function subtitleFor(node: WorkflowNode, describe: NodeDescriptions): string {
     return type.length > 0 ? `commits ${type}` : 'no object type chosen';
   }
   if (node.kind === 'call') return callSubtitle(node);
-  return describe.transformName(node.transformId) ?? 'no transform chosen';
+  if (node.kind === 'if') return ifSubtitle(node);
+  if (node.kind === 'transform') {
+    return describe.transformName(node.transformId) ?? 'no transform chosen';
+  }
+  return unreachableNodeKind(node, 'subtitleFor');
+}
+
+/**
+ * The test, on the face of the node.
+ *
+ * Written as the condition rather than as the variable alone, because the whole
+ * question somebody reads a branch to answer is "which way does this go here",
+ * and `CLICKHOUSE_URL` on its own does not say whether it is being tested for
+ * presence or for a value. The name is shown; a value never is — the node stores
+ * the name of a variable and this screen has no more than that.
+ */
+function ifSubtitle(node: WorkflowIfNode): string {
+  const name = typeof node.envVar === 'string' ? node.envVar.trim() : '';
+  if (name.length === 0) return 'no variable chosen';
+  return node.equals === undefined ? `if ${name} is set` : `if ${name} = ${node.equals}`;
 }
 
 /** What a source reads from: its kind, and the connection or mode that narrows it. */
@@ -128,7 +150,18 @@ function ariaLabelFor(
   const parts = [`${node.kind} node, ${data.label}, ${data.subtitle}`];
   parts.push(incoming.length === 0 ? 'nothing feeds it' : `fed by ${incoming.join(', ')}`);
   parts.push(outgoing.length === 0 ? 'feeds nothing' : `feeds ${outgoing.join(', ')}`);
-  if (data.run) parts.push(`last run ${data.run.status}`);
+  // The branch and the reason for a skip are in here as well as in the tooltip,
+  // because on a canvas this string is the only thing a screen reader gets — and
+  // "skipped" alone cannot distinguish a node a branch stood down from a node a
+  // failure stranded, which is the one distinction this feature adds.
+  if (data.run) {
+    const branch = data.run.branch ? `, took the ${data.run.branch} branch` : '';
+    const because =
+      data.run.skippedBecause === 'branch-not-taken'
+        ? ', because it is on the branch that was not taken, so it committed nothing'
+        : '';
+    parts.push(`last run ${data.run.status}${branch}${because}`);
+  }
   for (const problem of data.problems) parts.push(problem.message);
   return parts.join('. ');
 }
@@ -186,8 +219,29 @@ export function defaultLabel(kind: WorkflowNodeKind): string {
   if (kind === 'source') return 'Source';
   if (kind === 'sink') return 'Sink';
   if (kind === 'call') return 'Call';
-  return 'Transform';
+  if (kind === 'if') return 'If';
+  if (kind === 'transform') return 'Transform';
+  return unreachableNodeKind(kind, 'defaultLabel');
 }
+
+/**
+ * How a branch is drawn: a word on the wire, and a colour that means it.
+ *
+ * A **label**, not only a colour, and that is the accessibility half rather than
+ * a stylistic one — two lines leaving one box differing by hue alone are one
+ * line as far as a colour-blind reader is concerned, and this particular
+ * distinction decides which half of a pipeline runs. Emerald for the branch
+ * taken when the test passes and zinc for the other reads as "the positive one
+ * and the fallback", which is what a then and an else are.
+ *
+ * Kept as a `Record` keyed by the label union so a third branch label added to
+ * core without a line here is a type error rather than an unlabelled grey wire.
+ */
+const BRANCH_STYLE: Record<WorkflowBranchLabel, { stroke: string; text: string }> = {
+  else: { stroke: '#a1a1aa', text: '#71717a' },
+  // biome-ignore lint/suspicious/noThenProperty: the rule guards against an object being mistaken for a thenable by `await`; the key here is one of core's two branch labels and this record is only ever indexed by one of them, never awaited nor returned from anything async. Keying it by the label union is what makes a third label a compile error rather than an unlabelled grey wire, which is the whole reason it is a record and not a function.
+  then: { stroke: '#10b981', text: '#059669' },
+};
 
 export function toFlowEdges(
   edges: WorkflowEdge[],
@@ -195,27 +249,61 @@ export function toFlowEdges(
   brokenEdgeIds: ReadonlySet<string>,
 ): WorkflowFlowEdge[] {
   const labelOf = new Map(nodes.map((node) => [node.id, nodeName(node)]));
-  return edges.map((edge) => {
-    const from = labelOf.get(edge.from) ?? edge.from;
-    const to = labelOf.get(edge.to) ?? edge.to;
-    const id = edgeId(edge);
-    const broken = brokenEdgeIds.has(id);
-    return {
-      id,
-      source: edge.from,
-      target: edge.to,
-      type: 'smoothstep',
-      // An arrowhead, because "the output of this feeds that" is directional and
-      // a plain line says only that two nodes are related.
-      markerEnd: { type: MarkerType.ArrowClosed, width: 14, height: 14 },
-      ariaLabel: `the output of ${from} feeds ${to}${broken ? ', part of a loop' : ''}`,
-      // An inline stroke rather than a class, because the stroke lands on an
-      // SVG `<path>` React Flow owns: a Tailwind class on the edge wrapper does
-      // not reach it, and inventing a stylesheet rule would mean this package
-      // ships CSS for the first time just to colour one line.
-      style: broken ? { stroke: '#ef4444', strokeWidth: 2 } : undefined,
-    };
-  });
+  return edges.map((edge) =>
+    toFlowEdge(edge, {
+      from: labelOf.get(edge.from) ?? edge.from,
+      to: labelOf.get(edge.to) ?? edge.to,
+      broken: brokenEdgeIds.has(edgeId(edge)),
+    }),
+  );
+}
+
+/**
+ * One wire, drawn.
+ *
+ * Split out of the `map` above so the styling decisions — arrowhead, branch
+ * colour, the red a loop wears — sit in one function that is about a wire,
+ * rather than in a closure that is also about resolving names.
+ */
+function toFlowEdge(
+  edge: WorkflowEdge,
+  context: { from: string; to: string; broken: boolean },
+): WorkflowFlowEdge {
+  const branch = edge.branch === undefined ? undefined : BRANCH_STYLE[edge.branch];
+  return {
+    id: edgeId(edge),
+    source: edge.from,
+    target: edge.to,
+    type: 'smoothstep',
+    // An arrowhead, because "the output of this feeds that" is directional and
+    // a plain line says only that two nodes are related.
+    markerEnd: { type: MarkerType.ArrowClosed, width: 14, height: 14 },
+    label: edge.branch,
+    labelStyle: branch ? { fill: branch.text, fontSize: 10, fontWeight: 600 } : undefined,
+    // The word sits on the wire, so it takes the canvas behind it rather than a
+    // filled plate that would blank out whatever the wire crosses.
+    labelBgStyle: branch ? { fill: 'transparent' } : undefined,
+    ariaLabel: `the output of ${context.from} feeds ${context.to}${
+      edge.branch ? `, on the ${edge.branch} branch` : ''
+    }${context.broken ? ', part of a loop' : ''}`,
+    // An inline stroke rather than a class, because the stroke lands on an
+    // SVG `<path>` React Flow owns: a Tailwind class on the edge wrapper does
+    // not reach it, and inventing a stylesheet rule would mean this package
+    // ships CSS for the first time just to colour one line.
+    //
+    // Broken wins over branch: a wire in a loop is a graph that will not run at
+    // all, which is a bigger fact than which side of a decision it is on.
+    style: edgeStroke(context, branch),
+  };
+}
+
+/** Red for a loop, the branch's colour for a branch, React Flow's default otherwise. */
+function edgeStroke(
+  context: { broken: boolean },
+  branch: { stroke: string } | undefined,
+): { stroke: string; strokeWidth: number } | undefined {
+  if (context.broken) return { stroke: '#ef4444', strokeWidth: 2 };
+  return branch ? { stroke: branch.stroke, strokeWidth: 2 } : undefined;
 }
 
 /** Who feeds each node, by node id. Every node gets an entry, most of them empty. */
