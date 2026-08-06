@@ -23,6 +23,7 @@ import {
   workflowRunOrder,
 } from '@dudousxd/nestjs-catalog';
 import { BadRequestException, Inject, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { EXPECT_SHRINK_LABEL } from './load-expectations';
 import { PublishService } from './publish.service';
 import { redactLines, redactSecrets, safeLogLines } from './run-logs';
 import {
@@ -337,6 +338,15 @@ export class WorkflowRunnerService {
     connectorId: string;
     principalId: string;
     snapshotId: string;
+    /**
+     * Carried on the inline path as well as the durable one, and that symmetry
+     * is load-bearing rather than tidy. Which path a run takes is decided by
+     * whether a `WorkflowEngine` happened to resolve in this process — so an
+     * acknowledgement honoured only on the durable path would mean an operator's
+     * re-run was refused or allowed depending on deployment topology they cannot
+     * see, and the two would be told apart only by the load failing.
+     */
+    expectShrink?: string;
   }): Promise<ConnectorRun> {
     const { workflow, connectorId, principalId, snapshotId } = input;
     const order = workflowRunOrder(workflow);
@@ -366,6 +376,7 @@ export class WorkflowRunnerService {
           nodeId: entry.node.id,
           principalId,
           inputs: stageRefsFor(entry.inputs, progress.stages, snapshotId),
+          expectShrink: input.expectShrink,
         });
         this.record(progress, entry.node, output);
       } catch (error) {
@@ -645,7 +656,7 @@ export class WorkflowRunnerService {
     startedAt: number,
   ): Promise<WorkflowNodeStepOutput> {
     const logs: string[] = [];
-    const { connector, owner } = await this.sourceConnector(node);
+    const { connector, owner } = await this.resolveSourceNode(node);
 
     // A watermark belongs to the connector the node reads through, keyed by
     // node id: two nodes reading the same connector are two different reads and
@@ -777,7 +788,16 @@ export class WorkflowRunnerService {
   ): Promise<WorkflowNodeStepOutput> {
     const logs: string[] = [];
     const store = this.requireStore();
-    const labels = { source: 'workflow', workflow: workflow.name };
+    const labels = sinkLabels(workflow.name, input.expectShrink);
+    if (labels[EXPECT_SHRINK_LABEL]) {
+      // Said in the run's own log, because the label lives on the snapshot and
+      // nobody reads a snapshot's labels while wondering why a load was allowed
+      // through. Read back off the labels rather than off the input, so the line
+      // and the snapshot cannot disagree about what was acknowledged.
+      logs.push(
+        `This load is allowed to lose rows: ${labels[EXPECT_SHRINK_LABEL]} — the row-count bound stands down for this snapshot only.`,
+      );
+    }
     const incremental = node.mode === 'incremental';
 
     // The batch number is a position in the ordered list of the stages this
@@ -958,8 +978,16 @@ export class WorkflowRunnerService {
    * built here is a plain description of a source rather than a row that
    * exists: the fetchers take a connector shape, and inventing one is cheaper
    * than a second fetcher interface that means the same thing.
+   *
+   * **Public, because schema discovery resolves through it too.** That is not
+   * convenience — it is the property `schema-discovery.ts` claims in its own
+   * docblock and could not previously keep: "the read is the same read a run
+   * does, through the same fetcher". A second resolution written for the
+   * discovery route would fold a connection in slightly differently the first
+   * time either side was edited, and the symptom would be a discovery that
+   * described a source the load never touches. One method, both callers.
    */
-  private async sourceConnector(
+  async resolveSourceNode(
     node: WorkflowSourceNode,
   ): Promise<{ connector: CatalogConnector; owner?: CatalogConnector }> {
     const store = this.requireStore();
@@ -1120,6 +1148,41 @@ function redactOutcomes(
       outcome.error === undefined ? outcome : { ...outcome, error: redactSecrets(outcome.error) };
   }
   return redacted;
+}
+
+/**
+ * What every write of one sink is labelled with.
+ *
+ * The sibling of `labelsFor` in `connector-runner.service.ts`, and it refuses a
+ * blank reason for exactly the same reason that one does: the reason is the
+ * whole value of the acknowledgement — it is stored in the snapshot's labels and
+ * is the only answer anybody has in six months to "why was this load allowed to
+ * lose most of the data?".
+ *
+ * Built once per sink and used by both writes in it — the batches and the
+ * incremental carry-forward — because the store creates the snapshot row from
+ * whichever reaches it first. An acknowledgement attached to only one of them
+ * would land or not depending on whether this run happened to stage any rows,
+ * which is precisely the intermittent failure the connector runner's version
+ * documents.
+ *
+ * `BadRequestException` rather than a refusal further out, and here rather than
+ * only at the route, because this method is reached from the durable step as
+ * well as from the controller: a rule that lived in one of them would be a rule
+ * the other does not have.
+ */
+function sinkLabels(workflowName: string, expectShrink?: string): Record<string, string> {
+  const labels: Record<string, string> = { source: 'workflow', workflow: workflowName };
+  if (expectShrink === undefined) return labels;
+
+  const because = expectShrink.trim();
+  if (because.length === 0) {
+    throw new BadRequestException(
+      `This run of "${workflowName}" was told to expect a shrink and given no reason for it. The reason is what makes the acknowledgement worth anything: it is stored in the snapshot's labels and is the only answer anybody will have in six months to "why was this load allowed to lose most of the data?". Say what happened at the source — a truncation, a migration, a base being cut — or drop the acknowledgement and let the bound decide.`,
+    );
+  }
+  labels[EXPECT_SHRINK_LABEL] = because;
+  return labels;
 }
 
 function positiveInt(raw: string | undefined, fallback: number): number {

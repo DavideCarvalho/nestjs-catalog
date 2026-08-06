@@ -252,31 +252,65 @@ describe('CatalogPipelineModule.forRoot (integration)', () => {
     const pipeline = routes.filter((route) => route.includes('/api/catalog-service/pipeline'));
     const publish = routes.filter((route) => route.includes('/api/catalog-service/publish'));
 
-    // 29 + 4. Pinned as a total rather than route-by-route so that a route which
+    // 26 + 4. Pinned as a total rather than route-by-route so that a route which
     // moves prefix — the failure mode this whole file is about — cannot be
-    // mistaken for a route that was merely renamed. The last four added were the
-    // per-type load expectations — `GET expectations`, and `GET`/`PUT`/`DELETE
-    // expectations/:type` — which are what let an operator declare a delete
-    // strategy without a deploy; before them `GET transforms/:id/revisions`,
-    // which is what makes the version number a run records name code that can
-    // still be read.
-    expect(pipeline).toHaveLength(29);
+    // mistaken for a route that was merely renamed.
+    //
+    // It went 29 -> 26 when the workflow became the only thing anybody authors.
+    // Five connector routes left — `POST connectors`, `DELETE connectors/:id`,
+    // `POST connectors/:id/run`, `POST connectors/:id/discover` and
+    // `GET workflows/:id/connectors` — and two arrived in their place:
+    // `PUT workflows/:id/schedule`, because a schedule is authored on the graph
+    // now, and `POST workflows/:id/nodes/:nodeId/discover`, because discovery is
+    // how a type gets its shape and had to survive the move rather than be
+    // rebuilt afterwards. `GET connections/:id/connectors` became
+    // `GET connections/:id/workflows`, which is a rename and not a count change.
+    expect(pipeline).toHaveLength(26);
     expect(publish).toHaveLength(4);
 
-    // The five workflow routes named explicitly, because they are the ones that
-    // went missing. The console asked for `/pipeline/workflows`, the package
-    // served everything else, and the screen reported only that it could not
-    // read the workflows — which reads as a broken deployment rather than an
-    // endpoint that was never ported.
+    // The workflow routes named explicitly, because they are the whole authoring
+    // surface now. They went missing once — the console asked for
+    // `/pipeline/workflows`, the package served everything else, and the screen
+    // reported only that it could not read them, which reads as a broken
+    // deployment rather than an endpoint that was never ported.
     expect(pipeline).toEqual(
       expect.arrayContaining([
         'GET /api/catalog-service/pipeline/workflows',
         'POST /api/catalog-service/pipeline/workflows',
         'DELETE /api/catalog-service/pipeline/workflows/:id',
         'POST /api/catalog-service/pipeline/workflows/:id/run',
+        'POST /api/catalog-service/pipeline/workflows/:id/publish',
+        'PUT /api/catalog-service/pipeline/workflows/:id/schedule',
+        'POST /api/catalog-service/pipeline/workflows/:id/nodes/:nodeId/discover',
+        'GET /api/catalog-service/pipeline/connections/:id/workflows',
+      ]),
+    );
+
+    /**
+     * And the authoring surface a connector used to have is gone, named route by
+     * route.
+     *
+     * Asserted as absences rather than left to the total above, because a total
+     * cannot tell "removed" from "removed and something else added". Any one of
+     * these coming back would be a second way to author or run a pipeline, which
+     * is the state this change exists to leave.
+     */
+    expect(pipeline).toEqual(
+      expect.not.arrayContaining([
+        'POST /api/catalog-service/pipeline/connectors',
+        'DELETE /api/catalog-service/pipeline/connectors/:id',
+        'POST /api/catalog-service/pipeline/connectors/:id/run',
+        'POST /api/catalog-service/pipeline/connectors/:id/discover',
+        'GET /api/catalog-service/pipeline/connections/:id/connectors',
         'GET /api/catalog-service/pipeline/workflows/:id/connectors',
       ]),
     );
+
+    // The one connector route left, and it is a read: the internal record a
+    // published graph runs as, which is where a run history and a watermark are
+    // actually keyed.
+    expect(pipeline).toContain('GET /api/catalog-service/pipeline/connectors');
+
     expect(routes.filter((route) => route.startsWith('GET /api/catalog-service'))).toContain(
       'GET /api/catalog-service/pipeline/connections',
     );

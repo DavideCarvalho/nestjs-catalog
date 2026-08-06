@@ -25,8 +25,13 @@ function entityManager(rows: {
   connector?: ConnectorRow;
   transform?: TransformRow;
   usingConnectors?: ConnectorRow[];
-}): { em: EntityManager; flushed: Array<Record<string, unknown>> } {
+}): {
+  em: EntityManager;
+  flushed: Array<Record<string, unknown>>;
+  updates: Array<{ where: Record<string, unknown>; data: Record<string, unknown> }>;
+} {
   const flushed: Array<Record<string, unknown>> = [];
+  const updates: Array<{ where: Record<string, unknown>; data: Record<string, unknown> }> = [];
   let pending: Array<Record<string, unknown>> = [];
 
   const fake = {
@@ -44,6 +49,18 @@ function entityManager(rows: {
       throw new Error('These tests find no other entity.');
     },
     create: (_entity: unknown, data: Record<string, unknown>) => ({ ...data }),
+    // Reached by `unpublishWorkflow` (disabling the connector the graph ran as)
+    // and by `publishWorkflow` through `mintConnectorFor`. Recorded rather than
+    // ignored so a test can assert the cascade happened, which is the whole of
+    // what changed about unpublishing.
+    nativeUpdate: (
+      _entity: unknown,
+      where: Record<string, unknown>,
+      data: Record<string, unknown>,
+    ) => {
+      updates.push({ where, data });
+      return Promise.resolve(1);
+    },
     persist: (row: Record<string, unknown>) => {
       pending.push(row);
     },
@@ -56,7 +73,7 @@ function entityManager(rows: {
 
   // Not a type assertion: `Object.create(null)` is `any`, so the merged value is
   // too, and the declared return type is what narrows it back down.
-  return { em: Object.assign(Object.create(null), fake), flushed };
+  return { em: Object.assign(Object.create(null), fake), flushed, updates };
 }
 
 /** A source and a sink, wired. The smallest graph that validates. */
@@ -200,27 +217,67 @@ describe('MySqlPipelineStore.publishWorkflow: the gate, moved', () => {
     // Re-derived at this instant rather than trusted from the row: the row's
     // copy was written by a save that may have had no sink at all.
     expect(published.targetType).toBe('Subwo');
-    expect(flushed).toHaveLength(1);
+    // Two, and the second is the point: publishing is what mints the connector
+    // the graph runs as. There is no `POST connectors` any more, so if this
+    // flush stopped happening a published graph would have nothing to key a run,
+    // a watermark or the singleton mutex on, and the only symptom would be a
+    // schedule that never fires.
+    expect(flushed).toHaveLength(2);
+    const minted = flushed[1];
+    expect(minted.workflowId).toBe('w1');
+    expect(minted.targetType).toBe('Subwo');
+  });
+
+  it('updates the connector it already minted rather than making a second one', async () => {
+    const existing = usingConnector();
+    const { em, flushed } = entityManager({
+      workflow: storedWorkflow('ready'),
+      connector: existing,
+    });
+    const store = new MySqlPipelineStore(em);
+
+    await store.publishWorkflow('w1', 'ana');
+
+    // Found by `workflowId`, so a re-publish keeps the id every run, watermark
+    // and mutex key hangs off. Minting a second row here would silently start a
+    // fresh pipeline beside the old one, with both on the same cron.
+    expect(flushed.filter((row) => row.workflowId === 'w1')).toHaveLength(1);
+    expect(flushed.some((row) => row.id === existing.id)).toBe(true);
   });
 });
 
-describe('MySqlPipelineStore.unpublishWorkflow: refuses rather than cascades', () => {
-  it('refuses while a connector still runs it, and names it', async () => {
-    const { em, flushed } = entityManager({
+describe('MySqlPipelineStore.unpublishWorkflow: cascades, but only as far as disabling', () => {
+  /**
+   * This used to refuse while a connector still ran the graph. It cannot any
+   * more and the reason is structural rather than a loosening: a published graph
+   * now runs as exactly one connector, its own, so the old check would refuse
+   * every unpublish there is — and "point those connectors elsewhere first" is
+   * advice about a route that no longer exists.
+   */
+  it('takes the graph back to draft and disables what it ran as', async () => {
+    const { em, updates } = entityManager({
       workflow: storedWorkflow('ready'),
       usingConnectors: [usingConnector()],
     });
     const store = new MySqlPipelineStore(em);
 
-    await expect(store.unpublishWorkflow('w1', 'ana')).rejects.toThrow(/Nightly/);
-    expect(flushed).toHaveLength(0);
+    expect((await store.unpublishWorkflow('w1', 'ana')).status).toBe('draft');
+    expect(updates).toEqual([{ where: { workflowId: 'w1' }, data: { enabled: false } }]);
   });
 
-  it('takes an unused graph back to draft', async () => {
-    const { em } = entityManager({ workflow: storedWorkflow('ready'), usingConnectors: [] });
+  it('disables rather than deletes, so re-publishing resumes the same pipeline', async () => {
+    const { em, updates } = entityManager({
+      workflow: storedWorkflow('ready'),
+      usingConnectors: [usingConnector()],
+    });
     const store = new MySqlPipelineStore(em);
 
-    expect((await store.unpublishWorkflow('w1', 'ana')).status).toBe('draft');
+    await store.unpublishWorkflow('w1', 'ana');
+
+    // The id, the run history and the watermark all survive an unpublish. A
+    // delete here would make parking a graph for an afternoon cost its history.
+    expect(updates.every((update) => update.data.enabled === false)).toBe(true);
+    expect(updates.some((update) => 'id' in update.where)).toBe(false);
   });
 });
 

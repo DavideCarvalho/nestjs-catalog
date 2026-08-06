@@ -32,6 +32,26 @@ export interface CatalogWorkflowRunInput {
    */
   connectorId: string;
   principalId: string;
+  /**
+   * The operator's acknowledgement that this load is allowed to collapse.
+   *
+   * Carried here because the escape hatch had nowhere else to go. It reached
+   * the row-count bound only through `ConnectorRunOptions.expectShrink` on
+   * `POST connectors/:id/run` — and that route is gone, because a connector is
+   * not something anybody authors or runs directly any more. Without this
+   * field, removing the route would have removed the only way an operator can
+   * re-drive a load the bound refused, which leaves them raising the bound in
+   * policy instead: standing the guard down for every future load of that type
+   * rather than for this one snapshot. That is the failure `EXPECT_SHRINK_LABEL`
+   * exists to prevent, arrived at by deleting its only entrance.
+   *
+   * **A scheduled run must never set it**, exactly as before: `ConnectorScheduler`
+   * builds this payload with no `expectShrink` field at all, because a cron
+   * window is unattended and an acknowledgement that fires every night is the
+   * bound switched off in a costume. The route for a refused scheduled load is
+   * still to look at the source and re-run it by hand, saying why.
+   */
+  expectShrink?: string;
 }
 
 export interface CatalogWorkflowRunOutput {
@@ -124,6 +144,13 @@ export class CatalogWorkflowRunWorkflow {
           runId: snapshotId,
           nodeId: entry.nodeId,
           principalId: input.principalId,
+          // Handed to every node and read by exactly one of them. Carrying it
+          // per node rather than resolving it at the sink is what keeps the
+          // body replayable: the sink step must be a pure function of its
+          // checkpointed input, and a sink that went looking for the run's
+          // options would be a database read whose answer can change between
+          // the first attempt and the replay.
+          expectShrink: input.expectShrink,
           // In edge order, because that is the order `plan.order[].inputs`
           // preserved from the graph's edge array — never the iteration order
           // of `progress.stages`, which is keyed by node id and knows nothing

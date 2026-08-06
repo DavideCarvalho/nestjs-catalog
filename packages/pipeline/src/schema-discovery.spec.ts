@@ -3,8 +3,9 @@ import { describe, expect, it } from 'vitest';
 import {
   type ConnectorSchemaDiscovery,
   type DiscoveredColumn,
+  type DiscoverySource,
   columnsFromSqlDescription,
-  discoverConnectorSchema,
+  discoverSourceSchema,
   driftFrom,
   flagUnusableNames,
 } from './schema-discovery';
@@ -41,13 +42,35 @@ function connector(overrides: Partial<CatalogConnector> = {}): CatalogConnector 
   };
 }
 
-/** Discovery over an inline connector: real fetcher, records supplied by the test. */
+/**
+ * One source node, resolved — what a run would hand a fetcher.
+ *
+ * `reader` is connector-shaped because a fetcher's contract is, and building it
+ * from the same `connector()` fixture keeps this file's fixtures to one.
+ */
+function source(
+  overrides: Partial<CatalogConnector> = {},
+  extra: Partial<DiscoverySource> = {},
+): DiscoverySource {
+  return {
+    workflowId: 'w1',
+    nodeId: 'source',
+    nodeName: 'Nightly pull',
+    targetType: 'Mvr',
+    reader: connector(overrides),
+    transformed: false,
+    ...extra,
+  };
+}
+
+/** Discovery over an inline source: real fetcher, records supplied by the test. */
 function discoverRecords(
   records: unknown[],
   overrides: Partial<CatalogConnector> = {},
+  extra: Partial<DiscoverySource> = {},
 ): Promise<ConnectorSchemaDiscovery> {
-  return discoverConnectorSchema({
-    connector: connector({ config: { records }, ...overrides }),
+  return discoverSourceSchema({
+    source: source({ config: { records }, ...overrides }, extra),
   });
 }
 
@@ -221,8 +244,8 @@ describe('a sampled source', () => {
   // the difference between a button that is cheap to press on a source with a
   // million rows behind it and one nobody presses twice.
   it('looks at no more records than it was told to', async () => {
-    const discovery = await discoverConnectorSchema({
-      connector: connector({ config: { records: [{ a: 1 }, { a: 2 }, { a: 3 }] } }),
+    const discovery = await discoverSourceSchema({
+      source: source({ config: { records: [{ a: 1 }, { a: 2 }, { a: 3 }] } }),
       sampleLimit: 2,
     });
     expect(discovery.sampled).toBe(2);
@@ -236,15 +259,22 @@ describe('a sampled source', () => {
     expect(discovery.caveat).toMatch(/no records/);
   });
 
-  it('says the columns are the pre-transform shape when a transform is configured', async () => {
-    const discovery = await discoverRecords([{ plate: 'AB-1' }], { transformId: 't1' });
+  /**
+   * Driven by `transformed` now rather than by the reader's `transformId`, and
+   * the swap widens what the caveat can see: the old test could only notice one
+   * transform hanging off one connector, while a graph may put three in a row
+   * between this source and the sink. Every one of them makes these columns an
+   * input to code rather than columns of the lake.
+   */
+  it('says the columns are the pre-transform shape when a transform is in the way', async () => {
+    const discovery = await discoverRecords([{ plate: 'AB-1' }], {}, { transformed: true });
     expect(discovery.caveat).toMatch(/before|BEFORE|SOURCE/);
-    expect(discovery.caveat).toMatch(/transform emits/);
+    expect(discovery.caveat).toMatch(/that emits/);
   });
 
   it('leaves the caveat alone when there is no transform in the way', async () => {
     const discovery = await discoverRecords([{ plate: 'AB-1' }]);
-    expect(discovery.caveat).not.toMatch(/transform emits/);
+    expect(discovery.caveat).not.toMatch(/that emits/);
   });
 });
 
@@ -427,8 +457,8 @@ describe('drift', () => {
   });
 
   it('reports a quiet source as quiet rather than as nothing', async () => {
-    const discovery = await discoverConnectorSchema({
-      connector: connector({ config: { records: [{ plate: 'AB-1', miles: 3 }] } }),
+    const discovery = await discoverSourceSchema({
+      source: source({ config: { records: [{ plate: 'AB-1', miles: 3 }] } }),
       existing,
     });
     expect(discovery.typeExists).toBe(true);
@@ -436,13 +466,42 @@ describe('drift', () => {
   });
 });
 
-describe('what discovery refuses to describe', () => {
-  // A connector attached to a graph does not read its own config at all — the
-  // workflow's source nodes do. Describing that config would describe a source
-  // that never loads, and the person reading it has no way to tell.
-  it('refuses a connector whose source is a workflow, naming the workflow', async () => {
-    await expect(
-      discoverConnectorSchema({ connector: connector({ workflowId: 'wf-9' }) }),
-    ).rejects.toThrow(/wf-9/);
+describe('what a discovery says it is about', () => {
+  /**
+   * The refusal this replaced was `discoverConnectorSchema` throwing on any
+   * connector with a `workflowId`, on the correct grounds that such a connector
+   * does not read its own config — the graph's source nodes do. The advice it
+   * gave ("discover from the graph's source node instead") is now the only thing
+   * this function can do, so the refusal has nothing left to refuse: the input
+   * IS a source node.
+   *
+   * What is asserted instead is the thing that made the old shape wrong, and it
+   * is the reason the response fields were renamed: an answer has to name the
+   * node it describes. A graph may have several sources, and `connectorId` could
+   * not tell two of them apart.
+   */
+  it('names the node and the graph it describes, not a connector', async () => {
+    const discovery = await discoverRecords(
+      [{ plate: 'AB-1' }],
+      {},
+      {
+        workflowId: 'w9',
+        nodeId: 'left',
+        nodeName: 'Left source',
+      },
+    );
+    expect(discovery.workflowId).toBe('w9');
+    expect(discovery.nodeId).toBe('left');
+    expect(discovery.nodeName).toBe('Left source');
+  });
+
+  it('tells two sources of one graph apart, which the old shape could not', async () => {
+    const [left, right] = await Promise.all([
+      discoverRecords([{ plate: 'AB-1' }], {}, { nodeId: 'left' }),
+      discoverRecords([{ vin: 'X' }], {}, { nodeId: 'right' }),
+    ]);
+    expect(left.nodeId).not.toBe(right.nodeId);
+    expect(left.columns.map((column) => column.name)).toEqual(['plate']);
+    expect(right.columns.map((column) => column.name)).toEqual(['vin']);
   });
 });

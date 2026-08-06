@@ -122,6 +122,7 @@ class MemoryPipelineStore implements CatalogPipelineStore {
   seed(workflow: Pick<CatalogWorkflow, 'id' | 'name' | 'nodes' | 'edges'>): void {
     this.workflows.set(workflow.id, {
       ...workflow,
+      enabled: true,
       version: 1,
       graphHash: 'hash',
       // Seeded graphs stand for rows already in a database, and every row there
@@ -156,6 +157,15 @@ class MemoryPipelineStore implements CatalogPipelineStore {
     if (!workflow) throw new Error(`No workflow ${id}`);
     return Promise.resolve({ ...workflow, status: 'ready' });
   }
+  /** Present for the reason `publishWorkflow` above is: `supportsWorkflows` asks. */
+  saveWorkflowSchedule(id: string): Promise<CatalogWorkflow> {
+    const workflow = this.workflows.get(id);
+    if (!workflow) throw new Error(`No workflow ${id}`);
+    return Promise.resolve(workflow);
+  }
+  adoptConnector(): Promise<undefined> {
+    return Promise.resolve(undefined);
+  }
   saveWorkflow(
     input: Pick<CatalogWorkflow, 'name' | 'nodes' | 'edges'> & { id?: string },
     createdBy: string,
@@ -164,6 +174,7 @@ class MemoryPipelineStore implements CatalogPipelineStore {
     const saved: CatalogWorkflow = {
       ...input,
       id,
+      enabled: true,
       version: 2,
       graphHash: 'hash',
       // A save through this stub stands for an ordinary edit, not a draft: the
@@ -595,37 +606,30 @@ describe('a workflow does not serve its source credentials', () => {
       expect(store.connections.get('c1')?.config.url).toBe(SECRET_URL);
     });
 
-    it('does not return the connector credential it just restored', async () => {
-      store.connectors.set('k1', {
-        id: 'k1',
-        name: 'Nightly',
-        kind: 'sql',
-        targetType: 'Mvr',
-        config: { url: SECRET_URL },
-        state: {},
-        mode: 'full',
-        enabled: true,
-        createdBy: 'ana@example.com',
-        createdAt: '2020-01-01T00:00:00.000Z',
-        updatedAt: '2020-01-01T00:00:00.000Z',
-      });
-
-      const shown = (
-        await request(app.getHttpServer())
-          .get(`${BASE}/connectors`)
-          .set('x-principal', 'ana')
-          .expect(200)
-      ).body[0];
-      expect(JSON.stringify(shown)).not.toContain('s3cr3t');
-
-      const response = await request(app.getHttpServer())
+    /**
+     * The route this used to cover is gone, so what is asserted is that it is
+     * gone rather than that it redacts.
+     *
+     * The property it protected — a save response is a read, so it must be
+     * redacted — has not been dropped: it is asserted one test up for a
+     * connection and, in `the round trip` above, for a workflow's source nodes.
+     * Those are the two things anybody can still POST. A connector is minted by
+     * publishing a graph now, so there is no request whose response could leak a
+     * connector's credential back.
+     */
+    it('has no route that writes a connector at all', async () => {
+      await request(app.getHttpServer())
         .post(`${BASE}/connectors`)
         .set('x-principal', 'ana')
-        .send({ ...shown, name: 'Nightly (renamed)' })
-        .expect(201);
+        .send({ name: 'Nightly', kind: 'sql', targetType: 'Mvr', config: { url: SECRET_URL } })
+        .expect(404);
+    });
 
-      expect(JSON.stringify(response.body)).not.toContain('s3cr3t');
-      expect(store.connectors.get('k1')?.config.url).toBe(SECRET_URL);
+    it('has no route that deletes one either, so a graph is the only handle', async () => {
+      await request(app.getHttpServer())
+        .delete(`${BASE}/connectors/k1`)
+        .set('x-principal', 'ana')
+        .expect(404);
     });
   });
 });

@@ -50,6 +50,37 @@ export function isConnectorKind(value: unknown): value is ConnectorKind {
   return CONNECTOR_KINDS.some((kind) => kind === value);
 }
 
+/**
+ * What a published workflow runs as. **Not an authored object.**
+ *
+ * This used to be the thing somebody created: a screen, a `POST connectors`, a
+ * kind and a config and a schedule typed into a form. It is not that any more,
+ * and every route that let anybody make one directly has been removed. A
+ * connector is now minted by {@link CatalogWorkflowStore.publishWorkflow} and
+ * exists for the four jobs a graph cannot do for itself:
+ *
+ * - **It is the mutex key.** `singleton: { key: connectorMutexKey }` on the
+ *   durable workflow serialises runs per connector id, which is what stops two
+ *   workers loading one type at once.
+ * - **It is the run's owner.** `ConnectorRun.connectorId` is how `listRuns`
+ *   groups a history, so a stable id across edits of the graph is what makes
+ *   "what has this pipeline done" answerable at all.
+ * - **It holds the watermark.** `state`, keyed by source-node id — see
+ *   {@link CatalogConnector.state}.
+ * - **It answers "which connectors write this type".** `targetType` is kept
+ *   equal to the workflow's sink type, so that query keeps working.
+ *
+ * Everything else on it is derived. `kind`, `config`, `connectionId` and
+ * `secretEnvVar` are **not read** on a connector that has a `workflowId`, and
+ * every connector has one now; they survive only because a row adopted from
+ * before this change still carries what it was configured with, and throwing
+ * that away would destroy the evidence of what a load used to do.
+ *
+ * The reason for keeping a record at all rather than running graphs directly is
+ * that all four jobs above need an identity that outlives an edit. A graph's
+ * version changes when anybody drags a node; the thing a run belongs to must
+ * not.
+ */
 export interface CatalogConnector {
   id: string;
   name: string;
@@ -77,28 +108,39 @@ export interface CatalogConnector {
   /** The transform that turns source records into rows of `targetType`. */
   transformId?: string;
   /**
-   * The workflow that turns source records into rows of `targetType`, when one
-   * transform is not enough.
+   * The graph this connector runs. **The only thing that says what it does.**
+   *
+   * Optional in the type and mandatory in practice: `publishWorkflow` sets it on
+   * every connector it mints, and adoption sets it on every connector that
+   * predates this change. It stays optional here because a store read must be
+   * able to represent a row written before adoption ran without asserting
+   * something about it that is not yet true — narrowing this to `string` would
+   * turn "we have not migrated yet" into a type error at the read.
    *
    * Mutually exclusive with {@link transformId}, and the store refuses a
    * connector that sets both: two answers to "what shapes this data" means the
    * runner picks one, and which one it picked is invisible until the load comes
-   * out wrong. A connector with a `transformId` and no `workflowId` behaves
-   * exactly as it did before workflows existed.
+   * out wrong.
    *
-   * When this is set, the connector's own `kind`, `config`, `connectionId` and
+   * When this is set the connector's own `kind`, `config`, `connectionId` and
    * `secretEnvVar` are **not read**: the workflow's source nodes say where the
-   * data comes from, and letting the connector also say would be two authorities
-   * for one question. `targetType` stays meaningful and is kept equal to the
-   * workflow's sink type by {@link CatalogPipelineStore.saveConnector}, so every
-   * existing "which connectors write this type" answer keeps working.
-   *
-   * `state` keeps its meaning too, but is keyed by node id when a workflow runs:
-   * a graph with two sources has two watermarks, and one flat blob would let
-   * them overwrite each other.
+   * data comes from, and letting the connector also say would be two
+   * authorities for one question. `targetType` is kept equal to the workflow's
+   * sink type, so every existing "which connectors write this type" answer
+   * keeps working.
    */
   workflowId?: string;
-  /** Cron-ish, interpreted by whatever schedules it. Empty means manual only. */
+  /**
+   * A **copy** of {@link CatalogWorkflow.schedule}, and nothing reads it.
+   *
+   * Kept, and kept honest by the store, for exactly one reason: it is the
+   * evidence of what a connector was doing before its schedule moved onto the
+   * graph. The authority is the workflow, {@link CatalogWorkflowStore} writes
+   * this from there on every publish, and the scheduler deliberately does not
+   * consult it — see the note on `ConnectorScheduler`, which used to read this
+   * field and now reads workflows, because a second copy of a column is how the
+   * two come to disagree the first time somebody edits one.
+   */
   schedule?: string;
   /**
    * Whether a run replaces the dataset or adds to it.
@@ -136,6 +178,13 @@ export interface CatalogConnector {
    * is a consequence. Mixing them means a person editing a connector can
    * silently rewind or skip data, and a diff of the config stops meaning what
    * somebody decided.
+   *
+   * **Keyed by source-node id**, because a graph with two sources has two
+   * watermarks and one flat blob would let them overwrite each other. A
+   * connector adopted from before workflows existed had a flat blob, and
+   * adoption re-keys it under the id of the single source node it was wrapped
+   * into — losing that would make the first run after an upgrade re-read an
+   * incremental source from the beginning.
    */
   state?: Record<string, unknown>;
   enabled: boolean;
@@ -850,6 +899,31 @@ export interface CatalogWorkflow {
    * a connector claims to write something else.
    */
   targetType: string;
+  /**
+   * Cron-ish, interpreted by whatever schedules it. Empty means manual only.
+   *
+   * **Authored here, on the graph, and nowhere else.** It used to live on the
+   * connector, which was defensible while a connector was a thing somebody
+   * created and is not now that one is minted: a schedule is a statement about
+   * a pipeline, and the pipeline is the graph. The connector keeps a copy for
+   * evidence — see {@link CatalogConnector.schedule} — and `ConnectorScheduler`
+   * reads this field rather than that one, so there is one authority.
+   *
+   * Only a `ready` graph is scheduled. A draft carrying a cron is a load nobody
+   * declared finished, and the scheduler says so out loud rather than skipping
+   * it quietly; that silence is the exact shape of the incident this field's
+   * predecessor caused.
+   */
+  schedule?: string;
+  /**
+   * Whether this graph runs at all.
+   *
+   * Both halves of the old `isScheduled` test now live on the workflow, because
+   * splitting them across two rows is what made "my connector is enabled but
+   * nothing runs" a question with two places to look. Defaults true: a graph
+   * somebody went to the trouble of publishing is one they meant to run.
+   */
+  enabled: boolean;
   createdBy: string;
   createdAt: string;
   updatedAt: string;
@@ -941,6 +1015,15 @@ export interface WorkflowNodeStepInput {
    * graph. Empty for a source node, which reads from a system instead.
    */
   inputs: WorkflowStageRef[];
+  /**
+   * The operator's reason for expecting this load to lose rows. Read only by
+   * the sink, and absent on every scheduled run by construction.
+   *
+   * On the step input rather than fetched at the sink because a durable step
+   * has to be a pure function of what was checkpointed — see the note where
+   * this is passed in `CatalogWorkflowRunWorkflow`.
+   */
+  expectShrink?: string;
 }
 
 /** What a node step returns. Also ids and counters. */
@@ -1553,8 +1636,14 @@ export interface CatalogWorkflowStore {
    * point at a ready graph, so a save that dropped the status would disable a
    * scheduled load with nothing said to anybody. Refusing puts the error in
    * front of the person who is editing, at the moment they edit. To park a
-   * broken idea on a live graph, {@link unpublishWorkflow} it first and be told
-   * which connectors that stops.
+   * broken idea on a live graph, {@link unpublishWorkflow} it first — which
+   * disables the connector it runs as, so the parking is visible rather than a
+   * graph that is quietly still on a cron.
+   *
+   * `schedule` and `enabled` are not inputs either, and for a different reason
+   * from the derived three: they are authored, but not *here*. See
+   * {@link saveWorkflowSchedule} for why a cron must not ride along on an
+   * autosave.
    *
    * `version`, `graphHash` and `targetType` are not inputs: the first two are
    * derived from the graph and the third from the sink, and accepting them from
@@ -1581,24 +1670,115 @@ export interface CatalogWorkflowStore {
    *
    * Idempotent on an already-ready graph, because the honest answer to "publish
    * this thing that is published" is the graph, not an error.
+   *
+   * **Publishing is also what mints the connector.** That is the load-bearing
+   * half of "the workflow is the only thing anybody authors": there is no
+   * `POST connectors` any more, so this is the only way one comes into
+   * existence. The minted row carries this workflow's id, its sink's type, its
+   * schedule and its enabled flag, and it is the identity every later run,
+   * watermark and mutex is keyed on — so publishing an already-published graph
+   * must **update** that row rather than mint a second one, or a re-publish
+   * would orphan a pipeline's entire history.
    */
   publishWorkflow(id: string, publishedBy: string): Promise<CatalogWorkflow>;
   /**
-   * Take a graph back to `draft`.
+   * Take a graph back to `draft`, and stop what it was running.
    *
-   * **Refuses while any connector still runs it**, exactly as
-   * {@link deleteWorkflow} does and for the same reason: a connector may only
-   * point at a ready graph, so unpublishing one out from under a schedule breaks
-   * a load that was working, and the operator needs to know *which* connectors
-   * to point elsewhere first. Refusing here rather than cascading is deliberate —
-   * disabling somebody's connectors as a side effect of an edit to something
-   * else is precisely the silent action this status exists to prevent.
+   * This used to refuse while any connector still ran the graph, on the reasoning
+   * that unpublishing one out from under a schedule breaks a working load and the
+   * operator should point those connectors elsewhere first. That reasoning
+   * assumed a connector was an independently authored object that could be
+   * pointed somewhere; it no longer is. A published graph now has exactly one
+   * connector and it is this graph's own, so the old refusal would refuse
+   * every unpublish there is — a rule that always fires is not a rule.
+   *
+   * So the cascade the old docblock argued against is now the correct behaviour,
+   * and the thing it was protecting is protected differently: the connector is
+   * **disabled, not deleted**. Its id, its run history and its watermark all
+   * survive, so re-publishing resumes the same pipeline rather than starting a
+   * new one, and nothing silently keeps running in the meantime.
    */
   unpublishWorkflow(id: string, unpublishedBy: string): Promise<CatalogWorkflow>;
-  /** Refuses while any connector still runs it. */
+  /**
+   * Delete the graph and the connector it ran as.
+   *
+   * Cascading for the reason {@link unpublishWorkflow} gives — the connector is
+   * this graph's own and there is nowhere else to point it — and destructive
+   * here rather than disabling, because the graph is going too and a connector
+   * whose workflow does not exist is precisely the dangling row this cascade
+   * exists to avoid leaving behind.
+   */
   deleteWorkflow(id: string): Promise<boolean>;
-  /** Which connectors run it. Named, so a refusal can say. */
+  /**
+   * The connector this graph runs as, as a list.
+   *
+   * A list rather than an optional single value, because that is what it
+   * honestly is: a store predating this change may hold several connectors
+   * pointing at one graph, and answering with the first would hide the rest from
+   * the operator who has to reconcile them. A graph published under the current
+   * rules has exactly one.
+   */
   connectorsUsingWorkflow(id: string): Promise<CatalogConnector[]>;
+  /**
+   * Set when this graph runs, and whether it runs.
+   *
+   * Its own method rather than fields on {@link saveWorkflow}, and for the
+   * reason `saveConnectorState` is separate from `saveConnector`: a canvas
+   * autosaves. A cron folded into the save every drag of a node passes through
+   * is a cron that a stale editor tab can silently revert, and the symptom would
+   * be a load that stopped running with a diff nobody made.
+   *
+   * Writes through to the minted connector's copy in the same call, so the two
+   * cannot be observed disagreeing.
+   */
+  saveWorkflowSchedule(
+    id: string,
+    input: { schedule?: string; enabled?: boolean },
+    changedBy: string,
+  ): Promise<CatalogWorkflow>;
+  /**
+   * Wrap a connector that predates workflows into the graph it always was.
+   *
+   * **The upgrade path, and the reason removing `POST connectors` does not
+   * orphan anything.** A deployment upgrading into this change has connectors
+   * that were authored directly — a kind, a config, optionally one transform,
+   * and a target type — and no route can edit them any more. Three outcomes
+   * were possible: migrate them, leave them readable but frozen, or make
+   * somebody rebuild each by hand. This is the first, and it is chosen because
+   * the shape was already exactly representable: a connector *is* a
+   * single-source, single-sink graph with at most one transform in the middle,
+   * and it has been describable as one since `workflowId` existed.
+   *
+   * ## What is preserved, and why each matters
+   *
+   * - **The connector id.** It is the mutex key, the owner of every
+   *   `ConnectorRun` and the holder of the watermark. Minting a fresh connector
+   *   and leaving the old one would split one pipeline's history in two and
+   *   leave nothing serialising the halves against each other.
+   * - **The watermark, re-keyed.** A plain connector kept a flat `state`; a
+   *   graph keys it by source-node id. Carrying the blob over unchanged would
+   *   leave the new source node with no watermark at all, and the first run
+   *   after the upgrade would re-read an incremental source from the beginning —
+   *   which is not data loss, but is a surprise measured in hours on a large
+   *   source.
+   * - **The schedule**, moved to the graph, which is where it is authored now.
+   *
+   * ## What changes, stated plainly
+   *
+   * The graph is published as `ready` without a person having declared it
+   * finished, because refusing to publish would leave the pipeline not running —
+   * an upgrade that silently stops twelve loads is a worse outcome than one that
+   * carries a decision forward on the operator's behalf. It is validated first
+   * and the adoption is **refused** if the wrap does not validate, so nothing is
+   * published that could not have been drawn.
+   *
+   * Idempotent: a connector that already has a `workflowId` is left alone and
+   * answered `undefined`. That is what makes it safe to run at every boot.
+   */
+  adoptConnector(
+    connectorId: string,
+    adoptedBy: string,
+  ): Promise<{ workflow: CatalogWorkflow; connector: CatalogConnector } | undefined>;
 }
 
 /**
@@ -1660,7 +1840,14 @@ export function supportsWorkflows(
     // save and not the transition would narrow cleanly here and then fail one
     // call later, in the middle of an apply that has already written types and
     // transforms into the target.
-    typeof store.publishWorkflow === 'function'
+    typeof store.publishWorkflow === 'function' &&
+    // Asked for by name for the same reason `publishWorkflow` is, and it earned
+    // the place the hard way: a schedule authored on a graph is worthless if the
+    // store cannot hold one, and a predicate that narrowed without checking
+    // would let the schedule route resolve, accept a cron, and throw
+    // "saveWorkflowSchedule is not a function" at the person who typed it. This
+    // is the surface a scheduling incident already came through once.
+    typeof store.saveWorkflowSchedule === 'function'
   );
 }
 

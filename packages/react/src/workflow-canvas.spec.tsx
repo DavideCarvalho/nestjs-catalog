@@ -172,6 +172,7 @@ function wholeWorkflow(overrides: Partial<CatalogWorkflow> = {}): CatalogWorkflo
   return {
     id: 'wf1',
     name: 'Fleet',
+    enabled: true,
     version: 1,
     // `ready` rather than `draft`: this fixture is a stored, complete graph, which is what makes
     // the node added on top of it the only unfinished thing on the canvas.

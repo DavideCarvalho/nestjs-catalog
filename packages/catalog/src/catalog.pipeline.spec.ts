@@ -659,6 +659,11 @@ describe('store capability checks', () => {
       // store with the save and not the transition would narrow cleanly and then
       // fail one call into an apply that has already written types.
       publishWorkflow: async () => undefined,
+      // Asked for by name too, and for a sharper reason than the rest: a store
+      // that narrowed without it would accept a cron and then throw on writing
+      // one, which is the shape of a scheduling failure this codebase has had.
+      saveWorkflowSchedule: async () => undefined,
+      adoptConnector: async () => undefined,
       writeStage: async () => ({ written: 0 }),
       readStage: async () => [],
     });
