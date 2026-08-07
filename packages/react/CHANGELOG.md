@@ -1,5 +1,23 @@
 # @dudousxd/nestjs-catalog-react
 
+## 0.22.0
+
+### Minor Changes
+
+- 3ae190b: Right-click the workflow canvas: a menu on a node, a wire, empty space or a selection — and a faster way to delete a node
+
+  **Why this exists is a discoverability failure, not a missing convenience.** "Make the next node and wire it in one action" already shipped. It lived in a pill on a node's hover toolbar, roughly 46×20 pixels on a 1600-pixel canvas, and the person who asked for this had never found it. Told it was there, they answered: _"Apertei na borda e só deu wire ué"_ — they pressed the handle, got the click-to-connect gesture, and reasonably concluded that was the feature. **Two different affordances were both called "wire", and the one carrying the menu was the less visible of the two.** So this is the discoverable home for capability that already existed and was being missed.
+
+  The hover pill therefore **survives and is renamed**. It says "Actions" now, it is announced as the actions for the node it belongs to, and it opens _the same list_ right-click gives — one builder, one model, no way for two menus to answer "what can this node do" differently. It survives rather than being deleted because right-click is not discoverable either: a control that appears under the pointer is how somebody learns the menu exists, and the menu is how they learn what is in it.
+
+  **What each target offers, worked out from the graph rather than written down.** A node: open it, edit its code (only once it names a transform), send its output to any node that can legally take it, make one of any kind that can legally follow it, disconnect any wire it is part of, delete it. A wire: open either end, **put a node in the middle of it** — `A → B` becomes `A → filter → B` in one action, which used to be four gestures, one of which was undoing the connection you already had — move it to the other branch where it leaves an `if`, disconnect it. Empty canvas: add a node **where the pointer is** rather than off the right-hand edge where the dock has to put one, tidy, fit. A selection: bring it into view, delete it.
+
+  Every option that makes an edge is filtered through `canConnect` — the same function the drag, the click gesture and the inspector's picker are refused by — by building a throwaway node and asking. Nothing restates a rule about what may follow what. Where a list comes out empty the menu **says why** rather than showing a gap, because "nothing here" and "nothing is possible" look identical and mean different things: a sink is told "a sink commits its rows, nothing runs after one". The kinds come from `WORKFLOW_NODE_KINDS`, never a hand-written row — that is the bug that shipped `filter` complete with no way to create it.
+
+  **A faster delete, asked for and made safe.** A node can now be removed from a control on its hover toolbar or from its menu, instead of opening the inspector and scrolling to the bottom of it. Neither stops to ask, deliberately: a confirmation on every node removal is friction people learn to click through without reading, and it would make the fast gesture the slow one. What makes that trade sound is the canvas's own per-action undo, which the delete goes through as one labelled entry. What undo does _not_ do is make it **visible** that a node took two other nodes' wiring with it — so every removal now says so, by name and by count, on the item before the click and in the live region after it. Deleting from a published workflow's node says what the server will do about it: a published graph has to stay runnable, so the edit is taken here and refused at the save.
+
+  Destructive items are separated by a rule and sit last, in their own tone. Keyboard parity comes from the platform: the context-menu key and Shift+F10 dispatch the same `contextmenu` event, so a focused node or wire opens the same menu, arrow-navigable, Escape to close. The anchor is corrected for it — measured in a browser, Chrome reports the _last mouse position_ on a keyboard-fired event, so a keyboard user would otherwise have got the menu wherever they last clicked. Right-click is taken over on nodes, wires and the canvas pane and **nowhere else**: every text field in the chrome floating over the canvas keeps the browser's own menu, which is the only useful one inside an input. Motion is `motion-safe:` throughout.
+
 ## 0.21.0
 
 ### Minor Changes
