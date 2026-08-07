@@ -289,6 +289,30 @@ export function CanvasContextMenu({
  * pointer has to travel from the node to the toolbar, and any gap is canvas —
  * `onNodeMouseLeave` would fire with nothing to catch it and the control would
  * vanish on the way to itself.
+ *
+ * ## Why `nopan` is what makes the pill openable at all
+ *
+ * `NodeToolbar` renders as a **direct child of `.react-flow__renderer`** — the
+ * element React Flow attaches d3-zoom to — rather than inside the node it points
+ * at. So a `mousedown` anywhere on this toolbar bubbles straight into the pan
+ * gesture, and d3-zoom's `mousedowned` opens with `nopropagation(event)`, which
+ * is `stopImmediatePropagation`. React 17+ delegates its listeners to the ROOT
+ * container, which is an ancestor of the renderer, so an event stopped there
+ * never reaches React at all: `onMouseDown` simply does not fire.
+ *
+ * That is fatal here and nowhere else on this toolbar, because Base UI's
+ * `Menu.Trigger` opens on **mousedown**, not click (`useClick({ event:
+ * 'mousedown' })`). The trash button beside it opens on `click`, which d3-zoom
+ * leaves alone — so the toolbar looked half-working: delete fine, "Actions"
+ * inert, with no error and nothing rendered to inspect.
+ *
+ * `nopan` is React Flow's own escape hatch and the only thing needed: its zoom
+ * filter refuses the gesture outright when the event's target is inside an
+ * element carrying that class, so `mousedowned` returns before it stops
+ * anything. `nodrag` would be cargo — that one is read by the per-node drag
+ * handler, and this toolbar is a sibling of every node rather than inside one.
+ * The edge's × wrapper in `edges.tsx` has carried the same guard since it
+ * shipped; this toolbar was the one control inside the flow that went without.
  */
 export function NodeActionsToolbar({
   node,
@@ -323,7 +347,10 @@ export function NodeActionsToolbar({
       offset={0}
       onMouseEnter={() => onHoverChange(true)}
       onMouseLeave={() => onHoverChange(false)}
-      className="flex items-center gap-1"
+      // `nopan` first, because it is the reason anything on this toolbar can be
+      // pressed — see the note above. Without it d3-zoom eats the mousedown and
+      // Base UI's trigger never hears the press that opens it.
+      className="nopan flex items-center gap-1"
     >
       <BaseMenu.Root open={open} onOpenChange={onOpenChange} modal={false}>
         <BaseMenu.Trigger
