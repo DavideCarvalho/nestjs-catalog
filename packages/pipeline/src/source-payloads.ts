@@ -152,7 +152,20 @@ export async function localPayload(source: string, limits: PayloadLimits): Promi
   // the bytes go past. A server that says how big the object is has told us
   // enough to refuse it without spending the transfer.
   refuseOversize(declaredLength(response), source, limits.maxBytes);
-  return spool(webBodyChunks(response.body), source, limits);
+
+  const body = webBody(response.body);
+  try {
+    return await spool(body.chunks, source, limits);
+  } catch (error) {
+    // The socket, explicitly. A generator abandoned at a `read()` that will
+    // never settle cannot close itself — its `finally` only runs when it is
+    // resumed, and nothing is going to resume it. Cancelling the reader is what
+    // actually resolves that pending read and frees the connection, and it is
+    // the difference between a read that gave up after its idle timeout and a
+    // worker that gave up and then held the socket anyway.
+    body.abort();
+    throw error;
+  }
 }
 
 /**
@@ -210,18 +223,34 @@ export function payloadChunks(payload: LocalPayload): AsyncIterable<Uint8Array> 
   return createReadStream(payload.path);
 }
 
-/** A `fetch` body as chunks, without the web-stream types leaking outwards. */
-async function* webBodyChunks(body: ReadableStream<Uint8Array>): AsyncGenerator<Uint8Array> {
+/**
+ * A `fetch` body as chunks, with a way to hang up on it.
+ *
+ * The abort is separate from the iterator on purpose. `return()`ing a generator
+ * that is suspended at an `await` does not run its `finally` until that `await`
+ * settles, so a body that has gone silent cannot be closed from the consumer's
+ * side at all — which is precisely the case the idle timeout exists for.
+ * `reader.cancel()` reaches past the generator to the stream, and a pending
+ * `read()` resolves as done.
+ */
+function webBody(body: ReadableStream<Uint8Array>): {
+  chunks: AsyncIterable<Uint8Array>;
+  abort(): void;
+} {
   const reader = body.getReader();
-  try {
+  const chunks = (async function* (): AsyncGenerator<Uint8Array> {
     while (true) {
       const { done, value } = await reader.read();
       if (done) return;
       if (value) yield value;
     }
-  } finally {
-    reader.releaseLock();
-  }
+  })();
+  return {
+    chunks,
+    abort: () => {
+      void reader.cancel().catch(() => undefined);
+    },
+  };
 }
 
 /**
@@ -310,7 +339,13 @@ async function* watched(
       yield result.value;
     }
   } finally {
-    await iterator.return?.().catch(() => undefined);
+    // Not awaited. A source that stopped producing is a source whose `next()`
+    // is still pending, and an async generator suspended at an `await` does not
+    // reach its own `finally` until that settles — so awaiting this would hang
+    // on exactly the read the timeout just gave up on. The close is asked for;
+    // whether the source can honour it is the source's problem, and the caller
+    // that owns the transport hangs up separately.
+    void Promise.resolve(iterator.return?.()).catch(() => undefined);
   }
 }
 

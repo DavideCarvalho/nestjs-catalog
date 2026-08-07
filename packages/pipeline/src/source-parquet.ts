@@ -95,8 +95,8 @@ export async function* parquetRecordsFrom(
   source: string,
 ): AsyncGenerator<unknown> {
   const api = await parquetApi();
-  const metadata = readMetadata(await api.metadata(file), source);
-  refuseUnreadableColumns(metadata.schema, source);
+  const metadata = readMetadata(await api.metadata(file, PARSERS), source);
+  refuseUnreadableColumns(metadata.elements, source);
   const compressors = await resolveCompressors(metadata, source);
   const columns = topLevelColumns(metadata.schema);
 
@@ -144,15 +144,46 @@ export async function* parquetRecordsFrom(
  * into midnight UTC would invent an instant the file never contained, and a
  * consumer in a negative offset would then read the day before.
  *
- * These are merged over the library's defaults, so the parsers not named here —
- * strings, JSON, UUID, geometry — keep their normal behaviour.
+ * **The set is complete rather than a partial override, and that is forced.**
+ * hyparquet documents `parsers` as merged over its defaults and merges them in
+ * `readRowGroup` — and then spreads the caller's whole options object over the
+ * result on the next line, which puts the *unmerged* `parsers` back. A partial
+ * override therefore reaches the column decoder missing every key it did not
+ * name, and the read dies on `parsers.stringFromBytes is not a function` at the
+ * first text column. Supplying all of them sidesteps a bug this package cannot
+ * fix; the five that are not about time behave exactly as the library's do.
+ *
+ * The two geospatial ones are the exception and they refuse. Reproducing them
+ * would mean reimplementing a WKB-to-GeoJSON decoder, and a wrong one is a
+ * silently misplaced coordinate. A geospatial column is refused by name up
+ * front instead — see {@link refuseUnreadableColumns} — and these exist as the
+ * backstop for a file whose column was not marked as one.
  */
+const TEXT_DECODER = new TextDecoder();
+
 const PARSERS = {
   timestampFromMilliseconds: (millis: bigint): string => epochIso(millis, 1_000n, 3),
   timestampFromMicroseconds: (micros: bigint): string => epochIso(micros, 1_000_000n, 6),
   timestampFromNanoseconds: (nanos: bigint): string => epochIso(nanos, 1_000_000_000n, 9),
   dateFromDays: (days: number): string => dayIso(days),
+  stringFromBytes: (bytes: Uint8Array | undefined): string | undefined =>
+    bytes && TEXT_DECODER.decode(bytes),
+  jsonFromBytes: (bytes: Uint8Array | undefined): unknown =>
+    bytes && JSON.parse(TEXT_DECODER.decode(bytes)),
+  uuidFromBytes: (bytes: Uint8Array | undefined): string | undefined => {
+    if (!bytes) return undefined;
+    const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+  },
+  geometryFromBytes: (): never => refuseGeospatial(),
+  geographyFromBytes: (): never => refuseGeospatial(),
 };
+
+function refuseGeospatial(): never {
+  throw new Error(
+    'This reads no geospatial parquet column. Decoding WKB into coordinates is a thing to get exactly right or not at all, and a column of silently misplaced points is worse than a refusal. Drop the column from what the connector reads.',
+  );
+}
 
 /** The largest millisecond offset from the epoch a `Date` can represent. */
 const MAX_EPOCH_MS = 8.64e15;
@@ -309,19 +340,32 @@ const BINARY_ADVICE =
  *   somewhere deep inside a page decoder and returns undecoded bytes for the
  *   third. Named here so the message says which column and which file.
  */
-function refuseUnreadableColumns(schema: readonly SchemaNode[], source: string): void {
-  const refusals: string[] = [];
-
-  for (const node of schema) {
-    const reason = unreadableReason(node);
-    if (reason) refusals.push(`"${node.path.join('.')}" ${reason}`);
-  }
+function refuseUnreadableColumns(elements: readonly unknown[], source: string): void {
+  const refusals = unreadableParquetColumns(elements);
 
   if (refusals.length > 0) {
     throw new Error(
       `${source} has ${refusals.length === 1 ? 'a column' : 'columns'} this cannot read as records: ${refusals.join('; ')}. Refusing rather than guessing — every one of these would otherwise arrive as a value that looks right and is not.`,
     );
   }
+}
+
+/**
+ * The same judgement over a footer's raw schema elements, without the throw.
+ *
+ * Exported because a parquet footer is the only honest input to this question,
+ * and it is a plain array of schema elements — the same shape the file carries.
+ * Splitting the answer from the refusal is what makes the rules checkable
+ * against a hand-written schema rather than only against a file some writer
+ * happened to be able to produce, which for DECIMAL and INT96 is no file at all.
+ */
+export function unreadableParquetColumns(elements: readonly unknown[]): string[] {
+  const refusals: string[] = [];
+  for (const node of readSchema(elements)) {
+    const reason = unreadableReason(node);
+    if (reason) refusals.push(`"${node.path.join('.')}" ${reason}`);
+  }
+  return refusals;
 }
 
 /** Why one schema element cannot be read, or nothing if it can. */
@@ -340,6 +384,9 @@ function unreadableReason(node: SchemaNode): string | undefined {
   }
   if (logical === 'VARIANT') {
     return 'is a VARIANT, whose value arrives as undecoded bytes.';
+  }
+  if (logical === 'GEOMETRY' || logical === 'GEOGRAPHY') {
+    return 'is a geospatial column, which this does not decode. Decoding WKB into coordinates is a thing to get exactly right or not at all.';
   }
   if (node.isDecimal && node.precision !== undefined && node.precision > EXACT_DECIMAL_DIGITS) {
     return `is a DECIMAL(${node.precision}${node.scale === undefined ? '' : `,${node.scale}`}), which is read through a double and would lose digits past ${EXACT_DECIMAL_DIGITS}. Cast it to a string in whatever writes the file.`;
@@ -382,7 +429,7 @@ async function resolveCompressors(
 
 /** As much of `hyparquet` as this file calls, checked before it is called. */
 interface ParquetApi {
-  metadata(file: RandomAccessBytes): Promise<unknown>;
+  metadata(file: RandomAccessBytes, parsers: object): Promise<unknown>;
   readObjects(options: Record<string, unknown>): Promise<unknown[]>;
 }
 
@@ -401,8 +448,12 @@ async function parquetApi(): Promise<ParquetApi> {
   const readObjects = functionAt(module, 'parquetReadObjects');
 
   return {
-    async metadata(file: RandomAccessBytes): Promise<unknown> {
-      return await metadata(file);
+    async metadata(file: RandomAccessBytes, parsers: object): Promise<unknown> {
+      // The footer's own statistics are decoded with these too. Nothing here
+      // reads them, but a metadata parse and a row read disagreeing about what a
+      // timestamp is would be a difference waiting to be noticed by something
+      // that does.
+      return await metadata(file, { parsers });
     },
     async readObjects(options: Record<string, unknown>): Promise<unknown[]> {
       const rows: unknown = await readObjects(options);
@@ -484,6 +535,8 @@ interface SchemaNode {
 interface ParquetMetadata {
   /** The library's own object, handed straight back to it for the row reads. */
   raw: unknown;
+  /** The footer's schema elements, exactly as they arrived. */
+  elements: readonly unknown[];
   schema: SchemaNode[];
   /** Rows per row group, in file order. */
   rowGroups: number[];
@@ -511,7 +564,7 @@ function readMetadata(value: unknown, source: string): ParquetMetadata {
     }
   }
 
-  return { raw: value, schema: readSchema(schemaValue), rowGroups, codecs };
+  return { raw: value, elements: schemaValue, schema: readSchema(schemaValue), rowGroups, codecs };
 }
 
 /** A row count, which the footer carries as a bigint. */
@@ -581,6 +634,16 @@ function readSchema(elements: readonly unknown[]): SchemaNode[] {
 }
 
 const TEXT_CONVERTED: ReadonlySet<string> = new Set(['UTF8', 'ENUM', 'JSON', 'DECIMAL', 'BSON']);
+/**
+ * Logical types that make a byte array something other than raw bytes.
+ *
+ * `GEOMETRY` and `GEOGRAPHY` are deliberately absent: they *are* structured
+ * rather than raw, but they are refused for their own reason a few lines up and
+ * listing them here would make the binary rule fire first and give the wrong
+ * message. The library marks geoparquet columns with these during the metadata
+ * parse — `markGeoColumns` writes them onto the schema — so a WKB column in a
+ * geoparquet file reaches the check named rather than as an unlabelled blob.
+ */
 const TEXT_LOGICAL: ReadonlySet<string> = new Set([
   'STRING',
   'ENUM',
@@ -589,8 +652,6 @@ const TEXT_LOGICAL: ReadonlySet<string> = new Set([
   'UUID',
   'DECIMAL',
   'FLOAT16',
-  'GEOMETRY',
-  'GEOGRAPHY',
   'VARIANT',
 ]);
 
