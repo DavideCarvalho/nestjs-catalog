@@ -185,9 +185,7 @@ describe('the pipeline store on Postgres', () => {
     // create route looked fine while the read route did not.
     expect(saved.mode).toBeUndefined();
 
-    const stored = await db.execute(
-      `SELECT mode FROM catalog_transform WHERE id = '${saved.id}'`,
-    );
+    const stored = await db.execute(`SELECT mode FROM catalog_transform WHERE id = '${saved.id}'`);
     expect(JSON.stringify(stored)).toContain('null');
 
     // Re-read through a fresh fork, so the row is hydrated from the column
