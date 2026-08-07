@@ -8,7 +8,25 @@ import {
   unreachableSourceFormat,
 } from '@dudousxd/nestjs-catalog';
 import { Logger } from '@nestjs/common';
+import { importOptional } from './optional-modules';
+import {
+  type BlankRowLedger,
+  blankRowLedger,
+  csvRecords,
+  decodeChunks,
+  ndjsonRecords,
+} from './record-streams';
 import { admitsSecretEnv, credentialUnavailable, secretEnvAllowlist } from './secret-env-allowlist';
+import { parquetRecords } from './source-parquet';
+import {
+  type LocalPayload,
+  type PayloadLimits,
+  localPayload,
+  payloadChunks,
+  spool,
+} from './source-payloads';
+
+export { importOptional };
 
 /**
  * Pulling raw records out of a source.
@@ -102,6 +120,22 @@ export interface StreamedFetchResult {
    * failure path does with every other error.
    */
   state?: () => Record<string, unknown> | undefined;
+  /**
+   * {@link FetchResult.notes}, asked **only after `records` is exhausted**.
+   *
+   * A function rather than the array {@link FetchResult} carries, for the same
+   * reason `state` is one: the ledger a streamed read keeps is a running count,
+   * and a note asked for before the last row would report a number smaller than
+   * the truth. A file connector's whole-read path knows its blank-line count
+   * the moment the parse returns; a streamed one does not know it until the
+   * bytes run out.
+   *
+   * This is not optional decoration. The count exists because a `.filter` with
+   * no counter silently removed 568 rows from a real drop, and a streamed CSV
+   * read that dropped the ledger would put that defect straight back — for the
+   * two fetchers it most affects.
+   */
+  notes?: () => string[];
 }
 
 /**
@@ -163,32 +197,41 @@ export interface RecordStream {
   /** Whether the source was handing rows over incrementally. */
   streamed: boolean;
   /**
-   * {@link FetchResult.notes}, and known before the first row rather than after
-   * the last.
+   * {@link FetchResult.notes}. Call only after `records` is exhausted.
    *
-   * Not a function the way `state` is, and the asymmetry is the truth about the
-   * two: a watermark is a running maximum over rows that have not been read
-   * yet, while a note is about the parse that produced the iterable and is
-   * settled the moment the fetcher returns. A streamed source has nothing to
-   * say here, because nothing that streams parses CSV.
+   * A function, and it did not used to be. When the array shapes were the only
+   * ones that could produce a note, "known the moment the fetcher returns" was
+   * true and the field was an array. It stopped being true when the file and
+   * S3 fetchers began to stream: their blank-line ledger is a running count
+   * over rows that have not been read yet, exactly as a watermark is, so it has
+   * exactly the same timing as `state` and is asked at the same moment. On the
+   * array shapes it answers immediately and always the same thing, which is
+   * what a function over a settled value does.
    */
-  notes: string[];
+  notes(): string[];
 }
 
 export function toRecordStream(value: unknown[] | FetchResult | StreamedFetchResult): RecordStream {
   if (Array.isArray(value)) {
-    return { records: fromArray(value), state: () => undefined, streamed: false, notes: [] };
+    return { records: fromArray(value), state: () => undefined, streamed: false, notes: () => [] };
   }
   if (isStreamedFetch(value)) {
     const settle = value.state;
-    return { records: value.records, state: () => settle?.(), streamed: true, notes: [] };
+    const settleNotes = value.notes;
+    return {
+      records: value.records,
+      state: () => settle?.(),
+      streamed: true,
+      notes: () => settleNotes?.() ?? [],
+    };
   }
   const state = value.state;
+  const notes = value.notes ?? [];
   return {
     records: fromArray(value.records),
     state: () => state,
     streamed: false,
-    notes: value.notes ?? [],
+    notes: () => notes,
   };
 }
 
@@ -223,20 +266,40 @@ export async function toBufferedFetchResult(
     // discovery sample as it is of the whole read — and it is the discovery that
     // most wants to hear it, because that is where somebody is still deciding
     // what the file is.
-    return {
-      records,
-      ...(value.state === undefined ? {} : { state: value.state }),
-      ...(value.notes === undefined ? {} : { notes: value.notes }),
-    };
+    return withSettled(records, value.state, value.notes);
   }
 
   const records: unknown[] = [];
   for await (const record of value.records) {
+    // Neither state nor notes on a truncated read. The watermark reason is
+    // above; the notes reason is the mirror of the one a sliced *array* keeps
+    // them for — a discovery that stopped after twenty rows has not seen the
+    // rest of the file, so "0 blank lines" would be a claim about a file it
+    // never finished reading rather than a fact about the parse.
     if (limit !== undefined && records.length >= limit) return { records };
     records.push(record);
   }
-  const state = value.state?.();
-  return state === undefined ? { records } : { records, state };
+  return withSettled(records, value.state?.(), value.notes?.());
+}
+
+/**
+ * A finished read, with the two optional fields present only when they say
+ * something.
+ *
+ * One place rather than two literals: `state` and `notes` are both absent-means-
+ * nothing, and an object that carried `notes: []` would read as "the parse had
+ * nothing to report" where the truth is "the parse reported nothing".
+ */
+function withSettled(
+  records: unknown[],
+  state: Record<string, unknown> | undefined,
+  notes: string[] | undefined,
+): FetchResult {
+  return {
+    records,
+    ...(state === undefined ? {} : { state }),
+    ...(notes === undefined || notes.length === 0 ? {} : { notes }),
+  };
 }
 
 /** An array, seen as the stream shape. Yields out of it rather than copying it. */
@@ -330,7 +393,25 @@ export const fetchInline: SourceFetcher = async ({ connector }) => {
   return Array.isArray(records) ? records : [];
 };
 
-/** A JSON endpoint, optionally with the array nested inside an envelope. */
+/**
+ * A JSON endpoint, optionally with the array nested inside an envelope.
+ *
+ * **Read whole, and deliberately left that way.** The question was asked
+ * alongside making the file-backed fetchers stream, and the answer is that
+ * there is nothing here to stream *to*. A JSON document is a single value with
+ * no row boundary in it: an incremental parser would still have to read down to
+ * wherever `path` points before it could yield anything, and for the common
+ * case — a bare top-level array — the elements it would then yield are the
+ * whole response anyway. What it would buy is not holding the parsed document
+ * *and* the array at once, which is a constant factor rather than a ceiling.
+ *
+ * The honest bound for an HTTP source is pagination, and this connector does
+ * not paginate. Streaming the body would move where the memory is held without
+ * changing how much of it there is, and would cost an incremental JSON parser
+ * that this repository has no way to exercise against real envelopes. A `file`
+ * or `s3` connector in `json` format is left whole for the same reason — see
+ * {@link FORMAT_READING}.
+ */
 export const fetchHttp: SourceFetcher = async ({ connector, secret }) => {
   const url = String(connector.config.url ?? '');
   if (!url) throw new Error('This connector has no url configured.');
@@ -353,10 +434,33 @@ export const fetchHttp: SourceFetcher = async ({ connector, secret }) => {
  * Format from the extension, overridable by config, because a signed S3 URL
  * ends in a query string and a `Content-Type` of `application/octet-stream` is
  * what most object stores actually send.
+ *
+ * **Read as a stream unless the format has no row boundary.** This used to pull
+ * the whole file into memory before it parsed a byte of it, which put a ceiling
+ * on what a connector could read that had nothing to do with the source: a
+ * 7.6 MB export is a 7.6 MB buffer plus a 7.6 MB string plus every record built
+ * out of it, all held at once, inside a durable step. Now the bytes arrive in
+ * chunks and the records go out as they are found, so what is held is a batch.
+ * {@link StreamedFetchResult} explains why that is a different return shape
+ * rather than a widening, and {@link FORMAT_READING} says which formats can do
+ * it.
+ *
+ * Still no state either way. A file has no watermark to advance: nothing in a
+ * path says which rows a previous run got to, and pretending otherwise is how a
+ * re-read of an edited file quietly skips its first half.
  */
 export const fetchFile: SourceFetcher = async ({ connector }) => {
   const source = String(connector.config.path ?? connector.config.url ?? '');
   if (!source) throw new Error('This connector has no path or url configured.');
+
+  const format = resolveFormat(source, connector.config);
+  if (FORMAT_READING[format] === 'stream') {
+    const ledger = blankRowLedger();
+    return {
+      records: streamPayload(source, format, connector.config, ledger),
+      notes: () => blankRowNotes(ledger, `"${source}"`),
+    };
+  }
 
   // Bytes, not text, and the encoding argument is gone from both branches on
   // purpose. `readFile(source, 'utf8')` and `Response.text()` both decode as
@@ -382,6 +486,29 @@ export const fetchFile: SourceFetcher = async ({ connector }) => {
 };
 
 /**
+ * One payload's records, with the payload released when they run out.
+ *
+ * The `finally` runs on an early `break` as well as on exhaustion, because a
+ * `for await` that stops calls the generator's `return`. That is what keeps a
+ * discovery reading twenty rows from leaving a spooled copy of a 27 MB export
+ * on the worker's disk — see {@link toBufferedFetchResult}, which stops early
+ * by design.
+ */
+async function* streamPayload(
+  source: string,
+  format: SourceFormat,
+  config: Record<string, unknown>,
+  ledger: BlankRowLedger,
+): AsyncGenerator<unknown> {
+  const payload = await localPayload(source, payloadLimits(config));
+  try {
+    yield* streamedRecords(payload, format, source, config, ledger);
+  } finally {
+    await payload.release();
+  }
+}
+
+/**
  * An object store prefix — S3, MinIO, anything that speaks S3.
  *
  * The unit of work is an object rather than a bucket: a run lists what is under
@@ -395,6 +522,23 @@ export const fetchFile: SourceFetcher = async ({ connector }) => {
  * naming an env var there would mean minting a static key pair that never
  * expires. `secretEnvVar` exists for a local MinIO and holds
  * `accessKeyId:secretAccessKey`.
+ *
+ * **The read is a stream, and the watermark is what the stream got through.**
+ * This used to concatenate every object's records into one array before it
+ * returned, so a prefix of ten 40 MB drops was 400 MB of records in the heap
+ * before a single row was written. Now the objects are read in order and the
+ * rows go out as they are found, which is why the state is a *function*: the
+ * list of objects this run consumed is not final until the last one has been
+ * read, and the runner asks only after that. See {@link StreamedFetchResult}.
+ *
+ * The consequence worth stating is the one about failure. `completed` is
+ * appended to only after an object's last record has been yielded, so a run
+ * that dies on the fourth of ten objects never reaches `state()` at all and
+ * advances nothing — the three objects it did read are left in an uncommitted
+ * snapshot and read again next time, which is the same at-least-once behaviour
+ * every other mid-run failure has here. A watermark computed from the *listing*
+ * instead would have promised never to read objects four through ten again, and
+ * they would be gone.
  */
 export const fetchS3: SourceFetcher = async ({ connector, secret, state, mode }) => {
   const bucket = String(connector.config.bucket ?? '').trim();
@@ -419,6 +563,7 @@ export const fetchS3: SourceFetcher = async ({ connector, secret, state, mode })
   const s3 = await importOptional<S3Module>('@aws-sdk/client-s3', 'S3');
   const client = createS3Client(s3, connector, secret);
 
+  let consumed: S3Object[];
   try {
     const candidates = await listUnreadObjects({
       client,
@@ -435,33 +580,48 @@ export const fetchS3: SourceFetcher = async ({ connector, secret, state, mode })
     // different place each time and the keys recorded at the watermark would
     // not be the ones actually read.
     candidates.sort(byOldestThenKey);
-    const consumed = limit === undefined ? candidates : candidates.slice(0, limit);
-    // Nothing new. Returning no state leaves the previous watermark exactly
-    // where it was, which is what "nothing happened" should mean.
-    if (consumed.length === 0) return [];
+    consumed = limit === undefined ? candidates : candidates.slice(0, limit);
+  } catch (error) {
+    // The listing is the only part that still runs before the fetcher returns,
+    // so it is the only part whose failure can be caught here. Everything after
+    // it is the generator's, including tearing the client down.
+    client.destroy?.();
+    throw error;
+  }
 
-    const read = await readObjectRecords({
+  // Nothing new. Returning no state leaves the previous watermark exactly
+  // where it was, which is what "nothing happened" should mean.
+  if (consumed.length === 0) {
+    client.destroy?.();
+    return [];
+  }
+
+  // Filled by the generator as each object finishes, and read by `state` after
+  // it. The two halves share this rather than the state being computed from
+  // `consumed`, which is the list of objects this run *intended* to read.
+  const completed: S3Object[] = [];
+  const ledger = blankRowLedger();
+
+  return {
+    records: readObjectRecords({
       client,
       s3,
       bucket,
       objects: consumed,
       config: connector.config,
-    });
-
+      completed,
+      ledger,
+    }),
     // State is returned even on a full run. It is a fact about what this run
     // read, true whichever mode asked for it, and recording it means switching
     // a connector to incremental afterwards continues from here instead of
     // loading the whole prefix a second time.
-    return {
-      records: read.records,
-      state: nextObjectState(consumed, previousWatermark, previousKeys),
-      ...(read.notes.length > 0 ? { notes: read.notes } : {}),
-    };
-  } finally {
-    // The SDK keeps sockets alive for reuse, which keeps the process alive too
-    // when a run is the only thing happening.
-    client.destroy?.();
-  }
+    state: () =>
+      completed.length === 0
+        ? undefined
+        : nextObjectState(completed, previousWatermark, previousKeys),
+    notes: () => blankRowNotes(ledger, `s3://${bucket}/${prefix}`),
+  };
 };
 
 /**
@@ -1104,26 +1264,6 @@ function asInteger(value: string | number): bigint | undefined {
   return /^-?\d+$/.test(value) ? BigInt(value) : undefined;
 }
 
-/**
- * Import a driver only when a connector needs it.
- *
- * The error names the package, because "Cannot find module 'pg'" in a catalog
- * log tells an operator nothing about which connector caused it.
- */
-export async function importOptional<T>(specifier: string, label: string): Promise<T> {
-  try {
-    return (await import(specifier)) as T;
-  } catch {
-    // The package, not the entry point: "mysql2/promise" is not installable and
-    // neither is "@aws-sdk", so a scoped name keeps both of its segments.
-    const parts = specifier.split('/');
-    const pkg = specifier.startsWith('@') ? parts.slice(0, 2).join('/') : parts[0];
-    throw new Error(
-      `This deployment has no ${label} driver installed. Add "${pkg}" to the catalog service to use ${label} connectors.`,
-    );
-  }
-}
-
 export const SOURCES: Record<string, SourceFetcher> = {
   http: fetchHttp,
   file: fetchFile,
@@ -1140,10 +1280,18 @@ export const SOURCES: Record<string, SourceFetcher> = {
  * same drop loads two different ways depending on where it was read from, and
  * the difference would show up as a column of nulls rather than as an error.
  *
- * Returns what it skipped as well as what it produced. Only the CSV reader has
- * anything to skip — the NDJSON one drops blank lines too, but a blank line in
- * NDJSON is a line separator rather than a record with every field empty, and
- * counting those would be counting the file's punctuation.
+ * Returns what it skipped as well as what it produced. Nothing it reads has
+ * anything to skip any more — the two formats that did are streamed now, and
+ * their ledger is {@link BlankRowLedger} — but the shape stays, because the
+ * next whole-read format to arrive will have the same question and the caller
+ * should not have to be changed to hear the answer.
+ *
+ * Only the formats {@link FORMAT_READING} calls `whole` reach here. The streamed
+ * ones are read by {@link streamedRecords} from a file, and their whole-text
+ * equivalents are not kept alive alongside it: two implementations of "where
+ * does a row end" is two answers to what a quoted newline means, and the symptom
+ * of them disagreeing would be a row count that differs by how the file happened
+ * to be delivered.
  */
 async function parseRecords(
   bytes: Uint8Array,
@@ -1152,37 +1300,119 @@ async function parseRecords(
 ): Promise<{ records: unknown[]; blankRows: number }> {
   const format = resolveFormat(source, config);
 
-  // The one member whose payload is binary, and the reason this takes bytes.
-  // Handled before the decode rather than after it, because the decode is what
-  // would destroy it.
-  //
-  // `blankRows: 0` is the truth rather than a placeholder. A workbook has no
-  // blank *line* to skip — a row of empty cells is a row of `null`s the reader
-  // hands over like any other — so there is nothing for it to under-report.
-  if (format === 'xlsx') {
-    return { records: await parseWorkbook(bytes, source, config), blankRows: 0 };
+  switch (format) {
+    // The binary member that is still read whole, and the reason this takes
+    // bytes. Handled before any decode, because the decode is what would
+    // destroy it.
+    //
+    // `blankRows: 0` is the truth rather than a placeholder. A workbook has no
+    // blank *line* to skip — a row of empty cells is a row of `null`s the
+    // reader hands over like any other — so there is nothing to under-report.
+    case 'xlsx':
+      return { records: await parseWorkbook(bytes, source, config), blankRows: 0 };
+    case 'json':
+      return { records: unwrap(JSON.parse(decodeText(bytes)), config.jsonPath), blankRows: 0 };
+    case 'csv':
+    case 'ndjson':
+    case 'parquet':
+      throw new Error(
+        `${source} is ${format}, which is read as a stream rather than from a finished buffer. This is unreachable through the fetchers and means FORMAT_READING and this switch have disagreed.`,
+      );
+    default:
+      // Was `return unwrap(JSON.parse(text), …)` as an unconditional tail, which
+      // is how a `.xlsx` used to be read as JSON. Every member is now named
+      // above and this line is what a sixth one has to answer.
+      return unreachableSourceFormat(format, 'parseRecords');
   }
+}
 
-  const text = decodeText(bytes);
-  if (format === 'ndjson') {
-    return {
-      records: text
-        .split('\n')
-        .map((line) => line.trim())
-        .filter(Boolean)
-        .map((line) => JSON.parse(line)),
-      blankRows: 0,
-    };
-  }
-  if (format === 'csv') return parseCsv(text, config);
-  if (format === 'json') {
-    return { records: unwrap(JSON.parse(text), config.jsonPath), blankRows: 0 };
-  }
+/**
+ * Which formats have a row boundary a reader can find as the bytes arrive.
+ *
+ * A map rather than a set, so that a format added to `SOURCE_FORMATS` leaves
+ * this object missing a property and the build stops *here* — at the one place
+ * that has to decide whether the new format can be read incrementally — rather
+ * than at a run-time fallback that quietly picked one.
+ *
+ * `csv` and `ndjson` are line-oriented: a row ends at a newline the scanner has
+ * already seen, and nothing later in the file can change that. `parquet` is
+ * organised in row groups, which is a chunk boundary the format itself supplies.
+ * `json` is one value with no boundary inside it — {@link fetchHttp} carries the
+ * rest of that argument. `xlsx` is a ZIP whose shared-string table generally has
+ * to be read before the sheet, which is why {@link parseWorkbook} caps its size
+ * instead; a genuinely streaming workbook reader is a different piece of work.
+ */
+const FORMAT_READING = {
+  csv: 'stream',
+  ndjson: 'stream',
+  json: 'whole',
+  xlsx: 'whole',
+  parquet: 'stream',
+} satisfies Record<SourceFormat, 'stream' | 'whole'>;
 
-  // Was `return unwrap(JSON.parse(text), …)` as an unconditional tail, which is
-  // how a `.xlsx` used to be read as JSON. Now every member is named above and
-  // this line is what a fifth one has to answer.
-  return unreachableSourceFormat(format, 'parseRecords');
+/**
+ * One local payload as records, in whichever streamed format it is.
+ *
+ * Every streamed format reads from a *file* rather than from whatever the bytes
+ * arrived on — see `source-payloads.ts` for why a remote body is spooled first.
+ * The text formats take the file as chunks and decode them; parquet seeks
+ * around it.
+ */
+function streamedRecords(
+  payload: LocalPayload,
+  format: SourceFormat,
+  source: string,
+  config: Record<string, unknown>,
+  ledger: BlankRowLedger,
+): AsyncIterable<unknown> {
+  switch (format) {
+    case 'csv':
+      return csvRecords(
+        decodeChunks(payloadChunks(payload)),
+        String(config.delimiter ?? ','),
+        source,
+        ledger,
+      );
+    case 'ndjson':
+      return ndjsonRecords(decodeChunks(payloadChunks(payload)), source);
+    case 'parquet':
+      return parquetRecords(payload, source);
+    case 'json':
+    case 'xlsx':
+      throw new Error(
+        `${source} is ${format}, which is read whole rather than streamed. This is unreachable through the fetchers and means FORMAT_READING and this switch have disagreed.`,
+      );
+    default:
+      return unreachableSourceFormat(format, 'streamedRecords');
+  }
+}
+
+/** What a connector says about how much it will read and how long it will wait. */
+function payloadLimits(config: Record<string, unknown>): PayloadLimits {
+  const maxBytes = positiveInteger(config.maxBytes);
+  const idleTimeoutMs = positiveInteger(config.readIdleTimeoutMs);
+  return {
+    ...(maxBytes === undefined ? {} : { maxBytes }),
+    ...(idleTimeoutMs === undefined ? {} : { idleTimeoutMs }),
+  };
+}
+
+/**
+ * The note a drained stream has to make, or nothing.
+ *
+ * The plural of {@link blankRowNote} for a read whose ledger was filled as it
+ * went. `where` is the first source that skipped something when there is one,
+ * because that is what somebody opens; the prefix is the fallback for a read
+ * over many objects, and the count of sources is what says it was many.
+ */
+function blankRowNotes(ledger: BlankRowLedger, fallback: string): string[] {
+  if (ledger.blankRows === 0) return [];
+  const first = ledger.firstSource;
+  const where =
+    first === undefined || ledger.sources > 1
+      ? `${ledger.sources} sources read this run under "${fallback}"${first === undefined ? '' : `, the first being "${first}"`}`
+      : `"${first}"`;
+  return [blankRowNote(ledger.blankRows, where)];
 }
 
 /**
@@ -1392,54 +1622,128 @@ function byOldestThenKey(a: S3Object, b: S3Object): number {
  * and a per-object line would be a note per part file — which the node's log cap
  * would then truncate, pushing out the lines that say what the run did. The
  * total is the number that matters, and the first affected key is what somebody
- * opens to see why.
+ * opens to see why. That is what {@link BlankRowLedger} carries, and it is now a
+ * running tally rather than a returned sum for the reason everything else here
+ * became one: the objects are read as the consumer pulls, so there is no moment
+ * before the last row at which a total could be returned.
+ *
+ * The client is destroyed in this generator's `finally` rather than in the
+ * fetcher's, and that move is forced rather than stylistic: the fetcher now
+ * returns before a single object has been read, so a `finally` there would tear
+ * the connection down before the first `GetObject`. The obligation it creates —
+ * a consumer that abandons the iterator without closing it leaks the client —
+ * is the same one {@link streamMysql} already carries, and every consumer in
+ * this package either drains the stream or `break`s out of a `for await`, which
+ * calls `return` and unwinds this.
  */
-async function readObjectRecords(input: {
+async function* readObjectRecords(input: {
   client: S3ClientLike;
   s3: S3Module;
   bucket: string;
   objects: readonly S3Object[];
   config: Record<string, unknown>;
-}): Promise<{ records: unknown[]; notes: string[] }> {
-  const { client, s3, bucket, objects, config } = input;
-  const records: unknown[] = [];
-  let blankRows = 0;
-  const blankKeys: string[] = [];
+  completed: S3Object[];
+  ledger: BlankRowLedger;
+}): AsyncGenerator<unknown> {
+  const { client, s3, bucket, objects, config, completed, ledger } = input;
 
-  for (const object of objects) {
-    const uri = `s3://${bucket}/${object.key}`;
-    const bytes = await readObjectBytes(
-      await client.send(new s3.GetObjectCommand({ Bucket: bucket, Key: object.key })),
-      uri,
-    );
-    // Was `!text.trim()` on the decoded body. Asked of the bytes instead so the
-    // skip still happens for a whitespace-only object — which matters, because
-    // the alternative is handing `""` to `JSON.parse` and failing a whole run on
-    // an empty part file that this has always skipped.
-    if (isBlank(bytes)) continue;
-    // The same format logic a file connector uses, per object: the extension
-    // decides unless the connector overrides it, which is what a prefix full of
-    // `part-00000` files needs.
-    const parsed = await parseRecords(bytes, object.key, config);
-    if (parsed.blankRows > 0) {
-      blankRows += parsed.blankRows;
-      blankKeys.push(uri);
+  try {
+    for (const object of objects) {
+      const uri = `s3://${bucket}/${object.key}`;
+      // The same format logic a file connector uses, per object: the extension
+      // decides unless the connector overrides it, which is what a prefix full
+      // of `part-00000` files needs.
+      const format = resolveFormat(object.key, config);
+      const body = await client.send(new s3.GetObjectCommand({ Bucket: bucket, Key: object.key }));
+
+      yield* FORMAT_READING[format] === 'stream'
+        ? streamObject(body, uri, format, config, ledger)
+        : wholeObject(body, uri, config, ledger);
+
+      completed.push(object);
     }
-    // Appended one at a time rather than spread into `push`, because a spread
-    // becomes one argument per row and a CSV drop with a few hundred thousand of
-    // them overflows the call stack — a failure that only shows up on the large
-    // files this connector exists to read.
-    for (const record of parsed.records) {
-      records.push(record);
-    }
+  } finally {
+    // The SDK keeps sockets alive for reuse, which keeps the process alive too
+    // when a run is the only thing happening.
+    client.destroy?.();
   }
+}
 
-  if (blankRows === 0) return { records, notes: [] };
-  const where =
-    blankKeys.length === 1
-      ? `"${blankKeys[0]}"`
-      : `${blankKeys.length} objects read this run, the first being "${blankKeys[0]}"`;
-  return { records, notes: [blankRowNote(blankRows, where)] };
+/**
+ * One object's rows, from a body read whole.
+ *
+ * The formats {@link FORMAT_READING} calls `whole` still go this way, and this
+ * still holds one object at a time rather than the prefix — which is the part
+ * that changed. The records are yielded one at a time rather than spread into a
+ * `push`, because a spread becomes one argument per row and a drop with a few
+ * hundred thousand of them overflows the call stack.
+ */
+async function* wholeObject(
+  body: unknown,
+  label: string,
+  config: Record<string, unknown>,
+  ledger: BlankRowLedger,
+): AsyncGenerator<unknown> {
+  const bytes = await readObjectBytes(body, label);
+  // Was `!text.trim()` on the decoded body. Asked of the bytes instead so the
+  // skip still happens for a whitespace-only object — which matters, because
+  // the alternative is handing `""` to `JSON.parse` and failing a whole run on
+  // an empty part file that this has always skipped.
+  if (isBlank(bytes)) return;
+
+  const parsed = await parseRecords(bytes, label, config);
+  if (parsed.blankRows > 0) {
+    ledger.blankRows += parsed.blankRows;
+    ledger.sources += 1;
+    if (ledger.firstSource === undefined) ledger.firstSource = label;
+  }
+  for (const record of parsed.records) yield record;
+}
+
+/**
+ * One object's rows, through a spool.
+ *
+ * The download is not interleaved with the parse, and that is the point. Left
+ * as a live socket, a `GetObject` body would be paused by every batch flush
+ * downstream — flip measured an ECONNRESET three to four minutes into exactly
+ * that pattern, because S3 closes a connection that has gone quiet. Spooling
+ * first means the socket's lifetime is the object's size over the network, and
+ * the slow half reads from a local file that is not going anywhere. See
+ * `source-payloads.ts`, which carries the rest of that argument.
+ */
+async function* streamObject(
+  body: unknown,
+  label: string,
+  format: SourceFormat,
+  config: Record<string, unknown>,
+  ledger: BlankRowLedger,
+): AsyncGenerator<unknown> {
+  const payload = await spool(objectBodyChunks(body, label), label, payloadLimits(config));
+  try {
+    yield* streamedRecords(payload, format, label, config, ledger);
+  } finally {
+    await payload.release();
+  }
+}
+
+/** The body of a `GetObject`, as the chunks it arrives in. */
+function objectBodyChunks(value: unknown, label: string): AsyncIterable<Uint8Array> {
+  const body: unknown = value && typeof value === 'object' ? Reflect.get(value, 'Body') : undefined;
+  if (!isAsyncIterable(body)) {
+    throw new Error(
+      `${label} came back without a readable body. This needs an @aws-sdk/client-s3 whose response body is a Node stream.`,
+    );
+  }
+  return chunksOf(body, label);
+}
+
+async function* chunksOf(body: AsyncIterable<unknown>, label: string): AsyncGenerator<Uint8Array> {
+  for await (const chunk of body) {
+    if (!ArrayBuffer.isView(chunk)) {
+      throw new Error(`${label} produced something other than bytes, so it cannot be read.`);
+    }
+    yield new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+  }
 }
 
 /** Where this run got to, carrying the tie set forward when it did not advance. */
@@ -1593,6 +1897,12 @@ function guessFormat(source: string): SourceFormat {
     withoutQuery.endsWith('.xls')
   ) {
     return 'xlsx';
+  }
+  // `.parq` alongside `.parquet` because both are in the wild and both are the
+  // same decision — a `.parq` drop falling through to JSON would report a syntax
+  // error at byte 0 of a binary file.
+  if (withoutQuery.endsWith('.parquet') || withoutQuery.endsWith('.parq')) {
+    return 'parquet';
   }
   return 'json';
 }
@@ -2031,63 +2341,6 @@ function cellDateIso(api: WorkbookApi, serial: number, date1904: boolean): strin
 }
 
 /**
- * A CSV reader that handles quotes and embedded newlines.
- *
- * Not a split on commas. Real exports contain `"Smith, John"` and multi-line
- * address fields, and a naive split turns both into silently wrong rows —
- * which is worse than failing, because nobody notices.
- *
- * ## Blank lines are skipped, and the count comes back
- *
- * A line with no content in any cell cannot be shaped into a record worth
- * having: every column of it would be `null`, and the rows that come out of a
- * CSV are supposed to be the rows somebody exported. So they are skipped, as
- * they always were.
- *
- * What is new is that {@link blankRows} comes back with them. The skip used to
- * be invisible — a `.filter` with no counter — and on a real 103,087-row drop
- * it removed 568 rows that the source node then reported as 102,519 with
- * nothing anywhere saying where the other 568 went. It survived a test only
- * because a downstream filter happened to drop exactly those rows for its own
- * reasons; on a graph with no filter they would have gone straight out of the
- * committed count. That is the one thing this project refuses to do elsewhere:
- * the filter node reports `rowsIn` and `rows` precisely so a shrink is legible,
- * and the parser was dropping rows with no ledger at all.
- *
- * **A file ending in a single newline does not produce one of these**, so the
- * note this feeds is not a thing every well-formed file says. `splitCsvRows`
- * closes its last row at the `\n` and starts no new one, which is why a
- * non-zero count means genuinely empty lines rather than the way the file ends.
- *
- * The count includes any blank line *before* the header — which shifts which
- * line the header is read from, and is worth hearing about for that reason
- * alone.
- */
-function parseCsv(
-  text: string,
-  config: Record<string, unknown>,
-): { records: unknown[]; blankRows: number } {
-  const rows = splitCsvRows(text, String(config.delimiter ?? ','));
-
-  // On the raw cells, and deliberately before `emptyAsNull` runs: this asks
-  // whether the *line* had any content, which is a question about the file. A
-  // row of empty cells and a row of `null`s are the same thing by the time the
-  // mapping below is done, and by then the distinction this counts is gone.
-  const kept = rows.filter((r) => r.some((c) => c.length > 0));
-  const blankRows = rows.length - kept.length;
-
-  const [header, ...body] = kept;
-  if (!header) return { records: [], blankRows };
-
-  return {
-    records: body.map((cells) =>
-      Object.fromEntries(header.map((name, index) => [name, emptyAsNull(cells[index])])),
-    ),
-    blankRows,
-  };
-}
-
-/**
  * The one line a reader gets about rows a parse threw away.
  *
  * Written once and shared by every fetcher that parses, so a file connector and
@@ -2107,101 +2360,15 @@ function blankRowNote(blankRows: number, where: string): string {
 }
 
 /**
- * An empty field, as `null` rather than as `""`.
+ * The CSV reader moved to `record-streams.ts`.
  *
- * This was `cells[index] ?? null`, which made a **missing** cell `null` and a
- * **blank** one `""` — two spellings of "this row has no value here", only one
- * of which the `present` predicate recognises, because it tests `null` and
- * `undefined` and an empty string is neither. A graph filtering on `isNotNull`
- * therefore kept every blank in the file: measured against one real drop, it
- * committed 102,519 rows where the right answer was 89,458.
- *
- * `null` is now the single answer, and the reason to prefer it over teaching
- * `present` about `""` is that the workbook reader has the same question and
- * cannot answer it the other way: a blank spreadsheet cell is an *absent* cell,
- * there is no empty string anywhere in the file to report. Aligning CSV on
- * `null` makes one predicate mean one thing whichever format the source read;
- * aligning the other way would have meant inventing a value for the 3,468 empty
- * cells in the MVR sample.
- *
- * Nothing is trimmed on the way past. A field of spaces is a value somebody
- * typed, and deciding what it means is the transform's job — as it always was.
+ * It is the same scanner, with the variables that carried state between
+ * characters lifted into a closure so it can be fed a chunk at a time — which
+ * is what lets a `file` or `s3` connector hand rows over as the bytes arrive.
+ * Nothing about what a row *is* changed, `emptyAsNull` went with it unaltered,
+ * and the blank-line count went from a returned sum to `BlankRowLedger`,
+ * because a streamed read has no moment before the last row at which it could
+ * return one. The whole-text entry points are still exported from there, so the
+ * streamed and buffered readings of one file are the same code rather than two
+ * implementations that agree until a chunk lands mid-quoted-field.
  */
-function emptyAsNull(value: string | undefined): string | null {
-  return value === undefined || value === '' ? null : value;
-}
-
-/**
- * The scanner half of {@link parseCsv}: text in, rows of raw cells out.
- *
- * Split from the record shaping because it is the part that carries state
- * across characters, and it reads far better without the header logic sitting
- * under it. It knows nothing about headers and makes no judgement about which
- * rows are worth keeping.
- */
-function splitCsvRows(text: string, delimiter: string): string[][] {
-  const rows: string[][] = [];
-  let row: string[] = [];
-  let field = '';
-
-  for (let index = 0; index < text.length; index += 1) {
-    const char = text[index];
-
-    if (char === '"') {
-      // Appended rather than assigned, because a quoted run is part of the
-      // field and not necessarily the whole of it: `ab"c,d"ef` is one field.
-      const quoted = readQuotedField(text, index + 1);
-      field += quoted.value;
-      index = quoted.end;
-    } else if (char === delimiter) {
-      row.push(field);
-      field = '';
-    } else if (char === '\n') {
-      row.push(field.replace(/\r$/, ''));
-      rows.push(row);
-      row = [];
-      field = '';
-    } else {
-      field += char;
-    }
-  }
-  if (field.length > 0 || row.length > 0) {
-    row.push(field.replace(/\r$/, ''));
-    rows.push(row);
-  }
-
-  return rows;
-}
-
-/**
- * The contents of a quoted run, starting just past the opening quote.
- *
- * Returns where the closing quote sat, so the scanner resumes after it. Inside
- * the quotes a delimiter and a newline are ordinary characters — which is the
- * whole reason this reader exists rather than a split on commas — and a doubled
- * quote is the CSV escape for one literal quote.
- *
- * An unterminated quote yields the rest of the text rather than throwing, which
- * is what the previous inline scanner did: a truncated export is far more
- * common than a deliberately malformed one, and the row count is what makes it
- * noticed.
- */
-function readQuotedField(text: string, start: number): { value: string; end: number } {
-  let value = '';
-  let index = start;
-
-  while (index < text.length) {
-    const char = text[index];
-    if (char !== '"') {
-      value += char;
-      index += 1;
-    } else if (text[index + 1] === '"') {
-      value += '"';
-      index += 2;
-    } else {
-      return { value, end: index };
-    }
-  }
-
-  return { value, end: index };
-}

@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { CatalogConnector } from '@dudousxd/nestjs-catalog';
 import { describe, expect, it } from 'vitest';
-import { type FetchResult, fetchFile } from './sources';
+import { type FetchResult, fetchFile, toBufferedFetchResult } from './sources';
 
 /**
  * What a CSV parse hands back, and what it says about what it threw away.
@@ -43,17 +43,23 @@ function connector(path: string, config: Record<string, unknown> = {}): CatalogC
  * is not exported and the thing under test is what a *connector* produces —
  * including whether the note survives the trip out of the fetcher, which is the
  * half that was missing.
+ *
+ * Drained through `toBufferedFetchResult` rather than by reading `.records` off
+ * the result, and that is now load-bearing rather than convenience: a CSV
+ * connector returns a `StreamedFetchResult`, whose note is a *function* asked
+ * after the last row. Reading the field directly would have been the exact
+ * mistake this file exists to catch — a count taken before the read finished,
+ * which for a stream is always zero. Every real caller goes through this
+ * function or `toRecordStream`, so this is the contract rather than a detail.
  */
 async function read(text: string, config: Record<string, unknown> = {}): Promise<FetchResult> {
-  const result = await fetchFile({
-    connector: connector(await csvFile(text), config),
-    state: {},
-    mode: 'full',
-  });
-  if (Array.isArray(result) || !Array.isArray(result.records)) {
-    throw new Error('fetchFile returned a shape this test does not understand.');
-  }
-  return { records: result.records, ...('notes' in result ? { notes: result.notes } : {}) };
+  return toBufferedFetchResult(
+    await fetchFile({
+      connector: connector(await csvFile(text), config),
+      state: {},
+      mode: 'full',
+    }),
+  );
 }
 
 /** `af_fleet.csv`, to scale: 103,087 data rows, 568 of them blank lines. */

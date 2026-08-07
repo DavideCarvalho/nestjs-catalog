@@ -55,7 +55,7 @@ export function usesConnection(kind: ConnectorKind): kind is ConnectableKind {
 export const KIND_OPTIONS = [
   { value: 'http', label: 'HTTP — a JSON endpoint' },
   { value: 'sql', label: 'SQL — a database query' },
-  { value: 'file', label: 'File — CSV, NDJSON, JSON or Excel' },
+  { value: 'file', label: 'File — CSV, NDJSON, JSON, Excel or Parquet' },
   { value: 's3', label: 'S3 — a bucket prefix' },
   { value: 'inline', label: 'Inline — records pasted below' },
 ];
@@ -74,6 +74,7 @@ const FORMAT_LABELS = {
   ndjson: 'NDJSON',
   json: 'JSON',
   xlsx: 'Excel workbook (.xlsx)',
+  parquet: 'Parquet',
 } satisfies Record<SourceFormat, string>;
 
 /**

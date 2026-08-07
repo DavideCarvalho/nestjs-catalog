@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import type { CatalogConnector } from '@dudousxd/nestjs-catalog';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import * as XLSX from 'xlsx';
-import { fetchFile } from './sources';
+import { fetchFile, toBufferedFetchResult } from './sources';
 
 /**
  * The workbook reader, against workbooks built here and against a real one.
@@ -83,11 +83,9 @@ function isConnector(value: unknown): value is CatalogConnector {
  * carries no notes, which the case below asserts rather than assumes.
  */
 async function read(config: Record<string, unknown>): Promise<unknown[]> {
-  const result = await fetchFile({ connector: connector(config), state: {}, mode: 'full' });
-  if (Array.isArray(result)) return result;
-  if (!Array.isArray(result.records)) {
-    throw new Error('the file fetcher returned a shape it never returns');
-  }
+  const result = await toBufferedFetchResult(
+    await fetchFile({ connector: connector(config), state: {}, mode: 'full' }),
+  );
   return result.records;
 }
 
@@ -310,11 +308,16 @@ describe('refusing what would load wrong', () => {
     );
   });
 
+  // `parquet` was the example here until parquet became a format this reads.
+  // `avro` is the replacement rather than a stand-in for it: the case is about
+  // what happens to a name the list does not carry, and picking a real format
+  // somebody might plausibly configure keeps the message under test the one
+  // they would actually see.
   it('refuses a format it does not know instead of reading it as JSON', async () => {
-    const path = writeWorkbook('parquet.xlsx', { Sheet1: [['a'], ['1']] });
+    const path = writeWorkbook('avro.xlsx', { Sheet1: [['a'], ['1']] });
 
-    await expect(read({ path, format: 'parquet' })).rejects.toThrow(
-      /"parquet" is not a format this can read\. Use one of: csv, ndjson, json, xlsx/,
+    await expect(read({ path, format: 'avro' })).rejects.toThrow(
+      /"avro" is not a format this can read\. Use one of: csv, ndjson, json, xlsx, parquet/,
     );
   });
 });

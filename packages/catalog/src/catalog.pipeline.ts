@@ -57,13 +57,20 @@ export function isConnectorKind(value: unknown): value is ConnectorKind {
  * one: this used to be compared against string literals in the parser and
  * spelled out again in a dropdown, and the two had no way to disagree loudly.
  * The parser's chain also *ended* in JSON, so a format it did not recognise was
- * not refused — it was read as JSON, and a spreadsheet handed to `JSON.parse`
- * fails with a syntax error that names a byte offset rather than the format.
+ * not refused — it was read as JSON, so a spreadsheet handed to `JSON.parse`
+ * failed with a syntax error naming a byte offset rather than the format, and
+ * so did `format: "parquet"`.
  *
- * `xlsx` is the odd one and is named for what it is: the only member whose
- * payload is binary. The other three are text, and everything that reads them
- * decodes the bytes first. Anything deciding something *per format* narrows
- * against this and answers {@link unreachableSourceFormat}.
+ * Two things distinguish the members, and everything downstream turns on one or
+ * the other. **Text or binary:** `xlsx` and `parquet` are binary, so everything
+ * that reads them takes bytes, and the other two are decoded first. **Whether
+ * there is a row boundary a reader can find without holding the whole
+ * payload:** `csv` and `ndjson` have one at every newline and `parquet` has one
+ * at every row group, so those three are read as a stream; `json` is a single
+ * value whose array may be nested inside an envelope that is only found by
+ * parsing down to it, and `xlsx` is a ZIP whose shared-string table generally
+ * has to be read before the sheet. Anything deciding something *per format*
+ * narrows against this list and answers {@link unreachableSourceFormat}.
  */
 export const SOURCE_FORMATS = [
   /** Delimited text with a header row. The delimiter is configurable. */
@@ -73,13 +80,22 @@ export const SOURCE_FORMATS = [
   /** A JSON document, optionally with the array nested in an envelope. */
   'json',
   /**
-   * A spreadsheet workbook — binary, and the only member that is.
+   * A spreadsheet workbook — binary, and read whole.
    *
    * Named for the modern extension, but the reader identifies the container
    * from its own bytes, so the legacy `.xls` and the macro-enabled `.xlsm` are
    * this format too rather than three names for one decision.
    */
   'xlsx',
+  /**
+   * Apache Parquet — binary, and read a row group at a time.
+   *
+   * A row group is a chunk boundary the format supplies rather than one a
+   * reader has to invent, which is what separates it from `xlsx`. It also
+   * carries a real type system, so unlike the text formats a value arrives as
+   * the type the writer meant rather than as a string.
+   */
+  'parquet',
 ] as const;
 
 export type SourceFormat = (typeof SOURCE_FORMATS)[number];
