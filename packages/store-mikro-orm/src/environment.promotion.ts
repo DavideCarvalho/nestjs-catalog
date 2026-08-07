@@ -38,7 +38,7 @@ import { ObjectTypeRow, PropertyRow, type StoredRelation, relationsOf } from './
 import type { CatalogEnvironmentBundle } from './environment.bundle';
 import { tableFor } from './identifiers';
 import type { StoredCatalogRegistry } from './stored-registry.service';
-import type { MySqlWarehouseStore } from './warehouse.store';
+import type { MikroOrmWarehouseStore } from './warehouse.store';
 
 /**
  * Everything promotable in one environment.
@@ -216,7 +216,7 @@ export interface PromotionTarget {
   readonly environment: Pick<CatalogEnvironment, 'id'>;
   readonly em: Pick<EntityManager, 'fork'>;
   readonly registry: Pick<StoredCatalogRegistry, 'reload' | 'getType'>;
-  readonly store: Pick<MySqlWarehouseStore, 'ensureType'>;
+  readonly store: Pick<MikroOrmWarehouseStore, 'ensureType'>;
   /** Whole, because {@link supportsWorkflows} narrows the store, not a method. */
   readonly pipeline: CatalogPipelineStore;
   readonly workspace: Pick<CatalogWorkspaceStore, 'recordEvent'>;
