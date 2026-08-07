@@ -31,7 +31,9 @@ import {
   SecretOpenFailedError,
   SecretSealFailedError,
   SecretVaultNotConfiguredError,
+  decodeStageRows,
   emitCatalog,
+  encodeStageRows,
   isConnectorKind,
   isSealedSecret,
   isTransformLanguage,
@@ -1284,6 +1286,10 @@ export class MySqlPipelineStore
    * which is two statements on MySQL: it reloads the row afterwards to hand back
    * a managed entity, and this method returns a count and throws that entity
    * away.
+   *
+   * Written columnar — see `catalog.stage-encoding.ts` for the shape and the
+   * measurement. `rowCount` still counts rows and not anything about the
+   * encoding, because it is what the runner and the run report read.
    */
   async writeStage(input: {
     runId: string;
@@ -1301,7 +1307,7 @@ export class MySqlPipelineStore
         runId: input.runId,
         nodeId: input.nodeId,
         batch: input.batch,
-        rows: input.rows,
+        rows: encodeStageRows(input.rows),
         rowCount: input.rows.length,
         createdAt: new Date(),
       })
@@ -1328,11 +1334,13 @@ export class MySqlPipelineStore
       id: stageKey(ref.runId, ref.nodeId, ref.batch),
     });
     if (!row) return [];
-    // Narrowed rather than trusted. A staged batch is JSON that a transform
-    // produced, and a transform can return anything; anything that is not a
-    // plain object could not have been written as a row and is dropped here
-    // rather than surfacing as a column named after an array index.
-    return row.rows.filter(isRowRecord);
+    // Both encodings, told apart by which JSON type the payload is and then by
+    // the tag the new one carries — never by what the rows inside look like.
+    // A batch staged before this build shipped is a JSON array and decodes the
+    // way it always did; a batch staged since is a tagged object. Narrowing is
+    // still done rather than trusted, for the reason it always was: a staged
+    // batch is JSON a transform produced, and a transform can return anything.
+    return decodeStageRows(row.rows);
   }
 
   async dropStages(runId: string): Promise<number> {
@@ -2106,10 +2114,6 @@ function toNodeOutcome(raw: unknown): WorkflowNodeOutcome | undefined {
  */
 function stageKey(runId: string, nodeId: string, batch: number): string {
   return `${runId}#${nodeId}#${batch}`;
-}
-
-function isRowRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function toWorkflow(row: WorkflowRow): CatalogWorkflow {
