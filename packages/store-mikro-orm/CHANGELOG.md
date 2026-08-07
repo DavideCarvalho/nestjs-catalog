@@ -1,5 +1,685 @@
 # @dudousxd/nestjs-catalog-store-mikro-orm
 
+## 0.12.0
+
+### Minor Changes
+
+- 8b21b7d: A batch replace reads its batch instead of scanning the table
+
+  A deployment's query log had one statement at **821 seconds**:
+
+  ```
+  DELETE FROM obj_subwo WHERE _snapshot_id = ? AND _batch = ?    821021 ms
+  DELETE FROM obj_util  WHERE _snapshot_id = ? AND _batch = ?    612990 ms
+  SELECT COUNT(*) AS total FROM obj_subwo WHERE _snapshot_id = ?  15213 ms
+  ```
+
+  Every `obj_*` table was created with one secondary index, `ix_snapshot
+(_snapshot_id)`, and the statement that replaces a batch names two columns.
+  Every row of a snapshot carries the same `_snapshot_id`, so that index narrows
+  nothing — and MySQL, correctly, **declines to use it and scans the whole table**,
+  taking row locks the whole way. Thirty batches per load, on a 313,833-row
+  snapshot, with the API on the same database waiting behind the locks.
+
+  Measured on MySQL 8.0 with 300,000 rows in one snapshot and 30 batches
+  (`write-path.db.spec.ts`), replacing one 10,000-row batch:
+
+  |      | before                               | after                        |
+  | ---- | ------------------------------------ | ---------------------------- |
+  | plan | **no index**, ~296,500 rows examined | `ix_snapshot_batch`, ~19,100 |
+  | time | 248ms                                | 90ms                         |
+
+  The 90ms that remain are removing 10,000 rows, which is the work the load asked
+  for. The scan is what has gone, and with it the row locks it held across the
+  whole table. On a warm local container with nothing else running the wall-clock
+  gain is 2.8×; on the contended table above, where the cost _is_ the scan and the
+  locking, it should be far larger — but that is a prediction and only the plan is
+  measured here.
+
+  **The load-bearing half is the evolution path, not the `CREATE TABLE`.** The
+  index only ever appeared inside `CREATE TABLE`, and nothing added indexes to
+  tables that already existed — so changing the DDL alone would have fixed no
+  deployment that has ever run this package. `ensureType` now checks
+  `information_schema.STATISTICS` and adds the composite where it is missing,
+  beside the reserved-column path that already existed for exactly this reason. It
+  runs on the first write to each table after boot, not at boot: boot does not know
+  which types exist, and the pod that needs the index is the one about to write.
+  InnoDB builds it in place without blocking DML — 1,010ms for 300,000 rows here,
+  once.
+
+  A failure there is a **warning, not a throw**, and the asymmetry is the argument:
+  a missing column makes the next INSERT fail, so evolving it is a correctness
+  repair; a missing index makes it slow. Refusing the load would turn a performance
+  problem into an outage on a deployment whose database user may simply not hold
+  ALTER. The log names the statement to run by hand.
+
+  New tables get `ix_snapshot_batch` **instead of** `ix_snapshot`: a composite
+  leading on `_snapshot_id` answers every snapshot-only lookup as a prefix match —
+  confirmed, not assumed, by dropping `ix_snapshot` and checking that both the
+  snapshot count and a page of rows still plan onto the composite at the same cost
+  — and a redundant index is not free on a table whose ingestion pattern is
+  delete-and-reinsert. Existing tables **keep** `ix_snapshot`: adding an index is
+  recoverable and dropping one is not, this package does not otherwise remove
+  anything from a table it did not create in this process, and the log says it can
+  go.
+
+  `schema.changed` gains an optional `addedIndexes`, so a table that acquires an
+  index appears in the audit trail as the real event it is rather than as a
+  column-less one. Additive, and separate from `addedColumns` because an operator
+  asking when a column appeared must not get an index name back.
+
+  **Staging a batch is now one statement.** `writeStage` read the row before
+  writing it, and the deployment's N+1 list had that `SELECT` at 29 executions per
+  request. The key is computed in the method from three arguments, so the read only
+  ever chose between two writes that end in the same row. It is an upsert now, and
+  the replace-not-append guarantee is _strengthened_: read-then-write is two
+  statements with a gap, so two attempts at one batch could both read nothing and
+  both insert; `ON DUPLICATE KEY UPDATE` makes it a property of one statement.
+  `createdAt` stays out of the merge — a retry is not a new batch.
+
+  **Deliberately not changed: the per-batch `SELECT COUNT(*)`.** It was the
+  suspect, and the numbers say it is second-order — 15s against 821s in the
+  deployment's own log, and 65ms against 248ms here. The composite does not improve
+  it (it already had an index it could use), so removing it would mean accumulating
+  `rowCount += inserted - deleted` in Node instead of counting the table. That
+  trades an exact number for arithmetic, and that number feeds `refuseRowCountDrift`
+  — the bound that stops an empty load replacing a live dataset. Not a trade worth
+  making for the third-largest cost on the path, and it is written down here so the
+  next person does not have to re-derive the decision.
+
+  **Also deliberately not changed: the batched `DELETE`/`INSERT` pairs** that a
+  query profiler flags as N+1. They are the delete-and-reinsert ingestion pattern
+  working as designed, one per batch by construction; the profiler is counting them
+  per request. Nothing to fix.
+
+- 3f878f9: A filter node, whose predicate is a structure rather than code
+
+  A transform can already filter — it takes rows and returns rows, so returning a
+  subset filters — and this file's own node-kind list used to reject `filter` for
+  exactly that reason. That argument is sound about _code_, and it is why this
+  node does not take any. What changed is the predicate: a closed structure of
+  column, operator and value, combined with `all`/`any`, which is a thing
+  something other than a JavaScript engine can read.
+
+  Three reasons the kind earns itself, and the third decides the shape. It is
+  legible on the canvas without opening anything. Its effect is **reportable** —
+  the node records rows in beside rows out, so a run panel can say what was
+  dropped, where a transform records one number and a transform that quietly
+  started dropping 90% of its input looks identical to a source that got smaller.
+  And only a declarative predicate can be pushed into the source as a `WHERE`.
+  That last one is not a micro-optimisation: filtering `obj_pribuybuylistdetail`
+  in memory means every one of 7,637,391 rows is read off disk, crosses the
+  network, and becomes a JS object of ~80 properties before anything decides it
+  was unwanted.
+
+  **The pushdown is not built, and this ships saying so rather than implying it.**
+  The mechanism it would reuse already exists — `boundStatement` in `sources.ts`
+  wraps an author's query as `SELECT * FROM (…) WHERE …` with the identifier
+  quoted per dialect and the value bound — but `SourceFetcher` takes a connector,
+  a secret, a watermark and a mode and knows nothing about the graph, while the
+  runner that does know the graph dispatches by connector kind alone; threading a
+  predicate through also drags in schema discovery, which shares `sqlTarget`.
+  There is a second reason and it is the more interesting one: a pushed-down
+  filter cannot honestly report rows in, because the rows it removed were never
+  read — reason three deletes reason two, and recovering the number means a
+  `COUNT(*)` over the unfiltered query, which is the scan the pushdown was for.
+  Those are decisions, not typing, so they belong to the change that makes the
+  move. What is _not_ deferred is the part that would have made it impossible
+  later: the predicate is closed, its columns already have to match the identifier
+  pattern `boundStatement` requires, and every comparison follows **SQL's
+  three-valued logic** — a null column fails every test including the negative
+  ones — so pushing it down cannot change which rows a type ends up holding.
+
+  Meanwhile it runs in memory **one staged batch at a time**, never over the whole
+  input. The obvious implementation is `readInputs()` then `.filter()`, and that
+  is the shape that spent a day of this project's life stalling everything sharing
+  a database: one synchronous pass over millions of objects holds the event loop
+  for its whole duration. Survivors are coalesced back into full batches, so a
+  filter keeping one percent does not write fifteen thousand stage rows of five.
+
+  **The trap it had to be designed against**, and the reason `WorkflowFilterNode`
+  carries `narrows`: dropping a filter onto a working `source → sink` wire
+  replaces the published snapshot of that type with a subset, silently, because
+  from the run's point of view everything succeeded. Filtering to _derive a new
+  type_ and filtering before _recommitting the same type_ are structurally
+  identical graphs — the only difference is what the name on the sink already
+  means to the people reading it — so no rule over the shape can tell them apart
+  without inventing a signal. The graph therefore makes the author **name the
+  types**, and `validateWorkflow` requires it exactly where it matters and refuses
+  it everywhere else: every full-mode sink this node is the only path to must be
+  listed, and nothing that it is not. A filter on one of several paths into a
+  sink, or in front of an incremental one, narrows nothing and may not claim to.
+  The consequence is the intended one — that dragged-on filter produces a graph
+  that will not save until somebody writes down the name of the type they are
+  about to shrink. The sink's `maxShrink` bound is unchanged and still the last
+  word at run time.
+
+  `WorkflowNodeOutcome.rowsIn` is new and optional, and absent is not zero: a node
+  that never reported an input count and a filter that was handed nothing are
+  different facts, and defaulting would make every outcome stored before this
+  exists read as having dropped everything it produced.
+
+  Existing graphs are untouched — a graph with no filter in it hashes to exactly
+  what it always did, which is pinned by a literal recorded from the previous
+  build. Every per-kind decision still fails to compile when a kind is missing
+  from it; adding this one found seven such places on the way in, and turned up a
+  narrowing bug worth knowing about: TypeScript will **not** remove a union member
+  whose discriminant is itself a union of literals, so an `all`/`any` group
+  written as one interface silently disabled the exhaustiveness check for both.
+  It is two interfaces over a shared base for that reason.
+
+- 3290183: A graph exists because somebody made it, not because a boot hook inferred it
+
+  Boot-time connector adoption is removed entirely. A workflow now comes into
+  existence only because something explicitly created it through the API. `minor`
+  and not `major` on purpose — this is 0.x, and the project versions on that basis
+  rather than on whether behaviour was withdrawn.
+
+  **Why it goes.** Adoption wrapped every pre-workflow connector into a
+  single-source, single-sink graph at boot and published it as `ready`. The wrap
+  was validated, so `ready` was true in the narrow sense — it meant "this
+  validated". It was false in the sense the word is actually read on that screen,
+  which is "somebody looked at this and said it was finished". The console had
+  grown a badge and a paragraph to explain that a pipeline marked ready had no
+  author, which is the tell: a status that needs a note beside it saying it does
+  not mean what it says is the wrong status, and the honest fix is to stop minting
+  it rather than to keep apologising for it. Publishing is a decision, and a
+  process starting up is not somebody deciding.
+
+  **Gone.** `ConnectorAdoption` and the `CATALOG_ADOPT_CONNECTORS` token, the
+  `adoptConnectors` module option and its entry in `CATALOG_PIPELINE_TOKENS`,
+  `CatalogWorkflowStore.adoptConnector` with its MikroORM implementation and the
+  environment-routing delegation, and — on the console — the `adopted` badge, the
+  "adopted at boot" note, `wasAdopted` and `WORKFLOW_ADOPTION_ACTOR`.
+
+  **No migration, because there was never a column.** "Adopted" was never stored.
+  It was derived at render time from `createdBy === 'connector-adoption'`, so
+  there is nothing to drop and nothing to rewrite. Graphs adopted by an earlier
+  release keep working exactly as they did; the string in `createdBy` stops being
+  read as a marker and reads as what it is, the name of whatever authored the row.
+
+  **Nothing was keyed on the adoption.** The connector id is what a run history,
+  the singleton mutex and the incremental watermark hang off, and it is
+  `publishWorkflow` -> `mintConnectorFor` that ties a connector to its graph — the
+  ordinary publish path, untouched here. Adoption borrowed that machinery for
+  already-existing rows; it never owned it. Watermarks already re-keyed under a
+  source node stay re-keyed, and no incremental source falls back to a full read.
+
+  **What an upgraded deployment sees.** A connector that predates workflows is no
+  longer wrapped into anything. It keeps loading on the path it was already on,
+  `GET connectors` still reports it, and no route can edit it — the same standing
+  consequence `adoptConnectors: false` always had, now the only behaviour. A
+  deployment with connectors and no workflows therefore shows an empty
+  `#workflows`, so the canvas gains an empty state that says so: that nothing is
+  missing, that this deployment has simply never had one drawn, and that
+  connectors already loading data are not shown there and nothing will turn them
+  into workflows on their own. Three states rendered identically before — a first
+  run, a graph whose nodes were all deleted, and a list that failed to load — and
+  only one of them was speaking.
+
+- 2a2833d: A load stops counting itself once per batch
+
+  `MySqlWarehouseStore.write` ended every batch with
+
+  ```sql
+  SELECT COUNT(*) AS total FROM <obj_table> WHERE _snapshot_id = ?
+  ```
+
+  The predicate names the **snapshot**, not the batch, so the scan grows with the
+  snapshot while the number of scans grows with the load: a load costs
+  O(rows² / batch). At `BATCH_SIZE = 500` and the 783,000 rows a deployment's
+  Subwo load carries, that is 1,566 scans of an ever-larger range.
+
+  A previous changeset in this series looked at this statement and left it alone,
+  on the evidence that it was 15s against the batch `DELETE`'s 821s in a
+  deployment's query log. That reading was right about the ranking and wrong about
+  what it implied: the `DELETE` was 821s **because it had no usable index and was
+  scanning the whole table**, and now that it does, the count is what is left, and
+  it is the only term on the path that is quadratic rather than linear.
+
+  Measured on MySQL 8.0 against the 42-column PriBuy shape, three isolated samples
+  per size, the scratch schema **recreated between every sample** — without that,
+  three identical 50,000-row loads report 14.6s, 34s and 61.6s as the table
+  outgrows the buffer pool, which measures the cache and not the code:
+
+  | load                  | before       | after            |        |
+  | --------------------- | ------------ | ---------------- | ------ |
+  | 50,000 rows + commit  | 4,409ms ±201 | **3,272ms ±85**  | −25.8% |
+  | 100,000 rows + commit | 9,596ms ±567 | **6,887ms ±745** | −28.2% |
+
+  The saving grows faster than the data — 1.14s at 50k, 2.71s at 100k, 2.4× for 2×
+  the rows — which is the quadratic term leaving. Per batch, the cost stops
+  climbing with the load: 44.1 → 48.0 ms/batch before, 32.7 → 34.4 after.
+
+  One `COUNT(*)` in isolation costs 1.7ms over 10,000 rows, 3.9ms over 25,000,
+  7.0ms over 50,000 and 14.4ms over 100,000 — linear, as an index range scan
+  should be. Multiplied out per load that is 0.03s, 0.19s, 0.70s, 2.87s.
+
+  **Local absolute numbers do not transfer to a deployment.** This machine has 22
+  vCPU and a 128 MB buffer pool; the deployment is a `db.t4g.medium` with 300
+  baseline IOPS and a 1.5 GB pool against ~36 GB of data. It is not uniformly
+  faster or slower — only the ratios and the shape of the curve carry over.
+
+  **Statements per batch fell from 7 to 3.3** (70 → 33 over ten batches, counted
+  from MikroORM's query log). `rowCount` was the only field a batch after the
+  first one changed, so maintaining it cost an `UPDATE catalog_snapshot` per batch
+  as well as the scan; with nothing to change, change tracking issues neither.
+  That half is round trips rather than scans, which is what a remote database
+  charges for.
+
+  ## Arithmetic is not the answer, and the reason is not the obvious one
+
+  `rowCount += inserted - deleted` is the tempting repair. It fails twice.
+
+  First, **the number is not there to add**. `write` issues its DELETE through
+  `connection.execute(sql, params)`, whose default method is `all`. Measured, not
+  assumed: that call returns `[]` for a DELETE that removed 300 rows and `[]` for
+  one that removed none — the affected-row count is discarded. It is reachable
+  only by passing the method explicitly, where `execute(sql, params, 'run')`
+  returns `{ affectedRows, insertId, row, rows }`. (The usual `ON DUPLICATE KEY
+UPDATE` hazard — updated rows counting 2, unchanged 0, depending on
+  `CLIENT_FOUND_ROWS` — does not arise: the object-table INSERT is a plain
+  multi-row `INSERT ... VALUES` and the insert count is just `rows.length`.)
+
+  Second, and fatal: **it drifts on the event it exists to survive.** `write` is
+  three statements outside a transaction — DELETE, INSERT, then the snapshot row's
+  flush. A crash between the INSERT and the flush leaves the table holding N rows
+  the snapshot row was never told about; the retry re-sends the batch, deletes
+  those N, inserts N, nets zero, and the snapshot is permanently N rows short.
+  Counting has no such window — it reports what is there whenever it is asked, so
+  a replay converges instead of accumulating error. Making arithmetic safe would
+  mean putting all three statements in one transaction, which is a much larger
+  claim than this class makes today (`transactional: false`).
+
+  ## So it is still counted — once per read, not once per batch
+
+  `commit` counts the snapshot it is about to publish, which makes the stored
+  number final and authoritative for every later reader of that committed row.
+  `listSnapshots` counts the **uncommitted** snapshots it reports, in one grouped
+  statement, because that is what `PublishService.assertRowCountIsPlausible` reads
+  the pending snapshot's size from — and it runs _before_ `commit`, so a count
+  taken only at commit would arrive after the check that needs it. Committed rows
+  are not recounted: `commit` is the only thing that sets the flag, and it sets the
+  count in the same flush. `carryForward` already counted from the table and still
+  does, once, as part of the statement that tells it how many rows it carried.
+
+  Both properties the old comment bought are kept and are now covered by tests
+  that fail without this change: a replaced batch does not double-count, and a
+  snapshot whose stored count has drifted commits at the size the table actually
+  holds.
+
+  **One observable change.** `catalog_snapshot.row_count` is no longer maintained
+  while a load is in flight, so a host reading that column directly for an
+  uncommitted snapshot now sees `0` rather than a partial total. Everything that
+  goes through the store — `commit`, `listSnapshots`, `currentSnapshot`,
+  `carryForward` — reports the true size, and the row-count bound is unaffected.
+  Committed rows written by earlier versions are already correct and need no
+  backfill.
+
+- 90a219d: Staged batches are written columnar: each key-set once per batch, not once per row.
+
+  `catalog_workflow_stage.rows` held a JSON array of row objects, so every property name was written
+  out again for every row — `Sub_Work_Order_State_Cd` 500 times per batch, once per row, for 85
+  properties. On one deployment that is 9.04 GB across ~16,233 staged batches in a week, on graphs
+  that are two nodes long.
+
+  **Why this and not fusing the nodes.** A two-node graph has no second consumer that the
+  materialisation serves, so handing the array over in memory is the obvious cut — and it is the wrong
+  one. The stage is not a cache: the durable engine checkpoints a step's output so that a crash
+  resumes instead of re-reading the source, and a two-node graph is exactly the case where re-reading
+  the source is the expensive thing. Fusing spends the resume guarantee to buy the speed. This keeps
+  the guarantee and makes it cheaper, which is why it is a `minor` and not a change anybody has to
+  reason about before upgrading.
+
+  **The shape is a shape dictionary**, not a single column list: `shapes` holds each distinct key-set
+  in the batch once, `shapeOf[i]` says which one row `i` uses, and `values[i]` runs parallel to it. A
+  padded union column list would have been simpler and could not say **absent** — a row that lacks
+  `note` and a row whose `note` is `null` are different facts, and every sentinel that could stand for
+  the first inside a JSON array is also a value a row is entitled to hold. Naming each row's own
+  key-set has the distinction built in. It also degrades gracefully: a batch of 500 mutually distinct
+  rows stores 500 key-sets, which is what the old encoding stored anyway, where a padded union list
+  would have been far worse than what it replaced.
+
+  **Old batches still read, and are told apart by JSON type rather than by inspection.** The previous
+  writer only ever `JSON.stringify`'d an array, and this one only ever writes an object tagged
+  `"enc": "columnar"`. A top-level JSON value cannot be both, so no batch matches both branches and
+  nothing is inferred from what the rows look like — an empty legacy batch, where a
+  contents-sniffing discriminator would have nothing to read, classifies as cleanly as a full one.
+  Anything else throws by name, including a version this build does not know: a stage that decoded to
+  `[]` would reach an incremental sink as "nothing changed", and carry-forward would commit a snapshot
+  quietly missing whatever the batch held.
+
+  There is **no migration and no new column** — a MySQL `JSON` column takes an object as readily as an
+  array — so batches already staged stay as they are, and a run in flight resumes onto them.
+
+  **Keys whose value is `undefined`, a function or a symbol are dropped, key and all**, which is what
+  `JSON.stringify` did to them under the old encoding, and what `codeContext` does deliberately for
+  the same reason.
+
+  **Key order now survives, which it did not before.** A MySQL `JSON` column stores a normalised
+  binary document in which an object's members are sorted by key length then bytes, so
+  `{zebra, a, Middle_Name, b}` came back as `{a, b, zebra, Middle_Name}` — every staged row has been
+  returning reordered since the stage existed. Here the names live in an array, whose order that format
+  keeps. Nothing downstream depended on either behaviour: the warehouse stores build their column list
+  from the object type's declared properties and read each row by name, and the three places a row's
+  key order does decide something (schema discovery's proposed column order, `csvLines` without an
+  explicit column list, the ClickHouse ad-hoc query fallback) none of them read a staged batch.
+
+  Measured on the shipped store, 50,000 rows, real column lists, `BATCH_SIZE = 500`, five interleaved
+  samples: the 85-column shape's round trip falls from 8,630 ms (±593) to 4,980 ms (±130), a 42%
+  saving, and the bytes in the table from 133.2 MB to 66.7 MB — 49.9% smaller. The 42-column shape
+  saves 34.5% of its round trip and 46.2% of its bytes. The saving arrives mostly through the
+  `INSERT`, whose cost is linear in bytes, and not through the parse.
+
+  New from `@dudousxd/nestjs-catalog`: `encodeStageRows`, `decodeStageRows`, `classifyStagePayload`,
+  `isColumnarStageBatch`, `ColumnarStageBatch`, `StagePayload`, `STAGE_ENCODING`,
+  `STAGE_ENCODING_VERSION` — exported because `CatalogStageStore` is a seam a host can implement, and
+  two stores encoding the same batch differently would be a run that cannot resume across a deployment
+  that changed its mind about where stages live.
+
+- 2d543ef: Adopted graphs stop drawing their boxes on top of each other, a connection can be cut by clicking
+  it, and "Save first" now comes with a way to save.
+
+  ## The nodes were four pixels too close, and the number was derived from nothing
+
+  Opening any of the thirteen adopted workflows in the dev deployment drew every box glued to the
+  next one. Nothing was stacked and nothing was missing, which is why it read as ugly rather than as
+  broken and survived until somebody opened all thirteen.
+
+  `adoptConnector` lays a pre-workflow connector out as a graph, and it placed its columns **220**
+  apart. A node is **224** wide. So each box overlapped the next by exactly four pixels — and a
+  connector that had a transform got the three-node shape, which collides twice and pinches the
+  middle box from both sides.
+
+  The interesting part is not that 220 was too small. It is that 220 had no relationship to anything.
+  The width lived in `packages/react/src/workflow/graph.ts`, where the server could not see it, so
+  the writer of the layout had nothing to derive from and picked a number that was correct only by
+  luck. Raising it to 240 would have been the same bug with more slack.
+
+  So the geometry moved to core, where both sides already depend on it:
+
+  - `WORKFLOW_NODE_WIDTH`, `WORKFLOW_NODE_HEIGHT`, `WORKFLOW_COLUMN_GAP`, `WORKFLOW_ROW_GAP`
+  - `workflowColumnX(column)` and `workflowRowY(row)`, which every generator of a layout now goes
+    through instead of multiplying by a literal
+
+  Exported from both the package root and `/client`, because the two things that have to agree are a
+  store and a browser component.
+
+  `WORKFLOW_NODE_WIDTH` is not a description of the node — it is the **source of** the node's width.
+  `WorkflowNodeBody` sets its own width from the constant rather than from a `w-56` class, so there is
+  one number and no way to restyle the box without moving the columns with it. The react package's
+  `NODE_WIDTH` / `NODE_HEIGHT` keep their names on the `/workflow` entry point and are re-exports.
+
+  The test is the overlap itself rather than the coordinates: `x[n+1] - x[n] >= WORKFLOW_NODE_WIDTH`,
+  on both the two-node and the three-node shapes. Pinning `{x: 320}` would pass just as happily on a
+  node 400 wide.
+
+  ### Graphs already saved with the old positions
+
+  **They do not fix themselves, and nothing repositions them behind anyone's back.** A stored graph
+  whose nodes are 220 apart has distinct positions, so `layoutIfUnarranged` correctly reads it as
+  "somebody arranged this" and leaves it alone — which is the right rule, because the alternative is a
+  canvas that silently rearranges a layout a person deliberately built. Re-adopting will not help
+  either: adoption is idempotent by design and skips anything that already has a `workflowId`.
+
+  Fixing the thirteen that exist means rewriting their positions through `POST workflows`, which takes
+  the whole graph back. New adoptions are correct from here.
+
+  ## Clicking a connection offers to remove it
+
+  `onDisconnect(edge)` has been wired since the wiring menu landed; what was missing was the gesture.
+  Every route to it went through something else — a menu hanging off a node, a row in the wiring rail,
+  or knowing that a selected edge answers to Delete — and the thing people reach for first is the
+  connection itself, which did nothing.
+
+  Edges are now this package's own type (`workflow/edges.tsx`) rather than the built-in `smoothstep`.
+  Selecting one puts a round × above its midpoint, and pressing it removes that connection.
+
+  - **Selection, not hover.** Hover would be slightly quicker with a mouse, unreachable without one,
+    and would put a delete button under the pointer of somebody merely tracing where a line goes.
+  - **The keyboard gets all of it, by two routes.** React Flow makes an edge focusable, and Enter or
+    Space selects it — at which point the × is an ordinary `<button>` in the tab order, with an
+    accessible name that says which connection it removes _in the words on the canvas_: "Remove the
+    connection from Feed to Out", never the node ids. And the wiring rail's Disconnect row is
+    untouched, so nobody has to go near the canvas at all. Both halves are held by tests, so neither
+    can quietly become the only one.
+  - The × deselects the edge before removing it, so an id reused later by a rewired pair does not come
+    back already carrying a delete button nobody summoned.
+
+  ## Nodes and edges, generally
+
+  Per-kind colour is now three coordinated tokens rather than one accent bar — a tinted header strip,
+  the icon and the kind word — because four kinds distinguished by four pixels of colour are not
+  distinguished at the zoom people work at. `transform` moved to violet so it stops reading as a
+  second `source`. Every token has a `dark:` counterpart.
+
+  Nodes lift on hover and ring deeper when selected; handles grow under the pointer; edges thicken
+  when selected and take a rounder corner. Nodes spring in on mount, and the × springs in and out.
+  While a run is in progress the edges leaving the node that is _running_ flow — the one thing a
+  picture can say about a run that a list of statuses cannot.
+
+  **Nothing is revealed by an animation.** Under `prefers-reduced-motion` the × is mounted by the same
+  selection and simply arrives without the transition, nodes are simply there, and no edge is marked
+  `animated` — React Flow's flow animation is a keyframe in its own stylesheet, so declining to set
+  the flag is the only honest accommodation. Nothing is lost by it: a running node still spins its own
+  badge and says "Running now.", and the run panel still lists every step. `flowingEdgeIds` is where
+  that decision lives, as a value rather than a branch in a render, and it is tested in both states.
+
+  `@dudousxd/nestjs-catalog-react/workflow` now needs `motion` as well as `@xyflow/react`. Both are
+  optional peers of the package and both are required by this subpath — a host mounting a node canvas
+  is already installing a graph library, and one that wants neither wants the root entry point.
+
+  ## "Discover schema — Save first" now comes with the save
+
+  Reported as _"ué mas ta desabilitado não vejo nada"_ — it is disabled and I cannot see anything.
+
+  The refusal is correct and unchanged: discovery reads the **stored** node, so with unsaved edits it
+  would describe the source as it was before them. What was wrong is that the sentence lived inside a
+  side sheet and the Save button lived in the header behind it, so a reader was told to do something
+  with no way to do it where they were standing.
+
+  `SchemaDiscoveryPanel` takes an optional `onSave` and `saving`, and renders a "Save now" button
+  beside the refusal when there is one — plus a line saying that saving stores a draft and does not
+  publish, carrying the same care the `!draft.id` reason already takes, because publishing is a
+  different and much louder thing on this screen.
+
+  The other half of that report was worth checking rather than assuming: is `dirty` honest? It is —
+  `draftFrom` sets `dirty: false` even though it runs `layoutIfUnarranged` on the way in, because a
+  derived layout re-derives identically next time and there is nothing to save. There are now tests
+  that opening a workflow and touching nothing leaves discovery offered, including for a graph the
+  server sent with no positions at all, which is the case a future layout change is most likely to
+  break.
+
+  ## The × was painted under a node, and the test that "covered" it could never have said so
+
+  Reported as _"Cliquei na linha e não aparece um x em cima pra deletar"_ — I clicked the line and no
+  × appears above it to delete. It was there. It was 38×38, fully opaque, correctly labelled, and
+  414px to the left and 42px above its own line, directly underneath the first node — so
+  `elementFromPoint` at its centre returned that node's header, not the button.
+
+  The cause is a rule about Motion that is easy to walk into: **an element Motion animates a transform
+  component of no longer owns its own `transform` property.** The control set
+  `transform: translate(-50%, -140%) translate(Xpx, Ypx)` in `style` _and_ animated `scale`. Motion
+  composes the whole property from the values it is animating and writes the result every frame, so
+  the hand-written translate was overwritten — and at rest, with `scale: 1` and nothing else to
+  compose, what it wrote was `transform: none`. The button landed at the untranslated origin of
+  `.react-flow__edgelabel-renderer`, which is the top-left corner of the graph.
+
+  The placement and the animation are now on two elements: a plain `<div>` carries the translate and
+  Motion never touches it, and the `motion.div` inside animates opacity and scale about an origin that
+  is already correct. The outer element stays mounted whether or not the × is offered, because that is
+  what `AnimatePresence` needs in order to still play the exit.
+
+  The more useful part is the test. `workflow-edge-delete.spec.tsx` had five tests over this control
+  and **all of them passed the whole time it was unreachable** — they asserted that it existed, what it
+  was called, and what pressing it did. So there is now one that reads the inline transform of the
+  positioning element after the animated child has mounted, and a comment saying why that property and
+  not a rect: jsdom lays nothing out, every element in it is 0×0, and a `getBoundingClientRect`
+  assertion would have agreed with the broken placement just as readily as with the fixed one.
+
+  ## Wiring is click, click — no drag required
+
+  Asked for as _"invés de clicar e arrastar, queremos clicar na pontinha, aí já aparece a linha ta
+  ligado e aí é só clicar no outro"_. Click a handle, see the line, click the other end.
+
+  React Flow's `connectOnClick` was already on, and it already connected — but it draws **nothing**
+  while the connection is open, because the connection line renders from `connection.inProgress` and
+  that flag is only ever set by the pointer-drag path, past a 1px threshold a click never crosses. So
+  the gesture worked and looked exactly like a dead click. It also cannot explain itself: the state it
+  hands `onClickConnectEnd` after a click carries no target, so an illegal pair and a missed click
+  were indistinguishable.
+
+  So the click path is owned by the new `workflow/wiring.tsx` and `connectOnClick` is off, which keeps
+  one state rather than two disagreeing about whether a wire is in flight:
+
+  - a dashed, travelling line follows the pointer from the handle that was clicked, drawn into
+    `ViewportPortal` so it stays registered with the graph while somebody pans or zooms mid-gesture
+  - either end starts it. Clicking a sink's input first draws the wire backwards until it lands, which
+    is the right affordance for somebody thinking "this needs feeding"
+  - while a wire is open every handle says whether it can take it — green where it can, faded almost
+    out where it cannot — which is the same judgement the drag has always shown on the one handle
+    under the cursor, shown on all of them at once because a click has no "under the cursor" moment
+  - **a refusal is a sentence on the canvas**, not silence. A loop, a duplicate, or anything else
+    `canConnect` refuses now says so in a panel over the graph, and the wire stays in hand so
+    correcting it is one more click rather than a restart
+  - Escape, the pane, and clicking the same handle twice all put it away
+
+  **Dragging is untouched.** It is React Flow's pointer-down path, it still validates through the same
+  `isValidConnection`, and it still colours the handle under the cursor. This adds a way in; it removes
+  none. Every rule still comes from `canConnect` — the one the drag, the wiring menu and the
+  inspector's picker are all refused by — so there is no second copy of "nothing runs after a sink" to
+  drift.
+
+  A handle is now a control, so it says so: `role="button"`, in the tab order, and operable with Enter
+  or Space. React Flow renders a handle as a plain `<div>`, so none of that is inherited.
+
+  ## Prettier, where it changes what you can see
+
+  The selected connection gets a soft halo behind the line, in the same variable the stroke uses, so
+  selection reads at the zoom people actually work at instead of being a 1px thickening. The kind rail
+  down the left of a node is a gradient rather than a flat fill — at 4px wide and full height, flat
+  reads as a printing error. Nodes lift a little further on hover; the controls and the minimap are
+  rounded and lifted so they read as panels on the canvas rather than as chrome bolted to it.
+
+  `prefers-reduced-motion` remains the fallback and not the ceiling: the travelling dashes hold still,
+  the pulse on an open handle is `motion-safe:`, and the wiring hint arrives without its spring. In
+  every case what is left is the colour and the position, which is where the information was.
+
+### Patch Changes
+
+- 81a15c5: An `if` node, so one graph can serve two deployments
+
+  The case that asked for it: a local deployment has a ClickHouse and dev does
+  not. Without a conditional that is two workflows, which is two things to keep in
+  step and one of them always drifts — so the graph gains a node that decides, at
+  run time, which half of itself runs.
+
+  An `if` names an **environment variable** and takes a `then` and an `else`.
+  Declarative rather than code, and that is the safety property rather than a
+  simplification: a predicate is the one expression whose answer decides which
+  nodes exist for a run, so an answer that can differ between a run and its replay
+  is a load that goes down a path nobody chose. The evaluated branch is recorded
+  on the node's outcome the first time it is asked and read back afterwards — the
+  node runs inside a durable step, whose output is a checkpoint, and the workflow
+  body reads that record rather than the environment. A resumed run on another pod
+  therefore reproduces the first run's decision instead of making a new one.
+
+  **A sink on the untaken branch does not commit.** This is the part worth reading
+  before upgrading. Committing is what repoints the live view of a type, so a sink
+  that "ran with no rows" would publish an empty snapshot over a good dataset and
+  report success while doing it. A skipped node is not executed at all, so nothing
+  reaches the publish protocol; and because "skipped" already meant "the run
+  stopped before here", the outcome now carries `skippedBecause` so the two can be
+  told apart in the data and on the run panel. A sink stood down by a branch says
+  so in the run's log, naming the type it did not commit and saying that whatever
+  was live still is.
+
+  The skip rule is reachability from the **taken** edges, not descendants of the
+  untaken one. The obvious version is wrong on the shape branches are most often
+  drawn in: where both sides converge on one node, walking down from the untaken
+  edge skips the join — and with it the sink behind it — on a run that otherwise
+  succeeded. `workflowNodeRuns` is exported so a screen can answer "would this have
+  run" exactly the way the runner decided it.
+
+  Nothing about an existing graph changes. `WorkflowEdge.branch` is optional and
+  absent on every stored edge; an unlabelled wire is unconditional, and the graph
+  fingerprint folds the label in only when there is one, so no stored workflow is
+  renumbered and no past run becomes unidentifiable. What is refused is the pair of
+  silent mistakes: an unlabelled wire out of an `if` (a subtree that would never
+  run) and a label on a wire that leaves anything else (a decision that is drawn
+  and never read).
+
+  Every place that decides something per node kind now fails to compile when a kind
+  is missing from it, rather than falling through to the last branch. Adding `if`
+  found two such places on the way in, which is the argument for it.
+
+  The console gets the node, an inspector, and `then`/`else` labelled and coloured
+  on the wires — labelled as well as coloured, because two lines leaving one box
+  that differ only by hue are one line to a colour-blind reader, and this
+  particular difference decides which half of the pipeline runs.
+
+- ae76198: The activity screen pages off an index instead of grading the whole trail
+
+  `GET catalog/events/traces` cost work proportional to the entire audit table on
+  every request, no matter that it returns 25 traces. On 21k rows the default page
+  took 151ms against 11ms for the unaggregated `GET catalog/events` beside it; on
+  622k rows it took 9.2s, with one sample at 216s.
+
+  It was not a missing index. The table's four indexes are the right four, and the
+  statement could not use any of them: every filter was written against a `scoped`
+  CTE — the whole linked half of the table, `detail` column included, spooled into
+  a temporary table — rather than against `catalog_audit_event`, so there was
+  nothing indexed left for the optimiser to reason about. `EXPLAIN ANALYZE` showed
+  the table read three times and sorted once to return 289 span rows.
+
+  Two changes. Every CTE now reads the base table, so the conditions reach the
+  indexes. And when the caller has not filtered by outcome — which is what the
+  explorer asks on load — the page is chosen _before_ anything is graded, by
+  `GROUP BY snapshot_id ORDER BY MIN(occurred_at)`, which MySQL answers as a
+  covering skip scan over `(snapshot_id, occurred_at)` without reading a row.
+  Aggregation, JSON parsing and the span join then run over the ≤ 200 traces that
+  survived rather than over everything ever recorded.
+
+  Measured through the store against MySQL 8.0, median of seven:
+
+  |                           | 21k rows         | 622k rows           |
+  | ------------------------- | ---------------- | ------------------- |
+  | default page              | 151ms → **20ms** | 9,234ms → **453ms** |
+  | `?offset=500`             | 150ms → **25ms** | 7,760ms → **550ms** |
+  | `?type=…`                 | 19ms → 18ms      | 1,701ms → **666ms** |
+  | `?outcome=failed`         | 140ms → 104ms    | 5,322ms → 3,818ms   |
+  | `?outcome=failed&since=…` | 27ms → 38ms      | 2,181ms → 1,566ms   |
+  | `traceTotals`             | 141ms → 140ms    | 6,711ms → 5,422ms   |
+
+  Filtering by outcome still costs a pass over every matching trace, and that is
+  not a shortcoming of the statement: an outcome is `CASE` over
+  `JSON_EXTRACT(detail, '$.status')`, so no index can answer "which traces failed"
+  before the grading it is derived from has happened. Pass `since` — every caller
+  in this repo that filters by outcome already does.
+
+  **No DDL, and nothing to run against a deployed database** — except one thing
+  worth knowing: if `catalog_audit_event` was loaded in bulk rather than grown a
+  row at a time (a restored dump, a backfill), run
+  `ANALYZE TABLE catalog_audit_event` once. Choosing the page needs no statistics,
+  but the two span joins do: with statistics MySQL has never gathered it prices a
+  scan of the table at `0.102` and hash-joins instead of looking each trace up —
+  138ms against 415ms for the identical statement on a 173k-row table. A trail
+  that grew normally gets this from `innodb_stats_auto_recalc`.
+
+  Behaviour is unchanged with one improvement: a page past the end of the list now
+  reports how many traces there are, instead of answering an out-of-range offset
+  with "there are none". The lifecycle rank that orders a same-millisecond trace is
+  untouched, and `audit-trace.db.spec.ts` now holds it against a real MySQL with a
+  fixture written backwards on one timestamp, so that only the rank can put it
+  right.
+
+  Nothing prunes `catalog_audit_event`, `catalog_connector_run` or
+  `catalog_snapshot`, and this does not change that — the default page no longer
+  grows with the table, but the outcome path still does. The retention note in
+  `audit-recorder.service.ts` argues the shape it should take, and why capping the
+  window would be worse than a slow screen: a page that silently truncates reads
+  as "this is everything", on the one screen whose job is to say what happened.
+
 ## 0.11.0
 
 ### Minor Changes
