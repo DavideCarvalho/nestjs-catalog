@@ -1,6 +1,6 @@
 {
   "name": "@dudousxd/nestjs-catalog-dashboard",
-  "version": "0.25.0",
+  "version": "0.25.1",
   "description": "The catalog console for @dudousxd/nestjs-catalog: model, objects, query, dashboards, connectors, workflows, lineage, activity and access, served as a mountable NestJS module.",
   "license": "MIT",
   "author": "Davide Carvalho",
