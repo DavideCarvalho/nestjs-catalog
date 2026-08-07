@@ -61,5 +61,22 @@ permanently-vulnerable package in every consumer's tree, including the consumers
 that never read a spreadsheet, and pin them to one choice of provenance. Install
 `xlsx` from whichever patched distribution you trust and this reads it.
 
-**One behaviour change worth naming.** A `format` the library does not recognise
-is now refused, listing the ones it knows. It used to be read as JSON.
+**A blank cell is `null`, and CSV changed to agree.** This is the one change
+here that touches a format that already worked, so it is the one to read
+carefully. `parseCsv` did `cells[index] ?? null`, which made a *missing* cell
+`null` and a *blank* cell `""` — two spellings of "no value here", only one of
+which the `present` predicate recognises, since it tests `null` and `undefined`.
+A graph filtering on `isNotNull` therefore kept every blank in the file:
+measured against one real drop, it committed 102,519 rows where the right answer
+was 89,458. Both readers now answer `null`.
+
+Aligning CSV rather than the workbook reader is deliberate. A blank spreadsheet
+cell is an *absent* cell — there is no empty string in the file to report — so
+the workbook reader cannot honestly answer the other way, and the MVR sample has
+3,468 of them. One predicate should not mean two things depending on which
+format the source happened to read. If a transform downstream relied on a blank
+CSV field arriving as `""`, it now sees `null`. Nothing is trimmed on the way
+past in either format: a field holding spaces is still a value.
+
+**One other behaviour change worth naming.** A `format` the library does not
+recognise is now refused, listing the ones it knows. It used to be read as JSON.

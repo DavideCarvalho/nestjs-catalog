@@ -2,9 +2,9 @@ import { readFile } from 'node:fs/promises';
 import {
   type CatalogConnection,
   type CatalogConnector,
-  isSourceFormat,
   SOURCE_FORMATS,
   type SourceFormat,
+  isSourceFormat,
   unreachableSourceFormat,
 } from '@dudousxd/nestjs-catalog';
 import { Logger } from '@nestjs/common';
@@ -1654,7 +1654,8 @@ async function workbookApi(): Promise<WorkbookApi> {
         // Absent means the ordinary 1900 epoch. Only a workbook saved by the
         // old Mac Excel sets it, and getting it wrong moves every date in the
         // file by four years and a day.
-        date1904: property(property(property(workbook, 'Workbook'), 'WBProps'), 'date1904') === true,
+        date1904:
+          property(property(property(workbook, 'Workbook'), 'WBProps'), 'date1904') === true,
       };
     },
     decodeRange(ref) {
@@ -1801,7 +1802,9 @@ function readSheet(
     // The column may still hold data, and dropping it — or letting every blank
     // heading collide on one empty key — loses it silently.
     const label =
-      heading === null ? address.replace(/\d+$/, '') : String(heading).trim() || address.replace(/\d+$/, '');
+      heading === null
+        ? address.replace(/\d+$/, '')
+        : String(heading).trim() || address.replace(/\d+$/, '');
 
     const previous = seen.get(label);
     if (previous !== undefined) {
@@ -1960,8 +1963,33 @@ function parseCsv(text: string, config: Record<string, unknown>): unknown[] {
   if (!header) return [];
 
   return body.map((cells) =>
-    Object.fromEntries(header.map((name, index) => [name, cells[index] ?? null])),
+    Object.fromEntries(header.map((name, index) => [name, emptyAsNull(cells[index])])),
   );
+}
+
+/**
+ * An empty field, as `null` rather than as `""`.
+ *
+ * This was `cells[index] ?? null`, which made a **missing** cell `null` and a
+ * **blank** one `""` — two spellings of "this row has no value here", only one
+ * of which the `present` predicate recognises, because it tests `null` and
+ * `undefined` and an empty string is neither. A graph filtering on `isNotNull`
+ * therefore kept every blank in the file: measured against one real drop, it
+ * committed 102,519 rows where the right answer was 89,458.
+ *
+ * `null` is now the single answer, and the reason to prefer it over teaching
+ * `present` about `""` is that the workbook reader has the same question and
+ * cannot answer it the other way: a blank spreadsheet cell is an *absent* cell,
+ * there is no empty string anywhere in the file to report. Aligning CSV on
+ * `null` makes one predicate mean one thing whichever format the source read;
+ * aligning the other way would have meant inventing a value for the 3,468 empty
+ * cells in the MVR sample.
+ *
+ * Nothing is trimmed on the way past. A field of spaces is a value somebody
+ * typed, and deciding what it means is the transform's job — as it always was.
+ */
+function emptyAsNull(value: string | undefined): string | null {
+  return value === undefined || value === '' ? null : value;
 }
 
 /**

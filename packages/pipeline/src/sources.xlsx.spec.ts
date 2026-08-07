@@ -119,12 +119,16 @@ describe('reading a workbook', () => {
     expect(readProperty(records[0], 'when')).toBe('2026-06-10T00:00:00.000Z');
   });
 
-  it('keeps the time of day, and does not shift it by the reader\'s timezone', async () => {
+  it("keeps the time of day, and does not shift it by the reader's timezone", async () => {
     // 2026-06-10 14:30:15 as a serial. The assertion is a real one on any
     // machine that is not on UTC — this suite runs on America/Sao_Paulo, where
     // calling `toISOString()` on the Date the library hands back would return
     // 17:30 rather than 14:30.
-    const path = writeSerialDateWorkbook('datetimes.xlsx', 46183.60434027778, 'yyyy-mm-dd hh:mm:ss');
+    const path = writeSerialDateWorkbook(
+      'datetimes.xlsx',
+      46183.60434027778,
+      'yyyy-mm-dd hh:mm:ss',
+    );
 
     const records = await read({ path });
     expect(readProperty(records[0], 'when')).toBe('2026-06-10T14:30:15.000Z');
@@ -147,6 +151,55 @@ describe('reading a workbook', () => {
     });
 
     await expect(read({ path })).resolves.toEqual([{ a: 'one' }, { a: 'two' }]);
+  });
+});
+
+/**
+ * The two readers, asked the same question.
+ *
+ * These belong together in one block rather than one assertion each, because the
+ * property under test is not what either reader returns — it is that they return
+ * the *same* thing. A `present` filter downstream tests `null`, so a format that
+ * spelled "no value here" as `""` would quietly pass a predicate the other
+ * format fails, and the graph would commit a different number of rows depending
+ * on which file it happened to read.
+ */
+describe('a blank cell means the same thing in either format', () => {
+  it('gives null for a blank and for a missing cell, from CSV', async () => {
+    const path = join(directory, 'blanks.csv');
+    // `b` is blank on the first row and absent from the second.
+    writeFileSync(path, 'a,b,c\n1,,3\n4,5\n');
+
+    await expect(read({ path })).resolves.toEqual([
+      { a: '1', b: null, c: '3' },
+      { a: '4', b: '5', c: null },
+    ]);
+  });
+
+  it('gives null for the same shape from a workbook', async () => {
+    const path = writeWorkbook('blanks-agree.xlsx', {
+      Sheet1: [
+        ['a', 'b', 'c'],
+        ['1', null, '3'],
+        ['4', '5', null],
+      ],
+    });
+
+    await expect(read({ path })).resolves.toEqual([
+      { a: '1', b: null, c: '3' },
+      { a: '4', b: '5', c: null },
+    ]);
+  });
+
+  it('does not trim a field that holds whitespace, in either format', async () => {
+    // A blank is absent; a space is a value somebody typed. The distinction is
+    // the transform's to interpret, and neither reader may collapse it.
+    const csv = join(directory, 'spaces.csv');
+    writeFileSync(csv, 'a\n" "\n');
+    await expect(read({ path: csv })).resolves.toEqual([{ a: ' ' }]);
+
+    const workbook = writeWorkbook('spaces.xlsx', { Sheet1: [['a'], [' ']] });
+    await expect(read({ path: workbook })).resolves.toEqual([{ a: ' ' }]);
   });
 });
 
@@ -241,27 +294,30 @@ describe('a real MVR drop', () => {
     'sampleFiles/21st/june-2026/DOD SAFE-PocAncIqXAAUjMA0/to-upload/mvr.xlsx',
   );
 
-  it.skipIf(!existsSync(fixture))('reads every row and carries no value across a merge', async () => {
-    const records = await read({ path: fixture });
+  it.skipIf(!existsSync(fixture))(
+    'reads every row and carries no value across a merge',
+    async () => {
+      const records = await read({ path: fixture });
 
-    // 974 rows in the used range: one header, 973 data rows, none blank across.
-    expect(records).toHaveLength(973);
+      // 974 rows in the used range: one header, 973 data rows, none blank across.
+      expect(records).toHaveLength(973);
 
-    const first = records[0];
-    expect(readProperty(first, 'Host Command')).toBe('AFRC');
-    expect(readProperty(first, 'Base Name')).toBe('PETERSON (AFRC)');
-    // A column whose cell is empty on this row, not the string "undefined".
-    expect(readProperty(first, 'UNIT_TYP_CD')).toBeNull();
+      const first = records[0];
+      expect(readProperty(first, 'Host Command')).toBe('AFRC');
+      expect(readProperty(first, 'Base Name')).toBe('PETERSON (AFRC)');
+      // A column whose cell is empty on this row, not the string "undefined".
+      expect(readProperty(first, 'UNIT_TYP_CD')).toBeNull();
 
-    // The second row sits inside merged ranges that start on the first. Only the
-    // anchor holds the value, so these are null — the fill-forward that a real
-    // MVR transform needs is transform-level work and deliberately not done here.
-    const second = records[1];
-    expect(readProperty(second, 'Use_CD')).toBeNull();
-    expect(readProperty(second, 'Asset_ID')).toBeNull();
-    // Its own cells are still its own.
-    expect(readProperty(second, 'ASC')).toBe('Total Auth / Assigned');
-  });
+      // The second row sits inside merged ranges that start on the first. Only the
+      // anchor holds the value, so these are null — the fill-forward that a real
+      // MVR transform needs is transform-level work and deliberately not done here.
+      const second = records[1];
+      expect(readProperty(second, 'Use_CD')).toBeNull();
+      expect(readProperty(second, 'Asset_ID')).toBeNull();
+      // Its own cells are still its own.
+      expect(readProperty(second, 'ASC')).toBe('Total Auth / Assigned');
+    },
+  );
 });
 
 function readProperty(record: unknown, name: string): unknown {
