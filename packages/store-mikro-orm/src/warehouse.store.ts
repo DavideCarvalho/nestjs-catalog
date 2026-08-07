@@ -1193,20 +1193,22 @@ export class MikroOrmWarehouseStore
   }
 
   private async existingColumns(table: string): Promise<Set<string>> {
+    const { sql, nameKey } = this.dialect.existingColumnsQuery();
     const rows = await this.em
       .getConnection()
-      .execute<Array<{ column_name: string }>>(this.dialect.existingColumnsQuery(), [table]);
-    return new Set(rows.map((r) => this.foldName(String(r.column_name))));
+      .execute<Array<Record<string, unknown>>>(sql, [table]);
+    return new Set(rows.map((row) => this.foldName(String(row[nameKey]))));
   }
 
   private async existingIndexes(table: string): Promise<Set<string>> {
+    const { sql, nameKey } = this.dialect.existingIndexesQuery();
     const rows = await this.em
       .getConnection()
-      .execute<Array<{ index_name: string }>>(this.dialect.existingIndexesQuery(), [table]);
+      .execute<Array<Record<string, unknown>>>(sql, [table]);
     // Index names are always compared case-insensitively, unlike columns: this
     // package chooses them itself (`ix_snapshot_batch`), they are never a
     // publisher's, and both engines create them lower-case.
-    return new Set(rows.map((row) => String(row.index_name).toLowerCase()));
+    return new Set(rows.map((row) => String(row[nameKey]).toLowerCase()));
   }
 
   /**

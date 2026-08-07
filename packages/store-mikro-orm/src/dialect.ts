@@ -144,11 +144,22 @@ export interface CatalogSqlDialect {
    */
   addIndex(table: string, index: string, columns: readonly string[]): string;
 
-  /** The catalogue read that says which columns a table already has. */
-  existingColumnsQuery(): string;
+  /**
+   * The catalogue read that says which columns a table already has, and the key
+   * its rows carry the name under.
+   *
+   * The key is part of the dialect rather than normalised with an `AS` alias,
+   * and that is a deliberate second-guess of the tidier option. Aliasing works
+   * against both real servers — MySQL honours a lower-case alias over
+   * `COLUMN_NAME` — but it changes the shape of a result that this package's own
+   * MySQL specs stand in for, and the constraint on this whole change was that
+   * MySQL emits the same bytes and its suite passes untouched. Naming the key
+   * costs one field and keeps that true.
+   */
+  existingColumnsQuery(): { sql: string; nameKey: string };
 
   /** The catalogue read that says which indexes a table already has. */
-  existingIndexesQuery(): string;
+  existingIndexesQuery(): { sql: string; nameKey: string };
 
   /**
    * `COUNT(*)` and "how many of those were carried", in one statement.
@@ -314,14 +325,20 @@ export const MYSQL_DIALECT: CatalogSqlDialect = {
     return `ALTER TABLE ${ident(table)} ADD INDEX ${ident(index)} (${columns.map(ident).join(', ')})`;
   },
 
-  existingColumnsQuery(): string {
-    return `SELECT COLUMN_NAME AS column_name FROM information_schema.COLUMNS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?`;
+  existingColumnsQuery(): { sql: string; nameKey: string } {
+    return {
+      sql: `SELECT COLUMN_NAME FROM information_schema.COLUMNS
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?`,
+      nameKey: 'COLUMN_NAME',
+    };
   },
 
-  existingIndexesQuery(): string {
-    return `SELECT DISTINCT INDEX_NAME AS index_name FROM information_schema.STATISTICS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?`;
+  existingIndexesQuery(): { sql: string; nameKey: string } {
+    return {
+      sql: `SELECT DISTINCT INDEX_NAME FROM information_schema.STATISTICS
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?`,
+      nameKey: 'INDEX_NAME',
+    };
   },
 
   countCarried(quotedBatchColumn: string): string {
@@ -492,21 +509,29 @@ export const POSTGRES_DIALECT: CatalogSqlDialect = {
     return `CREATE INDEX IF NOT EXISTS ${ident(index)} ON ${ident(table)} (${columns.map(ident).join(', ')})`;
   },
 
-  existingColumnsQuery(): string {
+  existingColumnsQuery(): { sql: string; nameKey: string } {
     // `current_schema()` rather than `DATABASE()`. The environment model puts
     // each environment in its own database (see `catalog.environment.ts`), so
     // this is asking about the one schema on the one connection that this
     // environment's tables live in — which on a default install is `public`.
-    return `SELECT column_name FROM information_schema.columns
-         WHERE table_schema = current_schema() AND table_name = ?`;
+    return {
+      sql: `SELECT column_name FROM information_schema.columns
+         WHERE table_schema = current_schema() AND table_name = ?`,
+      // Lower-case, because Postgres folds an unquoted identifier down rather
+      // than up. The same catalogue view, the other spelling.
+      nameKey: 'column_name',
+    };
   },
 
-  existingIndexesQuery(): string {
+  existingIndexesQuery(): { sql: string; nameKey: string } {
     // `pg_indexes` rather than `information_schema.STATISTICS`, which Postgres
     // does not have — the SQL standard has no index catalogue and every engine
     // invents its own.
-    return `SELECT indexname AS index_name FROM pg_indexes
-         WHERE schemaname = current_schema() AND tablename = ?`;
+    return {
+      sql: `SELECT indexname FROM pg_indexes
+         WHERE schemaname = current_schema() AND tablename = ?`,
+      nameKey: 'indexname',
+    };
   },
 
   countCarried(quotedBatchColumn: string): string {

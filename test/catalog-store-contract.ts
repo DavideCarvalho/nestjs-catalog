@@ -74,6 +74,24 @@ export interface ContractStore {
   readBackType?(name: string): Promise<CatalogObjectTypeDef | undefined>;
   /** Why {@link readBackType} is absent. Required when it is. */
   readonly noModelReason?: string;
+  /**
+   * How this store's engine quotes an identifier, for the one case that has to
+   * write a statement by hand.
+   *
+   * **This hook exists because the contract was not as engine-neutral as it read.**
+   * The SQL-console case below used to embed backticks with the comment "both
+   * engines quote with backticks, so one statement serves both" — true of MySQL
+   * and ClickHouse, and false the moment a third adapter arrived: Postgres
+   * spells it `"Asset_Id"` and answers a backtick with `syntax error at or near
+   * "\`"`. The suite would have reported that as the Postgres store failing to
+   * expose a column it exposes perfectly well.
+   *
+   * Defaulted to backticks so the two adapters that were passing keep passing on
+   * a suite that has not changed for them. It is deliberately the only place the
+   * contract writes SQL at all — every other case goes through the store
+   * interface, which is the point.
+   */
+  quoteIdentifier?(value: string): string;
 }
 
 /** Every property the contract's fixture type declares, in one place. */
@@ -670,9 +688,11 @@ export function describeCatalogStoreContract(boot: () => ContractStore): void {
       expect(columns).toContain('Asset_LIN_TAMCN');
 
       // And then the view itself, selected from by the name the panel just gave.
-      // Both engines quote with backticks, so one statement serves both.
+      // Quoted through the adapter, because the engines do not agree — see
+      // {@link ContractStore.quoteIdentifier}.
+      const quote = subject.quoteIdentifier ?? ((value: string) => `\`${value}\``);
       const result = await store.runQuery({
-        sql: `SELECT \`Asset_Id\` FROM \`${current?.name}\``,
+        sql: `SELECT ${quote('Asset_Id')} FROM ${quote(String(current?.name))}`,
       });
       expect(result.rowCount).toBe(1);
       expect(result.rows[0]?.Asset_Id).toBe('A-71');
