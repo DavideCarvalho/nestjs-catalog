@@ -10,6 +10,7 @@ import {
   LoadExpectationRow,
   ReusableNodeRow,
   TransformRow,
+  WorkflowReleaseRow,
   WorkflowRow,
   WorkflowStageRow,
 } from './entities/pipeline';
@@ -52,6 +53,12 @@ const OWNED = [
   // one cannot cascade a node out of somebody else's graph — so discovery can
   // reach this from nothing either.
   ReusableNodeRow,
+  // And again: a workflow's live pointer is a NUMBER on `catalog_workflow`, not
+  // a relation to this table — deliberately, since the column must be able to
+  // hold nothing at all, which is what "follow the latest save" is stored as —
+  // so discovery can reach this from nothing either, and this list is what
+  // creates it.
+  WorkflowReleaseRow,
 ];
 
 /**

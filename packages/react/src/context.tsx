@@ -52,6 +52,7 @@ import {
 // src/workflow/model.ts.
 import type {
   CatalogWorkflow,
+  CatalogWorkflowRelease,
   WorkflowDurability,
   WorkflowInput,
   WorkflowRun,
@@ -339,6 +340,32 @@ export interface WorkflowRunOptions {
    * acknowledgement and gave no reason, which is refused.
    */
   expectShrink?: string;
+  /**
+   * Run a particular released version rather than the one this graph is set to.
+   *
+   * Absent — the ordinary case — runs whatever the graph is set to run: its live
+   * version if it has one, its latest save otherwise. Present is how a newly
+   * released version gets tried **without becoming what the cron executes**,
+   * which is the half of this feature that makes the other half safe: if the
+   * only way to run a new version were to deploy it, nobody would release
+   * anything they had not already decided to ship.
+   *
+   * Naming a version here does not move the live pointer. Deploying is
+   * `setWorkflowLiveVersion`, and the two are deliberately different calls.
+   */
+  version?: number;
+}
+
+export interface WorkflowReleaseInput {
+  /**
+   * Whatever the releaser wants to say about this version.
+   *
+   * Optional, and usually empty. It is stored on the release rather than derived
+   * from anything, because the one question a rollback has to answer six months
+   * later — "what was wrong with v8?" — has no other place to be written down:
+   * the graph diff says what changed and never says why.
+   */
+  notes?: string;
 }
 
 export interface WorkflowScheduleInput {
@@ -887,6 +914,37 @@ export interface CatalogClient {
    */
   scheduleWorkflow(id: string, input: WorkflowScheduleInput): Promise<ScheduledWorkflow>;
   /**
+   * Every released version of this graph, newest first.
+   *
+   * What a version picker is built on, and what a rollback is chosen from: the
+   * entry above the live one is what you came back from. Each carries the graph
+   * as it was, so a screen can draw an old version rather than only name it.
+   */
+  listWorkflowReleases(id: string): Promise<CatalogWorkflowRelease[]>;
+  /**
+   * Freeze this graph as it currently stands. **Deploys nothing.**
+   *
+   * Answers with the release, and with the *existing* one if this version was
+   * already released — the graph has not changed, so a second release would
+   * record an event that did not happen. A screen may therefore treat this as
+   * idempotent and does not need to disable its own button to be correct.
+   */
+  releaseWorkflow(id: string, input?: WorkflowReleaseInput): Promise<CatalogWorkflowRelease>;
+  /**
+   * Choose which released version this graph runs. **This is the deploy.**
+   *
+   * The same call is going live, rolling back and un-pinning: a smaller number
+   * is the rollback, and `null` takes the graph back to running its latest save.
+   * There is no separate rollback call because there is no separate mechanism —
+   * the older graph is still stored, so repointing is the whole of it.
+   *
+   * A screen that offers this should show both numbers. `liveWorkflowVersion`
+   * from `@dudousxd/nestjs-catalog/client` is the shared answer to "which one
+   * runs now", so a console does not reimplement the rule and end up disagreeing
+   * with the scheduler about what is deployed.
+   */
+  setWorkflowLiveVersion(id: string, version: number | null): Promise<CatalogWorkflow>;
+  /**
    * What the system behind one source node looks like right now. Writes nothing.
    *
    * Takes a node and not a connector, and the swap is the whole of the move:
@@ -1097,7 +1155,31 @@ export function CatalogProvider({
           ...(options && 'expectShrink' in options && options.expectShrink !== undefined
             ? { expectShrink: options.expectShrink }
             : {}),
+          ...(options?.version === undefined ? {} : { version: options.version }),
         }),
+      listWorkflowReleases: (id) => transport.get(pipeline.workflowReleases(id)),
+      releaseWorkflow: (id, input) =>
+        transport.post<CatalogWorkflowRelease>(pipeline.workflowReleases(id), {
+          // Conditionally, for the reason `runWorkflow` spreads its two: the
+          // server distinguishes a body with no `notes` from one carrying an
+          // empty string, and a transport that serialised `undefined` would
+          // flatten the two.
+          ...(input?.notes === undefined ? {} : { notes: input.notes }),
+        }),
+      setWorkflowLiveVersion: (id, version) => {
+        if (!transport.put) {
+          throw new Error(
+            'This transport cannot PUT, so it cannot set a live version. Implement `put` on the ' +
+              'transport you passed to CatalogProvider — going live sets a pointer to a value ' +
+              'rather than appending anything, which is why the route is a PUT and not a POST.',
+          );
+        }
+        // `version` is sent even when it is null, and that is the contract
+        // rather than an oversight: the server refuses a body with no `version`
+        // key, because reading an omitted field as "un-pin" would deploy the
+        // most dangerous of the three operations by default.
+        return transport.put<CatalogWorkflow>(pipeline.workflowLive(id), { version });
+      },
       scheduleWorkflow: (id, input) => {
         if (!transport.put) {
           throw new Error(

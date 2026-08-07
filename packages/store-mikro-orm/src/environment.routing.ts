@@ -55,6 +55,8 @@ import type {
   CatalogStoreCapabilities,
   CatalogTransform,
   CatalogWorkflow,
+  CatalogWorkflowRelease,
+  CatalogWorkflowReleaseStore,
   CatalogWorkflowStore,
   CatalogWorkspaceStore,
   ConnectionCheck,
@@ -79,6 +81,7 @@ import {
   supportsSavedQueryRevisions,
   supportsTransformPins,
   supportsTransformRevisions,
+  supportsWorkflowReleases,
   supportsWorkflowStages,
   supportsWorkflows,
 } from '@dudousxd/nestjs-catalog';
@@ -606,6 +609,44 @@ export class RoutingPipelineStore implements CatalogPipelineStore {
     return supportsWorkflows(inner) ? inner.connectorsUsingWorkflow(id) : Promise.resolve([]);
   }
 
+  // Releases and the live pointer, forwarded like everything else — and the
+  // split between refusing and answering empty is the same one drawn above, for
+  // a sharper reason.
+  //
+  // The three that *change or resolve* what runs refuse when the environment's
+  // store cannot hold releases. A `setLiveWorkflowVersion` that resolved to a
+  // quiet no-op would report a successful deploy and leave the pipeline running
+  // the old graph; a `getWorkflowAt` that answered `undefined` on a store which
+  // could have answered would be indistinguishable from an evicted version, and
+  // the caller's correct response to that is to fail a load. Only the list is
+  // safe to answer empty, because "this store keeps no releases" is a true and
+  // renderable sentence.
+
+  releaseWorkflow(
+    id: string,
+    releasedBy: string,
+    options?: { notes?: string },
+  ): Promise<CatalogWorkflowRelease> {
+    return requireWorkflowReleases(this.inner).releaseWorkflow(id, releasedBy, options);
+  }
+
+  listWorkflowReleases(id: string): Promise<CatalogWorkflowRelease[]> {
+    const inner = this.inner;
+    return supportsWorkflowReleases(inner) ? inner.listWorkflowReleases(id) : Promise.resolve([]);
+  }
+
+  getWorkflowAt(id: string, version: number): Promise<CatalogWorkflow | undefined> {
+    return requireWorkflowReleases(this.inner).getWorkflowAt(id, version);
+  }
+
+  setLiveWorkflowVersion(
+    id: string,
+    version: number | undefined,
+    changedBy: string,
+  ): Promise<CatalogWorkflow> {
+    return requireWorkflowReleases(this.inner).setLiveWorkflowVersion(id, version, changedBy);
+  }
+
   writeStage(input: {
     runId: string;
     nodeId: string;
@@ -693,6 +734,23 @@ function requireWorkflows(
 ): CatalogPipelineStore & CatalogWorkflowStore {
   if (!supportsWorkflows(store)) {
     throw new BadRequestException("This environment's pipeline store cannot hold workflows.");
+  }
+  return store;
+}
+
+/**
+ * Refuses rather than resolving to a no-op, for the reason `saveWorkflowSchedule`
+ * is required rather than probed: the calls behind this decide what a cron
+ * executes, and a deploy that silently did nothing would report success while
+ * the pipeline kept running the graph it was meant to move off.
+ */
+function requireWorkflowReleases(
+  store: CatalogPipelineStore,
+): CatalogPipelineStore & CatalogWorkflowReleaseStore {
+  if (!supportsWorkflowReleases(store)) {
+    throw new BadRequestException(
+      "This environment's pipeline store cannot hold workflow releases, so there is no version to freeze and nothing to point a schedule at.",
+    );
   }
   return store;
 }

@@ -278,6 +278,36 @@ export interface PipelineRoutes {
    */
   workflowSchedule(id: string): string;
   /**
+   * Frozen versions of this graph. GET lists them newest first, POST mints one.
+   *
+   * A sub-resource of the graph rather than a top-level listing, because a
+   * release has no identity away from the workflow it is a release of — the same
+   * reasoning `transformRevisions` follows one object over.
+   *
+   * **Pressing POST deploys nothing.** It writes an immutable copy of the graph
+   * as it currently stands and answers with it; what runs is unchanged until
+   * somebody presses {@link PipelineRoutes.workflowLive}. The two are separate
+   * routes because they are separate decisions, and a screen that offered them
+   * as one button would rebuild the coupling this pair exists to break.
+   */
+  workflowReleases(id: string): string;
+  /**
+   * Which released version this graph actually runs. **This is the deploy.**
+   *
+   * `PUT` a `{ version }` to go live, and the same `PUT` with a smaller number
+   * is the rollback — there is no separate rollback route because there is no
+   * separate mechanism, the older graph is still stored. `{ version: null }`
+   * takes the graph back to running whatever its latest save holds, which is
+   * where every graph starts and is the one call here that makes editing mean
+   * deploying again.
+   *
+   * A screen built on this needs both numbers to say anything useful: the live
+   * version and the head. `liveWorkflowVersion` from `@dudousxd/nestjs-catalog/client`
+   * is the shared answer to "which one runs", so a console does not compute it
+   * with its own `??` and end up disagreeing with the scheduler.
+   */
+  workflowLive(id: string): string;
+  /**
    * What the system behind one source node looks like right now. Writes nothing.
    *
    * `connectors/:id/discover` before. It had to move rather than be dropped —
@@ -355,6 +385,8 @@ export function pipelineRoutes(basePath: string = DEFAULT_PIPELINE_BASE_PATH): P
     unpublishWorkflow: (id) => `${base}/workflows/${encodeURIComponent(id)}/unpublish`,
     runWorkflow: (id) => `${base}/workflows/${encodeURIComponent(id)}/run`,
     workflowSchedule: (id) => `${base}/workflows/${encodeURIComponent(id)}/schedule`,
+    workflowReleases: (id) => `${base}/workflows/${encodeURIComponent(id)}/releases`,
+    workflowLive: (id) => `${base}/workflows/${encodeURIComponent(id)}/live`,
     discoverSourceSchema: (id, nodeId) =>
       `${base}/workflows/${encodeURIComponent(id)}/nodes/${encodeURIComponent(nodeId)}/discover`,
     saveNodeAsReusable: (id, nodeId) =>

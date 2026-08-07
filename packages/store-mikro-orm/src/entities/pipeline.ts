@@ -366,6 +366,29 @@ export class WorkflowRow {
   graphHash!: string;
 
   /**
+   * Which released version runs when nobody names one. Null means the latest.
+   *
+   * **Nullable with no default, and that is the migration decision** — the
+   * opposite of the two `status` and `enabled` make below, arrived at by the
+   * same test. Those two default to something because leaving them empty would
+   * stop a working pipeline. This one defaults to *nothing* because filling it
+   * in would change what a working pipeline runs: a backfill pointing every
+   * existing graph at its current version would be a deploy of every pipeline on
+   * the deployment, performed by a migration, at a moment nobody chose. So every
+   * row already in a database keeps following its head, exactly as it does
+   * today, until a person points this somewhere.
+   *
+   * Not a foreign key to `catalog_workflow_release`, and not because of the
+   * usual cascade argument. The column has to be able to hold *nothing*, which
+   * is the state that means "follow the latest", and the store already refuses
+   * to set it to a version with no release behind it — a constraint here would
+   * add nothing except a delete behaviour to choose, on a table nothing deletes
+   * from.
+   */
+  @Property({ nullable: true })
+  liveVersion?: number;
+
+  /**
    * The type the sink writes, lifted out of the JSON.
    *
    * Derived and stored, which is only safe because validation guarantees exactly
@@ -408,6 +431,114 @@ export class WorkflowRow {
 
   @Property({ onCreate: () => new Date(), onUpdate: () => new Date() })
   updatedAt!: Date;
+}
+
+/**
+ * One version of a graph, frozen because somebody released it.
+ *
+ * ## Why this table exists at all, given `WorkflowRow` argues against archiving
+ *
+ * Because `CatalogWorkflow`'s argument is against archiving **saves**, and this
+ * archives **releases**. The argument, in full, is that `version` is bumped on
+ * draft edits by design so a run's `workflowVersion` can never mean two graphs,
+ * and that archiving one body per version would therefore store every autosave
+ * of a canvas somebody is still dragging boxes around on. It is correct.
+ * `MySqlPipelineStore.saveWorkflow` still writes nothing here; only
+ * `releaseWorkflow` does, and only a person pressing a route reaches that. The
+ * counter stays cheap to inflate and the archive stays sparse.
+ *
+ * ## Why not a `workflow` subject in `catalog_revision`
+ *
+ * That table holds versioned bodies already and adding a subject to it is a
+ * trodden path. Two reasons not to. Its `body` is `text` — code and SQL, read by
+ * routes built to render text — and a graph is a structure. And its retention
+ * rule is a per-subject cap, which is right for code and wrong here: the row a
+ * `catalog_workflow.live_version` names is the graph production is *running*,
+ * and an eviction rule that could delete it would stop a working pipeline to
+ * enforce a storage policy. Nothing evicts from this table.
+ *
+ * ## Unbounded, and what earns that
+ *
+ * `RevisionRow` is bounded and says why: it grows with how often somebody edits,
+ * which nobody meters, and each row carries a whole body. This grows with how
+ * often somebody deliberately ships, which is a rate an operator reads off their
+ * own change process — the same test `catalog_audit_event` and
+ * `catalog_connector_run` pass to earn being append-only. A graph is also
+ * smaller than it looks: nodes and edges, with the row data living in
+ * `catalog_workflow_stage` and never here.
+ *
+ * ## No foreign key to `catalog_workflow`
+ *
+ * For the reason `RevisionRow.subjectId` has none, pointed the other way. There
+ * is one operation that removes a workflow, `deleteWorkflow`, and it already
+ * takes the connector and the entire run history with it — so the store deletes
+ * these in the same call rather than leaving the choice to a constraint. Nothing
+ * that could still name a release survives that operation, which is exactly why
+ * the call goes the opposite way from a transform's revisions, which outlive
+ * their transform *because* the runs that ran them do not.
+ */
+@Entity({ tableName: 'catalog_workflow_release' })
+// The one query: this graph's releases, newest first, and the point lookup that
+// resolves a live pointer. Both are covered by the pair — the primary key alone
+// would serve the lookup and force a scan for the list.
+@Index({ properties: ['workflowId', 'version'] })
+export class WorkflowReleaseRow {
+  /**
+   * `{workflowId}:{version}`.
+   *
+   * Derived, not random, exactly as `revisionKey` is and for the same property:
+   * a second release of one version collides with the first instead of landing
+   * beside it, so "one release per version" is enforced by the primary key
+   * rather than by a check the store has to remember to make.
+   */
+  @PrimaryKey({ length: 160 })
+  id!: string;
+
+  @Property({ length: 64 })
+  workflowId!: string;
+
+  /** The `WorkflowRow.version` this release IS — the number a run records. */
+  @Property()
+  version!: number;
+
+  /** The graph's fingerprint as released. Copied, never recomputed on read. */
+  @Property({ length: 32 })
+  graphHash!: string;
+
+  /**
+   * The nodes exactly as `catalog_workflow.nodes` held them — **sealed**.
+   *
+   * Typed as `unknown[]` for the reason `WorkflowRow.nodes` is: MikroORM hands
+   * back whatever the column holds, and declaring `WorkflowNode[]` would make
+   * every read a silent assertion about what an earlier build wrote.
+   *
+   * Copied from the stored row rather than from an opened graph, and that is the
+   * security-relevant line in this class. `MySqlPipelineStore` opens credentials
+   * on the way out of `getWorkflow`; releasing an opened graph would write those
+   * plaintext credentials into a second table that no `withOpenGraph` ever
+   * re-seals. So the release is taken from the row as stored and opened on read
+   * through the same path the workflow itself takes.
+   */
+  @Property({ type: 'json' })
+  nodes: unknown[] = [];
+
+  @Property({ type: 'json' })
+  edges: unknown[] = [];
+
+  /** The type the sink committed at this version. */
+  @Property({ length: 128 })
+  targetType!: string;
+
+  /** Whatever the releaser wanted to say. Optional, and usually empty. */
+  @Property({ type: 'text', nullable: true })
+  notes?: string;
+
+  @Property({ length: 128 })
+  releasedBy!: string;
+
+  /** Millisecond precision, matching `RevisionRow.authoredAt` for the same reason. */
+  @Property({ length: 3, onCreate: () => new Date() })
+  releasedAt!: Date;
 }
 
 /**

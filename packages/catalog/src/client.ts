@@ -256,6 +256,7 @@ export type {
   CatalogTransform,
   CatalogWorkflow,
   CatalogWorkflowCapabilities,
+  CatalogWorkflowRelease,
   ConnectorKind,
   ConnectorRun,
   TransformLanguage,
@@ -317,6 +318,13 @@ export {
   // drift this entry point exists to prevent.
   isWorkflowEdge,
   isWorkflowNode,
+  // "Which version does this actually run", answered once. A screen that showed
+  // the row's `version` beside a live pointer and left the reader to work out
+  // which one a cron would use is the exact confusion the pointer exists to
+  // remove — and a console computing it with its own `??` is a second copy of
+  // the rule, which is how the canvas and the scheduler come to disagree about
+  // what is deployed.
+  liveWorkflowVersion,
   // What a redacted password reads as. A form that lets somebody paste an
   // address has to recognise the string a read showed them, or it posts the
   // placeholder back as the password on a connection that has no stored row to
@@ -348,6 +356,9 @@ export {
   // One wording for "pinned" and "follows the latest", so an inspector cannot
   // describe following as though it were pinning — which is the whole
   // misunderstanding the pin exists to end.
+  // The same sentence, asked about a whole graph rather than one node. Shares
+  // `VersionPinCopy` with the line below so a console renders one vocabulary.
+  describeLiveVersion,
   describeVersionPin,
 } from './catalog.pipeline';
 

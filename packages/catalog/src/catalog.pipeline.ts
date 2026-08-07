@@ -2486,6 +2486,46 @@ export function describeVersionPin(version: number | undefined, subject: string)
 }
 
 /**
+ * The same question about a whole graph: does it follow its latest save, or does
+ * it run a version somebody chose?
+ *
+ * Shares {@link VersionPinCopy} and its two labels with
+ * {@link describeVersionPin} deliberately. A console that said "pinned to v6"
+ * about a transform node and invented different words for a graph would be two
+ * vocabularies for one idea, and the reader would have to work out whether they
+ * meant the same thing — which is the confusion the whole notion of a pin exists
+ * to remove.
+ *
+ * The *detail* differs, and only where the facts do. Two of them:
+ *
+ * - A node's pin can outlive the revision it names, because `catalog_revision`
+ *   is capped. A graph's cannot: releases are never evicted, precisely because
+ *   the one a live pointer names is the graph production is running. So this
+ *   copy makes no eviction caveat, and must not acquire one.
+ * - Following the latest is *cheap* for a node — everybody moves together, which
+ *   is often the point. For a graph it means editing is deploying, which is the
+ *   hazard this field was added to remove. So the unpinned sentence here is a
+ *   warning where the node's is a trade-off.
+ */
+export function describeLiveVersion(workflow: CatalogWorkflow): VersionPinCopy {
+  if (workflow.liveVersion === undefined) {
+    return {
+      pinned: false,
+      label: 'follows the latest',
+      detail: `This graph runs whatever its latest save holds, currently v${workflow.version}. Editing it is therefore the same act as deploying it: the next scheduled window runs what was last saved, with nobody having decided that it should. Releasing a version and setting it live is what separates the two.`,
+    };
+  }
+  return {
+    pinned: true,
+    label: `running v${workflow.liveVersion}`,
+    detail:
+      workflow.liveVersion === workflow.version
+        ? `This graph runs the released v${workflow.liveVersion}, which is also its latest save. Editing it from here changes nothing about what runs until a new version is released and set live.`
+        : `This graph runs the released v${workflow.liveVersion} while its latest save is v${workflow.version}. The edits since then are stored and are not running; setting a newer release live is what deploys them, and setting an older one live is a rollback.`,
+  };
+}
+
+/**
  * Which side of an {@link WorkflowIfNode} a wire leaves by.
  *
  * **Two closed values rather than free-form labels**, which was the other design
@@ -2651,6 +2691,51 @@ export interface CatalogWorkflow {
   version: number;
   /** Fingerprint of the graph at this version. See {@link workflowGraphHash}. */
   graphHash: string;
+  /**
+   * Which released version a run of this graph gets when nobody names one.
+   *
+   * **Absent means follow the latest**, which is what every graph in every
+   * deployment does today and what every existing graph keeps doing until
+   * somebody points this at something. Absence is a real answer rather than a
+   * state waiting to be filled in — the same stance {@link WorkflowCallNode}
+   * takes from the other side, where a call that named no version would run
+   * whichever one is registered when the load happens.
+   *
+   * Present, it names a {@link CatalogWorkflowRelease} — and from that moment
+   * **editing this graph stops being deploying it**. A save bumps
+   * {@link version} as it always did; the next scheduled window still runs the
+   * released version this names, because a cron tick that executed whatever the
+   * canvas happened to hold is a deploy nobody performed. Moving it is
+   * {@link CatalogWorkflowReleaseStore.setLiveWorkflowVersion}, which is a
+   * deliberate act by a named principal, and moving it *backwards* is the whole
+   * of rollback.
+   *
+   * ## Why this is a column here and not a row in an environments table
+   *
+   * Because the row is already per-environment. Environments in this catalog are
+   * physically isolated — one database each, see `catalog.environment.ts` — so
+   * this `catalog_workflow` row exists once per environment already, and a
+   * second dimension keyed on the environment id would be a table whose every
+   * query filtered on a constant. The environment is the connection, and it has
+   * been since environments were added.
+   *
+   * That is also why the field is not called `productionVersion`. "Production"
+   * in this catalog is the *name of an environment* — see `CatalogEnvironment`
+   * in `catalog.environment.ts` — so a column called that, on a row which
+   * already lives inside exactly one environment, would read as naming a
+   * different one.
+   *
+   * ## Why it does not cross a promotion
+   *
+   * `planPromotion` is explicit that version numbers do not cross: a version
+   * counts edits made in the environment it lives in, so dev's v7 and
+   * production's v7 are unrelated numbers. A pointer *to* a version inherits
+   * that argument whole — carrying this field would point the target's live
+   * pointer at whatever its own seventh edit happened to be. So
+   * `PromotableWorkflow` does not carry it, and a promoted graph arrives
+   * following the latest, exactly as a newly created one does.
+   */
+  liveVersion?: number;
   /**
    * The type the sink writes.
    *
@@ -4514,6 +4599,180 @@ export interface CatalogWorkflowStore {
 }
 
 /**
+ * One version of a graph, kept exactly as it was, because somebody said so.
+ *
+ * ## The archive `CatalogWorkflow` argues against, and why this is not it
+ *
+ * {@link CatalogWorkflow} states plainly that a graph is not revisioned, and the
+ * decisive reason it gives is the counter: {@link CatalogWorkflow.version} is
+ * bumped on **draft** edits by design, so archiving one body per version would
+ * store every autosave of a canvas somebody is still dragging boxes around on —
+ * and under a bounded archive that noise would evict the versions that actually
+ * ran. **That argument is correct and nothing here weakens it.** It is an
+ * argument against archiving *saves*, and this archives *releases*: a release is
+ * minted only by `releaseWorkflow`, which is a route a person presses, and a
+ * canvas autosave does not reach it. So the counter stays cheap to inflate, the
+ * archive stays keyed on a deliberate act, and the two now compose because they
+ * are counting different things.
+ *
+ * The second half of that docblock — that a graph is a structure and a line
+ * differ over serialised JSON would report a dragged box as a change — is also
+ * untouched. This is not a diff feature. It stores the graph so a version can be
+ * *run*, and diffing graphs remains a graph problem deserving a screen that
+ * draws one.
+ *
+ * ## Why not `catalog_revision`, which already archives versioned bodies
+ *
+ * Two reasons, and the second is the one that decides it.
+ *
+ * `CatalogRevision.body` is text a person typed — a transform's code, a saved
+ * query's SQL — and every route over it is built to render text. A graph is
+ * nodes and edges, and folding it into that column would put JSON nobody wrote
+ * in front of a differ built for source.
+ *
+ * The one that decides it is {@link CATALOG_REVISION_LIMIT}. That cap is right
+ * for code, for the reason its own docblock gives: revisions grow with how often
+ * somebody edits, which nobody meters. A release does not grow that way — it
+ * grows with how often somebody deliberately ships — and, crucially, a release
+ * is the thing a live pointer names. An eviction rule over this table could
+ * delete the graph that production is *currently running*, turning
+ * {@link CatalogWorkflow.liveVersion} into a pin nothing can honour and stopping
+ * a working pipeline on a retention policy. **So releases are never evicted.**
+ * That makes this an unbounded table, which this codebase is careful about — and
+ * it earns it on the same test `catalog_audit_event` and `catalog_connector_run`
+ * pass: one row per thing a person deliberately did, at a rate an operator can
+ * read off their own change process.
+ *
+ * ## Immutable, and there is no route that removes one
+ *
+ * Nothing edits a release and nothing deletes one. That is the strongest form of
+ * "refuse to delete the version that is live": there is no operation to refuse.
+ * The one exception is {@link CatalogWorkflowStore.deleteWorkflow}, which takes
+ * the graph, its connector and its whole run history — releases go with it,
+ * because nothing survives that could still name one. (The opposite call is made
+ * for a transform, whose revisions outlive it precisely *because* runs that ran
+ * them survive.)
+ */
+export interface CatalogWorkflowRelease {
+  /**
+   * `{workflowId}:{version}`, derived rather than random.
+   *
+   * The same construction `revisionKey` uses in the MikroORM store and for the
+   * same property: releasing the same version twice cannot append a second copy,
+   * because the second write would collide with the first rather than land
+   * beside it.
+   */
+  id: string;
+  workflowId: string;
+  /**
+   * The {@link CatalogWorkflow.version} this release IS.
+   *
+   * The same number, not a parallel sequence. A release sequence of its own was
+   * the alternative and it is worse in the one place it matters: a run records
+   * `workflowVersion`, so a second numbering would mean a run naming "v3" and an
+   * operator reading "release 3" could be two different graphs, which is exactly
+   * the ambiguity the edit counter was made cheap to avoid.
+   */
+  version: number;
+  /** Fingerprint of the graph as released. See {@link workflowGraphHash}. */
+  graphHash: string;
+  nodes: WorkflowNode[];
+  edges: WorkflowEdge[];
+  /** The type the sink committed at this version. */
+  targetType: string;
+  /** Whatever the releaser wanted to say about it. */
+  notes?: string;
+  releasedBy: string;
+  releasedAt: string;
+}
+
+/**
+ * Minting releases, and pointing at one.
+ *
+ * Its own interface mixed in optionally, for the reason {@link
+ * CatalogWorkflowStore} is: a store written against the previous shape must keep
+ * compiling, and "this deployment cannot hold releases" has to be a sentence a
+ * UI can say rather than a method missing at run time.
+ *
+ * The split from `CatalogWorkflowStore` is not only compatibility. These four
+ * are the only members in this file that can change *what a cron executes*
+ * without touching a graph, and keeping them behind their own predicate means a
+ * store can hold graphs without acquiring that power by accident.
+ */
+export interface CatalogWorkflowReleaseStore {
+  /**
+   * Freeze the graph as it currently stands, under its current version.
+   *
+   * **The only thing that mints one.** Not `saveWorkflow`, which is the autosave
+   * this whole feature exists to stop being a deploy; not `publishWorkflow`,
+   * which is idempotent and is called by a promotion apply — a release minted as
+   * a side effect of promoting configuration into an environment would be a
+   * release nobody in that environment chose.
+   *
+   * Refuses a draft, for the reason `WORKFLOW_STATUSES` already gives about what
+   * a connector may point at and what a promotion may carry: what gets shipped
+   * should be something a person declared finished.
+   *
+   * **Idempotent per version.** Releasing a graph whose current version is
+   * already released answers with the existing release rather than minting a
+   * second or overwriting its notes — the graph has not changed, so a second
+   * release would be a record of an event that did not happen, and re-attributing
+   * the first one would erase who actually shipped it.
+   */
+  releaseWorkflow(
+    id: string,
+    releasedBy: string,
+    options?: { notes?: string },
+  ): Promise<CatalogWorkflowRelease>;
+  /** Newest first. */
+  listWorkflowReleases(id: string): Promise<CatalogWorkflowRelease[]>;
+  /**
+   * The graph as it was at a released version, or `undefined`.
+   *
+   * `undefined` for a version that was never released as much as for a workflow
+   * that does not exist, and callers must treat the two the same way: **fail,
+   * never fall back to the latest.** Running the current graph because the named
+   * one could not be produced is precisely the substitution a pin is written
+   * down to prevent.
+   *
+   * Answers with a whole {@link CatalogWorkflow} rather than the bare release,
+   * because that is what a run needs: the released graph, carried on the row's
+   * present identity. The graph fields — nodes, edges, `targetType`,
+   * `graphHash`, `version` — come from the release. The operational ones —
+   * `name`, `status`, `schedule`, `enabled`, `liveVersion` — come from the row
+   * as it is now, because they are not part of what was released. A cron somebody
+   * changed this morning applies to the version that is live, not to whatever
+   * cron was on the row the day it was released.
+   */
+  getWorkflowAt(id: string, version: number): Promise<CatalogWorkflow | undefined>;
+  /**
+   * Point {@link CatalogWorkflow.liveVersion} at a released version — or clear it.
+   *
+   * One method for going live, for rolling back and for going back to following
+   * the latest, because they are one act with a different argument. Rollback in
+   * particular is not a separate mechanism to build and test: it is this call
+   * with a smaller number, and it works because the older graph is still stored.
+   *
+   * Refuses a version with no release behind it, naming what there is. A pointer
+   * accepted at a number nothing can produce would be a pipeline that stops at
+   * its next window, discovered by a load failing rather than by the person who
+   * typed it.
+   *
+   * `undefined` clears the pointer and takes the graph back to following the
+   * latest. Allowed rather than refused — it is the state every graph in every
+   * deployment is in, so refusing would strand anything that ever went live —
+   * and stated as a decision because it hands back exactly the hazard the
+   * pointer removes: from that moment, saving the graph changes what the next
+   * window runs.
+   */
+  setLiveWorkflowVersion(
+    id: string,
+    version: number | undefined,
+    changedBy: string,
+  ): Promise<CatalogWorkflow>;
+}
+
+/**
  * Where the rows between two nodes actually sit.
  *
  * Separate from {@link CatalogWorkflowStore} because they are different kinds of
@@ -4581,6 +4840,49 @@ export function supportsWorkflows(
     // is the surface a scheduling incident already came through once.
     typeof store.saveWorkflowSchedule === 'function'
   );
+}
+
+/**
+ * Whether this store can mint a release and be pointed at one.
+ *
+ * All four asked for by name, for the reason `supportsWorkflows` asks for
+ * `publishWorkflow` and `saveWorkflowSchedule` by name rather than assuming they
+ * arrive together: a store with the mint and not the pointer would narrow
+ * cleanly here, let somebody release a graph, and then fail on the call that was
+ * supposed to make it run.
+ *
+ * {@link getWorkflowAt} is the one whose absence is least visible and most
+ * expensive. A store that could hold a `liveVersion` and not resolve it would
+ * point a scheduled load at a version it cannot produce — and the only place
+ * that shows up is a cron window that stops firing.
+ */
+export function supportsWorkflowReleases(
+  store: CatalogPipelineStore,
+): store is CatalogPipelineStore & CatalogWorkflowReleaseStore {
+  return (
+    typeof store.releaseWorkflow === 'function' &&
+    typeof store.listWorkflowReleases === 'function' &&
+    typeof store.getWorkflowAt === 'function' &&
+    typeof store.setLiveWorkflowVersion === 'function'
+  );
+}
+
+/**
+ * Which version of this graph a run gets when the caller names none.
+ *
+ * The one implementation of "follow the latest unless something is live", shared
+ * by the scheduler and by the manual run route so the two cannot disagree about
+ * what a cron does and what the button next to it does. That divergence is not
+ * hypothetical: the schedule used to live on the connector and on the workflow
+ * at once, and the whole of `ConnectorScheduler`'s docblock is about what it
+ * cost to have two copies of one answer.
+ *
+ * Not a fallback in the defensive sense. `liveVersion` absent is a stated
+ * position — this graph follows its head — and this function is where that
+ * position is turned into a number, not where a missing value is patched over.
+ */
+export function liveWorkflowVersion(workflow: CatalogWorkflow): number {
+  return workflow.liveVersion ?? workflow.version;
 }
 
 /**
@@ -4706,6 +5008,7 @@ export function supportsLoadExpectations(
 
 export interface CatalogPipelineStore
   extends Partial<CatalogWorkflowStore>,
+    Partial<CatalogWorkflowReleaseStore>,
     Partial<CatalogStageStore> {
   listConnectors(): Promise<CatalogConnector[]>;
   getConnector(id: string): Promise<CatalogConnector | undefined>;

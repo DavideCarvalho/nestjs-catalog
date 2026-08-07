@@ -30,6 +30,7 @@ import {
   readWorkflowCallOutput,
   supportsReusableNodes,
   supportsTransformPins,
+  supportsWorkflowReleases,
   supportsWorkflowStages,
   supportsWorkflows,
   unreachableNodeKind,
@@ -337,11 +338,55 @@ export class WorkflowRunnerService {
     return store;
   }
 
-  /** The graph, or a refusal naming the id. */
+  /** The graph as it stands now, or a refusal naming the id. */
   async requireWorkflow(id: string): Promise<CatalogWorkflow> {
     const workflow = await this.requireStore().getWorkflow(id);
     if (!workflow) throw new NotFoundException(`No workflow ${id}`);
     return workflow;
+  }
+
+  /**
+   * The graph a run of this version executes — the head, or the release.
+   *
+   * ## What this replaces, and why it is not a loosening
+   *
+   * Every step of a run used to load the head and then call `assertSameGraph`,
+   * which failed the run when the version had moved. That refusal was right and
+   * it is still here, at the bottom: a run must not execute half of one graph
+   * and half of another. What has changed is that there is now a third answer
+   * between "the head is still v7" and "stop" — the archive can hand back v7
+   * itself — and where that answer exists it is strictly better than failing a
+   * load that was doing nothing wrong.
+   *
+   * So a run is pinned to the version it started on **for its whole life**. A
+   * release that goes live at node three of a ten-node run does not swap the
+   * graph underneath it; the run finishes on what it began, and the next window
+   * is the one that picks up the change. That is what the run row has always
+   * claimed by recording `workflowVersion` at start, and it is only now true.
+   *
+   * ## And where the archive cannot answer, nothing falls back
+   *
+   * A version that was never released is a version this cannot produce, and the
+   * run stops — exactly as it did before this method existed. Loading the head
+   * instead would be the substitution the whole feature is built to prevent,
+   * arrived at by a graph somebody edited mid-run.
+   */
+  async requireWorkflowAt(id: string, version: number): Promise<CatalogWorkflow> {
+    const head = await this.requireWorkflow(id);
+    // The overwhelmingly common case, and the one every deployment is in today:
+    // nothing has moved since the run started, so this is the read it always was
+    // and no archive is consulted.
+    if (head.version === version) return head;
+
+    const store = this.requireStore();
+    if (supportsWorkflowReleases(store)) {
+      const released = await store.getWorkflowAt(id, version);
+      if (released) return released;
+    }
+
+    throw new BadRequestException(
+      `Workflow "${head.name}" is now v${head.version}; this run started on v${version}, and there is no release of v${version} to run it from. A run must not execute half of one graph and half of another, so it stops here rather than loading something nobody drew. Releasing a version before it runs is what makes a graph edited mid-run finish on the graph it started on.`,
+    );
   }
 
   /**
@@ -394,8 +439,7 @@ export class WorkflowRunnerService {
     principalId: string;
     mode: WorkflowExecutionMode;
   }): Promise<WorkflowPlanResult> {
-    const workflow = await this.requireWorkflow(input.workflowId);
-    this.assertSameGraph(workflow, input.workflowVersion);
+    const workflow = await this.requireWorkflowAt(input.workflowId, input.workflowVersion);
 
     const opened = await this.beginRun({
       workflow,
@@ -425,8 +469,7 @@ export class WorkflowRunnerService {
    */
   async executeNode(input: WorkflowNodeStepInput): Promise<WorkflowNodeStepOutput> {
     const startedAt = Date.now();
-    const workflow = await this.requireWorkflow(input.workflowId);
-    this.assertSameGraph(workflow, input.workflowVersion);
+    const workflow = await this.requireWorkflowAt(input.workflowId, input.workflowVersion);
 
     const node = workflow.nodes.find((candidate) => candidate.id === input.nodeId);
     if (!node) {
@@ -913,22 +956,6 @@ export class WorkflowRunnerService {
   }
 
   /* --------------------------------------------------------------------- */
-
-  /**
-   * The graph this run started on is the graph it finishes on.
-   *
-   * A workflow keeps only its latest shape, so an edit between two nodes of a
-   * run would silently execute half of one graph and half of another — and the
-   * run row would name a single version for both halves. Refusing is the only
-   * honest option: the load is abandoned, the stages are kept, and the run says
-   * which version it expected.
-   */
-  private assertSameGraph(workflow: CatalogWorkflow, version: number): void {
-    if (workflow.version === version) return;
-    throw new BadRequestException(
-      `Workflow "${workflow.name}" is now v${workflow.version}; this run started on v${version}. A run must not execute half of one graph and half of another, so it stops here rather than loading something nobody drew.`,
-    );
-  }
 
   /**
    * Open this attempt's run row, having first dealt with what earlier ones left.
