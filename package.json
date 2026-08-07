@@ -24,6 +24,7 @@
     "@nestjs/testing": "11.1.19",
     "@swc/core": "1.15.41",
     "@testcontainers/mysql": "10.16.0",
+    "@testcontainers/postgresql": "10.16.0",
     "@testing-library/dom": "10.4.0",
     "@testing-library/jest-dom": "6.6.3",
     "@testing-library/react": "16.1.0",
