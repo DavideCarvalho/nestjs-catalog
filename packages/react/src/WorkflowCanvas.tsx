@@ -15,6 +15,7 @@ import {
   type NodeChange,
   NodeToolbar,
   type OnConnectEnd,
+  Panel,
   Position,
   ReactFlow,
   ReactFlowProvider,
@@ -285,6 +286,74 @@ function chromeFitPadding(railOpen: boolean, cardCollapsed: boolean): FitPadding
 function railOpenByWidth(): boolean {
   return typeof window === 'undefined' ? true : window.innerWidth >= 1024;
 }
+
+/**
+ * Whether this is a pointer that can hover at all.
+ *
+ * The whole shrink-and-expand idea below is built on hover, and hover is not a
+ * thing every pointer has. On a touch screen there is no state between "not
+ * touching" and "touching": the first contact with a pannable minimap IS a pan,
+ * so a map that expanded on touch would turn a navigation gesture into a resize
+ * gesture and move the viewport while doing it. There is no version of
+ * hover-to-expand that works there, so the honest answer is not to shrink at
+ * all — a finger gets the map exactly as it is today.
+ *
+ * `pointer: fine` as well as `hover: hover`, because the pair is what excludes a
+ * TV remote and a Wii-style pointer: those report `hover: hover` with a coarse
+ * pointer, and a 96px target you have to wave at is worse than a 200px one.
+ *
+ * Every failure answers `false` — no window, no `matchMedia` (jsdom does not
+ * implement it), or a throw. `false` means "do not shrink", which is the answer
+ * that takes nothing away, and that is the same rule
+ * {@link focusModeAtMount} follows for the same reason.
+ */
+const HOVER_POINTER_QUERY = '(hover: hover) and (pointer: fine)';
+
+function hoverCapablePointer(): boolean {
+  if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return false;
+  try {
+    return window.matchMedia(HOVER_POINTER_QUERY).matches;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * How much of its size the overview keeps while focus mode has the screen.
+ *
+ * React Flow's minimap is 200×150, and 0.48 of that is 96×72 — whole pixels on
+ * both axes, which a rounder-looking 0.5 would also give but 0.45 would not. A
+ * fractional height puts the mask's bottom edge on a half-pixel and the
+ * viewport box picks up a grey seam that reads as a border it does not have.
+ *
+ * WHAT SURVIVES AT THIS SIZE, which is the only question that matters — a
+ * shrunk minimap that reads as decoration has taken the navigation aid away and
+ * kept the pixels. At 96×72 the map still carries the one thing it is for: WHERE
+ * THE VIEWPORT IS IN THE GRAPH. That is drawn as a hole in a tinted mask, so it
+ * is an area rather than a detail, and area survives scaling — the box keeps its
+ * position and its proportion of the whole, which is the entire "am I looking at
+ * the middle of this graph or the far edge" question. The node dots keep their
+ * kind colours (see {@link miniMapColor}), so a cluster and a lone box on the
+ * other side of the graph are still two different pictures.
+ *
+ * WHAT IS SACRIFICED: reading an individual node's position precisely, and any
+ * hope of telling two adjacent nodes apart. Both are recovered by hovering, and
+ * neither was ever a gesture here — no `onNodeClick` is passed to the minimap,
+ * so a dot has never been a target.
+ *
+ * A single scale rather than a smaller `style={{ width, height }}`, and that is
+ * NOT a shortcut — see {@link FocusMiniMap} for why it is the only version of
+ * this that cannot make a drag jump under the finger.
+ *
+ * SPELLED AS A LITERAL CLASS, and it has to be. This package ships as compiled
+ * JS and the console's stylesheet points Tailwind at `dist/**\/*.js` to find the
+ * classes in it. Tailwind emits only what it can SEE in that text, so a class
+ * built as `scale-[${scale}]` survives compilation as an un-evaluated template
+ * and the rule is never generated — no error, no warning, and a focus mode
+ * whose minimap simply never shrinks. Hence one string, and the arithmetic in
+ * this comment rather than in the code: 200×150 × 0.48 = 96×72.
+ */
+const MINIMAP_FOCUSED_CLASS = 'scale-[0.48]';
 
 /* ---------------------------------------------------------------------------
  * Focus mode.
@@ -1413,6 +1482,165 @@ function miniMapColor(data: { kind?: unknown } | undefined): string {
 }
 
 /**
+ * The overview, and the one thing focus mode does to it.
+ *
+ * WHY IT SHRINKS RATHER THAN GOES
+ * -------------------------------
+ * Focus mode's argument everywhere else is that the chrome it hides is chrome
+ * you do not need while drawing. The minimap is the exception: it is a
+ * navigation aid for exactly the big graph that made somebody want the room in
+ * the first place, so taking it away is taking away the thing the mode is FOR.
+ * It shrinks to the size at which it still answers "where am I", and hovering
+ * it brings the rest back. See {@link MINIMAP_FOCUSED_CLASS} for what survives
+ * at that size and what does not.
+ *
+ * WHY A TRANSFORM AND NOT A SMALLER MINIMAP
+ * -----------------------------------------
+ * React Flow sizes the minimap from `style.width`/`style.height` (defaulting to
+ * 200×150) and derives `viewScale` from them — `boundingRect.width /
+ * elementWidth`. Its pan handler then moves the viewport by `rawClientDelta *
+ * viewScale`, reading `viewScale` LIVE from a ref on every mousemove.
+ *
+ * So shrinking the honest way — passing a smaller width and height — would
+ * change the pan gain, and change it on every frame of an animation between the
+ * two sizes. A drag that started while the map was small and expanded mid-
+ * gesture would have the viewport accelerate under the finger, continuously,
+ * for the length of the animation. That is the exact failure worth avoiding.
+ *
+ * Scaling has none of it: `style.width` stays 200 in both states, so `viewScale`
+ * is a constant and the pan gain is IDENTICAL small, large, and every frame in
+ * between. Scale is a compositor property, so the animation never touches
+ * layout, never re-renders React Flow, and never resolves against `height:
+ * auto` — which is the shape of animation that never settled under jsdom and
+ * left the card body mounted forever in a test. There is nothing here for that
+ * to happen to: the element is always mounted, always 200×150 in layout, and
+ * the only thing moving is one compositor property.
+ *
+ * (Tailwind v4 emits `scale-*` as the INDEPENDENT `scale` property rather than
+ * as `transform: scale(...)`, so the computed `transform` here reads `none` and
+ * the size lives in `scale`. It honours `transform-origin` exactly the same
+ * way, and `transition-transform` in v4 expands to `transform, translate,
+ * scale, rotate` — so the transition below does cover it. Both checked in a
+ * browser rather than assumed, because a transition that silently covers
+ * nothing is a snap that looks like a missing animation.)
+ *
+ * The residue is that while shrunk the pan gain is calibrated for the large map
+ * — a drag would move the viewport less than the small drawing suggests. On a
+ * fine pointer that state is unreachable: a drag needs a press, a press needs
+ * the pointer over the element, and the pointer being over the element is what
+ * expands it. Every drag begins on a settled, full-size map. On a touch screen
+ * there is no shrinking at all ({@link hoverCapablePointer}), so it cannot
+ * arise there either. Expand-then-pan, arrived at by geometry rather than by
+ * disabling anything.
+ *
+ * WHY IT CANNOT FLICKER
+ * ---------------------
+ * Both states are anchored at the same bottom-left corner and the transform
+ * origin is that corner, so the small box is a strict sub-rectangle of the
+ * large one. A pointer that enters the small box is therefore still inside the
+ * large box once it expands, and expansion can never move the element out from
+ * under the pointer that caused it. The one geometry that oscillates — expand,
+ * pointer now outside, collapse, repeat — needs the two boxes to disagree about
+ * a region, and containment is what rules that out.
+ *
+ * It also cannot collide with the zoom controls above it, because the expanded
+ * size is the size the minimap already is today: the gap the shrink opens up is
+ * space that was always reserved for this element, so growing back into it
+ * covers nothing that was not already covered.
+ */
+function FocusMiniMap({ focused }: { focused: boolean }) {
+  /*
+   * Read once at mount rather than subscribed to, which is the same call
+   * `railOpenByWidth` makes and for the same reason: a live query would re-shrink
+   * the map under a pointer that is resting on it because a tablet was docked.
+   * The cost of being wrong is one session on the size it booted with.
+   */
+  const [canHover] = useState(hoverCapablePointer);
+  const shrinks = focused && canHover;
+
+  return (
+    /*
+     * React Flow's own `Panel`, so this wrapper IS the panel: it takes the
+     * absolute positioning, the 15px margin, the z-index and — the reason it is
+     * `Panel` rather than a hand-rolled div — the rule that switches
+     * `pointer-events` off while a box-selection is being dragged across the
+     * canvas. The minimap inside is switched to `static` so it stops being the
+     * positioned element and becomes this one's content; without that there
+     * would be two absolutely-positioned boxes fighting over one corner.
+     */
+    <Panel
+      position="bottom-left"
+      /*
+       * THE KEYBOARD PATH, and it exists only while the map is shrunk.
+       *
+       * A minimap that expands on hover cannot be expanded by somebody who has
+       * no pointer, and `focus-within` is only an answer if something in here
+       * can hold a caret — React Flow's minimap is an `svg` with `role="img"`,
+       * which cannot. So the panel itself becomes the focus stop.
+       *
+       * Conditional on `shrinks`, and that is the whole reason this is safe:
+       * outside focus mode the tab order is byte-for-byte the one the previous
+       * round measured and settled — app nav, card, actions, rail toggle, dock,
+       * rail, canvas — because `undefined` puts no stop here at all. Inside
+       * focus mode there is one extra stop, at the end, on the element that
+       * needs it. That is a net gain for a keyboard: the minimap was never
+       * reachable before, in either mode.
+       */
+      tabIndex={shrinks ? 0 : undefined}
+      role={shrinks ? 'group' : undefined}
+      aria-label={
+        shrinks
+          ? 'Graph overview, reduced. Hold focus here, or hover it, to see it full size.'
+          : undefined
+      }
+      className={cn(
+        // An overview is worth least on the screen with least room for it:
+        // below `lg` it would cover a sixth of the canvas to describe the other
+        // five. Moved here from the minimap itself along with the positioning.
+        'hidden lg:block',
+        // The corner both states share. `scale` alone would shrink about the
+        // centre and unpin the map from the corner it is anchored to, which is
+        // also what makes the containment argument above hold.
+        'origin-bottom-left',
+        /*
+         * A tween on a transform, matching the duration and the curve the card
+         * body folds on, so the two halves of one gesture move as one gesture.
+         *
+         * `prefers-reduced-motion` gets the same end state and no transition —
+         * a CSS variant rather than the `useReducedMotion()` hook the motion
+         * components here use, because this animation is CSS and the media
+         * query is the direct expression of it. There is no state to keep in
+         * step and nothing to settle.
+         */
+        'transition-transform duration-200 ease-[cubic-bezier(0.32,0.72,0,1)]',
+        'motion-reduce:transition-none',
+        // `focus` as well as `focus-within`: the stop is on this element, so it
+        // is `focus` that fires today. `focus-within` is here so that a control
+        // added inside later expands the map rather than being drawn at half
+        // size under somebody's caret.
+        shrinks && MINIMAP_FOCUSED_CLASS,
+        shrinks && 'hover:scale-100 focus:scale-100 focus-within:scale-100',
+        // The focus ring goes on the panel, because the panel is the focus stop.
+        shrinks && 'rounded-lg outline-none focus-visible:ring-2 focus-visible:ring-sky-500',
+      )}
+    >
+      <MiniMap
+        pannable
+        zoomable
+        // Positioning now belongs to the panel above, so the minimap stops
+        // claiming a corner and just draws in the box it is given.
+        position="bottom-left"
+        nodeColor={(node) => miniMapColor(node.data)}
+        className={cn(
+          '!static !m-0',
+          '!overflow-hidden !rounded-lg !border !border-zinc-200 !shadow-sm dark:!border-zinc-800',
+        )}
+      />
+    </Panel>
+  );
+}
+
+/**
  * The graph itself, and the two states in which there is no graph to draw.
  *
  * Loading and failure are drawn inside the canvas's own frame rather than in
@@ -1443,6 +1671,7 @@ function GraphSurface({
   wiringRefusal,
   nodeMenu,
   fitPadding,
+  focused,
 }: {
   loading: boolean;
   failed: boolean;
@@ -1477,6 +1706,15 @@ function GraphSurface({
    * puts nodes under the floating panels.
    */
   fitPadding: FitPadding;
+  /**
+   * Whether focus mode has the screen — read here only by the minimap.
+   *
+   * Deliberately the MODE and not `cardCollapsed`. The card refuses to fold
+   * while the graph has no name, because the field that fixes that is inside
+   * it; the overview has no such dependency, so tying it to the refusal would
+   * leave the minimap full size for a reason that has nothing to do with it.
+   */
+  focused: boolean;
 }) {
   /*
    * Memoised because they are context values read by every node and every edge
@@ -1563,19 +1801,7 @@ function GraphSurface({
                   '!bottom-0 lg:!bottom-[9.5rem]',
                 )}
               />
-              <MiniMap
-                pannable
-                zoomable
-                position="bottom-left"
-                nodeColor={(node) => miniMapColor(node.data)}
-                // An overview is worth least on the screen with least room for
-                // it: below `lg` it would cover a sixth of the canvas to
-                // describe the other five.
-                className={cn(
-                  '!hidden lg:!block',
-                  '!overflow-hidden !rounded-lg !border !border-zinc-200 !shadow-sm dark:!border-zinc-800',
-                )}
-              />
+              <FocusMiniMap focused={focused} />
               <PendingWireLine pending={wiring.pending} />
               <WiringHint
                 pending={wiring.pending}
@@ -3078,6 +3304,7 @@ function Canvas({
       </div>
 
       <GraphSurface
+        focused={focused}
         loading={workflows.isPending}
         failed={workflows.isError}
         error={workflows.error}

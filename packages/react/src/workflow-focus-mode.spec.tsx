@@ -487,3 +487,182 @@ describe('remembering the mode', () => {
     expect(focusToggle().getAttribute('aria-pressed')).toBe('false');
   });
 });
+
+/* ---------------------------------------------------------------------------
+ * The overview.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * A pointer that can hover, or one that cannot.
+ *
+ * jsdom implements no `matchMedia` AT ALL, and the code under test answers "cannot hover" to every
+ * failure — so without a stub every test in this section would run as the touch case, and the ones
+ * asserting that the map shrinks would pass by never shrinking and never noticing. The stub is
+ * what makes the fine-pointer case reachable, and the touch case is then the SAME stub answering
+ * the other way rather than the absence of one.
+ *
+ * `prefers-reduced-motion` is answered `true` deliberately. It is what jsdom's missing `matchMedia`
+ * already means for `useReducedMotion()` in the rest of this file — the card body folds instantly
+ * — so installing this stub does not quietly turn a 220ms tween on underneath the tests above.
+ * Nothing in this section depends on that answer: the minimap's animation is CSS, so it is asserted
+ * as a class rather than as a settled value.
+ */
+function pointerThatCan(hover: boolean): void {
+  Object.defineProperty(window, 'matchMedia', {
+    configurable: true,
+    writable: true,
+    value: (query: string) => ({
+      matches: query.includes('hover: hover') ? hover : query.includes('prefers-reduced-motion'),
+      media: query,
+      onchange: null,
+      addListener: () => {},
+      removeListener: () => {},
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
+    }),
+  });
+}
+
+/**
+ * The panel the overview lives in — the element that carries the scale, the focus stop and the
+ * transition.
+ *
+ * Reached through the minimap's own test id and up one, rather than by a test id of its own: the
+ * relationship being asserted is "React Flow's minimap is INSIDE the thing focus mode resizes", and
+ * a query that walks it will fail if that ever stops being true.
+ */
+function overviewPanel(): HTMLElement {
+  const minimap = document.querySelector('[data-testid="rf__minimap"]');
+  const panel = minimap?.parentElement;
+  if (!(panel instanceof HTMLElement)) throw new Error('The overview is not in a panel');
+  return panel;
+}
+
+/** The `svg` React Flow measures its pan gain from. */
+function overviewSvg(): SVGElement {
+  const svg = document.querySelector('[data-testid="rf__minimap"] svg');
+  if (!(svg instanceof SVGElement)) throw new Error('The overview draws no svg');
+  return svg;
+}
+
+/** Turn focus mode on and wait for the card to have actually folded. */
+async function enterFocus(): Promise<void> {
+  fireEvent.click(focusToggle());
+  await waitFor(() => expect(focusToggle().getAttribute('aria-pressed')).toBe('true'));
+}
+
+describe('the overview, while focus mode has the screen', () => {
+  afterEach(() => {
+    Reflect.deleteProperty(window, 'matchMedia');
+  });
+
+  it('is left at full size until focus mode asks for the room', async () => {
+    pointerThatCan(true);
+    await openCanvas();
+
+    expect(overviewPanel().className).not.toContain('scale-[0.48]');
+  });
+
+  it('shrinks once focus mode has the screen', async () => {
+    pointerThatCan(true);
+    await openCanvas();
+    await enterFocus();
+
+    expect(overviewPanel().className).toContain('scale-[0.48]');
+  });
+
+  it('goes back to full size under a pointer, and under a caret', async () => {
+    pointerThatCan(true);
+    await openCanvas();
+    await enterFocus();
+
+    // jsdom resolves no `:hover` and no `:focus-visible`, so what is asserted is that BOTH routes
+    // back to full size are declared — the pointer one and the keyboard one. That they actually
+    // fire is a browser question, and was measured in one.
+    const className = overviewPanel().className;
+    expect(className).toContain('hover:scale-100');
+    expect(className).toContain('focus:scale-100');
+    expect(className).toContain('focus-within:scale-100');
+  });
+
+  it('becomes a focus stop while it is shrunk, so a keyboard can enlarge it too', async () => {
+    pointerThatCan(true);
+    await openCanvas();
+    await enterFocus();
+
+    const panel = overviewPanel();
+    expect(panel.getAttribute('tabindex')).toBe('0');
+    expect(panel.getAttribute('role')).toBe('group');
+    // Named for what it is and what to do with it, because a focus stop that announces nothing is
+    // a place the caret lands for no stated reason.
+    expect(panel.getAttribute('aria-label')).toMatch(/overview/i);
+    expect(panel.getAttribute('aria-label')).toMatch(/full size/i);
+  });
+
+  it('is not a focus stop at all outside focus mode, so the tab order is the one that was settled', async () => {
+    pointerThatCan(true);
+    await openCanvas();
+
+    const panel = overviewPanel();
+    expect(panel.getAttribute('tabindex')).toBeNull();
+    expect(panel.getAttribute('role')).toBeNull();
+  });
+
+  it('does not shrink for a pointer that cannot hover, because a tap there is a pan', async () => {
+    pointerThatCan(false);
+    await openCanvas();
+    await enterFocus();
+
+    const panel = overviewPanel();
+    // The whole treatment is off: no scale, and no focus stop invented to undo a scale that never
+    // happened. A finger gets the map exactly as it is outside focus mode.
+    expect(panel.className).not.toContain('scale-[0.48]');
+    expect(panel.getAttribute('tabindex')).toBeNull();
+  });
+
+  it('resizes on a transform, and not at all when motion is unwelcome', async () => {
+    pointerThatCan(true);
+    await openCanvas();
+    await enterFocus();
+
+    const className = overviewPanel().className;
+    // A transform rather than a width: it is the property that does not touch layout, and — see
+    // `FocusMiniMap` — the only one that leaves React Flow's pan gain alone.
+    expect(className).toContain('transition-transform');
+    expect(className).toContain('origin-bottom-left');
+    expect(className).toContain('motion-reduce:transition-none');
+  });
+
+  it('never unmounts the overview, in either state', async () => {
+    pointerThatCan(true);
+    await openCanvas();
+    expect(document.querySelector('[data-testid="rf__minimap"]')).not.toBeNull();
+
+    await enterFocus();
+
+    // The lesson from the card body, applied before it could be repeated: this is an animation of
+    // the same shape, and the version of it that resolves against `height: auto` never settled
+    // under jsdom, so `AnimatePresence` never unmounted and the collapsed content stayed in the
+    // document forever. Nothing here is ever unmounted or conditionally rendered, so there is no
+    // presence to settle and no way for this to lie the way that did.
+    expect(document.querySelector('[data-testid="rf__minimap"]')).not.toBeNull();
+  });
+
+  it('keeps the geometry React Flow pans by identical in both states', async () => {
+    pointerThatCan(true);
+    await openCanvas();
+
+    // React Flow derives `viewScale` — the number its pan handler multiplies raw pointer deltas by
+    // — from the minimap's own width and height. This assertion IS the panning argument: because
+    // the shrink is a transform and never touches these, the pan gain is the same small, large,
+    // and on every frame in between, so a drag cannot accelerate under the finger mid-animation.
+    expect(overviewSvg().getAttribute('width')).toBe('200');
+    expect(overviewSvg().getAttribute('height')).toBe('150');
+
+    await enterFocus();
+
+    expect(overviewSvg().getAttribute('width')).toBe('200');
+    expect(overviewSvg().getAttribute('height')).toBe('150');
+  });
+});
