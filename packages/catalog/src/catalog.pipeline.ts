@@ -5294,12 +5294,14 @@ function producedColumns(
  */
 function checkColumnsProduced(graph: WorkflowGraph, issues: WorkflowValidationIssue[]): void {
   for (const node of graph.nodes ?? []) {
+    // Narrowed off the union rather than tested with a property check, so a kind
+    // that starts naming columns without being answered for here is a type error
+    // at `missingColumnMessage` and not a check that silently passes.
+    if (node.kind !== 'filter' && node.kind !== 'rename') continue;
     const named =
       node.kind === 'filter'
         ? workflowFilterColumns(node.predicate)
-        : node.kind === 'rename'
-          ? Object.keys(node.columns ?? {})
-          : [];
+        : Object.keys(node.columns ?? {});
     if (named.length === 0) continue;
     const known = workflowKnownColumns(graph, node.id);
     if (known === undefined) continue;

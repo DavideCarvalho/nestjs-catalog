@@ -75,6 +75,9 @@ describe('what may be saved as a reusable node', () => {
     expect(nodeKindIsReusable('transform')).toBe(false);
     expect(nodeKindIsReusable('call')).toBe(false);
     expect(nodeKindIsReusable('filter')).toBe(false);
+    // A rename map names one source's own spelling of its own headers, so a
+    // shared one renames nothing in a graph reading anything else.
+    expect(nodeKindIsReusable('rename')).toBe(false);
   });
 });
 
