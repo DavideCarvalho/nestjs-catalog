@@ -127,14 +127,19 @@ source, transform and sink all run at once. Over the real 102,519-row `af_fleet.
 because a 44 MB JSON result exceeds `MAX_OUTPUT_BYTES`; the streamed arm holds 152 MB, and 217 MB at
 1.2 million records.
 
-**Which path is bounded end to end, and which is not.** A **connector** streams the whole way:
+**Which path is bounded end to end, and in what sense.** A **connector** streams the whole way:
 `source.records` goes into the child and the child's rows go into `appendBatches`, so back-pressure
-reaches the file descriptor. A **workflow graph** does not — its source node stages its whole output
-before any downstream node reads a row of it, which is deliberate and documented on `runSource`.
-What a graph gains from this mode is that its *transform node* no longer holds the whole of its
-input in the heap on top of that: it reads one staged batch, maps it, and writes what came out, the
-way the filter node already did. Staging a source incrementally is a separate change, and
-`runSource` marks the line.
+reaches the file descriptor. A **workflow graph** now does too, node by node. Its source node stages
+its output *as the fetcher produces it* (`stageStream`), its filter and per-record transform nodes
+read one staged batch at a time, and its rename node rewrites a batch's shape dictionary without
+decoding a row — so nothing on that path holds a whole load, and back-pressure reaches the file
+descriptor through the stage writes.
+
+The difference that remains is a **round trip through storage between nodes**, and it is the point
+of a graph rather than a defect in it: a node's output is staged so that the next node can be a
+separate durable step, resumable and checkpointed on its own. A connector has one node and therefore
+no boundary to cross. So a graph is *bounded* end to end without being as *cheap* as a single
+streamed connector, and those are different claims.
 
 **The mode is declared and never inferred.** Destructuring is not reliably introspectable and a
 parameter name is the author's to choose, and both wrong guesses commit silently: guess towards
