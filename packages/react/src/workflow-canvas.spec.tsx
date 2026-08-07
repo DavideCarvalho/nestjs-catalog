@@ -816,14 +816,27 @@ describe('asking a source what it reads', () => {
   });
 });
 
-describe('the wiring menu on a node', () => {
-  /** Hover a node by its accessible description, then open its menu. */
+describe('the actions menu on a node', () => {
+  /**
+   * Hover a node by its accessible description, then open its menu.
+   *
+   * The pill is called **Actions** now and used to be called "Wire", which is the
+   * whole reason this feature exists: the handle beside it starts the
+   * click-to-connect gesture, that gesture is also called wiring, and the person
+   * who asked for a right-click menu had pressed the handle, got a wire, and
+   * concluded that was the feature — "Apertei na borda e só deu wire ué". Two
+   * affordances with one name, and the one carrying the menu was the smaller.
+   *
+   * `findByRole` rather than `getByRole` on the way out: the popup is portalled
+   * and positioned, so it is not in the document on the tick the trigger is
+   * clicked.
+   */
   async function openMenuOn(label: string) {
     const node = document.querySelector(`.react-flow__node[aria-label^="${label}"]`);
     if (!node) throw new Error(`No canvas node whose description starts "${label}"`);
     fireEvent.mouseEnter(node);
-    fireEvent.click(await screen.findByLabelText(/^Wire /));
-    return screen.getByRole('menu');
+    fireEvent.click(await screen.findByLabelText(/^Actions for /));
+    return await screen.findByRole('menu');
   }
 
   it('offers only what the graph allows: a sink is offered nothing downstream', async () => {
@@ -1605,3 +1618,134 @@ function readCallNodes(body: unknown): Array<Record<string, unknown>> {
   }
   return calls;
 }
+
+/**
+ * Right-clicking the canvas.
+ *
+ * WHAT IS CHECKED HERE AND WHAT IS NOT
+ * ------------------------------------
+ * The *contents* of every menu are pinned in `workflow/canvas-menu.spec.ts`, against the model,
+ * because that is where the rules live and a portalled popup in a layout-less DOM is a bad place
+ * to ask "is a sink offered anything downstream". What is checked here is the wiring — that the
+ * right event on the right target opens the right menu — and the one thing only observable at this
+ * level: **which right-clicks the canvas declines to take over.** Placement near a viewport edge is
+ * checked in a real browser; jsdom has no layout and would pass it for the wrong reason.
+ */
+describe('right-clicking the canvas', () => {
+  async function rightClick(target: Element) {
+    // `button: 2` is what `anchorFor` reads to tell a pointer from the context-menu key.
+    fireEvent.contextMenu(target, { button: 2, clientX: 400, clientY: 300 });
+    return await screen.findByRole('menu');
+  }
+
+  it('opens a node’s own menu, and the browser’s does not also appear', async () => {
+    const { transport } = fakeTransport(answersFor([wholeWorkflow()]));
+    await openCanvas(transport);
+
+    const target = document.querySelector('.react-flow__node[aria-label^="source node, Feed"]');
+    if (!target) throw new Error('No source node on the canvas');
+    const event = new MouseEvent('contextmenu', {
+      bubbles: true,
+      cancelable: true,
+      button: 2,
+      clientX: 400,
+      clientY: 300,
+    });
+    target.dispatchEvent(event);
+
+    // Cancelled, which is what stops the browser drawing its own menu over this one.
+    expect(event.defaultPrevented).toBe(true);
+    const menu = await screen.findByRole('menu');
+    expect(within(menu).getByText('New transform')).toBeDefined();
+    expect(within(menu).getByText('Open Feed')).toBeDefined();
+  });
+
+  it('leaves the browser’s menu alone inside a text field', async () => {
+    // The one thing a canvas must not do: take over right-click everywhere. Cut, copy, paste and
+    // spell-check are the only useful menu inside an input, and this canvas has nothing better.
+    const { transport } = fakeTransport(answersFor([wholeWorkflow()]));
+    await openCanvas(transport);
+
+    const field = screen.getByLabelText('Name');
+    const event = new MouseEvent('contextmenu', { bubbles: true, cancelable: true, button: 2 });
+    field.dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(false);
+    expect(screen.queryByRole('menu')).toBeNull();
+  });
+
+  it('offers to add a node where the pointer is, on empty canvas', async () => {
+    const { transport } = fakeTransport(answersFor([wholeWorkflow()]));
+    await openCanvas(transport);
+
+    const pane = document.querySelector('.react-flow__pane');
+    if (!pane) throw new Error('No React Flow pane');
+    const menu = await rightClick(pane);
+
+    // Every kind, derived from `WORKFLOW_NODE_KINDS` — the row this replaced was hand-written, and
+    // that is exactly how `filter` shipped with no way to create it.
+    expect(within(menu).getByText('New source')).toBeDefined();
+    expect(within(menu).getByText('New filter')).toBeDefined();
+    expect(within(menu).getByText('Tidy the layout')).toBeDefined();
+  });
+});
+
+/**
+ * Deleting a node without opening its inspector.
+ *
+ * The gestures were asked for — *"tem que ter uma forma mais rápida de deletar o nó… talvez no
+ * hover tipo o wire"* — and what makes them safe to add is that the canvas now has a real undo.
+ * What undo does NOT do is make it visible that a node took two other nodes' wiring with it, so
+ * that is the part checked here.
+ */
+describe('removing a node without opening its inspector', () => {
+  /**
+   * Hover a node and return its delete button.
+   *
+   * Matched on the exact accessible name — "Delete Feed" and not `/^Delete /` — because the header
+   * carries "Delete this workflow", and a loose matcher finds both. That failure reads as a
+   * duplicate render rather than as an over-broad query, and the whole point of naming the node in
+   * the button's label is that a screen reader hears which box it is about.
+   */
+  async function hover(label: string, name: string) {
+    const node = document.querySelector(`.react-flow__node[aria-label^="${label}"]`);
+    if (!node) throw new Error(`No canvas node whose description starts "${label}"`);
+    fireEvent.mouseEnter(node);
+    return await screen.findByLabelText(`Delete ${name}`);
+  }
+
+  it('removes it from the hover toolbar in one click', async () => {
+    const { transport } = fakeTransport(answersFor([wholeWorkflow()]));
+    await openCanvas(transport);
+
+    fireEvent.click(await hover('source node, Feed', 'Feed'));
+
+    await waitFor(() => expect(screen.queryAllByText('Feed')).toHaveLength(0));
+  });
+
+  it('says the wires went too, rather than leaving it to be noticed later', async () => {
+    const { transport } = fakeTransport(answersFor([wholeWorkflow()]));
+    await openCanvas(transport);
+
+    fireEvent.click(await hover('source node, Feed', 'Feed'));
+
+    // In the polite live region, which is a canvas's only feedback to somebody who cannot see it:
+    // a node vanishing is silence.
+    expect(await screen.findByText(/connection it was part of went with it/)).toBeDefined();
+  });
+
+  it('is one undo entry, and Ctrl+Z puts the node and its wiring back', async () => {
+    // The trade this whole feature rests on: no confirmation dialog — which is friction people
+    // learn to click through without reading — and the canvas's own undo instead.
+    const { transport } = fakeTransport(answersFor([wholeWorkflow()]));
+    await openCanvas(transport);
+
+    fireEvent.click(await hover('source node, Feed', 'Feed'));
+    await waitFor(() => expect(screen.queryAllByText('Feed')).toHaveLength(0));
+
+    fireEvent.keyDown(document.body, { key: 'z', ctrlKey: true });
+
+    await waitFor(() => expect(screen.queryAllByText('Feed').length).toBeGreaterThan(0));
+    expect(panel('Wiring').getByLabelText('Disconnect Feed from Out')).toBeDefined();
+  });
+});

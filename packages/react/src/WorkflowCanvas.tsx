@@ -56,7 +56,7 @@ import {
   X,
 } from 'lucide-react';
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
-import type { ReactNode } from 'react';
+import type { MouseEvent as ReactMouseEvent, ReactNode } from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { connectionOptionsFor } from './ConnectionPanel';
 import { TransformEditor } from './TransformEditor';
@@ -90,6 +90,22 @@ import { Select, SelectField, type SelectOption } from './ui/select';
 import { Sheet } from './ui/sheet';
 import { Switch } from './ui/switch';
 import { Tooltip, TooltipProvider } from './ui/tooltip';
+import {
+  type CanvasMenuActions,
+  type CanvasMenuContext,
+  type CanvasMenuSection,
+  type CanvasMenuTarget,
+  buildCanvasMenu,
+  deleteCost,
+} from './workflow/canvas-menu';
+import {
+  graphWithNodeBetween,
+  newEdge,
+  newKindsFrom,
+  newNodeOfKind,
+  nodeBetween,
+  uniqueName,
+} from './workflow/create';
 import { WorkflowEdgeProvider, workflowEdgeTypes } from './workflow/edges';
 import {
   NODE_HEIGHT,
@@ -127,6 +143,7 @@ import {
   ShrinkRefusalNote,
   WorkflowStatusBadge,
 } from './workflow/lifecycle';
+import { CanvasContextMenu, type MenuAnchorRect, NodeActionsToolbar } from './workflow/menu';
 import {
   type CallableWorkflowBlock,
   type CallableWorkflowRef,
@@ -174,6 +191,8 @@ import {
 } from './workflow/model';
 import { WORKFLOW_NAME } from './workflow/name';
 import { WorkflowNodeProvider, workflowNodeTypes } from './workflow/nodes';
+import { freeSpot, placeNextTo } from './workflow/place';
+import { removeNodes, wiresOn } from './workflow/removal';
 import { RunsAsPanel } from './workflow/runs';
 import type { ShapeKnowledge, SourceShape } from './workflow/shape';
 import {
@@ -834,98 +853,6 @@ function nextSelection(
   return next;
 }
 
-/**
- * A fresh node of one kind, carrying only the fields that kind has.
- *
- * Built per kind rather than as one shape with optional fields, because the
- * executable model is a discriminated union: a source carries a source kind and
- * a config, a transform carries a transform, a sink carries the type it commits,
- * and nothing carries a field belonging to another kind.
- */
-function newNodeOfKind(
-  kind: WorkflowNodeKind,
-  id: string,
-  position: { x: number; y: number },
-  name: string,
-): WorkflowNode {
-  if (kind === 'source') {
-    return { id, name, kind: 'source', sourceKind: 'http', config: {}, position };
-  }
-  if (kind === 'transform') {
-    return { id, name, kind: 'transform', transformId: '', position };
-  }
-  if (kind === 'call') {
-    // Both empty, and the graph is invalid until they are not — deliberately.
-    // There is no list of workflows to default from (see `CallableWorkflowRef`
-    // in core), and defaulting a *version* to "1" would be the one guess that
-    // matters: it would silently pin whichever code happens to be registered as
-    // version 1 in whatever deployment this graph is promoted into.
-    return { id, name, kind: 'call', callName: '', callVersion: '', config: {}, position };
-  }
-  if (kind === 'if') {
-    // No variable, so the graph is invalid until somebody names one. There is
-    // nothing to guess: which variable tells this deployment apart from another
-    // is the entire content of the node, and a default would be a decision the
-    // graph appears to make and nobody authored.
-    //
-    // The *kind* of test does get a default, and it is the deployment one,
-    // because a predicate has to be one of them and an empty variable name is a
-    // gate that visibly refuses to publish. A row-count gate with its default
-    // threshold would publish happily while testing something nobody chose.
-    return { id, name, kind: 'if', predicate: { kind: 'env', envVar: '' }, position };
-  }
-  if (kind === 'filter') {
-    // One empty comparison rather than an empty `all`, and rather than nothing.
-    //
-    // Nothing is not available: the model has no "no predicate yet" state, on
-    // purpose, because a filter whose test is absent has to be given one by
-    // somebody and every default is a rule about rows nobody wrote. An empty
-    // `all` *is* representable and is refused by the validator, which is exactly
-    // why it is not the starting point — a group with no conditions keeps every
-    // row, so a filter that started that way would draw as a working node that
-    // does nothing.
-    //
-    // So it starts as one comparison with no column, which the validator refuses
-    // by name: the node says "needs a column" on the canvas from the moment it
-    // is dropped. The operator defaults to `equals` because it is the only one
-    // that is a guess about *form* rather than about data — every other choice
-    // implies something about the column's type before a column is chosen.
-    return {
-      id,
-      name,
-      kind: 'filter',
-      predicate: { kind: 'compare', column: '', operator: 'equals', value: '' },
-      position,
-    };
-  }
-  if (kind === 'sink') {
-    return { id, name, kind: 'sink', targetType: '', position };
-  }
-  return unreachableNodeKind(kind, 'newNodeOfKind');
-}
-
-/**
- * A wire, with its branch already decided when it leaves an `if`.
- *
- * Assigned here rather than left blank for somebody to fill in, because a blank
- * one is refused by `validateWorkflow` and the refusal would fire on the very
- * first wire out of a node somebody just created — the premature-error problem
- * `partitionProblems` exists to describe, arrived at from a different direction.
- *
- * The first wire out of a gate is the `then`, the second is the `else`, and
- * after that it is `then` again. That ordering is not arbitrary: those are the
- * two somebody is drawing when they draw a gate, in that order, and a third wire
- * is fan-out on a side they then choose in the inspector. Every one of them is
- * editable there, so this is a default and never a decision.
- */
-function newEdge(nodes: WorkflowNode[], edges: WorkflowEdge[], from: string, to: string) {
-  const source = nodes.find((node) => node.id === from);
-  if (source?.kind !== 'if') return { from, to };
-  const taken = edges.filter((edge) => edge.from === from).map((edge) => edge.branch);
-  const free = WORKFLOW_BRANCH_LABELS.find((label) => !taken.includes(label));
-  return { from, to, branch: free ?? 'then' };
-}
-
 /** The same graph with one wire moved onto the other side of its gate. */
 function edgeOnBranch(
   edges: WorkflowEdge[],
@@ -1017,99 +944,6 @@ function runningTransform(
   return nodes.map((node) =>
     node.id === nodeId && node.kind === 'transform' ? { ...node, transformId } : node,
   );
-}
-
-/**
- * A name nobody has used yet, so the fourth transform is not also "Transform".
- *
- * Every node used to be born called exactly `defaultLabel(kind)`, which is how
- * a graph ends up with three boxes called "Transform" and a problem message
- * that has to fall back to naming the id — `Sink (sink_3b5a…)` — because the
- * name it was given identifies nothing. A message that names an id is a message
- * whose reader has to go hunting for which box it means.
- *
- * Compared against what nodes are *called* rather than against a counter, so
- * renaming "Transform 2" to "Join" frees the number again, and so a name typed
- * by hand is never duplicated by one generated afterwards. `nodeName` is what
- * the rest of the screen displays, so it is what has to be unique.
- */
-function uniqueName(nodes: WorkflowNode[], kind: WorkflowNodeKind): string {
-  const base = defaultLabel(kind);
-  const taken = new Set(nodes.map((node) => nodeName(node)));
-  if (!taken.has(base)) return base;
-  // `taken.size + 1` candidates for `taken.size` names: one of them is free, so
-  // this always returns from inside the loop.
-  for (let n = 2; n <= taken.size + 1; n += 1) {
-    const candidate = `${base} ${n}`;
-    if (!taken.has(candidate)) return candidate;
-  }
-  return `${base} ${taken.size + 2}`;
-}
-
-/**
- * The grid `layout` uses, restated because it keeps its gaps to itself.
- *
- * `NODE_WIDTH` and `NODE_HEIGHT` are exported from `workflow/graph`; the column
- * and row gaps are not. They are repeated here so that a node created by wiring
- * from another one lands on the same grid Tidy would have put it on — otherwise
- * the two disagree and pressing Tidy shuffles everything by a few pixels for no
- * reason a reader can see. If they ever drift, the consequence is spacing that
- * looks slightly off, never a node in the wrong place: the placement below is
- * defined by what is *occupied*, not by these numbers.
- */
-const COLUMN_STEP = NODE_WIDTH + 96;
-const ROW_STEP = NODE_HEIGHT + 32;
-
-/**
- * Where a node created *by wiring from another node* goes.
- *
- * One column to the right of the node that spawned it, because that is exactly
- * what the canvas's arrangement means: `layout` puts a node one column past the
- * deepest thing feeding it, and a node created by this action is fed by that
- * node and nothing else. So the position that matches the picture is not a
- * guess — it is the position the layout would have chosen anyway.
- *
- * Then down a row at a time until the spot is free. The three obvious
- * alternatives are each wrong in their own way: under the cursor puts a node
- * wherever a menu happened to be dismissed, on top of an existing node reads as
- * "the button did nothing", and off-screen — which is what `nextPosition` does,
- * correctly, for the toolbar's add buttons, since those have no parent to sit
- * beside — leaves somebody looking at an unchanged canvas. Sitting beside its
- * parent means it is on screen whenever its parent is, which is the only
- * guarantee available without measuring the viewport.
- */
-function placeNextTo(from: WorkflowNode, nodes: WorkflowNode[]): { x: number; y: number } {
-  const taken = new Set(nodes.map((node) => `${node.position?.x ?? 0},${node.position?.y ?? 0}`));
-  const x = (from.position?.x ?? 0) + COLUMN_STEP;
-  let y = from.position?.y ?? 0;
-  while (taken.has(`${x},${y}`)) y += ROW_STEP;
-  return { x, y };
-}
-
-/**
- * Which kinds of new node this one could legally feed — asked, never restated.
- *
- * The menu must offer only edges the graph allows, and the temptation is to
- * write that down: "a source may feed a transform or a sink; nothing follows a
- * sink". Writing it down is how the canvas ends up with a second copy of rules
- * that live in `canConnect`, and the first time the two disagree the menu either
- * offers an edge that is then refused or hides one that was always fine.
- *
- * So this builds a throwaway node of each kind, drops it into a copy of the
- * graph, and asks `canConnect` — the same function the drag uses, the same one
- * the "send its output to" picker filters with. The probe is never stored and
- * its id never leaves this function. When a rule changes, this follows.
- */
-function newKindsFrom(
-  from: WorkflowNode,
-  nodes: WorkflowNode[],
-  edges: WorkflowEdge[],
-): WorkflowNodeKind[] {
-  const probeId = '__probe__';
-  return WORKFLOW_NODE_KINDS.filter((kind) => {
-    const probe = newNodeOfKind(kind, probeId, { x: 0, y: 0 }, probeId);
-    return canConnect([...nodes, probe], edges, from.id, probeId).ok;
-  });
 }
 
 /**
@@ -1695,6 +1529,129 @@ function FocusMiniMap({ focused }: { focused: boolean }) {
 }
 
 /**
+ * What the hover toolbar's delete button says it will do.
+ *
+ * The whole warning, on the tooltip, because that button is an unlabelled icon
+ * and the gesture behind it does not stop to ask. It names the node, counts the
+ * wires that go with it, adds the published-graph consequence where there is
+ * one, and points at the undo that makes the whole trade defensible.
+ */
+function deleteHint(
+  node: WorkflowNode | null,
+  draft: Draft,
+  stored: CatalogWorkflow | undefined,
+): string {
+  if (!node) return 'Remove this node';
+  const cost =
+    deleteCost(wiresOn(draft.edges, [node.id]), stored?.status === 'ready') ??
+    'Nothing is wired to it.';
+  return `Delete "${nodeName(node)}". ${cost} Ctrl+Z takes it back.`;
+}
+
+/**
+ * The menu for a target, or nothing at all when there is no target.
+ *
+ * A free function rather than a ternary in the canvas, and the same for
+ * {@link nodeTarget} and {@link idsOf} below. Each of them replaces one branch
+ * inside a component that is the largest thing in this package and is held to a
+ * complexity ceiling for exactly that reason — and each reads better as a named
+ * thing than as a `?:` in the middle of a render.
+ */
+function sectionsFor(
+  target: CanvasMenuTarget | undefined,
+  context: CanvasMenuContext,
+): CanvasMenuSection[] {
+  return target ? buildCanvasMenu(target, context) : [];
+}
+
+/** The hovered or selected node as a menu target, when there is one. */
+function nodeTarget(node: WorkflowNode | null): CanvasMenuTarget | undefined {
+  return node ? { kind: 'node', nodeId: node.id } : undefined;
+}
+
+/** One node's id as a list, or an empty list. What `dropNodes` wants either way. */
+function idsOf(node: WorkflowNode | null): string[] {
+  return node ? [node.id] : [];
+}
+
+/**
+ * A menu about to open, with a wire turned back into the graph's own edge.
+ *
+ * React Flow's edge carries `source`/`target` and no branch, and the branch is
+ * the one thing an edge menu has to know: offering "move it to the else branch"
+ * on a wire that is on no branch would be offering a change `validateWorkflow`
+ * refuses, and offering nothing on a wire that IS on one would hide the largest
+ * single change anybody can make from a menu.
+ *
+ * `null` when the wire is not in the draft at all — a stale click, which happens
+ * when a menu is opened on the frame a graph is being replaced. Nothing is a
+ * better answer there than a menu about an edge that no longer exists.
+ */
+function menuOpening(
+  target: CanvasMenuTarget,
+  anchor: MenuAnchorRect,
+  edges: WorkflowEdge[],
+): { target: CanvasMenuTarget; anchor: MenuAnchorRect } | null {
+  if (target.kind !== 'edge') return { target, anchor };
+  const found = edges.find((edge) => edge.from === target.edge.from && edge.to === target.edge.to);
+  return found ? { target: { kind: 'edge', edge: found }, anchor } : null;
+}
+
+/**
+ * What the menu is about, said for somebody who cannot see where it opened.
+ *
+ * A context menu is normally identified by the thing under the pointer, and a
+ * screen reader user has no pointer — so "Menu" would be the whole of what they
+ * were told about a popup with fourteen items in it. Every branch names the node
+ * or nodes in the words that are on the canvas.
+ */
+function describeMenuTarget(target: CanvasMenuTarget | undefined, nodes: WorkflowNode[]): string {
+  if (!target) return 'Canvas menu';
+  if (target.kind === 'node') return `Actions for ${nodeLabelIn(nodes, target.nodeId)}`;
+  if (target.kind === 'edge') {
+    const from = nodeLabelIn(nodes, target.edge.from);
+    return `Actions for the connection from ${from} to ${nodeLabelIn(nodes, target.edge.to)}`;
+  }
+  if (target.kind === 'selection') return `Actions for ${target.nodeIds.length} selected nodes`;
+  return 'Canvas menu';
+}
+
+/**
+ * Where a context menu should hang, given the event that asked for one.
+ *
+ * A `contextmenu` event is not always a right-click. Pressing the dedicated
+ * context-menu key, or Shift+F10, makes the browser dispatch exactly the same
+ * event type at whatever has focus — which is what gives this canvas keyboard
+ * parity for free, and is also the case that goes wrong if the coordinates on
+ * the event are trusted.
+ *
+ * So a pointer is detected rather than assumed, and when there is not one the
+ * anchor is the focused element's own box. That is better than a corner and
+ * better than the viewport centre: the menu appears attached to the thing it
+ * acts on, which is the same promise the pointer version makes.
+ *
+ * `currentTarget` is read synchronously, inside the dispatch, which is the only
+ * time React guarantees it is set.
+ */
+function anchorFor(event: ReactMouseEvent | MouseEvent): MenuAnchorRect {
+  // `button === 2` and nothing else, which is a correction made in a browser
+  // rather than a guess. The first version of this also accepted "the
+  // coordinates are not (0, 0)" as evidence of a pointer, on the theory that a
+  // keyboard-fired event carries none — and Chrome carries the LAST MOUSE
+  // POSITION instead, measured: Shift+F10 on a node at (28, 443) produced a
+  // `contextmenu` with `button: -1` and `clientX/Y` of (188, 500), left over
+  // from a right-click somewhere else entirely. A keyboard user would have got
+  // the menu wherever they last happened to click.
+  if (event.button === 2) return { x: event.clientX, y: event.clientY, width: 0, height: 0 };
+  const on = event.currentTarget;
+  if (on instanceof Element) {
+    const box = on.getBoundingClientRect();
+    return { x: box.x, y: box.y, width: box.width, height: box.height };
+  }
+  return { x: 0, y: 0, width: 0, height: 0 };
+}
+
+/**
  * The graph itself, and the two states in which there is no graph to draw.
  *
  * Loading and failure are drawn inside the canvas's own frame rather than in
@@ -1721,6 +1678,7 @@ function GraphSurface({
   onNodeLeave,
   onPaneClick,
   onDisconnect,
+  onOpenMenu,
   wiring,
   wiringRefusal,
   nodeMenu,
@@ -1747,6 +1705,16 @@ function GraphSurface({
   onPaneClick: () => void;
   /** Reached from the × on a selected edge. The same callback the rail uses. */
   onDisconnect: (edge: WorkflowEdge) => void;
+  /**
+   * Something on the canvas was right-clicked — or the context-menu key was
+   * pressed on it, which is the same event.
+   *
+   * The anchor travels with the target because only this component can work it
+   * out: it is the pointer for a right-click and the focused element's box for a
+   * keypress, and by the time the canvas has state to render from, the event is
+   * gone.
+   */
+  onOpenMenu: (target: CanvasMenuTarget, anchor: MenuAnchorRect) => void;
   /** Click-to-click wiring, handed to the nodes and to the line that follows. */
   wiring: WorkflowWiring;
   /** Why the last click was not allowed to close a connection, if it was not. */
@@ -1784,6 +1752,26 @@ function GraphSurface({
   );
   const edgeHandlers = useMemo(() => ({ onDisconnect, canEdit }), [onDisconnect, canEdit]);
 
+  const { screenToFlowPosition } = useReactFlow();
+
+  /**
+   * One place that turns a `contextmenu` event into "this thing, anchored here".
+   *
+   * `preventDefault` is what takes the browser's own menu off the table, and it
+   * is called ONLY from the four React Flow handlers below — a node, a wire, a
+   * selection, and the pane. Every other right-click on the screen, including
+   * every text field in the chrome floating over this canvas, is left entirely
+   * alone, because a canvas has nothing better than cut/copy/paste to offer
+   * inside an input.
+   */
+  const openMenu = useCallback(
+    (event: ReactMouseEvent | MouseEvent, target: CanvasMenuTarget) => {
+      event.preventDefault();
+      onOpenMenu(target, anchorFor(event));
+    },
+    [onOpenMenu],
+  );
+
   return (
     /*
      * The surface IS the screen: pinned to all four edges, with the chrome
@@ -1813,6 +1801,29 @@ function GraphSurface({
               onNodeMouseEnter={(_event, node) => onNodeEnter(node.id)}
               onNodeMouseLeave={onNodeLeave}
               onPaneClick={onPaneClick}
+              onNodeContextMenu={(event, node) =>
+                openMenu(event, { kind: 'node', nodeId: node.id })
+              }
+              onEdgeContextMenu={(event, edge) =>
+                openMenu(event, { kind: 'edge', edge: { from: edge.source, to: edge.target } })
+              }
+              // Several nodes at once gets its own target rather than falling
+              // through to whichever node happened to be under the pointer: a
+              // menu offering "send its output to" against five boxes would be
+              // offering an action whose "its" has no referent.
+              onSelectionContextMenu={(event, nodes) =>
+                openMenu(event, { kind: 'selection', nodeIds: nodes.map((node) => node.id) })
+              }
+              // The point is converted to GRAPH coordinates here and not later,
+              // because "here" is only meaningful while the viewport is what it
+              // was when the click happened — and a menu can sit open across a
+              // pan. What the menu carries is the spot, not the pixel.
+              onPaneContextMenu={(event) =>
+                openMenu(event, {
+                  kind: 'pane',
+                  at: screenToFlowPosition({ x: event.clientX, y: event.clientY }),
+                })
+              }
               connectionLineType={ConnectionLineType.SmoothStep}
               // Off, so there is exactly ONE click path through a handle and it
               // is the one in `workflow/wiring.tsx`. React Flow's own click
@@ -1869,232 +1880,6 @@ function GraphSurface({
         </WorkflowNodeProvider>
       )}
     </div>
-  );
-}
-
-/**
- * The wiring control that lives on a node, and the menu behind it.
- *
- * WHY THIS EXISTS
- * ---------------
- * Until this, the only way to make an edge on this canvas was to drag from one
- * handle to another. That is React Flow's gesture, it is perfectly good, and it
- * is invisible: nothing on the screen says the small circles are draggable, so
- * the canvas worked for people who had used a node editor before and read as
- * broken to everybody else. The wiring rail and the inspector's picker were the
- * answers for keyboard users — they are still the answers for keyboard users —
- * but reaching either means knowing to open a panel first.
- *
- * A control on the node, offering "connect to something that exists" and "make
- * the next thing and connect it", is the ordinary affordance for this kind of
- * editor. Its absence was the whole complaint.
- *
- * WHAT IT OFFERS
- * --------------
- * Only edges the graph allows, and it does not know which those are. Every
- * option — existing target, new kind, all of it — is filtered by `canConnect`,
- * the same function the drag is refused by. Offering an edge that is then
- * rejected teaches somebody the menu is a guess; restating the node-kind rules
- * here so the menu could be "smart" would be the same rules in a second place,
- * which is how they drift.
- *
- * Disconnect is here too. Removing a wire otherwise means finding a two-pixel
- * line on a canvas and pressing Delete, or scrolling the rail to the right row;
- * the node is where somebody knows *which* wire they mean, so it is where the
- * offer belongs.
- *
- * HOW IT IS PLACED
- * ----------------
- * `NodeToolbar` with an explicit `nodeId`, which is React Flow's documented way
- * of rendering a toolbar for a node from outside that node's own component. So
- * the position comes from the same measurements the canvas draws with, and this
- * file does not do arithmetic on a viewport transform.
- */
-function NodeWiringMenu({
-  node,
-  draft,
-  canEdit,
-  open,
-  onOpenChange,
-  onHoverChange,
-  onConnect,
-  onConnectToNew,
-  onDisconnect,
-}: {
-  /** Null whenever nothing is hovered or selected, which is most of the time. */
-  node: WorkflowNode | null;
-  draft: Draft;
-  canEdit: boolean;
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  onHoverChange: (hovering: boolean) => void;
-  onConnect: (from: string, to: string) => void;
-  onConnectToNew: (from: string, kind: WorkflowNodeKind) => void;
-  onDisconnect: (edge: WorkflowEdge) => void;
-}) {
-  if (!node || !canEdit) return null;
-
-  const targets = draft.nodes.filter(
-    (candidate) => canConnect(draft.nodes, draft.edges, node.id, candidate.id).ok,
-  );
-  const kinds = newKindsFrom(node, draft.nodes, draft.edges);
-  const wires = draft.edges.filter((edge) => edge.from === node.id || edge.to === node.id);
-  const label = (id: string) => nodeLabelIn(draft.nodes, id);
-
-  return (
-    <NodeToolbar
-      nodeId={node.id}
-      isVisible
-      position={Position.Top}
-      align="end"
-      // Flush against the node. The pointer has to travel from the node to this
-      // toolbar to use it, and any gap is canvas — which means `onNodeMouseLeave`
-      // fires with nothing to catch it and the control vanishes on the way to
-      // itself. Touching, the leave and the enter land in the same React batch.
-      offset={0}
-      onMouseEnter={() => onHoverChange(true)}
-      onMouseLeave={() => onHoverChange(false)}
-      className="flex flex-col items-end gap-1"
-    >
-      <Tooltip content={`Wire ${nodeName(node)} to something, or make the next node from it.`}>
-        <button
-          type="button"
-          onClick={() => onOpenChange(!open)}
-          aria-expanded={open}
-          aria-haspopup="menu"
-          aria-label={`Wire ${nodeName(node)}`}
-          className={cn(
-            'flex items-center gap-1 rounded-md border px-1.5 py-1 text-[10px] shadow-sm',
-            RULE,
-            PANEL,
-            'hover:bg-zinc-50 dark:hover:bg-zinc-800',
-          )}
-        >
-          <Link2 size={11} />
-          Wire
-        </button>
-      </Tooltip>
-
-      {open && (
-        <div
-          role="menu"
-          aria-label={`Wiring for ${nodeName(node)}`}
-          onKeyDown={(event) => {
-            if (event.key === 'Escape') onOpenChange(false);
-          }}
-          className={cn(
-            'w-60 rounded-md border p-1 text-left shadow-lg',
-            RULE,
-            PANEL,
-            // Above the nodes, which React Flow gives a z-index of their own.
-            'z-10',
-          )}
-        >
-          <MenuGroup title="Send its output to">
-            {targets.length === 0 ? (
-              <MenuNote>
-                {/* Said rather than shown as an empty list: "nothing here" and
-                    "nothing is possible" look identical and mean different
-                    things, and for a sink the answer is permanent. */}
-                {node.kind === 'sink'
-                  ? 'A sink commits its rows. Nothing runs after one.'
-                  : 'Nothing on the canvas can take its output yet. Make one below.'}
-              </MenuNote>
-            ) : (
-              targets.map((target) => (
-                <MenuItem
-                  key={target.id}
-                  onClick={() => {
-                    onConnect(node.id, target.id);
-                    onOpenChange(false);
-                  }}
-                  icon={<ArrowRight size={11} className={MUTED} />}
-                  hint={target.kind}
-                >
-                  {nodeName(target)}
-                </MenuItem>
-              ))
-            )}
-          </MenuGroup>
-
-          {kinds.length > 0 && (
-            <MenuGroup title="Or make one">
-              {kinds.map((kind) => (
-                <MenuItem
-                  key={kind}
-                  onClick={() => onConnectToNew(node.id, kind)}
-                  icon={<Plus size={11} className={MUTED} />}
-                  hint="added and wired"
-                >
-                  New {kind}
-                </MenuItem>
-              ))}
-            </MenuGroup>
-          )}
-
-          {wires.length > 0 && (
-            <MenuGroup title="Already wired">
-              {wires.map((edge) => (
-                <MenuItem
-                  key={edgeId(edge)}
-                  onClick={() => {
-                    onDisconnect(edge);
-                    onOpenChange(false);
-                  }}
-                  icon={<Unplug size={11} className={MUTED} />}
-                  hint={edge.from === node.id ? 'feeds' : 'fed by'}
-                >
-                  Disconnect {label(edge.from === node.id ? edge.to : edge.from)}
-                </MenuItem>
-              ))}
-            </MenuGroup>
-          )}
-        </div>
-      )}
-    </NodeToolbar>
-  );
-}
-
-function MenuGroup({ title, children }: { title: string; children: ReactNode }) {
-  return (
-    <div className="py-0.5">
-      <p className={cn('px-1.5 pb-0.5 font-mono text-[9px] uppercase tracking-[0.14em]', MUTED)}>
-        {title}
-      </p>
-      {children}
-    </div>
-  );
-}
-
-function MenuNote({ children }: { children: ReactNode }) {
-  return <p className={cn('px-1.5 py-0.5 text-[11px] leading-relaxed', MUTED)}>{children}</p>;
-}
-
-function MenuItem({
-  onClick,
-  icon,
-  hint,
-  children,
-}: {
-  onClick: () => void;
-  icon: ReactNode;
-  hint: string;
-  children: ReactNode;
-}) {
-  return (
-    <button
-      type="button"
-      role="menuitem"
-      onClick={onClick}
-      className={cn(
-        'flex w-full items-center gap-1.5 rounded px-1.5 py-1 text-left text-[11px]',
-        'hover:bg-zinc-100 dark:hover:bg-zinc-800',
-      )}
-    >
-      {icon}
-      <span className="truncate">{children}</span>
-      <span className={cn('ml-auto shrink-0 font-mono text-[9px]', MUTED)}>{hint}</span>
-    </button>
   );
 }
 
@@ -2482,6 +2267,18 @@ function Canvas({
    */
   const [announcement, setAnnouncement] = useState('');
 
+  /**
+   * What was right-clicked, and where the menu should hang.
+   *
+   * One piece of state for both, because they are one event: the anchor is the
+   * pointer for a right-click and the focused element's box for the context-menu
+   * key, and neither survives the event that carried it.
+   */
+  const [contextMenu, setContextMenu] = useState<{
+    target: CanvasMenuTarget;
+    anchor: MenuAnchorRect;
+  } | null>(null);
+
   const menu = useWiringMenu(draft.nodes, selectedNodeIds);
 
   /**
@@ -2512,6 +2309,9 @@ function Canvas({
     // not cross graphs. Keeping the map would be this screen holding one graph's
     // columns while drawing another's — silence is the right state on arrival.
     setShapesByNode(new Map());
+    // A menu is about something in the graph that was on screen. Left open
+    // across a swap it would offer to disconnect wires that no longer exist.
+    setContextMenu(null);
     menu.reset();
   }, [workflows.data, selected, menu.reset]);
 
@@ -2789,6 +2589,43 @@ function Canvas({
   );
 
   /**
+   * Take nodes out, and say what went with them.
+   *
+   * The one path every deliberate node removal goes through — the hover
+   * toolbar's button, the context menu's item, the selection menu, and the
+   * inspector's "Remove this node". The Delete key reaches the same graph change
+   * through React Flow's own change stream above, which labels its undo entry
+   * the same way.
+   *
+   * The label is the FUNCTION form so it can name the node out of `current`, and
+   * a deletion always opens its own entry rather than folding into whatever came
+   * before it — it is the change somebody is most likely to want back, and it
+   * must not disappear into the drag that happened a moment earlier.
+   *
+   * What this adds over the graph change itself is the sentence. Undo makes a
+   * removal recoverable; it does not make it *visible* that a node took two
+   * other nodes' wiring with it, and nothing else on the screen says so.
+   */
+  const dropNodes = useCallback(
+    (ids: string[]) => {
+      const { said } = removeNodes(draft.nodes, draft.edges, ids);
+      if (ids.length === 0) return;
+      edit(
+        (current) => {
+          const after = removeNodes(current.nodes, current.edges, ids);
+          return { ...current, nodes: after.nodes, edges: after.edges };
+        },
+        (current) => ({ label: `deleting ${namesOf(current.nodes, ids)}` }),
+      );
+      setUnstarted((current) => without(current, ids));
+      setAnnouncement(`${said} Ctrl+Z takes it back.`);
+    },
+    [draft.nodes, draft.edges, edit],
+  );
+
+  const forgetMenu = useCallback(() => setContextMenu(null), []);
+
+  /**
    * Put a wire on the other side of its gate.
    *
    * Announced, like every other wiring change on this screen, because the only
@@ -3036,15 +2873,29 @@ function Canvas({
     },
   });
 
+  /**
+   * Add a node, somewhere.
+   *
+   * `at` is what the right-click menu supplies and the dock does not, and the
+   * difference is the whole reason "add a node here" is worth having: the dock's
+   * buttons have no idea where anybody is looking, so `nextPosition` correctly
+   * puts a node past the right-hand edge of everything that exists. Somebody who
+   * has just pointed at a patch of empty canvas has said exactly where they want
+   * it, and putting it anywhere else reads as the menu ignoring them.
+   *
+   * `freeSpot` still applies to the pointer position, so a click on a spot that
+   * is already occupied — easy to do at low zoom — drops the node below it
+   * rather than on top of it.
+   */
   const addNode = useCallback(
-    (kind: WorkflowNodeKind) => {
+    (kind: WorkflowNodeKind, at?: { x: number; y: number }) => {
       const id = newLocalId(kind);
       edit(
         (current) => {
           const node = newNodeOfKind(
             kind,
             id,
-            nextPosition(current.nodes),
+            at ? freeSpot(current.nodes, at) : nextPosition(current.nodes),
             uniqueName(current.nodes, kind),
           );
           return { ...current, nodes: [...current.nodes, node] };
@@ -3102,6 +2953,51 @@ function Canvas({
       );
     },
     [draft, edit, menu.close],
+  );
+
+  /**
+   * Put a node in the middle of a wire that already exists.
+   *
+   * `A → B` becomes `A → new → B` in one action. Four gestures before this, one
+   * of which was undoing the connection you already had — and the graph passed
+   * through a state in which it was broken, so the checks fired at somebody
+   * halfway through a perfectly ordinary edit.
+   *
+   * All the care lives in `graphWithNodeBetween`: the branch label travels with
+   * the first half, and the two new wires go in at the index the old one held so
+   * the order of a join's inputs is not silently swapped. ONE undo entry, for
+   * three graph changes, on the argument `connectToNew` already makes — it is
+   * one gesture, and taking the pieces back separately would leave a node
+   * nobody asked for stranded on a wire that no longer exists.
+   */
+  const insertBetween = useCallback(
+    (edge: WorkflowEdge, kind: WorkflowNodeKind) => {
+      // Made once, out here. An updater React chose to replay would otherwise
+      // mint a second node with a second id, and the one this function then
+      // announced and opened would not be the one on the canvas.
+      const node = nodeBetween(edge, kind, draft.nodes);
+      edit(
+        (current) => {
+          const next = graphWithNodeBetween(edge, node, current.nodes, current.edges);
+          return { ...current, nodes: next.nodes, edges: next.edges };
+        },
+        (current) => ({
+          label: `putting ${nodeName(node)} between ${namesOf(current.nodes, [
+            edge.from,
+          ])} and ${namesOf(current.nodes, [edge.to])}`,
+        }),
+      );
+      setUnstarted((current) => new Set([...current, node.id]));
+      markStarted(edge.from, edge.to);
+      setInspecting(node.id);
+      setAnnouncement(
+        `${nodeName(node)} was put between ${nodeLabelIn(draft.nodes, edge.from)} and ${nodeLabelIn(
+          draft.nodes,
+          edge.to,
+        )}. Its inspector is open.`,
+      );
+    },
+    [draft.nodes, edit, markStarted],
   );
 
   const tidy = useCallback(() => {
@@ -3223,6 +3119,71 @@ function Canvas({
   const stored = useMemo(
     () => storedWorkflow(workflows.data, draft.id),
     [workflows.data, draft.id],
+  );
+
+  /**
+   * Everything the menus can ask for, in one object.
+   *
+   * Every entry is a callback that already exists on this screen with its own
+   * announcement, its own undo label and its own `markStarted` bookkeeping. A
+   * menu that reimplemented any of them would be a second path with one of those
+   * steps quietly missing — which is exactly the class of bug that produced a
+   * canvas with two things called "wire".
+   *
+   * Deliberately NOT memoised, along with the two lists below it. Everything
+   * here is already a `useCallback`, so a dependency array would be ten entries
+   * long and would say nothing a re-render does not; what it would buy is
+   * skipping `buildCanvasMenu`, which is six `canConnect` probes over a graph
+   * with tens of nodes in it. The memo would cost more to keep right than the
+   * work it saves.
+   */
+  const menuActions: CanvasMenuActions = {
+    inspect: setInspecting,
+    editCode: setEditingCodeFor,
+    connect,
+    connectToNew,
+    insertBetween,
+    setBranch,
+    disconnect,
+    removeNodes: dropNodes,
+    addAt: addNode,
+    tidy,
+    fitAll: () => fitView({ padding: fitPadding, duration: 200 }),
+    // Fitted to the selection rather than to the graph, which is the only useful
+    // reading of "bring these into view" when the reason somebody selected them
+    // is that the graph is too big to see at once.
+    fitNodes: (ids) =>
+      fitView({ nodes: ids.map((id) => ({ id })), padding: fitPadding, duration: 200 }),
+  };
+
+  const menuContext: CanvasMenuContext = {
+    nodes: draft.nodes,
+    edges: draft.edges,
+    // Core's list, never a copy. See the note on `ADD_NODE` for the kind that
+    // shipped complete and could not be added from this screen at all.
+    kinds: WORKFLOW_NODE_KINDS,
+    canEdit,
+    published: stored?.status === 'ready',
+    actions: menuActions,
+  };
+
+  /**
+   * What the right-click menu is showing, and what the hover pill's menu is.
+   *
+   * Two lists built by one function from one model, which is the point: the pill
+   * used to own a bespoke dropdown, and the moment a context menu existed the
+   * two would have started answering "what can this node do" differently.
+   */
+  const contextSections = sectionsFor(contextMenu?.target, menuContext);
+  const toolbarSections = sectionsFor(nodeTarget(menu.anchor), menuContext);
+  const contextLabel = describeMenuTarget(contextMenu?.target, draft.nodes);
+
+  /** Open the menu on whatever was right-clicked. See {@link menuOpening}. */
+  const openMenuFor = useCallback(
+    (target: CanvasMenuTarget, anchor: MenuAnchorRect) => {
+      setContextMenu(menuOpening(target, anchor, draft.edges));
+    },
+    [draft.edges],
   );
 
   /**
@@ -3551,25 +3512,41 @@ function Canvas({
         // wire on a handle does not also cancel it on the way past.
         onPaneClick={() => {
           menu.close();
+          forgetMenu();
           wiring.cancel();
         }}
         onDisconnect={disconnect}
+        onOpenMenu={openMenuFor}
         wiring={wiring}
         wiringRefusal={wiringRefusal}
         nodeMenu={
-          <NodeWiringMenu
+          <NodeActionsToolbar
             node={menu.anchor}
-            draft={draft}
             canEdit={canEdit}
             open={menu.open}
+            sections={toolbarSections}
+            deleteHint={deleteHint(menu.anchor, draft, stored)}
             onOpenChange={menu.onOpenChange}
             onHoverChange={menu.onHoverChange}
-            onConnect={connect}
-            onConnectToNew={connectToNew}
-            onDisconnect={disconnect}
+            onDelete={() => {
+              dropNodes(idsOf(menu.anchor));
+              menu.reset();
+            }}
           />
         }
         fitPadding={fitPadding}
+      />
+
+      {/*
+       * The menu itself, outside `GraphSurface` because Base UI portals it to
+       * the document anyway — putting it inside React Flow would only mean it
+       * unmounts every time the graph does, taking an open menu with it.
+       */}
+      <CanvasContextMenu
+        opening={contextMenu}
+        sections={contextSections}
+        label={contextLabel}
+        onClose={forgetMenu}
       />
 
       {workflows.isSuccess && workflows.data.length === 0 && <NothingDrawnYet />}
@@ -3634,17 +3611,12 @@ function Canvas({
         onCreateTransform={(nodeId) => createTransform.mutate(nodeId)}
         creatingTransform={createTransform.isPending}
         createTransformError={createTransform.error}
+        // The same path the hover button, the context menu and the selection
+        // menu take. It was the only way to remove a node before those existed,
+        // and it was the only one that did not say what the removal cost.
         onDelete={(nodeId) => {
-          edit(
-            (current) => ({
-              ...current,
-              nodes: current.nodes.filter((node) => node.id !== nodeId),
-              edges: current.edges.filter((edge) => edge.from !== nodeId && edge.to !== nodeId),
-            }),
-            (current) => ({ label: `deleting ${namesOf(current.nodes, [nodeId])}` }),
-          );
+          dropNodes([nodeId]);
           setInspecting(null);
-          setAnnouncement('Node removed, along with its connections.');
         }}
         onEditCode={(nodeId) => setEditingCodeFor(nodeId)}
       />
