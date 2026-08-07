@@ -155,4 +155,45 @@ describe('the pipeline store on Postgres', () => {
       { id: 'y' },
     ]);
   });
+
+  /**
+   * The other half of `pipeline.transform-mode.spec.ts`, and the half only an
+   * engine can answer.
+   *
+   * That file asserts the mapping reads an absent mode as absent, and it hands
+   * itself the `null` to do it. **This one is the premise underneath it**: that
+   * a transform saved without a mode really does come back holding `null` and
+   * not `undefined`, so the mapping is being tested against the value it will
+   * actually be given. Without this the unit file is a test of a belief about
+   * MikroORM, and the belief was the defect: the read path spelled the absent
+   * case `=== undefined`, the `null` fell through to `narrow`, and one such row
+   * failed `listTransforms` — the whole list route — for every transform in the
+   * catalog.
+   *
+   * Written through `saveTransform` rather than through raw SQL because that is
+   * the reproduction that matters: no upgrade, no legacy row, just a transform
+   * created the ordinary way, which is what `POST /pipeline/transforms` does
+   * whenever nobody names a mode.
+   */
+  it('hands back a null mode, not undefined, for a transform saved without one', async () => {
+    const saved = await stages.saveTransform(
+      { name: 'null-mode', language: 'javascript', code: 'return records;' },
+      'ana',
+    );
+
+    // The write path's own answer, off the in-memory row — which is why the
+    // create route looked fine while the read route did not.
+    expect(saved.mode).toBeUndefined();
+
+    const stored = await db.execute(
+      `SELECT mode FROM catalog_transform WHERE id = '${saved.id}'`,
+    );
+    expect(JSON.stringify(stored)).toContain('null');
+
+    // Re-read through a fresh fork, so the row is hydrated from the column
+    // rather than served out of the identity map that just wrote it.
+    const listed = (await stages.listTransforms()).find((row) => row.id === saved.id);
+    expect(listed).toBeDefined();
+    expect(listed?.mode).toBeUndefined();
+  });
 });
