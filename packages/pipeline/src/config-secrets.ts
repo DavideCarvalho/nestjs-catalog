@@ -62,14 +62,24 @@
  */
 
 import type { CatalogConnection, CatalogConnector } from '@dudousxd/nestjs-catalog';
+import { REDACTED_SECRET } from '@dudousxd/nestjs-catalog';
 
 /**
  * What a redacted password reads as.
  *
- * A fixed literal rather than a run of asterisks, so it is greppable in a bug
- * report and cannot be mistaken for a password somebody actually chose.
+ * Declared in `@dudousxd/nestjs-catalog` and re-exported here, rather than the
+ * other way round, because the literal is part of what this route ANSWERS and
+ * the audience is a browser: a form offering somebody a box to paste an address
+ * into has to be able to recognise the string a read showed them. That package
+ * has a browser entry point and this one does not — it reaches `node:fs` and a
+ * database driver — so a console importing the constant from here would drag
+ * the server into its bundle to learn one word.
+ *
+ * Re-exported and not merely imported: every reader below, and three specs,
+ * already name it through this module, and a constant that moved package
+ * without leaving a forwarding address is a rename dressed as a refactor.
  */
-export const REDACTED_SECRET = 'REDACTED';
+export { REDACTED_SECRET };
 
 /**
  * The config as a screen may see it: every URL password replaced.

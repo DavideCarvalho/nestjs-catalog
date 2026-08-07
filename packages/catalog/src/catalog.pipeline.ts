@@ -2666,6 +2666,28 @@ export interface CatalogConnection {
   lastCheckError?: string;
 }
 
+/**
+ * What a redacted password reads as, on the wire.
+ *
+ * Declared here rather than in `@dudousxd/nestjs-catalog-pipeline`, where the
+ * redaction itself lives, because this literal is not an implementation detail
+ * of the redaction: it is part of what `GET pipeline/connections` answers, and
+ * a browser is the audience it was invented for. A form that lets somebody
+ * paste an address has to be able to recognise the string it was shown — a
+ * `url` whose password is exactly this came out of a read, and posting it back
+ * as a NEW connection stores the word "REDACTED" as the password. There is no
+ * stored row behind a create for `restoreRedactedSecrets` to put the real one
+ * back from, so nothing downstream can catch it: the row saves, and the failure
+ * arrives at the first scheduled load as an authentication error against a
+ * password nobody typed.
+ *
+ * The pipeline package re-exports this rather than declaring its own, so the
+ * two halves cannot drift. A fixed literal rather than a run of asterisks, so
+ * it is greppable in a bug report and cannot be mistaken for a password
+ * somebody actually chose.
+ */
+export const REDACTED_SECRET = 'REDACTED';
+
 /** What checking a connection found. */
 export interface ConnectionCheck {
   ok: boolean;

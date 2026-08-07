@@ -147,6 +147,25 @@ export interface PipelineRoutes {
   connection(id: string): string;
   checkConnection(id: string): string;
   /**
+   * Reach a connection that has not been saved yet.
+   *
+   * A sibling of {@link PipelineRoutes.checkConnection} and not the same route
+   * with an absent id, because the two ask for different scopes and the
+   * difference is the point: checking a SAVED connection reaches an address
+   * somebody with `catalog:write` already chose and wrote down, so it asks only
+   * `catalog:read`; this one reaches an address supplied in the request, which
+   * under `catalog:read` would be a port scanner for anybody who may look at the
+   * catalog. It therefore asks `catalog:write`.
+   *
+   * The server declares its handler BEFORE `connections/:id/check`, because Nest
+   * matches in declaration order and `:id` captures the literal "check" happily.
+   * Nothing on this side can enforce that, and it is written down here because a
+   * console that gets a 404 from this path is most likely talking to a server
+   * where the two were reordered — which reads like a missing feature rather
+   * than like a routing bug.
+   */
+  checkUnsavedConnection(): string;
+  /**
    * Which pipelines read through a connection. Named, so a refusal can say.
    *
    * `.../connectors` before, and the rename is the question actually being
@@ -270,6 +289,7 @@ export function pipelineRoutes(basePath: string = DEFAULT_PIPELINE_BASE_PATH): P
     connections: () => `${base}/connections`,
     connection: (id) => `${base}/connections/${encodeURIComponent(id)}`,
     checkConnection: (id) => `${base}/connections/${encodeURIComponent(id)}/check`,
+    checkUnsavedConnection: () => `${base}/connections/check`,
     connectionWorkflows: (id) => `${base}/connections/${encodeURIComponent(id)}/workflows`,
     connectors: () => `${base}/connectors`,
     runs: () => `${base}/runs`,

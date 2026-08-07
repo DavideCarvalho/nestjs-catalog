@@ -60,6 +60,7 @@ import {
   SchemaDiscoveryPanel,
   narrowDiscovery,
 } from './schema-discovery';
+import { SourceConnectionCreator } from './source-connection';
 import {
   INLINE_CONNECTION,
   KIND_OPTIONS,
@@ -4264,35 +4265,60 @@ function SourceInspector({
        * screen can do — paste a URL, load it once — the slowest.
        */}
       {usesConnection(kind) && (
-        <SelectField
-          label="Read through"
-          ariaLabel="Connection"
-          value={chosen}
-          onValueChange={(value) =>
-            push(source, {
-              // Omitted, never sent empty: an empty string is a connection id
-              // the server would look up and fail to find, where absent means
-              // "this source carries its own address".
-              connectionId: value === INLINE_CONNECTION ? undefined : value,
-            })
-          }
-          options={[
-            {
-              value: INLINE_CONNECTION,
-              label: 'Configure the address here',
-              hint: 'This source alone',
-            },
-            ...options,
-          ]}
-          disabled={!canEdit}
-          hint={
-            options.length === 0
-              ? 'No connections of this kind yet. One is worth making when a second source needs the same address.'
-              : viaConnection
-                ? 'The connection supplies the address and the credential. What stays below is only what is specific to this load.'
-                : undefined
-          }
-        />
+        <>
+          <SelectField
+            label="Read through"
+            ariaLabel="Connection"
+            value={chosen}
+            onValueChange={(value) =>
+              push(source, {
+                // Omitted, never sent empty: an empty string is a connection id
+                // the server would look up and fail to find, where absent means
+                // "this source carries its own address".
+                connectionId: value === INLINE_CONNECTION ? undefined : value,
+              })
+            }
+            options={[
+              {
+                value: INLINE_CONNECTION,
+                label: 'Configure the address here',
+                hint: 'This source alone',
+              },
+              ...options,
+            ]}
+            disabled={!canEdit}
+            hint={
+              options.length === 0
+                ? 'No connections of this kind yet. One is worth making when a second source needs the same address.'
+                : viaConnection
+                  ? 'The connection supplies the address and the credential. What stays below is only what is specific to this load.'
+                  : undefined
+            }
+          />
+
+          {/*
+           * …and making one, rather than only choosing one.
+           *
+           * The other half of what the sink node has had all along: its
+           * schema-discovery panel creates the type it commits, here, on a
+           * draft. A source could only pick from addresses that already
+           * existed, so a graph whose connection did not exist yet meant
+           * leaving the canvas, making it on another screen, and coming back to
+           * find the node again.
+           *
+           * Selecting it is what `push` does everywhere else on this panel, so
+           * it marks the draft dirty exactly as typing a URL into the field
+           * below would. `SourceConnectionCreator` says so where it happens —
+           * see its docblock for why that is the honest option rather than a
+           * silent selection.
+           */}
+          <SourceConnectionCreator
+            kind={kind}
+            canEdit={canEdit}
+            hasOptions={options.length > 0}
+            onCreated={(connection) => push(source, { connectionId: connection.id })}
+          />
+        </>
       )}
 
       <SourceFields
