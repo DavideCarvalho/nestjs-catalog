@@ -1,5 +1,464 @@
 # @dudousxd/nestjs-catalog-pipeline
 
+## 0.13.0
+
+### Minor Changes
+
+- 3f878f9: A filter node, whose predicate is a structure rather than code
+
+  A transform can already filter — it takes rows and returns rows, so returning a
+  subset filters — and this file's own node-kind list used to reject `filter` for
+  exactly that reason. That argument is sound about _code_, and it is why this
+  node does not take any. What changed is the predicate: a closed structure of
+  column, operator and value, combined with `all`/`any`, which is a thing
+  something other than a JavaScript engine can read.
+
+  Three reasons the kind earns itself, and the third decides the shape. It is
+  legible on the canvas without opening anything. Its effect is **reportable** —
+  the node records rows in beside rows out, so a run panel can say what was
+  dropped, where a transform records one number and a transform that quietly
+  started dropping 90% of its input looks identical to a source that got smaller.
+  And only a declarative predicate can be pushed into the source as a `WHERE`.
+  That last one is not a micro-optimisation: filtering `obj_pribuybuylistdetail`
+  in memory means every one of 7,637,391 rows is read off disk, crosses the
+  network, and becomes a JS object of ~80 properties before anything decides it
+  was unwanted.
+
+  **The pushdown is not built, and this ships saying so rather than implying it.**
+  The mechanism it would reuse already exists — `boundStatement` in `sources.ts`
+  wraps an author's query as `SELECT * FROM (…) WHERE …` with the identifier
+  quoted per dialect and the value bound — but `SourceFetcher` takes a connector,
+  a secret, a watermark and a mode and knows nothing about the graph, while the
+  runner that does know the graph dispatches by connector kind alone; threading a
+  predicate through also drags in schema discovery, which shares `sqlTarget`.
+  There is a second reason and it is the more interesting one: a pushed-down
+  filter cannot honestly report rows in, because the rows it removed were never
+  read — reason three deletes reason two, and recovering the number means a
+  `COUNT(*)` over the unfiltered query, which is the scan the pushdown was for.
+  Those are decisions, not typing, so they belong to the change that makes the
+  move. What is _not_ deferred is the part that would have made it impossible
+  later: the predicate is closed, its columns already have to match the identifier
+  pattern `boundStatement` requires, and every comparison follows **SQL's
+  three-valued logic** — a null column fails every test including the negative
+  ones — so pushing it down cannot change which rows a type ends up holding.
+
+  Meanwhile it runs in memory **one staged batch at a time**, never over the whole
+  input. The obvious implementation is `readInputs()` then `.filter()`, and that
+  is the shape that spent a day of this project's life stalling everything sharing
+  a database: one synchronous pass over millions of objects holds the event loop
+  for its whole duration. Survivors are coalesced back into full batches, so a
+  filter keeping one percent does not write fifteen thousand stage rows of five.
+
+  **The trap it had to be designed against**, and the reason `WorkflowFilterNode`
+  carries `narrows`: dropping a filter onto a working `source → sink` wire
+  replaces the published snapshot of that type with a subset, silently, because
+  from the run's point of view everything succeeded. Filtering to _derive a new
+  type_ and filtering before _recommitting the same type_ are structurally
+  identical graphs — the only difference is what the name on the sink already
+  means to the people reading it — so no rule over the shape can tell them apart
+  without inventing a signal. The graph therefore makes the author **name the
+  types**, and `validateWorkflow` requires it exactly where it matters and refuses
+  it everywhere else: every full-mode sink this node is the only path to must be
+  listed, and nothing that it is not. A filter on one of several paths into a
+  sink, or in front of an incremental one, narrows nothing and may not claim to.
+  The consequence is the intended one — that dragged-on filter produces a graph
+  that will not save until somebody writes down the name of the type they are
+  about to shrink. The sink's `maxShrink` bound is unchanged and still the last
+  word at run time.
+
+  `WorkflowNodeOutcome.rowsIn` is new and optional, and absent is not zero: a node
+  that never reported an input count and a filter that was handed nothing are
+  different facts, and defaulting would make every outcome stored before this
+  exists read as having dropped everything it produced.
+
+  Existing graphs are untouched — a graph with no filter in it hashes to exactly
+  what it always did, which is pinned by a literal recorded from the previous
+  build. Every per-kind decision still fails to compile when a kind is missing
+  from it; adding this one found seven such places on the way in, and turned up a
+  narrowing bug worth knowing about: TypeScript will **not** remove a union member
+  whose discriminant is itself a union of literals, so an `all`/`any` group
+  written as one interface silently disabled the exhaustiveness check for both.
+  It is two interfaces over a shared base for that reason.
+
+- f9ee3b8: An `if` node can branch on how many rows reached it
+
+  The case that asked for it, and it is not hypothetical: a nightly export comes
+  back empty because the upstream system is mid-maintenance. Nothing is broken —
+  so the run succeeds, the sink commits, and committing is what repoints the live
+  view of a type. Yesterday's good data stops being served, and the run reports
+  success while it happens. The `if` node already had the mechanism to prevent
+  that (a skipped node is never executed, so nothing reaches the publish
+  protocol), and it could only be pointed at an environment variable, which
+  answers a question about the _deployment_ and not about this run.
+
+  So a gate now tests one of two things, and **the shape of the test changed to
+  say so**: `WorkflowIfNode` carries a `predicate` — `{kind: 'env', envVar,
+equals?}` or `{kind: 'rowCount', atLeast}` — where it used to carry `envVar` and
+  `equals` directly. The flat alternative was to add the threshold beside them and
+  mark everything optional, and that types a gate as "a variable, maybe, and a
+  number, maybe": a node carrying both is representable, a node carrying neither
+  is representable, and every reader has to invent its own rule for which one
+  wins. A gate that runs the test its author did not choose is precisely the
+  failure this node exists to prevent, so the ambiguity is not representable
+  instead. Every decision made per predicate kind ends in
+  `unreachablePredicateKind`, so the `code` predicate this file has been promising
+  lands as a build failure listing what has to answer for it — the same treatment
+  node kinds got.
+
+  The threshold is one integer of at least one, compared one way. `atLeast: 1` is
+  "did anything arrive at all", so the common case costs nothing to express, and
+  "a full export is never legitimately under ten thousand rows" is the next thing
+  anybody asks for — it would otherwise need a second predicate kind for one
+  number. There is no `atMost` and no operator picker for the reason there is no
+  `negate` flag: the inverse is already expressible by swapping which successor is
+  on `then`, and two ways to say one thing is two places to look when a load takes
+  the branch nobody expected. A threshold of zero is refused rather than treated
+  as "always", because it is a gate that can only answer one way — the `else`
+  subtree would never run on any deployment, which is the silent half-graph
+  reached by typing a number rather than by mislabelling a wire.
+
+  **The count is read off the checkpoint, never by counting rows.** It is
+  `WorkflowStageRef.rowCount` on the step's own input — assembled by the workflow
+  body from an upstream step's recorded output — so the predicate stays a pure
+  function of what the run already wrote down, and the branch it produced is
+  recorded on the step's output exactly as the env predicate's is. A resumed run
+  on another pod reads the decision back rather than making a new one; nothing
+  queries the stage store on the replay path. A gate still touches no rows, and
+  still takes exactly one inbound edge, so "how many rows" has exactly one answer
+  and it is the count on the very ref the gate hands on.
+
+  Because `if` nodes have never been released, no stored graph carries the old
+  flat shape and nothing is migrated. A payload carrying it is refused at the HTTP
+  boundary and by `isWorkflowNode` rather than adapted — guessing the test from
+  which fields happen to be present is the ambiguity above, arrived at by being
+  helpful.
+
+  The console's gate inspector picks the kind first and then shows that kind's
+  fields, and a predicate kind added without a form there stops the build naming
+  the file.
+
+- 81a15c5: An `if` node, so one graph can serve two deployments
+
+  The case that asked for it: a local deployment has a ClickHouse and dev does
+  not. Without a conditional that is two workflows, which is two things to keep in
+  step and one of them always drifts — so the graph gains a node that decides, at
+  run time, which half of itself runs.
+
+  An `if` names an **environment variable** and takes a `then` and an `else`.
+  Declarative rather than code, and that is the safety property rather than a
+  simplification: a predicate is the one expression whose answer decides which
+  nodes exist for a run, so an answer that can differ between a run and its replay
+  is a load that goes down a path nobody chose. The evaluated branch is recorded
+  on the node's outcome the first time it is asked and read back afterwards — the
+  node runs inside a durable step, whose output is a checkpoint, and the workflow
+  body reads that record rather than the environment. A resumed run on another pod
+  therefore reproduces the first run's decision instead of making a new one.
+
+  **A sink on the untaken branch does not commit.** This is the part worth reading
+  before upgrading. Committing is what repoints the live view of a type, so a sink
+  that "ran with no rows" would publish an empty snapshot over a good dataset and
+  report success while doing it. A skipped node is not executed at all, so nothing
+  reaches the publish protocol; and because "skipped" already meant "the run
+  stopped before here", the outcome now carries `skippedBecause` so the two can be
+  told apart in the data and on the run panel. A sink stood down by a branch says
+  so in the run's log, naming the type it did not commit and saying that whatever
+  was live still is.
+
+  The skip rule is reachability from the **taken** edges, not descendants of the
+  untaken one. The obvious version is wrong on the shape branches are most often
+  drawn in: where both sides converge on one node, walking down from the untaken
+  edge skips the join — and with it the sink behind it — on a run that otherwise
+  succeeded. `workflowNodeRuns` is exported so a screen can answer "would this have
+  run" exactly the way the runner decided it.
+
+  Nothing about an existing graph changes. `WorkflowEdge.branch` is optional and
+  absent on every stored edge; an unlabelled wire is unconditional, and the graph
+  fingerprint folds the label in only when there is one, so no stored workflow is
+  renumbered and no past run becomes unidentifiable. What is refused is the pair of
+  silent mistakes: an unlabelled wire out of an `if` (a subtree that would never
+  run) and a label on a wire that leaves anything else (a decision that is drawn
+  and never read).
+
+  Every place that decides something per node kind now fails to compile when a kind
+  is missing from it, rather than falling through to the last branch. Adding `if`
+  found two such places on the way in, which is the argument for it.
+
+  The console gets the node, an inspector, and `then`/`else` labelled and coloured
+  on the wires — labelled as well as coloured, because two lines leaving one box
+  that differ only by hue are one line to a colour-blind reader, and this
+  particular difference decides which half of the pipeline runs.
+
+- 3290183: A graph exists because somebody made it, not because a boot hook inferred it
+
+  Boot-time connector adoption is removed entirely. A workflow now comes into
+  existence only because something explicitly created it through the API. `minor`
+  and not `major` on purpose — this is 0.x, and the project versions on that basis
+  rather than on whether behaviour was withdrawn.
+
+  **Why it goes.** Adoption wrapped every pre-workflow connector into a
+  single-source, single-sink graph at boot and published it as `ready`. The wrap
+  was validated, so `ready` was true in the narrow sense — it meant "this
+  validated". It was false in the sense the word is actually read on that screen,
+  which is "somebody looked at this and said it was finished". The console had
+  grown a badge and a paragraph to explain that a pipeline marked ready had no
+  author, which is the tell: a status that needs a note beside it saying it does
+  not mean what it says is the wrong status, and the honest fix is to stop minting
+  it rather than to keep apologising for it. Publishing is a decision, and a
+  process starting up is not somebody deciding.
+
+  **Gone.** `ConnectorAdoption` and the `CATALOG_ADOPT_CONNECTORS` token, the
+  `adoptConnectors` module option and its entry in `CATALOG_PIPELINE_TOKENS`,
+  `CatalogWorkflowStore.adoptConnector` with its MikroORM implementation and the
+  environment-routing delegation, and — on the console — the `adopted` badge, the
+  "adopted at boot" note, `wasAdopted` and `WORKFLOW_ADOPTION_ACTOR`.
+
+  **No migration, because there was never a column.** "Adopted" was never stored.
+  It was derived at render time from `createdBy === 'connector-adoption'`, so
+  there is nothing to drop and nothing to rewrite. Graphs adopted by an earlier
+  release keep working exactly as they did; the string in `createdBy` stops being
+  read as a marker and reads as what it is, the name of whatever authored the row.
+
+  **Nothing was keyed on the adoption.** The connector id is what a run history,
+  the singleton mutex and the incremental watermark hang off, and it is
+  `publishWorkflow` -> `mintConnectorFor` that ties a connector to its graph — the
+  ordinary publish path, untouched here. Adoption borrowed that machinery for
+  already-existing rows; it never owned it. Watermarks already re-keyed under a
+  source node stay re-keyed, and no incremental source falls back to a full read.
+
+  **What an upgraded deployment sees.** A connector that predates workflows is no
+  longer wrapped into anything. It keeps loading on the path it was already on,
+  `GET connectors` still reports it, and no route can edit it — the same standing
+  consequence `adoptConnectors: false` always had, now the only behaviour. A
+  deployment with connectors and no workflows therefore shows an empty
+  `#workflows`, so the canvas gains an empty state that says so: that nothing is
+  missing, that this deployment has simply never had one drawn, and that
+  connectors already loading data are not shown there and nothing will turn them
+  into workflows on their own. Three states rendered identically before — a first
+  run, a graph whose nodes were all deleted, and a list that failed to load — and
+  only one of them was speaking.
+
+- 8b21b7d: An idle host pays one statement a tick, not one per pipeline
+
+  This library mounts inside somebody else's application, so what it costs a
+  process that is not using it is a property it has to hold rather than a detail.
+  It was not holding it. On a worker with twelve scheduled graphs, a
+  `ConnectorScheduler` tick issued **13 statements** — one `listWorkflows`, then a
+  `connectorsUsingWorkflow` per runnable graph to re-confirm a "not due" that could
+  not have changed — every thirty seconds, forever. `AbandonedRunReconciler` read
+  the whole connector table on every pass to have names ready for a warning that,
+  on a healthy deployment, is never written.
+
+  Measured against MySQL 8.0 with 20 workflows (12 scheduled), 20 connectors and
+  200 run rows, through the real classes rather than fakes. `blocked` is time the
+  event loop was held without yielding, sampled with a 1ms heartbeat — the number
+  that matters to a host, and the one an average CPU figure hides:
+
+  |                        | statements | blocked           | wall                 |
+  | ---------------------- | ---------- | ----------------- | -------------------- |
+  | scheduler tick, steady | 13 → **1** | 16.10ms → **0ms** | 26.41ms → **4.36ms** |
+  | reconciler pass        | 2 → **1**  | 8.62ms → 4.94ms   | 22.53ms → 20.56ms    |
+
+  Per idle hour on one worker: **1,584 → 132 statements**, and **2.04s → 0.06s** of
+  held event loop.
+
+  The scheduler now records the window it last carried each graph to a decision
+  for, fingerprinted with that graph's cron, version and `updatedAt`, and returns
+  without touching the store when the next tick brings the same one. It is not a
+  cached schedule: the schedule list is still rebuilt from the store on every
+  single tick, so an edit still takes effect within one poll interval. What it
+  gives up is a connector row whose `updatedAt` moves _backwards_, which only a
+  promotion importing an older environment's rows can do, and which costs one
+  catch-up window on a pipeline somebody is mid-migration on. The guarantee that
+  a window starts exactly once is untouched — it was never this filter, it is the
+  deterministic run id. A `ready` graph with no connector is deliberately left
+  paying a query per tick, so publishing again is still seen.
+
+  `ReconcileScan.names` is now `() => Promise<ReadonlyMap<string, string>>` rather
+  than the map itself, and is called only by a pass that has something to close.
+  That is a breaking change to an exported type, hence minor: a caller passing a
+  map gets a compile error rather than names that silently stop appearing.
+
+  `ConnectorScheduler.tick()` is public, for the reason
+  `AbandonedRunReconciler.pass()` already was — a host that drives it from its own
+  scheduler, and a measurement that would rather not own a timer.
+
+  `packages/pipeline/src/idle-cost.db.spec.ts` is that measurement, and it runs
+  under `pnpm test:db`. It asserts statement counts, which are the same everywhere,
+  and only reports timings, which are not.
+
+  **What this does not fix, said plainly.** On an API-role process a host passes
+  `scheduler: false` and `reconcileRuns` defaults to it, so neither loop runs there
+  and none of the above changes what an API pod pays. Measured on that side, a
+  mounted catalog costs ~19ms of held event loop once at boot (13.7ms for the
+  second MikroORM connection and its schema check, 5.2ms for the registry build
+  over 60 types and 902 properties) and nothing at all until somebody opens the
+  console. The one expensive request is `GET catalog/events/traces`, which is
+  already fixed and not yet released.
+
+- e4b6123: Transform code gets a second parameter: `context`
+
+  A transform was a function over a batch, and a batch is not the whole of what it needs. It needs the
+  token for the API it enriches against; it needs to say which run it belongs to when it logs; and the
+  conditional node coming next has a predicate with no `records` at all, which still has to answer "did
+  the source return anything" — the guard that stops an empty snapshot being committed over live data.
+
+  So `records` is joined by `context`, in JavaScript, TypeScript and Python alike: the run id, the
+  graph and node, `rowCount`, the per-edge `inputs` (handles and counts, the same `WorkflowStageRef`
+  the call node already hands a callee), the host's name for this environment, and `env`. The harness
+  generates the parameter, so every transform stored before today keeps running unchanged.
+
+  **`env` is the credential allow-list, not `process.env`, and that is the point of the change rather
+  than a caveat on it.** Handing code the raw environment would have silently repealed
+  `secret-env-allowlist.ts`: transform code is a string saved by a `catalog:write` principal, it runs
+  in this pod, and it can print whatever it reads into `logs` — which cross into the run record and are
+  served at `catalog:read`. That is precisely the route that let a connector's `secretEnvVar` name
+  `DATABASE_URL`, reopened somewhere nobody would think to look. One list, one boot warning, one place
+  an operator looks to answer "what can code on this deployment read".
+
+  `['*']` is the one configuration where code and connectors differ, and it differs in the safe
+  direction: it admits **nothing** to `context.env`. The escape hatch exists so an upgrade under time
+  pressure has one honest line that keeps connectors reading one named variable each, visible on their
+  own screens. Copying a whole pod's environment into every transform's context is a bulk disclosure
+  nobody consented to by typing one character, and there is no compatibility argument on the other side
+  because code previously got nothing at all. Every case says which of the three it was in the run's
+  own log, where the person who can fix it is already looking.
+
+  New optional seam `CATALOG_PIPELINE_ENVIRONMENT`, bound through `forRoot({ environmentName })` as a
+  string or a per-call function. It surfaces as `context.environment` so that a transform behaving
+  differently in production reads `context.environment === 'prod'` instead of sniffing a variable.
+  Unbound leaves the field absent, which is a different statement from `'dev'` and the only truthful
+  one available.
+
+  Everything on the context is plain JSON, and everything except `env` and `environment` derives from a
+  durable step's checkpointed input, so it is byte-identical across replays. `allowlistedCodeEnv()` and
+  `namedEnvironment()` are separate, exported, impure functions and `codeContext()` is pure — so code
+  evaluated in a workflow body rather than in a step can resolve them inside one and let the checkpoint
+  carry the answer, instead of re-reading pod-local state on replay and taking a different branch.
+
+- 2ab7077: A call node can now be pointed at a workflow by picking it, instead of typing its name from memory.
+
+  The `call` node shipped with two typed fields and a docblock explaining why there was no picker, and
+  that explanation was correct: nothing could enumerate a deployment's registrations.
+  `workflowBody(name, version)` answers only for the process asking, and a missing body is ambiguous by
+  construction — "not registered here" reads identically to "registered through `registerRemote`
+  against another SDK" and to "a group resolved by convention against a live worker". A list inferred
+  from it would have differed per replica and would have omitted precisely the cross-SDK workflows the
+  node exists to call.
+
+  `@dudousxd/nestjs-durable-core` **0.65.0** closed that with `WorkflowEngine.announcedWorkflows()`,
+  which is not an inference: live workers publish what they can execute on the worker-descriptor
+  keyspace, and every pod folds the same published statements. `GET <base>/pipeline/callable-workflows`
+  serves it, and the call node's inspector offers it. The pipeline package's `@dudousxd/nestjs-durable-core`
+  peer range moves to `>=0.65.0` accordingly.
+
+  - **Two searchable fields, not one list of `name@version` keys.** A real fleet announces more
+    workflows than fit in a popup somebody scrolls, so both fields are comboboxes you type into: the
+    first searches the announced **names** — on the name, the group and the description — and the
+    second lists the **versions announced for the name you chose**. A single combined list answered
+    the version question inside the name question, which made the name list as long as the version
+    count and, at eight versions, made the name eight times harder to find.
+  - **Both halves, or neither.** Splitting one list into two raises the failure the combined list
+    could not have: a name committed on its own leaves a node that runs whatever is newest on the day
+    it runs and looks configured while doing it — the single thing the pin exists to prevent. So
+    choosing a name writes `callVersion` in the **same** update whenever the fleet announces exactly
+    one pinnable version, which is the common case and stays one action. Where there is a real choice
+    the version is left blank on purpose rather than guessed — blank is visible, said out loud under
+    the field, and refused by the existing `call-not-named` check. A version already held is kept when
+    the new name still announces it, and a version somebody typed that the fleet never offered is
+    never erased: this field has no standing over a value it did not supply.
+  - **`group` is the field that carries the most.** It is the only signal that separates "this body
+    lives in another process, in another language" from "not registered at all", which is exactly what
+    a missing `workflowBody` could never tell apart. It is set only when the live announcers name
+    **one**; more than one is left absent and reported as a disagreement.
+  - **Disagreements are surfaced, not resolved.** Two workers claiming one `name@version` from two
+    groups mean nobody can say which queue a run would land on, or whether the two are even the same
+    code. Such an entry is **shown** — greyed, with both groups named in full under the field — and
+    cannot be chosen. Neither half of that is optional: silently picking one would act on a claim
+    nobody made, and silently dropping it is the "picker that hides what you are looking for" the
+    original docblock refused to build. A disagreement on `origin` or `requires` is shown and is _not_
+    a refusal: it does not change which queue the run goes to.
+  - **Silence is not a claim.** An un-upgraded worker of any SDK announces a bare name with no version
+    and no group. No version is invented for it from a sibling entry, and it is offered greyed with the
+    reason, because a name with no version cannot satisfy the pin — offering it as though it could
+    would be a lie the node then carries. `callableWorkflowBlock` is the shared rule behind both
+    refusals, exported from `@dudousxd/nestjs-catalog/client` as `validateWorkflow` is, so the picker
+    and anything server-side reasoning about the same list cannot drift.
+  - **It is a snapshot, and says so.** Liveness is a TTL on the descriptor key, so a worker that dies
+    takes its announcements with it within about one heartbeat. The route reads on demand and caches
+    nothing; the client caches for ten seconds, emphatically not the `Infinity` that is right for
+    `capabilities`; and the field prints the time it looked rather than presenting a moment as a
+    standing fact. Hence a route of its own rather than a field on `capabilities`, whose answers cannot
+    change without a redeploy.
+  - **"Nobody could be asked" is not "there are none".** With no durable engine — or when the read
+    itself fails — the answer is `{ supported: false, workflows: [], detail }`, never a bare empty
+    list. Rendering "no workflows found" over the second would tell somebody their workflow does not
+    exist. A failed read is reported, not thrown: this feeds a convenience, and it must not take the
+    inspector down with it.
+  - **Typing something nobody announced still works, and is not a fallback.** A deployment whose
+    workers have not upgraded announces little or nothing, and a picker that became the only path
+    would make the node unusable there. Both fields are text boxes first and lists second — the list
+    is a suggestion over what you type, never a gate in front of it — so they stay usable when the
+    list is empty, unavailable, or simply does not contain what somebody is pointing at. There is no
+    empty select promising a choice it does not have; when there is nothing to offer, the popup
+    carries the server's own sentence about why.
+
+  **The pin is still checked after the start, not honoured at it.** `engine.start` takes a pinned
+  `version` as of durable 0.65.0 and the catalog deliberately does not pass one: a pinned start is
+  refused outright on the two _synthesized_ registration paths — a child inheriting a remote ancestor's
+  routing, and convention routing to a live worker group — which are exactly how a cross-SDK workflow
+  is reached. Pinning at the start would break the calls this node exists for. So
+  `catalog.workflow.call-check` still reads the child's run row and cancels on a mismatch, and the
+  `CallInspector` docblock now records why rather than repeating that no version argument exists.
+
+### Patch Changes
+
+- 3acc560: A sink keeps the position it was saved at
+
+  `readNode` reads `position` once for every node, and the `sink` branch was the
+  one that did not return it. The read was four lines above.
+
+  The consequence was total rather than cosmetic: a sink could not be placed at
+  all, by any route. Drag one on the canvas, save, reload, and it is back where
+  the automatic layout puts it. `POST pipeline/workflows` carrying explicit
+  coordinates answers **201** and drops them — which is how this was found, by
+  rewriting thirteen adopted graphs' positions and reading one back.
+
+  The new spec is written over `Record<WorkflowNodeKind, …>` rather than about
+  sinks: four independent branches each remembering a field that was read for all
+  of them is the shape that caused this, and the fifth kind will be added by
+  somebody who never saw it. A kind added to the union without a fixture is now a
+  compile error.
+
+- cba1a42: A source node can make its connection without leaving the canvas.
+
+  The sink node could already create the thing it needs — its schema-discovery panel turns confirmed
+  columns into an object type, on a draft. The source node could only _choose_ an address, so a graph
+  whose connection did not exist yet meant leaving the canvas, opening the Connections tab, making
+  one, coming back and finding the node again.
+
+  `SourceConnectionCreator` sits under the "Read through" picker in the source inspector and carries
+  everything the Connections screen carries, because a connection is the credential and the address
+  boundary:
+
+  - the same per-kind fields, now shared from `connection-form.tsx` rather than copied — a record
+    keyed by `CONNECTOR_KINDS`, so a sixth kind fails the build instead of arriving with no fields;
+  - **test before save**, through `POST pipeline/connections/check`, which reaches an address that has
+    not been stored and records nothing — sent without an `id`, so nothing is restored and the address
+    reached is the one that was typed;
+  - the deployment's refusal of a credential at rest (`allowInlineCredentials`) printed verbatim, with
+    nothing attached to the node when it happens;
+  - a client-side refusal of a URL whose password is the redaction placeholder, which is the one case
+    the server cannot catch: a create has no stored row to restore the real credential from, so
+    `REDACTED` would simply become the password.
+
+  The new connection is selected onto the node immediately, which marks the draft dirty exactly as
+  typing a URL into the same node does — and the confirmation says so, rather than leaving somebody to
+  discover it from schema discovery going quiet.
+
+  `@dudousxd/nestjs-catalog` gains `REDACTED_SECRET` on both entry points: the placeholder is part of
+  what `GET pipeline/connections` answers, and a browser form has to be able to recognise the string it
+  was shown. `@dudousxd/nestjs-catalog-pipeline` re-exports it from there instead of declaring its own.
+
 ## 0.12.0
 
 ### Minor Changes
@@ -335,9 +794,9 @@
   Every scheduled connector in a deployment was silently inert. The worker said so
   at boot, once, and contradicted itself on the next line:
 
-      ERROR [ConnectorScheduler] No connector will run on a schedule:
-            parser.parseExpression is not a function.
-      LOG   [ConnectorScheduler] Watching connector schedules every 30000ms.
+        ERROR [ConnectorScheduler] No connector will run on a schedule:
+              parser.parseExpression is not a function.
+        LOG   [ConnectorScheduler] Watching connector schedules every 30000ms.
 
   `cron-parser` v4 exported `parseExpression`; v5 replaced it with
   `CronExpressionParser.parse`. The durable core read only the v4 shape, so
