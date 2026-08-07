@@ -127,14 +127,40 @@ source, transform and sink all run at once. Over the real 102,519-row `af_fleet.
 because a 44 MB JSON result exceeds `MAX_OUTPUT_BYTES`; the streamed arm holds 152 MB, and 217 MB at
 1.2 million records.
 
-**Which path is bounded end to end, and which is not.** A **connector** streams the whole way:
+**Which path is bounded end to end, and in what sense.** A **connector** streams the whole way:
 `source.records` goes into the child and the child's rows go into `appendBatches`, so back-pressure
-reaches the file descriptor. A **workflow graph** does not — its source node stages its whole output
-before any downstream node reads a row of it, which is deliberate and documented on `runSource`.
-What a graph gains from this mode is that its *transform node* no longer holds the whole of its
-input in the heap on top of that: it reads one staged batch, maps it, and writes what came out, the
-way the filter node already did. Staging a source incrementally is a separate change, and
-`runSource` marks the line.
+reaches the file descriptor. A **workflow graph** now does too, node by node. Its source node stages
+its output *as the fetcher produces it* (`stageStream`), its filter and per-record transform nodes
+read one staged batch at a time, and its rename node rewrites a batch's shape dictionary without
+decoding a row — so nothing on that path holds a whole load, and back-pressure reaches the file
+descriptor through the stage writes.
+
+The difference that remains is a **round trip through storage between nodes**, and it is the point
+of a graph rather than a defect in it: a node's output is staged so that the next node can be a
+separate durable step, resumable and checkpointed on its own. A connector has one node and therefore
+no boundary to cross. So a graph is *bounded* end to end without being as *cheap* as a single
+streamed connector, and those are different claims.
+
+`packages/pipeline/bench/source-stage.mjs` measures the whole graph — the shipped
+`WorkflowRunnerService`, a stage store that writes files so the staged rows are not in the heap
+being measured, and a counting sink. Over flip's real 102,519-record `af_fleet.csv`:
+
+| | peak RSS | median wall clock |
+|---|---|---|
+| the source buffered its read | 435 MB | 527 ms |
+| the source stages as it reads | 172 MB | 484 ms |
+
+At three times the data (307,557 records) the buffered arm goes to **769 MB** and 1,758 ms while the
+streamed arm holds **171 MB** — the same number it held at one third the size, which is the property
+worth having. Both arms produce identical counts: 102,519 records, 206 staged batches, 89,458 rows
+with a non-null `Mgmt Cd`, 568 blank lines skipped.
+
+**What it does not change is the durable checkpoint.** A node is the unit of resumption: its output
+is checkpointed when the step returns, so a crash part way through a source re-runs the whole read on
+the next attempt, exactly as it did when the read was buffered. What incremental staging changes is
+that a failed attempt leaves *more* batches behind — which is harmless because batch numbers are
+positions rather than a running count, so the retry writes over them, and `clearStaleTail` empties
+whatever a longer earlier attempt left past the end.
 
 **The mode is declared and never inferred.** Destructuring is not reliably introspectable and a
 parameter name is the author's to choose, and both wrong guesses commit silently: guess towards
