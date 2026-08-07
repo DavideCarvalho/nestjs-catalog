@@ -254,6 +254,11 @@ export type {
   CatalogConnector,
   ConnectionCheck,
   CatalogTransform,
+  // The shape a module-shaped transform's author writes against. Type-only, and
+  // that is the whole of what it is: `import type` is erased before the code
+  // runs, so this buys completion in the editor and nothing at run time.
+  CatalogTransformFunction,
+  CatalogTransformInput,
   CatalogWorkflow,
   CatalogWorkflowCapabilities,
   CatalogWorkflowRelease,
@@ -307,6 +312,17 @@ export type {
   SourceFormat,
   VersionPinCopy,
 } from './catalog.pipeline';
+
+// The transform shape rule, as the runner itself applies it. A browser build
+// can take this — `transform-shape.ts` imports nothing at all — and an editor
+// that tells the author which shape their code is in should be reading the
+// answer rather than reproducing the reasoning. A second copy would be the one
+// that disagrees on the day it matters.
+export {
+  type TransformShape,
+  transformDeclaresModule,
+  transformShape,
+} from './transform-shape';
 
 // Values, not types: a form that offers the kinds should read them from here
 // rather than keeping a copy that drifts.

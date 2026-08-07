@@ -58,6 +58,8 @@ export {
   type CatalogPipelineStore,
   type CatalogStageStore,
   type CatalogTransform,
+  type CatalogTransformFunction,
+  type CatalogTransformInput,
   type CatalogWorkflow,
   type CatalogWorkflowCapabilities,
   type CatalogWorkflowRelease,
@@ -228,6 +230,15 @@ export {
   SubprocessTransformRunner,
   type TransformRunnerOptions,
 } from './transform-runner';
+// One rule for which shape a transform's code is in, exported so the editor can
+// show the author what the runner concluded instead of maintaining a second
+// copy that says something else. Same reason `isTransformLanguage` is exported.
+export {
+  type TransformShape,
+  transformDeclaresModule,
+  transformShape,
+  transformShapeHint,
+} from './transform-shape';
 export { CatalogService } from './catalog.service';
 // Search. The result types are on `/client` too, for a browser; these are here
 // because a host that passed `controller: false` and wrote its own routes needs

@@ -1,7 +1,10 @@
 import { type ChildProcess, spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
+import { rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve as resolvePath } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { Injectable, Logger } from '@nestjs/common';
 import {
   CODE_CONTEXT_CONTRACT,
@@ -11,6 +14,7 @@ import {
   type TransformResult,
   type TransformRunner,
 } from './catalog.pipeline';
+import { type TransformShape, transformShape, transformShapeHint } from './transform-shape';
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_OUTPUT_BYTES = 32 * 1024 * 1024;
@@ -142,7 +146,12 @@ export interface TransformRunnerOptions {
  * - it runs in a working directory of this runner's choosing but on the host's
  *   filesystem, so a service account token under
  *   `/var/run/secrets/kubernetes.io/serviceaccount/` is an absolute path away;
- * - it can open sockets, as whatever user the service runs as.
+ * - it can open sockets, as whatever user the service runs as;
+ * - a module-shaped transform is written to a file in that temporary directory
+ *   for the length of the run, so its own source is briefly on disk. That is
+ *   not a new exposure — the code is the thing running, and it can read itself
+ *   from anywhere — but it is a fact worth having written down next to the
+ *   others rather than discovered in a directory listing.
  *
  * So the allowlist is a guard rail against the accident, and the reachability of
  * everything it names is a property of the process boundary, not a leak to be
@@ -255,20 +264,46 @@ export class SubprocessTransformRunner implements TransformRunner {
       );
     }
 
-    const script = python ? pythonHarness(transform.code) : javascriptHarness(transform.code);
+    // Python is not asked: its harness writes the `def`, so a Python transform
+    // never states a signature and has nothing to detect. See
+    // {@link pythonHarness}.
+    const shape: TransformShape = python ? 'body' : transformShape(transform.code);
 
-    // `module-typescript` is Node's own stripping — types are erased, never
-    // checked. A transform with a wrong type still runs; the editor's try pane
-    // is what catches it, not the compiler.
-    const args = python
-      ? ['-c', script]
-      : [
-          '--input-type',
-          transform.language === 'typescript' ? 'module-typescript' : 'module',
-          '-e',
-          script,
-        ];
+    // Written to disk only for the module shape, and only for the length of the
+    // run. A module has to be *imported* to be a module — its `export default`
+    // creates no binding this harness could name, and rewriting the keyword
+    // into an assignment would be surgery on somebody's source. A file also
+    // gives Node the extension it needs to strip TypeScript, and gives the
+    // author stack frames with real line numbers instead of `[eval]`.
+    const modulePath =
+      shape === 'module'
+        ? join(
+            tmpdir(),
+            `catalog-transform-${randomUUID()}.${transform.language === 'typescript' ? 'mts' : 'mjs'}`,
+          )
+        : undefined;
 
+    try {
+      if (modulePath) await writeFile(modulePath, transform.code, 'utf8');
+      const args = interpreterArgs(transform, modulePath);
+      return await this.execute(interpreter, args, records, context, timeoutMs, shape, started);
+    } finally {
+      // Unlinked whether the run returned, threw, or was killed on the timeout —
+      // the parent settles in all three, so nothing is left in `tmpdir` for an
+      // operator to find later and wonder about.
+      if (modulePath) await rm(modulePath, { force: true });
+    }
+  }
+
+  private async execute(
+    interpreter: string,
+    args: string[],
+    records: unknown[],
+    context: CatalogCodeContext,
+    timeoutMs: number,
+    shape: TransformShape,
+    started: number,
+  ): Promise<TransformResult> {
     // An envelope rather than the bare array stdin used to carry. The context
     // travels beside the records rather than in the child's `env`, and that is
     // the deliberate half of it: the child's own environment stays
@@ -279,6 +314,7 @@ export class SubprocessTransformRunner implements TransformRunner {
       args,
       JSON.stringify({ records, context }),
       timeoutMs,
+      shape,
     );
 
     let parsed: { rows?: unknown; logs?: unknown; error?: string };
@@ -316,6 +352,7 @@ export class SubprocessTransformRunner implements TransformRunner {
     args: string[],
     input: string,
     timeoutMs: number,
+    shape: TransformShape = 'body',
   ): Promise<{ stdout: string; stderr: string }> {
     return new Promise((resolve, reject) => {
       const child = spawn(command, args, {
@@ -375,7 +412,15 @@ export class SubprocessTransformRunner implements TransformRunner {
         settled = true;
         clearTimeout(timer);
         if (code !== 0 && stdout.trim().length === 0) {
-          reject(new Error(`The transform exited with code ${code}. ${stderr.slice(0, 500)}`));
+          // The shape hint rides along here specifically: a body whose author
+          // meant it as a module fails before the harness's own try/catch is
+          // ever entered, so this branch is the only place that error can be
+          // annotated. See {@link transformShapeHint}.
+          reject(
+            new Error(
+              `The transform exited with code ${code}. ${stderr.slice(0, 500)}${transformShapeHint(shape, stderr)}`,
+            ),
+          );
           return;
         }
         resolve({ stdout, stderr });
@@ -422,6 +467,31 @@ export class SubprocessTransformRunner implements TransformRunner {
     this.pythonPath = null;
     return null;
   }
+}
+
+/**
+ * What the interpreter is invoked with, and which harness it is handed.
+ *
+ * `module-typescript` is Node's own stripping — types are erased, never
+ * checked. A transform with a wrong type still runs; the editor's try pane is
+ * what catches it, not the compiler.
+ *
+ * The module shape needs none of that flag here: the harness itself is plain
+ * JavaScript, and the author's `.mts` file is stripped on import by its
+ * extension. That confines the stripper to the code that asked for it, rather
+ * than running this file's own generated source through it as well.
+ */
+function interpreterArgs(
+  transform: Pick<CatalogTransform, 'language' | 'code'>,
+  modulePath: string | undefined,
+): string[] {
+  if (transform.language === 'python') return ['-c', pythonHarness(transform.code)];
+  const script = modulePath
+    ? javascriptModuleHarness(pathToFileURL(modulePath).href)
+    : javascriptHarness(transform.code);
+  const inputType =
+    transform.language === 'typescript' && !modulePath ? 'module-typescript' : 'module';
+  return ['--input-type', inputType, '-e', script];
 }
 
 /**
@@ -496,7 +566,15 @@ function withFinalLogs(error: string, logs: string[]): string {
 }
 
 /**
- * The JavaScript and TypeScript harness.
+ * The JavaScript and TypeScript harness for the **bare-body** shape: the
+ * author's code is the inside of a function this string writes.
+ *
+ * Unchanged, and that is the feature. Every transform stored before the module
+ * shape existed is a bare body, and it runs through the identical wrapper with
+ * the identical positional parameters and the identical interpreter flags — the
+ * new shape is a second path beside this one, not a rewrite of it. See
+ * `transform-shape.ts` for the rule that decides which path a given piece of
+ * code takes, and why a stored transform cannot be sent down the wrong one.
  *
  * `console.log` is captured rather than left on stdout so user code cannot
  * corrupt the single JSON line this prints — a transform that logs a `{` would
@@ -521,7 +599,86 @@ function withFinalLogs(error: string, logs: string[]): string {
  * gets as far as being serialised.
  */
 function javascriptHarness(code: string): string {
-  return `
+  return `${JAVASCRIPT_PRELUDE}
+try {
+  ${JAVASCRIPT_PAYLOAD}
+  const transform = async (records, context) => { ${code} };
+  const rows = await transform(records, context);
+  process.stdout.write(JSON.stringify({ rows: rows ?? [], logs: captured() }));
+} catch (error) {
+  ${JAVASCRIPT_FAILURE}
+}
+`;
+}
+
+/**
+ * The harness for the module shape: import the author's module, call what it
+ * exports with one object.
+ *
+ * Everything above the call is the same prelude the bare-body harness uses —
+ * the same six console channels, the same two caps, the same envelope, the same
+ * frozen `context`. A transform's log behaviour changing because of the shape it
+ * happens to be written in would be exactly as surprising as it changing because
+ * of the language, and the constants say why that is not allowed to happen.
+ *
+ * The code arrives as a **file URL**, not as text spliced into this string, and
+ * the difference matters three times over. `export default` binds nothing that
+ * an enclosing scope could name, so the module genuinely has to be imported;
+ * `.mts` is what tells Node to strip the types, so the extension does the job
+ * `--input-type module-typescript` does for a body; and a stack frame reads
+ * `catalog-transform-….mts:3:11` rather than `[eval]`, which is the difference
+ * between a line number and a shrug.
+ *
+ * ## What it accepts, and what it refuses
+ *
+ * `export default`, or a named export called `transform`. Two spellings rather
+ * than one because both are things people write without being told to, and
+ * because both are *real exports* — neither is a guess about a name in scope.
+ *
+ * A module that exports neither is **refused, by name**. The alternative is a
+ * transform that returns no rows and says nothing about why, which downstream
+ * reads as a source that produced nothing — a connector would commit an empty
+ * snapshot over live data on the strength of a missing `default` keyword.
+ *
+ * The import is deliberately not wrapped in a fallback to the body shape. Code
+ * that fails to parse as a module has one honest answer — the parse error, with
+ * the line — and re-running it in the other shape would replace that with a
+ * second, different error about text the author never wrote.
+ */
+function javascriptModuleHarness(moduleUrl: string): string {
+  return `${JAVASCRIPT_PRELUDE}
+try {
+  ${JAVASCRIPT_PAYLOAD}
+  const mod = await import(${JSON.stringify(moduleUrl)});
+  const exported = typeof mod.default === "function"
+    ? mod.default
+    : typeof mod.transform === "function" ? mod.transform : null;
+  if (!exported) {
+    const names = Object.keys(mod).filter((key) => key !== "default");
+    throw new Error(
+      "This transform is a module — it has a top-level \`export\` — so the catalog imported it and " +
+      "looked for a function to call. \`export default\` is " + (("default" in mod) ? typeof mod.default : "missing") +
+      " and there is no exported \`transform\` function." +
+      (names.length > 0 ? " It does export: " + names.join(", ") + "." : "") +
+      " Export the function as \`export default\`, or name it \`transform\`."
+    );
+  }
+  const rows = await exported({ records, context });
+  process.stdout.write(JSON.stringify({ rows: rows ?? [], logs: captured() }));
+} catch (error) {
+  ${JAVASCRIPT_FAILURE}
+}
+`;
+}
+
+/**
+ * Capture the console, before any of the author's code can reach it.
+ *
+ * Shared verbatim by both JavaScript harnesses rather than copied into each: two
+ * copies of a log cap are two numbers that drift, and the one that drifts is
+ * discovered by a run record nobody can explain.
+ */
+const JAVASCRIPT_PRELUDE = `
 const logs = [];
 let dropped = 0;
 const keep = (line) => {
@@ -542,8 +699,10 @@ const captured = () => dropped === 0
 let input = "";
 process.stdin.setEncoding("utf8");
 for await (const chunk of process.stdin) input += chunk;
+`;
 
-try {
+/** Unpack the envelope. `context` is frozen one level down — see below. */
+const JAVASCRIPT_PAYLOAD = `
   const payload = JSON.parse(input || "{}");
   const records = Array.isArray(payload.records) ? payload.records : [];
   // Frozen, and one level down as well, so that a transform assigning to
@@ -551,20 +710,43 @@ try {
   // then confusing whoever reads the next node's code. Nothing propagates out
   // of this process either way; the freeze buys the honest error, not safety.
   const context = Object.freeze({ ...payload.context, env: Object.freeze({ ...payload.context?.env }) });
-  const transform = async (records, context) => { ${code} };
-  const rows = await transform(records, context);
-  process.stdout.write(JSON.stringify({ rows: rows ?? [], logs: captured() }));
-} catch (error) {
+`;
+
+/** The one JSON line a failed run prints, logs and all. */
+const JAVASCRIPT_FAILURE = `
   process.stdout.write(JSON.stringify({
     error: error instanceof Error ? \`\${error.name}: \${error.message}\` : String(error),
     logs: captured(),
   }));
-}
 `;
-}
 
 /**
  * The Python harness. `records` in, a list of dicts out.
+ *
+ * ## Why this did not move to the one-object shape
+ *
+ * JavaScript moved because a JavaScript transform *states its own signature* —
+ * the harness wrote `(records, context)` and the author's code depended on both
+ * names being where they were, so a third parameter would have been a change to
+ * text nobody was going to re-read. A Python transform states nothing. This
+ * harness writes `def transform(records, context):` and indents the author's
+ * code into it, so a fourth thing to pass is **one line changed here** and not a
+ * single stored transform touched. Python already has the property the object
+ * shape was introduced to buy.
+ *
+ * Moving it anyway would cost the thing the move was for. `records` and
+ * `context` are names in scope today; a `payload` dict makes them
+ * `payload["records"]` and `payload["context"]`, which is a break in every
+ * Python transform in existence — the exact outcome the JavaScript change was
+ * designed to avoid. Consistency between the two languages is worth something,
+ * but not a migration bought with somebody else's pandas code, and not when the
+ * inconsistency is *because* the two languages start from different places.
+ *
+ * The asymmetry left standing, said out loud: a Python author who writes their
+ * own `def transform(...)` at column 0 gets it indented into a nested
+ * definition, and the outer `transform` returns `None` — no error, no rows. That
+ * is a real footgun and it is older than this change; it is named here so the
+ * next person to open this file knows it is known rather than missed.
  *
  * A DataFrame is accepted as a return value and converted, because a transform
  * that reaches for pandas will naturally end with one — making it write

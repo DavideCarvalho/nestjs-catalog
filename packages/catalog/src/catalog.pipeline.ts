@@ -523,18 +523,39 @@ export interface CatalogTransform {
   description?: string;
   language: TransformLanguage;
   /**
-   * The body of a function over one batch. It receives `records` and
-   * `context`, and returns the rows to store.
+   * A function over one batch, in either of two shapes.
    *
    * A batch rather than a record at a time: a transform that needs to look up,
    * deduplicate or aggregate cannot do it one row at a time, and paying one
    * process spawn per record would make any real load unusable.
    *
+   * **The supported shape** is a module exporting a function that takes one
+   * object — a {@link CatalogTransformInput} — and returns the rows to store:
+   *
+   * ```js
+   * export default function transform({ records, context }) {
+   *   return records.map((r) => ({ mgmtCd: r["Mgmt Cd"] }));
+   * }
+   * ```
+   *
+   * One object rather than positional parameters, because the object is the
+   * only shape that can gain a field later. `context` arrived as a second
+   * positional parameter and got away with it; a third would have redefined
+   * what every signature already written means.
+   *
+   * **The bare-body shape** — the text between a function's braces, with
+   * `records` and `context` simply in scope — is what every transform stored
+   * before that shape existed is written in, and it keeps running byte for
+   * byte: same wrapper, same interpreter flags, same everything. See
+   * `transform-shape.ts` for how the two are told apart and why the rule cannot
+   * misread one for the other.
+   *
    * `context` is a {@link CatalogCodeContext} — the run, the node, the counts
    * of what fed it, and the environment variables this deployment admits.
-   * Second rather than first, so that every transform written before it existed
-   * still runs: the harness supplies the parameter, and code that never names
-   * it is unaffected.
+   *
+   * Python has neither shape and needs neither: its harness writes the `def`
+   * itself, so a Python transform is a body that never states a signature, and
+   * a new field costs one generated line rather than an edit to stored code.
    */
   code: string;
   version: number;
@@ -542,6 +563,81 @@ export interface CatalogTransform {
   createdAt: string;
   updatedAt: string;
 }
+
+/**
+ * The single argument a module-shaped transform is called with.
+ *
+ * ## Why one object
+ *
+ * So that the next thing a transform needs can be added without changing what
+ * any existing transform's signature means. Positional parameters spend that
+ * option the first time they are used: `(records, context)` fixed the list at
+ * two, and a third would silently redefine every signature ever written —
+ * including the ones in a database somewhere that nobody will re-read. A field
+ * on an object is additive by construction, and a transform that never names it
+ * is untouched by it.
+ *
+ * ## What is on it, and what is not
+ *
+ * {@link records} and {@link context}, and deliberately nothing else yet.
+ *
+ * - **No `log`.** Python's harness has one, because Python's `print` used to go
+ *   nowhere; JavaScript's `console.log` — and `info`, `warn`, `error`, `debug`,
+ *   `trace` — is already captured in call order. A second spelling that worked
+ *   only in the new shape would split the idiom for no gain.
+ * - **No `env` shortcut.** It is already `context.env`, filtered by the same
+ *   credential allow-list that governs connectors. Two paths to one value is
+ *   how the two come to disagree.
+ * - **No `signal`.** The timeout is a `SIGKILL` to the whole process group;
+ *   there is nothing for user code to cooperate with, and an `AbortSignal` that
+ *   never fires would be a promise the runner cannot keep.
+ *
+ * The point of the object is that each of those can be reconsidered later
+ * without a migration. That is the argument, not the current field list.
+ *
+ * @typeParam TRecord - what one inbound record looks like. Editor help only:
+ * types are erased before the code runs, so a wrong one is a squiggle, never a
+ * failed run. See {@link CatalogTransformFunction}.
+ */
+export interface CatalogTransformInput<TRecord = Record<string, unknown>> {
+  /** The batch, exactly as the source produced it. */
+  records: TRecord[];
+  /** The run, the node, the counts, and the admitted environment variables. */
+  context: CatalogCodeContext;
+}
+
+/**
+ * The function a module-shaped transform exports, as `export default` or as a
+ * named export called `transform`.
+ *
+ * **This type is for the editor and for nothing else.** TypeScript transforms
+ * run through Node's own type *stripping* — the annotations are erased on the
+ * way in and never checked, by this runner or by anything else — so a transform
+ * whose types are wrong runs anyway, and produces exactly the rows its code
+ * produces. What the type buys is completion on `records` and `context` while
+ * writing, and a red underline in an editor that happens to be type-aware. What
+ * it does not buy is a single guarantee at run time; the try pane is what
+ * catches a mistake.
+ *
+ * Referencing it costs nothing at run time either, and that is a property of
+ * `import type` specifically: the stripper erases the whole statement, so
+ * nothing tries to resolve `@dudousxd/nestjs-catalog/client` inside a child
+ * process that has no `node_modules` to resolve it in. A *value* import of the
+ * same module would fail — there is no package to find from the temporary
+ * directory a transform runs in.
+ *
+ * ```ts
+ * import type { CatalogTransformFunction } from '@dudousxd/nestjs-catalog/client';
+ *
+ * const transform: CatalogTransformFunction<{ 'Mgmt Cd': string }> = ({ records }) =>
+ *   records.map((r) => ({ mgmtCd: r['Mgmt Cd'] }));
+ *
+ * export default transform;
+ * ```
+ */
+export type CatalogTransformFunction<TRecord = Record<string, unknown>> = (
+  input: CatalogTransformInput<TRecord>,
+) => Array<Record<string, unknown>> | Promise<Array<Record<string, unknown>>>;
 
 export interface TransformResult {
   rows: Array<Record<string, unknown>>;
