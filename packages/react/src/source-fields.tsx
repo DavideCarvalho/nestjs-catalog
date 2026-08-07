@@ -1,5 +1,5 @@
-import type { ConnectorKind } from '@dudousxd/nestjs-catalog/client';
-import { CONNECTOR_KINDS } from '@dudousxd/nestjs-catalog/client';
+import type { ConnectorKind, SourceFormat } from '@dudousxd/nestjs-catalog/client';
+import { CONNECTOR_KINDS, SOURCE_FORMATS } from '@dudousxd/nestjs-catalog/client';
 import { cn } from './cn';
 import { CONNECTION_KINDS, type ConnectableKind } from './connection-form';
 import { FieldGroup, TextAreaField, TextField } from './ui/field';
@@ -55,16 +55,50 @@ export function usesConnection(kind: ConnectorKind): kind is ConnectableKind {
 export const KIND_OPTIONS = [
   { value: 'http', label: 'HTTP — a JSON endpoint' },
   { value: 'sql', label: 'SQL — a database query' },
-  { value: 'file', label: 'File — CSV, NDJSON or JSON' },
+  { value: 'file', label: 'File — CSV, NDJSON, JSON or Excel' },
   { value: 's3', label: 'S3 — a bucket prefix' },
   { value: 'inline', label: 'Inline — records pasted below' },
 ];
 
+/**
+ * How each format is labelled, and the reason this is a map rather than a list.
+ *
+ * `satisfies Record<SourceFormat, string>` is the whole point: a format added to
+ * the library's list leaves this object missing a property and the build stops
+ * here, rather than the console quietly offering three of four formats. It is
+ * the same argument {@link toConnectorKind} makes about kinds — the parser and
+ * the picker are meant to move together.
+ */
+const FORMAT_LABELS = {
+  csv: 'CSV',
+  ndjson: 'NDJSON',
+  json: 'JSON',
+  xlsx: 'Excel workbook (.xlsx)',
+} satisfies Record<SourceFormat, string>;
+
+/**
+ * The formats, with the leading "work it out" option.
+ *
+ * Derived from `SOURCE_FORMATS` rather than written out beside it, so the order
+ * and the membership are the library's and not a copy of them.
+ */
 export const FORMAT_OPTIONS = [
   { value: '', label: 'Format from the extension' },
-  { value: 'csv', label: 'CSV' },
-  { value: 'ndjson', label: 'NDJSON' },
-  { value: 'json', label: 'JSON' },
+  ...SOURCE_FORMATS.map((format) => ({ value: format, label: FORMAT_LABELS[format] })),
+];
+
+/**
+ * The same options for a bucket, whose blank option reads differently because
+ * an S3 connector guesses per key rather than once.
+ *
+ * A function over the named formats rather than `FORMAT_OPTIONS.slice(1)`, which
+ * is what this replaced: the slice encoded "the first entry is the blank one" as
+ * a number, and a format inserted at the front of the list would have dropped
+ * itself from this picker and nothing else.
+ */
+export const KEY_FORMAT_OPTIONS = [
+  { value: '', label: 'Format from each key' },
+  ...SOURCE_FORMATS.map((format) => ({ value: format, label: FORMAT_LABELS[format] })),
 ];
 
 /** The value the connection picker uses for "do not use one". */
@@ -400,7 +434,7 @@ export function SourceFields({
           ariaLabel="Format"
           value={draft.format}
           onValueChange={(format) => set({ format })}
-          options={[{ value: '', label: 'Format from each key' }, ...FORMAT_OPTIONS.slice(1)]}
+          options={KEY_FORMAT_OPTIONS}
           disabled={disabled}
         />
         {!viaConnection && (

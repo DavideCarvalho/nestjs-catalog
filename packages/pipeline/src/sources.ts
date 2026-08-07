@@ -1,5 +1,12 @@
 import { readFile } from 'node:fs/promises';
-import type { CatalogConnection, CatalogConnector } from '@dudousxd/nestjs-catalog';
+import {
+  type CatalogConnection,
+  type CatalogConnector,
+  SOURCE_FORMATS,
+  type SourceFormat,
+  isSourceFormat,
+  unreachableSourceFormat,
+} from '@dudousxd/nestjs-catalog';
 import { Logger } from '@nestjs/common';
 import { admitsSecretEnv, credentialUnavailable, secretEnvAllowlist } from './secret-env-allowlist';
 
@@ -312,15 +319,23 @@ export const fetchFile: SourceFetcher = async ({ connector }) => {
   const source = String(connector.config.path ?? connector.config.url ?? '');
   if (!source) throw new Error('This connector has no path or url configured.');
 
-  const text = /^https?:\/\//.test(source)
+  // Bytes, not text, and the encoding argument is gone from both branches on
+  // purpose. `readFile(source, 'utf8')` and `Response.text()` both decode as
+  // UTF-8 and replace every byte that is not valid UTF-8 with U+FFFD — which is
+  // most of a `.xlsx`, because a `.xlsx` is a ZIP archive. Decoding here would
+  // corrupt the payload *before* anything had decided what format it was, so the
+  // decode moved to {@link parseRecords}, which knows.
+  const bytes = /^https?:\/\//.test(source)
     ? await (async () => {
         const response = await fetch(source);
         if (!response.ok) throw new Error(`GET ${source} → ${response.status}`);
-        return response.text();
+        return new Uint8Array(await response.arrayBuffer());
       })()
-    : await readFile(source, 'utf8');
+    : // A `Buffer` already is a `Uint8Array`; wrapping it would copy the file a
+      // second time for no gain.
+      await readFile(source);
 
-  return parseRecords(text, source, connector.config);
+  return parseRecords(bytes, source, connector.config);
 };
 
 /**
@@ -1081,9 +1096,19 @@ export const SOURCES: Record<string, SourceFetcher> = {
  * same drop loads two different ways depending on where it was read from, and
  * the difference would show up as a column of nulls rather than as an error.
  */
-function parseRecords(text: string, source: string, config: Record<string, unknown>): unknown[] {
-  const format = String(config.format ?? guessFormat(source)).toLowerCase();
+async function parseRecords(
+  bytes: Uint8Array,
+  source: string,
+  config: Record<string, unknown>,
+): Promise<unknown[]> {
+  const format = resolveFormat(source, config);
 
+  // The one member whose payload is binary, and the reason this takes bytes.
+  // Handled before the decode rather than after it, because the decode is what
+  // would destroy it.
+  if (format === 'xlsx') return parseWorkbook(bytes, source, config);
+
+  const text = decodeText(bytes);
   if (format === 'ndjson') {
     return text
       .split('\n')
@@ -1092,7 +1117,62 @@ function parseRecords(text: string, source: string, config: Record<string, unkno
       .map((line) => JSON.parse(line));
   }
   if (format === 'csv') return parseCsv(text, config);
-  return unwrap(JSON.parse(text), config.jsonPath);
+  if (format === 'json') return unwrap(JSON.parse(text), config.jsonPath);
+
+  // Was `return unwrap(JSON.parse(text), …)` as an unconditional tail, which is
+  // how a `.xlsx` used to be read as JSON. Now every member is named above and
+  // this line is what a fifth one has to answer.
+  return unreachableSourceFormat(format, 'parseRecords');
+}
+
+/**
+ * The bytes of a text payload, as text.
+ *
+ * `Buffer.toString('utf8')` rather than a `TextDecoder`, and the difference is
+ * not stylistic: a `TextDecoder` strips a leading byte-order mark and
+ * `readFile(path, 'utf8')` — which is what this replaced — does not. Stripping
+ * it would be a defensible change and is not this one; a CSV whose first header
+ * silently lost its BOM is a different column name than the transform written
+ * against the old behaviour expects.
+ *
+ * The view is taken rather than the array copied, so a 27 MB CSV is not held
+ * twice while it is decoded.
+ */
+function decodeText(bytes: Uint8Array): string {
+  return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('utf8');
+}
+
+/** Whether a payload is empty or nothing but ASCII whitespace. */
+function isBlank(bytes: Uint8Array): boolean {
+  for (const byte of bytes) {
+    // space, tab, LF, CR, VT, FF — what `String.trim()` would have removed from
+    // any body that reached the old text-only reader.
+    if (byte !== 0x20 && (byte < 0x09 || byte > 0x0d)) return false;
+  }
+  return true;
+}
+
+/**
+ * The format this payload is to be read as.
+ *
+ * An unrecognised `format` is refused rather than read as JSON. That was the
+ * old behaviour and it is the one this exists to end: a connector configured
+ * with `format: "parquet"` reported a JSON syntax error at some byte offset,
+ * which names neither the format nor the mistake.
+ */
+function resolveFormat(source: string, config: Record<string, unknown>): SourceFormat {
+  const configured = config.format;
+  // Absent and empty mean the same thing — the console's "Format from the
+  // extension" option submits `''` — and both defer to the extension.
+  if (configured === undefined || configured === null || String(configured).trim() === '') {
+    return guessFormat(source);
+  }
+
+  const named = String(configured).trim().toLowerCase();
+  if (isSourceFormat(named)) return named;
+  throw new Error(
+    `"${String(configured)}" is not a format this can read. Use one of: ${SOURCE_FORMATS.join(', ')} — or leave it unset to take the format from the file extension.`,
+  );
 }
 
 /**
@@ -1256,11 +1336,15 @@ async function readObjectRecords(input: {
   const records: unknown[] = [];
 
   for (const object of objects) {
-    const text = await readObjectText(
+    const bytes = await readObjectBytes(
       await client.send(new s3.GetObjectCommand({ Bucket: bucket, Key: object.key })),
       `s3://${bucket}/${object.key}`,
     );
-    if (!text.trim()) continue;
+    // Was `!text.trim()` on the decoded body. Asked of the bytes instead so the
+    // skip still happens for a whitespace-only object — which matters, because
+    // the alternative is handing `""` to `JSON.parse` and failing a whole run on
+    // an empty part file that this has always skipped.
+    if (isBlank(bytes)) continue;
     // The same format logic a file connector uses, per object: the extension
     // decides unless the connector overrides it, which is what a prefix full of
     // `part-00000` files needs.
@@ -1269,7 +1353,7 @@ async function readObjectRecords(input: {
     // becomes one argument per row and a CSV drop with a few hundred thousand of
     // them overflows the call stack — a failure that only shows up on the large
     // files this connector exists to read.
-    for (const record of parseRecords(text, object.key, config)) {
+    for (const record of await parseRecords(bytes, object.key, config)) {
       records.push(record);
     }
   }
@@ -1352,18 +1436,31 @@ function readListingEntry(entry: unknown): S3Object | undefined {
   };
 }
 
-/** The body of a `GetObject`, as text. */
-async function readObjectText(value: unknown, label: string): Promise<string> {
+/**
+ * The body of a `GetObject`, as bytes.
+ *
+ * `transformToByteArray` rather than `transformToString('utf8')`, for the reason
+ * {@link fetchFile} stopped passing an encoding to `readFile`: the format is not
+ * known here, and a UTF-8 decode of a `.xlsx` — a ZIP archive — replaces most of
+ * it with U+FFFD before anything has had the chance to say so. The text formats
+ * are decoded a step later, in {@link parseRecords}, from exactly these bytes.
+ */
+async function readObjectBytes(value: unknown, label: string): Promise<Uint8Array> {
   const body: unknown = value && typeof value === 'object' ? Reflect.get(value, 'Body') : undefined;
-  const toText: unknown =
-    body && typeof body === 'object' ? Reflect.get(body, 'transformToString') : undefined;
-  if (typeof toText !== 'function') {
+  const toBytes: unknown =
+    body && typeof body === 'object' ? Reflect.get(body, 'transformToByteArray') : undefined;
+  if (typeof toBytes !== 'function') {
     throw new Error(
-      `${label} came back without a readable body. This fetcher reads whole text objects; a stream the SDK cannot collect is not one.`,
+      `${label} came back without a readable body. This fetcher reads whole objects; a stream the SDK cannot collect is not one.`,
     );
   }
-  const text: unknown = await toText.call(body, 'utf8');
-  return typeof text === 'string' ? text : String(text);
+  const bytes: unknown = await toBytes.call(body);
+  if (!(bytes instanceof Uint8Array)) {
+    throw new Error(
+      `${label} came back as ${typeof bytes} rather than bytes, so there is nothing to parse. This needs an @aws-sdk/client-s3 whose response body exposes transformToByteArray().`,
+    );
+  }
+  return bytes;
 }
 
 function positiveInteger(value: unknown): number | undefined {
@@ -1394,13 +1491,462 @@ function unwrap(payload: unknown, path: unknown): unknown[] {
   return target;
 }
 
-function guessFormat(source: string): string {
+/**
+ * The format an extension implies.
+ *
+ * The tail is still JSON, which is a guess and is meant to be: a signed URL ends
+ * in a query string and an object key often has no extension at all. What is no
+ * longer a guess is a workbook — `.xls` and `.xlsm` are claimed here alongside
+ * `.xlsx` because all three are the same decision, and the alternative is that a
+ * `.xls` drop falls through to JSON and reports a syntax error at byte 0.
+ */
+function guessFormat(source: string): SourceFormat {
   const withoutQuery = source.split('?')[0].toLowerCase();
   if (withoutQuery.endsWith('.csv')) return 'csv';
   if (withoutQuery.endsWith('.ndjson') || withoutQuery.endsWith('.jsonl')) {
     return 'ndjson';
   }
+  if (
+    withoutQuery.endsWith('.xlsx') ||
+    withoutQuery.endsWith('.xlsm') ||
+    withoutQuery.endsWith('.xls')
+  ) {
+    return 'xlsx';
+  }
   return 'json';
+}
+
+/**
+ * The most bytes a workbook may be before this refuses to read it.
+ *
+ * A guard rather than a limit anybody is expected to hit: 32 MiB of XLSX is a
+ * very large sheet, and the default exists so that the failure mode of a wrong
+ * `format` or a runaway export is a message rather than a stalled worker. See
+ * {@link parseWorkbook} for why an unbounded one is dangerous here specifically.
+ */
+const DEFAULT_MAX_WORKBOOK_BYTES = 32 * 1024 * 1024;
+
+/**
+ * A spreadsheet workbook, as records.
+ *
+ * **The library is not a dependency of this package, and that is deliberate.**
+ * It is loaded through {@link importOptional}, the same way `pg`, `mysql2` and
+ * the S3 SDK are, so a deployment that never reads a spreadsheet does not carry
+ * one. The reason is sharper than "keep the install small": SheetJS stopped
+ * publishing to npm at `0.18.5`, and that version has two unfixed advisories
+ * against it — CVE-2023-30533 (prototype pollution, fixed in 0.19.3) and
+ * CVE-2024-22363 (ReDoS, fixed in 0.20.2). Neither fix is on npm; they are only
+ * on the vendor's own CDN. Depending on `xlsx` directly would therefore put a
+ * permanently-vulnerable package into the tree of every consumer of this
+ * library, including the ones that never open a workbook — and it would pin
+ * them to *our* choice of provenance. Loading it optionally lets a deployment
+ * install `xlsx` from the vendor tarball at a patched version, or a maintained
+ * fork, and this reads whichever it finds.
+ *
+ * **It parses on the main thread, synchronously, and does not use a worker.**
+ * That is a real cost and is bounded rather than hidden. Parsing a large
+ * workbook is seconds of uninterrupted CPU, and a source node runs inside a
+ * durable step, so a long enough stall keeps a lock-renewal timer from firing
+ * and lets the step be reclaimed while it is still running. A worker thread is
+ * the mitigation that removes it, and it was rejected here for two reasons that
+ * do not apply to an application: a worker needs a separate entry file resolved
+ * from `dist` at run time, which a published library cannot rely on surviving a
+ * consumer's bundler, and the worker would then have to resolve the *optional*
+ * library out of the consumer's `node_modules` from inside our own package.
+ * Both fail only in production. So the exposure is capped instead —
+ * {@link DEFAULT_MAX_WORKBOOK_BYTES}, overridable per connector with
+ * `maxBytes` — which turns an unbounded stall into a refusal naming the file.
+ *
+ * **It reads the whole workbook into memory.** The format does not permit
+ * otherwise without a different library: XLSX is a ZIP archive whose sheet is
+ * one XML part, and a row-at-a-time reader is a different design that would
+ * also have to return {@link StreamedFetchResult}, which neither the file nor
+ * the S3 fetcher does for any format today. Not done here; the size cap is what
+ * stands in for it.
+ */
+async function parseWorkbook(
+  bytes: Uint8Array,
+  source: string,
+  config: Record<string, unknown>,
+): Promise<unknown[]> {
+  const maxBytes = positiveInteger(config.maxBytes) ?? DEFAULT_MAX_WORKBOOK_BYTES;
+  if (bytes.byteLength > maxBytes) {
+    throw new Error(
+      `${source} is ${bytes.byteLength} bytes, over the ${maxBytes}-byte workbook limit. Parsing a workbook is synchronous CPU that blocks this worker's event loop, so an unbounded one can outlive its own step lease. Raise "maxBytes" on the connector if this file really is meant to be read whole.`,
+    );
+  }
+
+  const api = await workbookApi();
+  const workbook = api.read(bytes);
+  const name = chooseSheet(workbook.sheetNames, source, config);
+  return readSheet(api, workbook.sheet(name), name, source, workbook.date1904);
+}
+
+/**
+ * The handful of calls this needs from whichever spreadsheet library is
+ * installed, each one checked before it is used.
+ *
+ * Narrowed rather than typed by assertion. The module arrives as `unknown` from
+ * a dynamic import of a package this repo does not depend on, so there is no
+ * declaration to trust and nothing to cast against — an interface written here
+ * would be a claim about someone else's package, and a wrong one would surface
+ * as `undefined is not a function` in the middle of a load.
+ */
+interface WorkbookApi {
+  read(bytes: Uint8Array): {
+    sheetNames: string[];
+    sheet(name: string): unknown;
+    /** The workbook's epoch flag — see {@link cellDateIso}. */
+    date1904: boolean;
+  };
+  decodeRange(ref: string): { start: CellAddress; end: CellAddress };
+  encodeCell(address: CellAddress): string;
+  /** Whether a cell's number format is one that displays a date. */
+  isDateFormat(format: unknown): boolean;
+  /** A serial number as calendar fields, with no `Date` in between. */
+  dateFields(serial: number, date1904: boolean): DateFields;
+}
+
+interface CellAddress {
+  row: number;
+  column: number;
+}
+
+interface DateFields {
+  year: number;
+  month: number;
+  day: number;
+  hours: number;
+  minutes: number;
+  seconds: number;
+  milliseconds: number;
+}
+
+async function workbookApi(): Promise<WorkbookApi> {
+  const module: unknown = await importOptional<unknown>('xlsx', 'spreadsheet');
+  const read = callable(module, 'read', 'read()');
+  const utils: unknown = property(module, 'utils');
+  const decodeRange = callable(utils, 'decode_range', 'utils.decode_range()');
+  const encodeCell = callable(utils, 'encode_cell', 'utils.encode_cell()');
+  const ssf: unknown = property(module, 'SSF');
+  const isDate = callable(ssf, 'is_date', 'SSF.is_date()');
+  const parseDateCode = callable(ssf, 'parse_date_code', 'SSF.parse_date_code()');
+
+  return {
+    read(bytes) {
+      // `cellDates` is deliberately OFF and `cellNF` deliberately ON: this wants
+      // the raw serial and the cell's number format, not the library's idea of a
+      // `Date`. See {@link cellDateIso} for why that distinction is the whole
+      // correctness argument for dates.
+      const workbook: unknown = read(bytes, { cellDates: false, cellNF: true, type: 'array' });
+      const names: unknown = property(workbook, 'SheetNames');
+      if (!Array.isArray(names) || !names.every((n) => typeof n === 'string')) {
+        throw new Error(
+          'The installed spreadsheet library returned a workbook with no SheetNames, so there is no sheet to read.',
+        );
+      }
+      const sheets: unknown = property(workbook, 'Sheets');
+      return {
+        sheetNames: names,
+        sheet(name) {
+          return property(sheets, name);
+        },
+        // Absent means the ordinary 1900 epoch. Only a workbook saved by the
+        // old Mac Excel sets it, and getting it wrong moves every date in the
+        // file by four years and a day.
+        date1904:
+          property(property(property(workbook, 'Workbook'), 'WBProps'), 'date1904') === true,
+      };
+    },
+    decodeRange(ref) {
+      const range: unknown = decodeRange(ref);
+      return { start: address(range, 's', ref), end: address(range, 'e', ref) };
+    },
+    encodeCell({ row, column }) {
+      const encoded: unknown = encodeCell({ r: row, c: column });
+      if (typeof encoded !== 'string') {
+        throw new Error(
+          'The installed spreadsheet library did not encode a cell address as a string.',
+        );
+      }
+      return encoded;
+    },
+    isDateFormat(format) {
+      // A cell with no format is a plain number. Asked before the call because
+      // the library's own check takes a string.
+      if (typeof format !== 'string') return false;
+      return isDate(format) === true;
+    },
+    dateFields(serial, date1904) {
+      const parsed: unknown = parseDateCode(serial, { date1904 });
+      const fields = {
+        year: property(parsed, 'y'),
+        month: property(parsed, 'm'),
+        day: property(parsed, 'd'),
+        hours: property(parsed, 'H'),
+        minutes: property(parsed, 'M'),
+        seconds: property(parsed, 'S'),
+        // Sub-second remainder, which the library reports as a fraction.
+        fraction: property(parsed, 'u'),
+      };
+      if (
+        typeof fields.year !== 'number' ||
+        typeof fields.month !== 'number' ||
+        typeof fields.day !== 'number' ||
+        typeof fields.hours !== 'number' ||
+        typeof fields.minutes !== 'number' ||
+        typeof fields.seconds !== 'number'
+      ) {
+        throw new Error(
+          `The spreadsheet serial ${serial} did not decode into calendar fields, so the date it names is not known.`,
+        );
+      }
+      return {
+        year: fields.year,
+        month: fields.month,
+        day: fields.day,
+        hours: fields.hours,
+        minutes: fields.minutes,
+        seconds: fields.seconds,
+        milliseconds: typeof fields.fraction === 'number' ? Math.round(fields.fraction * 1000) : 0,
+      };
+    },
+  };
+}
+
+function property(host: unknown, name: string): unknown {
+  return host && typeof host === 'object' ? Reflect.get(host, name) : undefined;
+}
+
+/** A function off the loaded module, bound to it, returning `unknown`. */
+function callable(host: unknown, name: string, label: string): (...args: unknown[]) => unknown {
+  const value: unknown = property(host, name);
+  if (typeof value !== 'function') {
+    throw new Error(
+      `The installed spreadsheet library has no ${label}. This expects the SheetJS interface — "xlsx" from the vendor's own distribution, or a fork that keeps it.`,
+    );
+  }
+  return (...args: unknown[]): unknown => Reflect.apply(value, host, args);
+}
+
+/** One corner of a decoded range, as numbers rather than as a shape to trust. */
+function address(range: unknown, corner: string, ref: string): CellAddress {
+  const point: unknown = property(range, corner);
+  const row: unknown = property(point, 'r');
+  const column: unknown = property(point, 'c');
+  if (typeof row !== 'number' || typeof column !== 'number') {
+    throw new Error(`The sheet range "${ref}" did not decode into row and column numbers.`);
+  }
+  return { row, column };
+}
+
+/**
+ * Which sheet a workbook's records come from.
+ *
+ * A workbook holds many sheets and a source produces one stream of records, so
+ * something has to choose. A single-sheet workbook chooses itself. Anything else
+ * must be named with `sheet`, and this **refuses** rather than taking the first
+ * one — taking the first is right most of the time, and the rest of the time it
+ * loads the wrong sheet's rows under the right sheet's name, with nothing in the
+ * run to point at. The error lists what the file actually contains, because the
+ * person configuring the connector usually cannot open it.
+ */
+function chooseSheet(names: string[], source: string, config: Record<string, unknown>): string {
+  const requested = config.sheet;
+  if (requested !== undefined && requested !== null && String(requested).trim() !== '') {
+    const wanted = String(requested).trim();
+    // Matched exactly first: a workbook may legitimately hold both "Data" and
+    // "data", and a case-insensitive match that picked one would be the silent
+    // choice this function exists to avoid making.
+    if (names.includes(wanted)) return wanted;
+    throw new Error(
+      `${source} has no sheet named "${wanted}". It has: ${names.map((n) => JSON.stringify(n)).join(', ')}.`,
+    );
+  }
+
+  if (names.length === 0) throw new Error(`${source} has no sheets in it.`);
+  if (names.length === 1) return names[0];
+  throw new Error(
+    `${source} has ${names.length} sheets and no "sheet" configured: ${names.map((n) => JSON.stringify(n)).join(', ')}. Name the one to read — this will not guess, because loading the wrong sheet looks exactly like loading the right one.`,
+  );
+}
+
+/**
+ * One sheet's used range, as records keyed by the header row.
+ *
+ * Walked cell by cell rather than handed to the library's own sheet-to-JSON
+ * helper, which is the choice that makes everything below decidable here: the
+ * helper has its own opinions about blank rows, duplicate headers and what a
+ * date becomes, they differ between versions, and this loads production data.
+ */
+function readSheet(
+  api: WorkbookApi,
+  sheet: unknown,
+  name: string,
+  source: string,
+  date1904: boolean,
+): unknown[] {
+  // No `!ref` means the sheet has no used range — a genuinely empty tab, which
+  // is nothing to read rather than something to refuse.
+  const ref: unknown = property(sheet, '!ref');
+  if (typeof ref !== 'string') return [];
+
+  const { start, end } = api.decodeRange(ref);
+  const columns: { name: string; index: number }[] = [];
+  const seen = new Map<string, number>();
+
+  for (let column = start.column; column <= end.column; column += 1) {
+    const address = api.encodeCell({ row: start.row, column });
+    const heading = cellValue(api, property(sheet, address), address, name, source, date1904);
+    // A blank heading becomes the sheet's own column letter rather than `""`.
+    // The column may still hold data, and dropping it — or letting every blank
+    // heading collide on one empty key — loses it silently.
+    const label =
+      heading === null
+        ? address.replace(/\d+$/, '')
+        : String(heading).trim() || address.replace(/\d+$/, '');
+
+    const previous = seen.get(label);
+    if (previous !== undefined) {
+      throw new Error(
+        `${source} sheet "${name}" has two columns headed "${label}" (${api.encodeCell({ row: start.row, column: previous })} and ${address}). One would overwrite the other and the load would be short a column with nothing to show for it.`,
+      );
+    }
+    seen.set(label, column);
+    columns.push({ name: label, index: column });
+  }
+
+  const records: unknown[] = [];
+  for (let row = start.row + 1; row <= end.row; row += 1) {
+    const record: Record<string, CellValue> = {};
+    let populated = false;
+    for (const column of columns) {
+      const address = api.encodeCell({ row, column: column.index });
+      const value = cellValue(api, property(sheet, address), address, name, source, date1904);
+      if (value !== null) populated = true;
+      record[column.name] = value;
+    }
+    // Matches what the CSV reader does with a row of empty fields: a spacer row
+    // is formatting, not a record.
+    if (populated) records.push(record);
+  }
+
+  return records;
+}
+
+/**
+ * What one cell becomes.
+ *
+ * The mapping is written out because a spreadsheet cell has a type and a CSV
+ * field does not, so this is a decision rather than a passthrough:
+ *
+ * - text stays text, untrimmed — trimming is the transform's job, as it is for CSV
+ * - a number stays a number, a boolean a boolean
+ * - a **date becomes an ISO-8601 string**, never a serial number and never a
+ *   `Date`. See {@link spreadsheetDateIso}, which is where the timezone goes
+ * - an **empty or absent cell becomes `null`**, which is what the CSV reader
+ *   puts in a short row, so a transform written against one works on the other
+ * - an **error cell is refused**, loudly and by address
+ *
+ * That last one is the only opinionated refusal. A cell holding `#REF!` or
+ * `#N/A` means the export itself is broken, and the alternatives are to pass the
+ * text `"#N/A"` into what is probably a numeric column or to null it — one
+ * corrupts the load, the other hides it. Failing names the cell.
+ *
+ * **Merged cells:** only the top-left cell of a merged range holds the value.
+ * Every other cell it covers is absent and therefore arrives as `null` — the
+ * value is *not* carried down or across. Anything that needs the merged value
+ * repeated down a column (a header-per-group layout, which real exports use
+ * heavily — the sample this was tested against has 1,732 merges in 974 rows)
+ * must fill it forward in a transform, and this note is here because that
+ * transform cannot be written without knowing it.
+ */
+type CellValue = string | number | boolean | null;
+
+function cellValue(
+  api: WorkbookApi,
+  cell: unknown,
+  address: string,
+  sheet: string,
+  source: string,
+  date1904: boolean,
+): CellValue {
+  if (cell === null || cell === undefined || typeof cell !== 'object') return null;
+
+  const type: unknown = Reflect.get(cell, 't');
+  const value: unknown = Reflect.get(cell, 'v');
+
+  // 'z' is the tag for a cell that carries formatting and no value.
+  if (type === 'z' || value === undefined || value === null) return null;
+  if (type === 'e') {
+    const rendered: unknown = Reflect.get(cell, 'w');
+    const text = typeof rendered === 'string' ? rendered : String(value);
+    throw new Error(
+      `${source} sheet "${sheet}" cell ${address} holds the spreadsheet error ${text}. Refusing the file rather than loading the error as a value or as a null, either of which would land in the warehouse looking like data.`,
+    );
+  }
+
+  // A date is a number wearing a date format, and this is where it stops being
+  // one. Checked before the plain-number branch, which is what it would
+  // otherwise fall into and leave as 46183.
+  if (typeof value === 'number' && api.isDateFormat(Reflect.get(cell, 'z'))) {
+    return cellDateIso(api, value, date1904);
+  }
+
+  // Otherwise dispatched on what the value *is* rather than on the tag beside
+  // it. The tag vocabulary belongs to the library, which is not a dependency
+  // here and may be a fork; the runtime type of the value is checkable.
+  //
+  // A `Date` should not arrive at all, since the workbook is read with
+  // `cellDates: false`. It is handled anyway, because a fork that ignores the
+  // option would otherwise reach the refusal below — and `toISOString()` is
+  // right for the convention every version of the library that produces Dates
+  // has used here, which is UTC components holding the cell's wall clock.
+  if (value instanceof Date) return value.toISOString();
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return value;
+  }
+  throw new Error(
+    `${source} sheet "${sheet}" cell ${address} came back as ${typeof value}, which this does not know how to store.`,
+  );
+}
+
+/**
+ * A date cell as an ISO-8601 string, built from the serial and never from a
+ * `Date`.
+ *
+ * This is the most deliberate decision in the reader, because a date is where a
+ * spreadsheet load goes wrong quietly. Three things had to be true at once:
+ *
+ * 1. **Not the serial.** A cell showing `2026-06-10` holds the number 46183. A
+ *    column of those arriving in the warehouse is not obviously wrong, which is
+ *    what makes it dangerous, so the serial never survives this function.
+ * 2. **The right epoch.** That 46183 counts from 1899-12-30 in an ordinary
+ *    workbook and from 1904-01-01 in one saved by the old Mac Excel. The flag
+ *    lives on the workbook and is passed in; ignoring it moves every date in the
+ *    file by four years and a day.
+ * 3. **No timezone, at all.** This is why the conversion goes through the
+ *    library's serial decoder rather than through a `Date`. The decoder returns
+ *    calendar fields — year, month, day, hours — which is what the cell actually
+ *    contains: a spreadsheet date has no zone. Building a `Date` from it would
+ *    immediately impose the server's, and whether `toISOString()` then agreed
+ *    with the cell would depend on whether the library had constructed that
+ *    `Date` with local or UTC components. Both conventions exist across
+ *    versions of it, they differ by exactly the machine's offset, and this
+ *    library does not control which version a deployment installs. Reading the
+ *    fields and formatting them directly makes the question not arise.
+ *
+ * The `Z` is therefore a statement about the format and not a claim about a
+ * zone: it says these are the fields the cell shows, so that two runs of the
+ * same file in two regions produce the same string.
+ */
+function cellDateIso(api: WorkbookApi, serial: number, date1904: boolean): string {
+  const { year, month, day, hours, minutes, seconds, milliseconds } = api.dateFields(
+    serial,
+    date1904,
+  );
+  const pad = (value: number, width: number): string => String(value).padStart(width, '0');
+  return `${pad(year, 4)}-${pad(month, 2)}-${pad(day, 2)}T${pad(hours, 2)}:${pad(minutes, 2)}:${pad(seconds, 2)}.${pad(milliseconds, 3)}Z`;
 }
 
 /**
@@ -1417,8 +1963,33 @@ function parseCsv(text: string, config: Record<string, unknown>): unknown[] {
   if (!header) return [];
 
   return body.map((cells) =>
-    Object.fromEntries(header.map((name, index) => [name, cells[index] ?? null])),
+    Object.fromEntries(header.map((name, index) => [name, emptyAsNull(cells[index])])),
   );
+}
+
+/**
+ * An empty field, as `null` rather than as `""`.
+ *
+ * This was `cells[index] ?? null`, which made a **missing** cell `null` and a
+ * **blank** one `""` — two spellings of "this row has no value here", only one
+ * of which the `present` predicate recognises, because it tests `null` and
+ * `undefined` and an empty string is neither. A graph filtering on `isNotNull`
+ * therefore kept every blank in the file: measured against one real drop, it
+ * committed 102,519 rows where the right answer was 89,458.
+ *
+ * `null` is now the single answer, and the reason to prefer it over teaching
+ * `present` about `""` is that the workbook reader has the same question and
+ * cannot answer it the other way: a blank spreadsheet cell is an *absent* cell,
+ * there is no empty string anywhere in the file to report. Aligning CSV on
+ * `null` makes one predicate mean one thing whichever format the source read;
+ * aligning the other way would have meant inventing a value for the 3,468 empty
+ * cells in the MVR sample.
+ *
+ * Nothing is trimmed on the way past. A field of spaces is a value somebody
+ * typed, and deciding what it means is the transform's job — as it always was.
+ */
+function emptyAsNull(value: string | undefined): string | null {
+  return value === undefined || value === '' ? null : value;
 }
 
 /**

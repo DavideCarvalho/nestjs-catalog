@@ -195,6 +195,9 @@ importers:
       typescript:
         specifier: 5.9.3
         version: 5.9.3
+      xlsx:
+        specifier: npm:@e965/xlsx@0.20.3
+        version: '@e965/xlsx@0.20.3'
 
   packages/react:
     dependencies:
@@ -857,6 +860,11 @@ packages:
     peerDependenciesMeta:
       '@dudousxd/nestjs-context':
         optional: true
+
+  '@e965/xlsx@0.20.3':
+    resolution: {integrity: sha512-703RN/3OdsRD5mtse2HBX7Um7xwaP9tlswEG6svOtjqokXoX7rJdQj7DyabD2I+xk22RgaIIU+R6BHgkpZGB/w==}
+    engines: {node: '>=0.8'}
+    hasBin: true
 
   '@esbuild/aix-ppc64@0.21.5':
     resolution: {integrity: sha512-1SDgH6ZSPTlggy1yI6+Dbkiz8xzpHJEVAlF/AM1tHPLsf5STom9rwtjE4hKAF20FfXXNTFqEYXyJNWh1GiZedQ==}
@@ -5238,6 +5246,8 @@ snapshots:
       rxjs: 7.8.2
       uuid: 11.1.1
       zod: 3.25.76
+
+  '@e965/xlsx@0.20.3': {}
 
   '@esbuild/aix-ppc64@0.21.5':
     optional: true
