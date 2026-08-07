@@ -68,6 +68,7 @@ import {
   namedEnvironment,
 } from './code-context';
 import { EXPECT_SHRINK_LABEL } from './load-expectations';
+import { CatalogStorage } from './media-storage';
 import { PublishService } from './publish.service';
 import { redactLines, redactSecrets, safeLogLines } from './run-logs';
 import { SOURCES, applyConnection, resolveSecret, toRecordStream } from './sources';
@@ -331,6 +332,14 @@ export class WorkflowRunnerService {
     @Optional()
     @Inject(CATALOG_PIPELINE_ENVIRONMENT)
     private readonly environmentName?: CatalogEnvironmentNameResolver,
+    /**
+     * The host's media disks, when it mounted any.
+     *
+     * Optional and last for the same reason the line above is. Absent means the
+     * direct-SDK path, which is what every deployment without media has always
+     * done; only a source node whose connector names a `disk` reaches for this.
+     */
+    @Optional() private readonly storage?: CatalogStorage,
   ) {}
 
   /**
@@ -1214,6 +1223,7 @@ export class WorkflowRunnerService {
         secret: resolveSecret(connector),
         state: state.committed,
         mode,
+        storage: this.storage?.manager(),
       }),
     );
 

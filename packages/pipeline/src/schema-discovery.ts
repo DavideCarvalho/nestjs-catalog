@@ -6,7 +6,13 @@ import {
   type ScalarType,
   isReservedColumn,
 } from '@dudousxd/nestjs-catalog';
-import { SOURCES, type SqlDescription, describeSql, toBufferedFetchResult } from './sources';
+import {
+  SOURCES,
+  type SqlDescription,
+  type StorageManagerLike,
+  describeSql,
+  toBufferedFetchResult,
+} from './sources';
 
 /**
  * Asking one source node of a graph what it actually looks like.
@@ -232,6 +238,15 @@ export interface DiscoverSchemaInput {
   existing?: CatalogObjectTypeDef;
   /** How many records a sampled inference looks at. See {@link SAMPLE_LIMIT}. */
   sampleLimit?: number;
+  /**
+   * The host's media disks, when it mounted any.
+   *
+   * Passed through for the same reason discovery uses the run's own fetcher at
+   * all: a connector that names a disk must be *discovered* the way it will be
+   * *read*. Without this, pressing "discover" on a disk-backed connector would
+   * take the refusal path and report a source that runs perfectly well.
+   */
+  storage?: StorageManagerLike;
 }
 
 /**
@@ -265,7 +280,7 @@ export async function discoverSourceSchema(
   const described =
     reader.kind === 'sql'
       ? await describeFromDriver(reader, secret)
-      : await describeFromSample(reader, secret, input.sampleLimit ?? SAMPLE_LIMIT);
+      : await describeFromSample(reader, secret, input.sampleLimit ?? SAMPLE_LIMIT, input.storage);
 
   const columns = flagUnusableNames(described.columns);
 
@@ -340,6 +355,7 @@ async function describeFromSample(
   connector: CatalogConnector,
   secret: string | undefined,
   limit: number,
+  storage: StorageManagerLike | undefined,
 ): Promise<{
   basis: DiscoveryBasis;
   sampled: number;
@@ -368,6 +384,7 @@ async function describeFromSample(
       // up to date is worse than useless.
       state: {},
       mode: 'full',
+      storage,
     }),
     limit,
   );

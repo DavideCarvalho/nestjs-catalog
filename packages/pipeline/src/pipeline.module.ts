@@ -21,6 +21,7 @@ import {
   type CatalogLoadExpectations,
   DEFAULT_ROW_COUNT_BOUND,
 } from './load-expectations';
+import { CatalogStorage } from './media-storage';
 import { createPipelineController } from './pipeline.controller';
 import { createPublishController } from './publish.controller';
 import { PublishService } from './publish.service';
@@ -328,6 +329,7 @@ export class CatalogPipelineModule {
         useFactory: () => new SubprocessTransformRunner({ pythonVenv: options.pythonVenv }),
       },
       PublishService,
+      CatalogStorage,
       ConnectorRunnerService,
       WorkflowRunnerService,
       WorkflowLauncher,
@@ -383,6 +385,9 @@ export class CatalogPipelineModule {
       providers,
       exports: [
         PublishService,
+        // Exported so a host can ask what this deployment can say about naming a
+        // media disk without reaching into the module's internals.
+        CatalogStorage,
         ConnectorRunnerService,
         WorkflowRunnerService,
         WorkflowLauncher,

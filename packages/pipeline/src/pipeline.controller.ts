@@ -83,6 +83,7 @@ import {
   refuseInvalidLoadExpectation,
   resolveLoadExpectation,
 } from './load-expectations';
+import { CatalogStorage, NO_STORAGE_DETAIL } from './media-storage';
 import { discoverSourceSchema } from './schema-discovery';
 import { CATALOG_PIPELINE_REGISTRY, type CatalogPipelineRegistry } from './seams';
 import { resolveSecret } from './sources';
@@ -149,6 +150,10 @@ export function createPipelineController(
       @Optional()
       @Inject(CATALOG_PIPELINE_ENVIRONMENT)
       private readonly environmentName?: CatalogEnvironmentNameResolver,
+      // The host's media disks, so `capabilities` can say whether a connector
+      // may name one and `discover` can read a disk-backed connector the same
+      // way a run would. Optional and last, like the two above.
+      @Optional() private readonly storage?: CatalogStorage,
     ) {}
 
     /**
@@ -200,6 +205,14 @@ export function createPipelineController(
       return {
         languages,
         pythonPackages: packages,
+        // Synchronous, like `durable` below, and cached forever by the console
+        // for the same reason: which disks this process can open cannot change
+        // without a redeploy.
+        storage: this.storage?.availability() ?? {
+          available: false,
+          disks: [],
+          detail: NO_STORAGE_DETAIL,
+        },
         // Served, finally. The console has always asked — `WorkflowCanvas`
         // reads `capabilities.durable` and prints whether a failed run resumes
         // where it stopped — and this route has never answered, so the screen
@@ -1623,6 +1636,10 @@ export function createPipelineController(
           // the engine currently sees it, which is the same object a load would
           // be written through.
           existing: workflow.targetType ? this.registry.getType(workflow.targetType) : undefined,
+          // Discovery reads through the run's own fetcher, so it must be handed
+          // the run's own disks. Without this a disk-backed connector would be
+          // refused here and load perfectly well.
+          storage: this.storage?.manager(),
         });
       } catch (error) {
         // A source that refuses, a query that does not parse, a missing
