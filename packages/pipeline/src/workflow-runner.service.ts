@@ -70,13 +70,7 @@ import {
 import { EXPECT_SHRINK_LABEL } from './load-expectations';
 import { PublishService } from './publish.service';
 import { redactLines, redactSecrets, safeLogLines } from './run-logs';
-import {
-  type FetchResult,
-  SOURCES,
-  applyConnection,
-  resolveSecret,
-  toBufferedFetchResult,
-} from './sources';
+import { SOURCES, applyConnection, resolveSecret, toRecordStream } from './sources';
 
 /**
  * Re-exported from where it now lives.
@@ -1200,13 +1194,21 @@ export class WorkflowRunnerService {
       );
     }
 
-    // Buffered, and it stays buffered. A source node stages its whole output
-    // before any downstream node reads a row of it — `stage` below is one write
-    // of `rows` — so a streamed read would arrive here and be turned back into an
-    // array a few lines later with nothing gained. The single-connector runner is
-    // where streaming pays, because there the next node IS the batch write. If
-    // this ever stages incrementally, this is the line to change.
-    const result: FetchResult = await toBufferedFetchResult(
+    // Staged as it arrives. This used to buffer the whole read before writing a
+    // batch of it, and the comment that stood here said the buffer bought
+    // nothing to remove because `stage` was one write of one finished array.
+    // That was true of `stage`; it was never true of the fetchers. A streamed
+    // source hands rows over as it finds them, so the array in the middle was
+    // the only thing holding the load — and it held it inside a durable step,
+    // on top of whatever the parse was already holding. Now the fetcher's
+    // stream is written a batch at a time and the next batch is not asked for
+    // until the previous write has finished, which is what carries the
+    // back-pressure from the stage store all the way to the file descriptor.
+    //
+    // A fetcher that hands back an array is unchanged and loses nothing: it had
+    // the whole result before it returned, and {@link toRecordStream} yields out
+    // of that array rather than copying it.
+    const stream = toRecordStream(
       await fetcher({
         connector,
         secret: resolveSecret(connector),
@@ -1215,47 +1217,65 @@ export class WorkflowRunnerService {
       }),
     );
 
-    // Records that are not objects cannot be staged as rows, and dropping them
-    // silently is how a load comes out short with nothing to explain it. The
-    // single-transform runner applies the same filter for the same reason.
-    const rows = result.records.filter(isRowRecord);
-    const dropped = result.records.length - rows.length;
+    const output = await this.stageStream(input.runId, node.id, stream.records);
+
     logs.push(
-      `Fetched ${result.records.length} records from ${connector.kind}${
-        dropped > 0 ? `, ${dropped} of which were not objects and were dropped` : ''
+      `Fetched ${output.seen} records from ${connector.kind}${
+        output.dropped > 0 ? `, ${output.dropped} of which were not objects and were dropped` : ''
       }.`,
     );
     // Immediately under the count they do not agree with, which is the whole
     // point of them: a source that skipped rows while parsing says so here,
-    // beside the number a reader is about to believe. See `FetchResult.notes`.
-    logs.push(...(result.notes ?? []));
+    // beside the number a reader is about to believe. See `FetchResult.notes`,
+    // and `RecordStream.notes` on why asking is only legal now — a streamed
+    // read's blank-line ledger is a running count, and a note asked for before
+    // the last row would report a number smaller than the truth. That is why
+    // this line moved *below* the staging rather than staying above it.
+    logs.push(...stream.notes());
     // Emphatically not an error. A source with nothing to read is an ordinary
     // outcome — the sink decides what to do about a load that produced nothing,
     // because the sink is the only node that can see the whole graph's output.
-    if (rows.length === 0) {
+    if (output.ref.rowCount === 0) {
       logs.push(`"${node.name}" read nothing this run.`);
     }
+    if (stream.streamed) {
+      logs.push(
+        `"${node.name}" staged its ${output.ref.batches} batches as they arrived; nothing held the whole read.`,
+      );
+    }
 
-    const output = await this.stage(input.runId, node.id, rows, logs);
+    await this.clearStaleTail(input.runId, node.id, output.ref.batches, logs);
+
+    // Asked only now, and that timing is the watermark rule rather than tidiness.
+    // `RecordStream.state` is a function precisely because a stream's watermark
+    // is not known until it has drained: the S3 fetcher appends an object key to
+    // `completed` only after that object's *last* record has been yielded, so a
+    // read that dies on object 4 of 10 never reaches this line and advances
+    // nothing. The same holds one level up now that staging is incremental — a
+    // run that dies after batch 7 of 20 throws out of the loop above, so this is
+    // not reached and no `pending` is written. The batches it did stage sit in an
+    // uncommitted snapshot and are read again next time, which is the
+    // at-least-once behaviour every other mid-run failure here has.
+    const settled = stream.state();
 
     // Written as *pending*, never as the watermark itself. Advancing it here
     // would promise never to read those records again on behalf of a run that
     // has not committed anything yet, and a failure at the next node would then
     // skip data nobody stored. The sink promotes it, after the commit.
-    if (result.state && owner) {
+    if (settled && owner) {
       await this.requireStore().saveConnectorState(owner.id, {
         ...(owner.state ?? {}),
-        [node.id]: { ...state.raw, pending: result.state },
+        [node.id]: { ...state.raw, pending: settled },
       });
       logs.push(
-        `Staged a new watermark for "${node.name}" (${Object.keys(result.state).join(', ')}); it is promoted only if this run commits.`,
+        `Staged a new watermark for "${node.name}" (${Object.keys(settled).join(', ')}); it is promoted only if this run commits.`,
       );
     }
 
     return {
       nodeId: node.id,
-      output,
-      rows: rows.length,
+      output: output.ref,
+      rows: output.ref.rowCount,
       elapsedMs: Date.now() - startedAt,
       logs: safeLogLines(logs, LOG_LINES_PER_NODE),
     };
@@ -1893,6 +1913,83 @@ export class WorkflowRunnerService {
     await this.clearStaleTail(runId, nodeId, batches, logs);
 
     return { runId, nodeId, batches, rowCount: rows.length };
+  }
+
+  /**
+   * The same staging, over records that are still arriving.
+   *
+   * ## Why it is a second method rather than a widening of {@link stage}
+   *
+   * They differ in the one thing a caller has to decide about: `stage` is handed
+   * a finished array and can therefore sweep the tail itself, because it knows
+   * its own last batch number the moment it is called. This does not know it
+   * until the stream has drained, and its caller has things to say — the record
+   * count, the parse notes, whether the read was streamed — that are only
+   * knowable at that same moment and belong *above* the sweep's line in the run
+   * log. So the sweep is the caller's call here, exactly as it is in
+   * {@link runFilter} and {@link streamTransform}, and this returns the counts
+   * the caller needs to make it.
+   *
+   * ## Batch numbering, and a retry
+   *
+   * A batch is the position of a group of rows in the source's record order, and
+   * this produces exactly the numbering `stage` produced over the same read:
+   * batch *n* is staged rows `(n-1) * BATCH_SIZE` to `n * BATCH_SIZE`, with no
+   * number ever skipped. That is the rule {@link runSink} states — a position and
+   * never a running count of the batches that happened to have rows — and it is
+   * what makes a retry safe: a second attempt at the same source writes the
+   * *same* numbers over the same stage and each one replaces itself, rather than
+   * shifting by one and leaving half of the first attempt readable under this
+   * node's name.
+   *
+   * The one thing that changes versus buffering is *when* a batch becomes
+   * readable, and it changes nothing about who may read it: a downstream node
+   * reads `1..batches` off the ref this node returns, and the ref does not exist
+   * until the stream has drained. A failure part way through leaves batches
+   * staged that no ref covers — nothing reads them, the next attempt overwrites
+   * them, and {@link clearStaleTail} empties whatever a longer earlier attempt
+   * left past the end.
+   *
+   * ## The heap
+   *
+   * One `carry` of at most `BATCH_SIZE` rows, plus whatever the fetcher holds to
+   * produce the next record. Nothing here scales with the size of the load.
+   */
+  private async stageStream(
+    runId: string,
+    nodeId: string,
+    records: AsyncIterable<unknown>,
+  ): Promise<{ ref: WorkflowStageRef; seen: number; dropped: number }> {
+    const store = this.requireStore();
+    let seen = 0;
+    let kept = 0;
+    let batches = 0;
+    const carry: Array<Record<string, unknown>> = [];
+    const flush = async (rows: Array<Record<string, unknown>>): Promise<void> => {
+      batches += 1;
+      await store.writeStage({ runId, nodeId, batch: batches, rows });
+    };
+
+    for await (const record of records) {
+      seen += 1;
+      // Records that are not objects cannot be staged as rows, and dropping them
+      // silently is how a load comes out short with nothing to explain it. The
+      // single-transform runner applies the same filter for the same reason —
+      // and applying it here rather than after the read is what keeps the batch
+      // boundaries identical to the ones the buffered path produced, which
+      // filtered before it sliced.
+      if (!isRowRecord(record)) continue;
+      kept += 1;
+      carry.push(record);
+      if (carry.length >= BATCH_SIZE) await flush(carry.splice(0, BATCH_SIZE));
+    }
+    if (carry.length > 0) await flush(carry.splice(0, carry.length));
+
+    return {
+      ref: { runId, nodeId, batches, rowCount: kept },
+      seen,
+      dropped: seen - kept,
+    };
   }
 
   /**

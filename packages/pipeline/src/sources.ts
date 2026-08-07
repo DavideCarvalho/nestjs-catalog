@@ -183,12 +183,15 @@ function isStreamedFetch(value: FetchResult | StreamedFetchResult): value is Str
  * generator and not a second copy of its data.
  *
  * `streamed` is reported rather than left to be inferred from the connector
- * kind, because the connector runner has one thing to say that depends on it: a
- * connector with a transform buffers its read, and "this read could have been
- * bounded and was not" belongs on the run rather than being something an
- * operator deduces from the fact that the connector has a transform attached.
- * On the array shapes it is false, which is the truth — those sources had
- * nothing to stream.
+ * kind, because both runners have something to say that depends on it. The
+ * connector runner says "this read could have been bounded and was not" when a
+ * transform forces it to buffer, which belongs on the run rather than being
+ * something an operator deduces from the fact that the connector has a transform
+ * attached. A workflow source node says the other half — that it staged its
+ * batches as they arrived and held no copy of the read — which is only true when
+ * the fetcher was actually handing rows over. On the array shapes it is false,
+ * which is the truth: those sources had nothing to stream, and a node that
+ * claimed otherwise over one of them would be claiming a bound it does not have.
  */
 export interface RecordStream {
   records: AsyncIterable<unknown>;
@@ -238,11 +241,18 @@ export function toRecordStream(value: unknown[] | FetchResult | StreamedFetchRes
 /**
  * A fetch as a finished array, whatever shape it arrived in.
  *
- * For the two consumers that cannot work incrementally and are honest about it:
- * a workflow source node stages its whole output before the next node reads it,
- * and a schema discovery infers from a sample. Both held the whole thing before
- * this existed and still do; what this adds is that they keep working when a
- * fetcher streams.
+ * For the one consumer that cannot work incrementally and is honest about it: a
+ * schema discovery infers a type from a sample, and inferring is not a per-record
+ * operation — the columns it reports are the union over everything it looked at.
+ * It held the whole sample before this existed and still does; what this adds is
+ * that it keeps working when a fetcher streams, and that `limit` stops the read
+ * rather than slicing it afterwards.
+ *
+ * A workflow source node used to be the second such consumer, on the grounds
+ * that it staged its whole output in one write. It no longer does — see
+ * `WorkflowRunnerService.stageStream`, which writes batch *n* while the fetcher
+ * is still producing batch *n + 1* — so the only thing left here that holds a
+ * whole read is the one that has to.
  *
  * `limit` stops pulling rather than slicing afterwards, which is the difference
  * between a discovery reading twenty rows out of a million-row table and reading
