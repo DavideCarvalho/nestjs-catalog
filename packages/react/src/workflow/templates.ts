@@ -274,6 +274,12 @@ export const SOURCE_KINDS: Record<ConnectorKind, SourceKindProfile> = {
     label: 'an object store',
     required: ['bucket'],
     optional: [
+      // A named media disk, which stands in for `bucket`, `region`, `endpoint`
+      // AND the credential — the host configured all four once, and a connector
+      // that names a disk inherits them instead of restating them. Optional
+      // rather than an alternative `required` set because a deployment with no
+      // media has no disks to name, and `bucket` is still the answer there.
+      'disk',
       'prefix',
       'suffix',
       'format',

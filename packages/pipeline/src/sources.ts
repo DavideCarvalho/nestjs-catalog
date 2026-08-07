@@ -1592,7 +1592,10 @@ export function unknownDiskDetail(disk: string, available: readonly string[]): s
  * Collapsing them into "could not open the disk" would send everybody to the
  * wrong place half the time.
  */
-export function resolveDisk(storage: StorageManagerLike | undefined, disk: string): StorageDriverLike {
+export function resolveDisk(
+  storage: StorageManagerLike | undefined,
+  disk: string,
+): StorageDriverLike {
   if (!storage) throw new Error(noStorageDetail(disk));
   const available = storage.diskNames();
   if (!available.includes(disk)) throw new Error(unknownDiskDetail(disk, available));
@@ -1841,10 +1844,7 @@ function asAsyncIterable(value: unknown, label: string): AsyncIterable<unknown> 
  * has to hold whichever transport produced it. Refused rather than skipped,
  * because a skipped object is one nobody notices is missing.
  */
-function readDiskListing(
-  value: unknown,
-  disk: string,
-): { objects: S3Object[]; cursor?: string } {
+function readDiskListing(value: unknown, disk: string): { objects: S3Object[]; cursor?: string } {
   if (!value || typeof value !== 'object') {
     throw new Error(`Disk "${disk}" answered a listing that was not a result object.`);
   }

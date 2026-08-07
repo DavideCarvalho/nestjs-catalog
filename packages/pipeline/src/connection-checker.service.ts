@@ -199,10 +199,7 @@ async function probeS3(connection: CatalogConnection, secret?: string): Promise<
  * The list is `MaxKeys`-equivalent — one page, one object — for the reason
  * {@link probeS3} gives: a test that can take minutes is a test nobody presses.
  */
-async function probeDisk(
-  storage: StorageManagerLike | undefined,
-  disk: string,
-): Promise<string> {
+async function probeDisk(storage: StorageManagerLike | undefined, disk: string): Promise<string> {
   if (!storage) {
     throw new Error(
       `This connection reads the media disk "${disk}", and no storage manager resolved in this process, so nothing here can open it. Mount @dudousxd/nestjs-media on this deployment, or clear the disk and give the connection a bucket and a credential of its own.`,

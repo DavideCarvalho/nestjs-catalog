@@ -149,6 +149,7 @@ import {
   type CallableWorkflowBlock,
   type CallableWorkflowRef,
   type CatalogWorkflow,
+  type StorageAvailability,
   WORKFLOW_BRANCH_LABELS,
   WORKFLOW_CALL_MODES,
   WORKFLOW_FILTER_MAX_DEPTH,
@@ -3095,6 +3096,9 @@ function Canvas({
   useUnsavedGuard(draft.dirty);
 
   const durability = describeDurability(capabilities?.durable);
+  // Threaded to the source inspector rather than read there, so the one query
+  // for `capabilities` serves both the canvas banner and the disk picker.
+  const storage = capabilities?.storage;
   // Asked about EVERY problem, not about `live`. This is the guarantee: a graph
   // that would silently do nothing is coloured as unsaveable from the moment it
   // becomes one, whether or not the node responsible is still being worked on.
@@ -3586,6 +3590,7 @@ function Canvas({
         draft={draft}
         transforms={transforms}
         connections={connections}
+        storage={storage}
         typeOptions={typeOptions}
         canEdit={canEdit}
         modelHref={modelHref}
@@ -6637,6 +6642,7 @@ function KindInspector({
   graph,
   transforms,
   connections,
+  storage,
   typeOptions,
   canEdit,
   modelHref,
@@ -6662,6 +6668,8 @@ function KindInspector({
   graph: WorkflowGraph;
   transforms: CatalogTransform[];
   connections: CatalogConnection[];
+  /** What this deployment says about naming a media disk. Absent is a third answer. */
+  storage?: StorageAvailability;
   typeOptions: SelectOption[];
   canEdit: boolean;
   /** The way out to the type, for the one kind of node that names one. */
@@ -6704,6 +6712,7 @@ function KindInspector({
         key={node.id}
         node={node}
         connections={connections}
+        storage={storage}
         canEdit={canEdit}
         discovery={discovery}
         discoverable={discoverable}
@@ -6774,6 +6783,7 @@ function NodeInspector({
   draft,
   transforms,
   connections,
+  storage,
   typeOptions,
   canEdit,
   modelHref,
@@ -6798,6 +6808,8 @@ function NodeInspector({
   draft: Draft;
   transforms: CatalogTransform[];
   connections: CatalogConnection[];
+  /** What this deployment says about naming a media disk. Absent is a third answer. */
+  storage?: StorageAvailability;
   typeOptions: SelectOption[];
   canEdit: boolean;
   /** Passed through to the sink inspector, the one node that names a type. */
@@ -6923,6 +6935,7 @@ function NodeInspector({
             graph={draft}
             transforms={transforms}
             connections={connections}
+            storage={storage}
             typeOptions={typeOptions}
             canEdit={canEdit}
             modelHref={modelHref}
@@ -7061,6 +7074,7 @@ function NodeInspector({
 function SourceInspector({
   node,
   connections,
+  storage,
   canEdit,
   discovery,
   discoverable,
@@ -7069,6 +7083,8 @@ function SourceInspector({
 }: {
   node: WorkflowSourceNode;
   connections: CatalogConnection[];
+  /** What this deployment says about naming a media disk. Absent is a third answer. */
+  storage?: StorageAvailability;
   canEdit: boolean;
   discovery: SchemaDiscoveryBridge;
   /**
@@ -7208,6 +7224,7 @@ function SourceInspector({
         onChange={update}
         viaConnection={viaConnection}
         disabled={!canEdit}
+        storage={storage}
       />
 
       <ReadModeFields

@@ -189,6 +189,69 @@ export function describeDurability(durability: WorkflowDurability | undefined): 
 }
 
 /**
+ * Whether a connector here may name a media disk.
+ *
+ * The same three-state shape {@link WorkflowDurability} has, for the same
+ * reason: the field being absent means a server that predates it, which is not
+ * the same as a server that says no.
+ */
+export interface StorageAvailability {
+  available: boolean;
+  disks: string[];
+  detail: string;
+}
+
+/** The three answers, as prose the screen can render without branching twice. */
+export interface StorageCopy {
+  state: 'disks' | 'none' | 'unknown';
+  label: string;
+  detail: string;
+}
+
+/**
+ * What to tell somebody authoring an object-store source.
+ *
+ * The `none` case is the one that matters, and it is written to say what is
+ * LOST rather than what is missing. "Media is not available" would be true and
+ * useless: nobody would notice the absence of a feature they have never used.
+ * What they will do instead is mint a second copy of a credential the host has
+ * already got, under a name of the catalog's own, and add that name to the
+ * secret allow-list — and the second copy is the one that outlives its
+ * rotation. Saying so is the whole point of rendering this at all.
+ */
+export function describeStorage(storage: StorageAvailability | undefined): StorageCopy {
+  if (!storage) {
+    return {
+      state: 'unknown',
+      label: 'disks: not reported',
+      detail:
+        'This deployment did not say whether media disks are wired up, so this screen cannot offer them. Give the connector a bucket and a credential of its own. Treating silence as "there are no disks" would send somebody looking for a picker that is not missing, only unreported.',
+    };
+  }
+  if (storage.available && storage.disks.length > 0) {
+    return {
+      state: 'disks',
+      label: `disks: ${storage.disks.length}`,
+      detail: `This connector can name a disk instead of carrying its own bucket, endpoint and credential: ${storage.disks.join(', ')}. The disk already holds all four, configured once by the host and rotated in one place.`,
+    };
+  }
+  if (storage.available) {
+    return {
+      state: 'none',
+      label: 'disks: none configured',
+      detail:
+        'Media is mounted here but has no disks configured, so there is nothing to name yet. Give the connector a bucket and a credential of its own, or configure a disk on the host and it becomes selectable here.',
+    };
+  }
+  return {
+    state: 'none',
+    label: 'disks: off',
+    detail:
+      'No media storage manager resolved here, so this connector cannot name a disk. It still reads an object store — but it has to carry its own bucket, endpoint and region, and its own environment variable holding "accessKeyId:secretAccessKey", which is a second copy of a credential this deployment would otherwise have configured once on a disk.',
+  };
+}
+
+/**
  * The outcome of running a graph, node by node.
  *
  * Not in core, and this is the one place where that is a statement rather than
