@@ -4,10 +4,12 @@ import {
   type ConnectorKind,
   type ConnectorRun,
   WORKFLOW_BRANCH_LABELS,
+  WORKFLOW_CALL_MODES,
   WORKFLOW_FILTER_MAX_DEPTH,
   WORKFLOW_FILTER_MAX_VALUES,
   WORKFLOW_PREDICATE_KINDS,
   type WorkflowBranchLabel,
+  type WorkflowCallMode,
   type WorkflowEdge,
   type WorkflowFilterPredicate,
   type WorkflowIfPredicate,
@@ -15,6 +17,7 @@ import {
   type WorkflowSkipReason,
   isConnectorKind,
   isWorkflowBranchLabel,
+  isWorkflowCallMode,
   isWorkflowFilterPredicate,
   isWorkflowNodeKind,
   unreachableNodeKind,
@@ -351,7 +354,42 @@ function toCallNode(
       }. A call pins a name and a version together, because the version is what decides which code runs.`,
     );
   }
-  return { ...base, kind: 'call', callName, callVersion };
+  const callMode = readCallMode(raw, base);
+  // Spread rather than assigned, so a call node that named no mode is stored
+  // with no `callMode` key at all rather than with an explicit `undefined`.
+  // That is what keeps `workflowGraphHash` still, and it is what every graph in
+  // every deployment already looks like.
+  return { ...base, kind: 'call', callName, callVersion, ...(callMode ? { callMode } : {}) };
+}
+
+/**
+ * Which wire format this call node was authored in, refused at the boundary if
+ * it is a word this build has no rule for.
+ *
+ * Refused rather than defaulted, for the reason {@link readVersion} refuses a
+ * pin it cannot use: the two modes send genuinely different payloads, and
+ * quietly reading an unrecognised one as `'envelope'` would wrap a config that
+ * was authored to travel bare — and the callee would fail on the first key it
+ * looked for, in a durable child run, with nothing at the boundary to point at.
+ *
+ * Absent and `null` fold together into absent, which is `'envelope'`: what every
+ * call node stored before this field existed is, and what all of them have
+ * always done. Absent is returned as `undefined` rather than as the string, so a
+ * graph that did not name a mode is stored exactly as it arrived and its
+ * `workflowGraphHash` does not move.
+ */
+function readCallMode(
+  raw: unknown,
+  base: { id: string; name: string },
+): WorkflowCallMode | undefined {
+  const found = readUnknown(raw, 'callMode');
+  if (found === undefined || found === null) return undefined;
+  if (!isWorkflowCallMode(found)) {
+    throw new BadRequestException(
+      `Call node "${base.name}" (${base.id}) carries a callMode of ${JSON.stringify(found)}, and the only ones this build can put on the wire are ${WORKFLOW_CALL_MODES.join(' and ')}. Leave it out for the envelope, which is what a call node has always sent.`,
+    );
+  }
+  return found;
 }
 
 /**

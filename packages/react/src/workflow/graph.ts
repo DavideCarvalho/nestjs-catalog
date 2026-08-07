@@ -26,6 +26,7 @@ import {
   unreachableFilterPredicateKind,
   unreachableNodeKind,
   unreachablePredicateKind,
+  workflowCallMode,
 } from './model';
 import { type WorkflowProblem, edgeId } from './validate';
 
@@ -283,7 +284,12 @@ function callSubtitle(node: WorkflowCallNode): string {
   const name = typeof node.callName === 'string' ? node.callName.trim() : '';
   const version = typeof node.callVersion === 'string' ? node.callVersion.trim() : '';
   if (name.length === 0) return 'no workflow chosen';
-  return version.length > 0 ? `${name}@${version}` : `${name} · no version pinned`;
+  const pinned = version.length > 0 ? `${name}@${version}` : `${name} · no version pinned`;
+  // The plain mode is on the face of the node for the reason the version is:
+  // it is the half that decides what the node can *do*, and a plain call that
+  // reads like an ordinary one is a box somebody wires into a sink and then
+  // wonders why the graph will not save.
+  return workflowCallMode(node) === 'plain' ? `${pinned} · plain` : pinned;
 }
 
 /**

@@ -264,6 +264,7 @@ export type {
   CallableWorkflowRef,
   WorkflowBranchLabel,
   WorkflowCallEnvelope,
+  WorkflowCallMode,
   WorkflowCallNode,
   WorkflowCallOutput,
   WorkflowEdge,
@@ -335,6 +336,15 @@ export {
   // runner does, so the two cannot disagree about what "no rows" looks like.
   readWorkflowCallOutput,
   WORKFLOW_CALL_CONTRACT,
+  // The two wire formats a call node can take, and the reader that applies the
+  // default. The inspector has to offer exactly the modes the runner can build a
+  // payload for, and a screen carrying its own `?? 'envelope'` is the second
+  // copy of a default that eventually disagrees with the hash — which would show
+  // an author unsaved changes on a graph nobody edited.
+  WORKFLOW_CALL_MODES,
+  isWorkflowCallMode,
+  unreachableCallMode,
+  workflowCallMode,
   // Reusable nodes, and the two directions a screen needs them in: the fold onto
   // a node, so a picker can show what choosing one will do without a round trip,
   // and the lift off a node, so "save this as reusable" sends the same body the

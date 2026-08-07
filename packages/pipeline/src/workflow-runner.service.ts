@@ -11,6 +11,7 @@ import {
   type ConnectorRun,
   SubprocessTransformRunner,
   type WorkflowBranchLabel,
+  type WorkflowCallMode,
   type WorkflowCallOutput,
   type WorkflowEnvPredicate,
   type WorkflowExecutionMode,
@@ -33,8 +34,10 @@ import {
   supportsWorkflowReleases,
   supportsWorkflowStages,
   supportsWorkflows,
+  unreachableCallMode,
   unreachableNodeKind,
   unreachablePredicateKind,
+  workflowCallMode,
   workflowFilterMatches,
   workflowNodeRuns,
   workflowRunOrder,
@@ -216,6 +219,19 @@ export interface WorkflowCallTarget {
   name: string;
   version: string;
   config: Record<string, unknown>;
+  /**
+   * Which payload the child is handed. See `WORKFLOW_CALL_MODES`.
+   *
+   * On the plan and resolved at planning time rather than read off the node in
+   * the body, for the reason every other field here is: the body must not read a
+   * database, and a graph repointed from an envelope call to a plain one between
+   * two nodes must not change what a half-finished run puts on the wire.
+   *
+   * Optional and absent means `'envelope'`, so a run whose plan was
+   * checkpointed before the field existed replays through here unchanged — which
+   * is every in-flight run on the day a deployment picks this up.
+   */
+  mode?: WorkflowCallMode;
 }
 
 /** What the planning step hands the durable workflow body. Ids and counters. */
@@ -526,6 +542,29 @@ export class WorkflowRunnerService {
    *
    * Pure, and it must stay pure: the durable body calls it, and anything
    * reaching a database from there would be a read on the replay path.
+   *
+   * ## A plain call's answer is not read, and that is the decision
+   *
+   * `readWorkflowCallOutput` is not reached on the plain path at all. A plain
+   * call sends no run id and no node id, so its callee had no key to stage rows
+   * under — and a callee that returns `{batches, rowCount}` meaning something of
+   * its own would otherwise send this graph to read a stage that cannot exist,
+   * while a callee returning one of the two would fail the node over a contract
+   * it was never shown. Both are the catalog inventing a claim about somebody
+   * else's return value.
+   *
+   * So the answer is **discarded**, not just unread as rows: it is not stored on
+   * the node's outcome and it is not logged. It is already recorded durably — it
+   * is the child run's own output, under the child run id this node's log line
+   * names, which is where an operator can read it in whatever detail they need.
+   * A second copy here would buy nothing and would put an arbitrary workflow's
+   * return value, which may contain anything a worker had in hand, into a run log
+   * that this package's redaction rules know nothing about.
+   *
+   * **What that costs, plainly:** a plain call can hand nothing back into the
+   * graph — not rows, and not a scalar an `if` node downstream could test on.
+   * A call whose answer the graph needs is an envelope call, and that is the
+   * trade the two modes are.
    */
   callOutput(input: {
     nodeId: string;
@@ -538,6 +577,10 @@ export class WorkflowRunnerService {
     elapsedMs: number;
   }): WorkflowNodeStepOutput {
     const called = `${input.target.name}@${input.target.version}`;
+    const mode = input.target.mode ?? 'envelope';
+    if (mode === 'plain') return this.plainCallOutput(input, called);
+    if (mode !== 'envelope') return unreachableCallMode(mode, 'WorkflowRunnerService.callOutput');
+
     let staged: WorkflowCallOutput | undefined;
     try {
       staged = readWorkflowCallOutput(input.result);
@@ -574,6 +617,37 @@ export class WorkflowRunnerService {
       rows: staged?.rowCount ?? 0,
       elapsedMs: input.elapsedMs,
       logs: safeLogLines(logs, LOG_LINES_PER_NODE),
+    };
+  }
+
+  /**
+   * A finished plain call: zero rows, unconditionally, and the child run named.
+   *
+   * The whole of the accounting, and there is nothing to decide in it — which is
+   * the point. See the note on {@link callOutput} for why the return value is
+   * neither read nor kept. The empty stage ref it hands back is the same one a
+   * call whose child returned nothing produces, so `record`, the run's counters
+   * and a downstream merge all treat it exactly as they already do.
+   *
+   * The log line says where the answer is rather than what it was, so an
+   * operator who wants it has a child run id to open and this run's log has no
+   * copy of a payload nobody here can vouch for.
+   */
+  private plainCallOutput(
+    input: { nodeId: string; runId: string; elapsedMs: number; childRunId: string },
+    called: string,
+  ): WorkflowNodeStepOutput {
+    return {
+      nodeId: input.nodeId,
+      output: { runId: input.runId, nodeId: input.nodeId, batches: 0, rowCount: 0 },
+      rows: 0,
+      elapsedMs: input.elapsedMs,
+      logs: safeLogLines(
+        [
+          `Called ${called} as child run ${input.childRunId} as a plain call: its parameters went across on their own, with no run id and no node id, so it had nowhere to stage rows and this node passes on 0. Whatever it returned is on the child run, not read here.`,
+        ],
+        LOG_LINES_PER_NODE,
+      ),
     };
   }
 
@@ -1867,6 +1941,7 @@ export function workflowPlanEntries(workflow: CatalogWorkflow): WorkflowPlanEntr
             name: entry.node.callName,
             version: entry.node.callVersion,
             config: entry.node.config,
+            mode: workflowCallMode(entry.node),
           }
         : undefined,
   }));

@@ -27,6 +27,7 @@ export type {
   CatalogWorkflowRelease,
   WorkflowBranchLabel,
   WorkflowEdge,
+  WorkflowCallMode,
   WorkflowCallNode,
   WorkflowEnvPredicate,
   WorkflowFilterAll,
@@ -66,6 +67,15 @@ export {
   isWorkflowFilterValue,
   isWorkflowNodeKind,
   isWorkflowPredicateKind,
+  // The two wire formats a call node can be authored in, plus the reader that
+  // applies the default. Core's, not a copy, for the reason every rule here is:
+  // an inspector offering a mode the runner cannot build a payload for is a
+  // graph somebody saves and a child run that fails, and a screen carrying its
+  // own `?? 'envelope'` would eventually disagree with `workflowGraphHash` and
+  // show unsaved changes on a graph nobody edited.
+  WORKFLOW_CALL_MODES,
+  unreachableCallMode,
+  workflowCallMode,
   unreachableFilterOperator,
   unreachableFilterPredicateKind,
   unreachableNodeKind,
