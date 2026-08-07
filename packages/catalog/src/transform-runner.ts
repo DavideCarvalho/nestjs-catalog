@@ -146,7 +146,12 @@ export interface TransformRunnerOptions {
  * - it runs in a working directory of this runner's choosing but on the host's
  *   filesystem, so a service account token under
  *   `/var/run/secrets/kubernetes.io/serviceaccount/` is an absolute path away;
- * - it can open sockets, as whatever user the service runs as.
+ * - it can open sockets, as whatever user the service runs as;
+ * - a module-shaped transform is written to a file in that temporary directory
+ *   for the length of the run, so its own source is briefly on disk. That is
+ *   not a new exposure — the code is the thing running, and it can read itself
+ *   from anywhere — but it is a fact worth having written down next to the
+ *   others rather than discovered in a directory listing.
  *
  * So the allowlist is a guard rail against the accident, and the reachability of
  * everything it names is a property of the process boundary, not a leak to be
