@@ -1373,7 +1373,11 @@ export function createPipelineController(
         // between the two reads.
         version,
         // Almost always absent — the console posts an empty body. Present when
-        // somebody is re-driving a load they already own the identity of.
+        // somebody is re-driving a load they already own the identity of, and
+        // it must be a load that FAILED: this doubles as the durable run id, so
+        // an id whose run already succeeded is replayed rather than re-run and
+        // answers with the earlier run's counts. See the field's own docblock on
+        // `WorkflowLauncher.run`.
         snapshotId: body?.snapshotId,
         // Forwarded, never defaulted, and the three states are kept apart:
         // absent means nobody said anything, a present empty string means

@@ -327,6 +327,21 @@ export class WorkflowLauncher {
      * behind and load the data twice. Passing the id of a failed run resumes
      * onto its staged rows and replaces its batches rather than adding to them.
      * Omitted, one is minted, which is what a button press does.
+     *
+     * **It is also the durable run id, so naming a run that already SUCCEEDED
+     * replays it rather than running anything.** `engine.start` is keyed on this
+     * value; an id it has already carried to completion is not started again,
+     * and `awaitRun` then finds the original run row and answers with it —
+     * `succeeded`, the original counts, the original `workflowVersion` and
+     * `graphHash`. Nothing is wrong with any of those numbers; they are simply
+     * about the earlier run. So "re-run with the same snapshot id to pick up my
+     * edit" does not pick up the edit, and says `succeeded` while not saying so.
+     *
+     * The response carries the version and hash that actually ran, which is the
+     * only reason this is detectable at all — compare them against the graph you
+     * meant to run. To genuinely re-run an edited graph, leave this out and let
+     * a fresh id be minted; reserve it for re-driving a run that *failed*, which
+     * is what it was added for.
      */
     snapshotId?: string;
     /**
