@@ -142,3 +142,101 @@ describe('the shape badge', () => {
     expect(screen.getByText('function')).toBeTruthy();
   });
 });
+
+/**
+ * The mode selector, and the two things that must follow it.
+ *
+ * The mode is the one field on this screen whose wrong value produces no error
+ * at all — a per-record transform saved as a batch is handed the whole array and
+ * reads `undefined` off every property, which commits. So what is tested here is
+ * not that the control renders, but that the screen refuses the combinations the
+ * server refuses, with the same sentence and before the click.
+ */
+describe('choosing what the code is called with', () => {
+  it('opens a stored transform in the mode it was saved in', () => {
+    render(
+      withCatalog(
+        <TransformEditor
+          transform={transform({ mode: 'record', code: 'export default ({ record }) => record;' })}
+          languages={['javascript']}
+          onClose={() => {}}
+          onSaved={() => {}}
+        />,
+      ),
+    );
+
+    expect(screen.getByLabelText('Called').textContent).toContain('once per record');
+  });
+
+  it('opens a transform stored before the field existed as a batch', () => {
+    // The backward-compatibility claim, on the screen rather than only in the
+    // reader: absent is `'batch'`, and every transform stored before this
+    // existed is one.
+    render(
+      withCatalog(
+        <TransformEditor
+          transform={transform({ code: 'return records;' })}
+          languages={['javascript']}
+          onClose={() => {}}
+          onSaved={() => {}}
+        />,
+      ),
+    );
+
+    expect(screen.getByLabelText('Called').textContent).toContain('whole batch');
+  });
+
+  it('refuses a per-record bare body before the save, in the server’s words', () => {
+    render(
+      withCatalog(
+        <TransformEditor
+          transform={transform({ mode: 'record', code: 'return records.map((r) => r);' })}
+          languages={['javascript']}
+          onClose={() => {}}
+          onSaved={() => {}}
+        />,
+      ),
+    );
+
+    expect(screen.getByText(/must be a module that exports a function/)).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Save changes' }).hasAttribute('disabled')).toBe(
+      true,
+    );
+  });
+
+  it('refuses a per-record Python transform, saying it is the harness and not the code', () => {
+    render(
+      withCatalog(
+        <TransformEditor
+          transform={transform({ mode: 'record', language: 'python', code: 'return records' })}
+          languages={['python']}
+          onClose={() => {}}
+          onSaved={() => {}}
+        />,
+      ),
+    );
+
+    expect(screen.getByText(/cannot be written in Python yet/)).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Save changes' }).hasAttribute('disabled')).toBe(
+      true,
+    );
+  });
+
+  it('says nothing at all about a batch transform of any shape', () => {
+    render(
+      withCatalog(
+        <TransformEditor
+          transform={transform({ language: 'python', code: 'return records' })}
+          languages={['python']}
+          onClose={() => {}}
+          onSaved={() => {}}
+        />,
+      ),
+    );
+
+    expect(screen.queryByText(/cannot be written in Python/)).toBeNull();
+    expect(screen.getByRole('button', { name: 'Save changes' }).hasAttribute('disabled')).toBe(
+      false,
+    );
+  });
+});

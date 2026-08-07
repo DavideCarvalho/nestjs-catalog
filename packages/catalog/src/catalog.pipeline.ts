@@ -14,6 +14,11 @@
 // edge only ever points this way: `catalog.workspace.ts` knows nothing about
 // pipelines.
 import { CATALOG_REVISION_LIMIT, type CatalogRevision } from './catalog.workspace';
+// The one rule that tells a module-shaped transform from a bare body, used here
+// to refuse a per-record transform written as a body. The edge only points this
+// way: `transform-shape.ts` imports nothing at all, so it can be read on its own
+// and cannot be dragged into a cycle.
+import { transformShape } from './transform-shape';
 
 /**
  * Where a connector pulls from.
@@ -503,6 +508,99 @@ export function isTransformLanguage(value: unknown): value is TransformLanguage 
 }
 
 /**
+ * Whether a transform is a function over the whole batch or over one record.
+ *
+ * ## Why this is declared and never inferred
+ *
+ * The two are not interchangeable and the difference is invisible in the code.
+ * `records.map(...)` and a body that returns one object read almost identically,
+ * and a detector that guessed from destructuring — `{ records }` versus
+ * `{ record }` — would be reading a *parameter name*, which is the author's to
+ * choose and which minification, a rename, or a rest parameter changes without
+ * changing what the function computes. Guess wrong towards `record` and an
+ * aggregation is called 102,520 times and returns 102,520 partial answers, none
+ * of which fails; guess wrong towards `batch` and a per-record function is handed
+ * an array and reads `undefined` off every property. Both commit. Neither errors.
+ * So the mode is a field somebody set, and the cost of setting it is one control
+ * in the editor.
+ *
+ * ## Why a closed list rather than `streaming?: boolean`
+ *
+ * The identical argument {@link WORKFLOW_CALL_MODES} makes one level up. A flag
+ * beside a future third calling convention — a windowed transform, a keyed one —
+ * is two optional booleans whose combinations nobody defined, and each reader
+ * invents its own rule for which wins. A closed list with an exhaustiveness guard
+ * ({@link unreachableTransformMode}) makes a third convention a compile error
+ * naming the files that have to answer for it: the harness that generates the
+ * call, the runner that chooses a transport, and the two runners that consume
+ * the result.
+ *
+ * ## What the default has to be, and why it is not a choice
+ *
+ * Absent means {@link CatalogTransform.mode} was never set, which is every
+ * transform stored before this field existed, and every one of them is a function
+ * over the whole batch — the harness handed it `records` and there was no other
+ * shape to write. Reading absence as anything else would silently change what a
+ * deployment's existing loads compute. Read it through {@link transformMode}
+ * rather than defaulting it a second time.
+ */
+export const TRANSFORM_MODES = [
+  /**
+   * The code is called **once**, with every record the node received.
+   *
+   * What every stored transform is, and what aggregating, deduplicating,
+   * sorting and joining require: none of them can be done a row at a time, and
+   * chunking the calls would not fail — it would return one answer per chunk and
+   * commit. The whole input is therefore in the running process's heap, which is
+   * the honest cost of the promise.
+   */
+  'batch',
+  /**
+   * The code is called **once per record**, and never sees the batch.
+   *
+   * What a rename, a projection or a normalisation is by construction — and,
+   * since `WORKFLOW_FILTER_COLUMN_PATTERN` and `property-names.ts` both refuse a
+   * header with a space in it, what every DPAS file this catalog ingests needs
+   * before anything else can touch it. The records arrive as a stream and the
+   * rows leave as one, so nothing anywhere holds the dataset.
+   */
+  'record',
+] as const;
+
+export type TransformMode = (typeof TRANSFORM_MODES)[number];
+
+/** Same reason as {@link isConnectorKind}: one list, no second copy to drift. */
+export function isTransformMode(value: unknown): value is TransformMode {
+  return TRANSFORM_MODES.some((mode) => mode === value);
+}
+
+/**
+ * {@link unreachableCallMode}, for transforms, and for the identical reason.
+ *
+ * Every branch over {@link TransformMode} ends here, so a third calling
+ * convention added to the list without a harness to generate it, a transport to
+ * carry it and a consumer to read its output is a type error naming the file. It
+ * throws as well, because a mode arrives as JSON out of a column and a build
+ * older than the data is a thing that happens.
+ */
+export function unreachableTransformMode(mode: never, where: string): never {
+  throw new Error(
+    `${where} has no rule for the transform mode ${JSON.stringify(mode)}. It was added to TRANSFORM_MODES without teaching this code how to call user code written for it, and guessing would run somebody's transform under a contract they did not write it against.`,
+  );
+}
+
+/**
+ * The mode this transform runs in, with the default applied once.
+ *
+ * Absent means `'batch'` — see {@link TRANSFORM_MODES}. One function so that the
+ * store, the runner, the two consumers, the editor and the try pane cannot each
+ * carry their own `?? 'batch'` and have one of them drift.
+ */
+export function transformMode(transform: Pick<CatalogTransform, 'mode'>): TransformMode {
+  return transform.mode ?? 'batch';
+}
+
+/**
  * User code that maps a source record to a row.
  *
  * Versioned, because a load that produced surprising numbers is investigated
@@ -558,10 +656,51 @@ export interface CatalogTransform {
    * a new field costs one generated line rather than an edit to stored code.
    */
   code: string;
+  /**
+   * Whether {@link code} is called once with the batch or once per record.
+   *
+   * Absent means `'batch'`, which is what every transform stored before this
+   * field existed is. See {@link TRANSFORM_MODES} for why it is declared rather
+   * than inferred, and read it through {@link transformMode}.
+   *
+   * A `'record'` transform is constrained in two ways the mode alone does not
+   * say, and both are refused rather than discovered at run time — see
+   * {@link recordModeRefusal}: it must be a **module**, because a bare body has
+   * `records` in scope by the harness's own construction, and it cannot be
+   * **Python**, because that harness writes the `def` and has no second one yet.
+   */
+  mode?: TransformMode;
   version: number;
   createdBy: string;
   createdAt: string;
   updatedAt: string;
+}
+
+/**
+ * Why this transform cannot run in the mode it declares, if it cannot.
+ *
+ * Two combinations are representable and neither can work, so both are refused
+ * at the point somebody presses save rather than at three in the morning when a
+ * schedule fires. `undefined` means there is nothing wrong.
+ *
+ * Asked in both places on purpose. The controller asks so the author is told
+ * while they are still looking at the code; the runner asks because a row can
+ * reach it that no controller in this build ever validated — promoted from
+ * another environment, restored from a backup, written by an older version — and
+ * the failure a runner must never have is the silent one where a per-record
+ * module is handed an array and quietly reads `undefined` off every property.
+ */
+export function recordModeRefusal(
+  transform: Pick<CatalogTransform, 'language' | 'code' | 'mode'>,
+): string | undefined {
+  if (transformMode(transform) !== 'record') return undefined;
+  if (transform.language === 'python') {
+    return 'A per-record transform cannot be written in Python yet. The Python harness writes `def transform(records, context):` around the code, so a Python transform never states its own signature and there is no second `def` for the per-record shape — see TRANSFORM_MODES. Use javascript or typescript for a per-record transform, or leave this one as a whole-batch transform.';
+  }
+  if (transformShape(transform.code) === 'body') {
+    return 'A per-record transform must be a module that exports a function — `export default function transform({ record, context }) { … }` — and this code has no `export` at the start of a statement, so the catalog would run it as a bare function body. A body is handed `records`, the whole array, by the wrapper the catalog writes around it; there is no honest way to give it one record under a name it never wrote. Add the `export`, or set this transform back to whole-batch.';
+  }
+  return undefined;
 }
 
 /**
@@ -639,6 +778,86 @@ export type CatalogTransformFunction<TRecord = Record<string, unknown>> = (
   input: CatalogTransformInput<TRecord>,
 ) => Array<Record<string, unknown>> | Promise<Array<Record<string, unknown>>>;
 
+/**
+ * The single argument a `'record'`-mode transform is called with, once per
+ * record.
+ *
+ * One object, for the reason {@link CatalogTransformInput} gives and not a
+ * second time: a field can be added later without redefining what any signature
+ * already written means.
+ *
+ * ## `record` rather than `records`, deliberately one letter apart
+ *
+ * Which is a real risk and was weighed against the alternatives. A name like
+ * `row` or `item` would be further from its sibling and would be *wrong*: what
+ * arrives is a record exactly as the source produced it, and a row is what the
+ * transform returns — the two words already mean different things everywhere
+ * else in this package, and borrowing one of them here to reduce a typo would
+ * make the vocabulary lie.
+ *
+ * The typo it invites is also the one mistake in this area that cannot go quiet.
+ * `{ records }` in a per-record transform destructures `undefined`, and the first
+ * thing anybody does with it — `.map`, `.length`, `.filter` — throws on the very
+ * first record, with a stack frame in the author's own file. The dangerous
+ * direction is the other one, and that is exactly what {@link TRANSFORM_MODES}
+ * refuses to guess about.
+ *
+ * ## What is not on it
+ *
+ * No index, no total, no `isFirst`. Each of those is a way to write a transform
+ * whose answer depends on where a record fell in the stream, which is the
+ * property this mode exists to *not* have — a record's row must be a function of
+ * that record. `context.rowCount` is a count of what reached the node and is
+ * already there for anything that legitimately needs the size of the load.
+ */
+export interface CatalogRecordTransformInput<TRecord = Record<string, unknown>> {
+  /** One record, exactly as the source produced it. */
+  record: TRecord;
+  /** The run, the node, the counts, and the admitted environment variables. */
+  context: CatalogCodeContext;
+}
+
+/**
+ * The function a `'record'`-mode transform exports.
+ *
+ * **For the editor and nothing else**, exactly as {@link CatalogTransformFunction}
+ * is: TypeScript transforms run through Node's own type *stripping*, so the
+ * annotations are erased on the way in and a wrong one is a squiggle rather than
+ * a failed run.
+ *
+ * The return type is the whole contract of the mode and it is deliberately four
+ * things at once:
+ *
+ * - **an object** — one row, the ordinary case;
+ * - **an array** — several rows, so one record can fan out;
+ * - **an empty array** — no rows, so a record can be dropped;
+ * - **`null` or `undefined`** — no rows either, because that is what a function
+ *   with a bare `return` or a missed branch produces and reading it as anything
+ *   else would invent a row nobody wrote.
+ *
+ * Map, filter and flatMap under one rule, and no ambiguity between the first two
+ * cases: an array is never a row, because a row is a plain object everywhere in
+ * this package and the runners have always dropped anything else.
+ *
+ * ```ts
+ * import type { CatalogRecordTransformFunction } from '@dudousxd/nestjs-catalog/client';
+ *
+ * const transform: CatalogRecordTransformFunction<{ 'Mgmt Cd': string }> = ({ record }) => ({
+ *   mgmtCd: record['Mgmt Cd'],
+ * });
+ *
+ * export default transform;
+ * ```
+ */
+export type CatalogRecordTransformFunction<TRecord = Record<string, unknown>> = (
+  input: CatalogRecordTransformInput<TRecord>,
+) =>
+  | Record<string, unknown>
+  | Array<Record<string, unknown>>
+  | null
+  | undefined
+  | Promise<Record<string, unknown> | Array<Record<string, unknown>> | null | undefined>;
+
 export interface TransformResult {
   rows: Array<Record<string, unknown>>;
   /**
@@ -678,12 +897,91 @@ export interface TransformResult {
  * people who are not already trusted with the database needs a container or a
  * sandboxed runtime, and this interface is where that gets plugged in.
  */
+/**
+ * What a per-record run produced, asked **only after {@link TransformStream.rows}
+ * is exhausted**.
+ *
+ * The stream equivalent of {@link TransformResult}, and it is a separate shape
+ * rather than the same one because the fields genuinely differ in *when they are
+ * knowable*. `rows` is not a value here — the whole point is that nothing holds
+ * them — so what is left is the counts and the log, and neither is final until
+ * the last record has gone past. `recordsIn` is new and is the one number a
+ * batch call never needed: a caller that streamed its source has no `.length` to
+ * report as `fetched`.
+ */
+export interface TransformStreamSummary {
+  /** How many records the runner fed the code. */
+  recordsIn: number;
+  /** How many rows came back, over every record. */
+  rowsOut: number;
+  /** {@link TransformResult.logs}, bounded by the runner in exactly the same way. */
+  logs: string[];
+  elapsedMs: number;
+}
+
+/**
+ * A per-record run in progress: the rows as they arrive, and the counts once
+ * they have.
+ *
+ * The same two-part shape `StreamedFetchResult` uses in the pipeline package —
+ * an iterable plus a function asked afterwards — and copied from it on purpose
+ * rather than invented. The reason it gives is the reason here: a stream is not
+ * complete until it has been drained, so anything computed *over* it is not yet
+ * known when the call returns, and a field would hand a caller a number that
+ * stops short of the rows they have already written.
+ *
+ * {@link summary} before {@link rows} is exhausted is a programming error and
+ * the bundled runner throws rather than answering with a running total, because
+ * a running total is exactly what somebody would then record as `fetched`.
+ */
+export interface TransformStream {
+  /**
+   * The rows, in record order, in the order the code emitted them.
+   *
+   * Pulled, not pushed: the next record is not fed to the code until the row
+   * before it has been taken, so a consumer that writes to a database
+   * back-pressures all the way to the source. That is the property the mode
+   * exists for and it is the caller's to keep — a consumer that collects this
+   * into an array has re-created the whole-batch memory profile with extra
+   * steps.
+   *
+   * Throws where the code threw, naming the record. See the runner.
+   */
+  rows: AsyncIterable<Record<string, unknown>>;
+  /** The counts and the log. Call only after {@link rows} is exhausted. */
+  summary(): TransformStreamSummary;
+}
+
 export interface TransformRunner {
   run(
     transform: Pick<CatalogTransform, 'language' | 'code'>,
     records: unknown[],
     options?: { timeoutMs?: number; context?: CatalogCodeContext },
   ): Promise<TransformResult>;
+  /**
+   * Run a `'record'`-mode transform over a stream of records, streaming the rows
+   * back.
+   *
+   * **Optional**, mixed in for the reason every optional member of
+   * {@link CatalogPipelineStore} is: a runner written against the previous shape
+   * of this interface still satisfies it, and a purely additive capability must
+   * not turn that into a compile error. {@link supportsTransformStreaming} is how
+   * a caller asks; a deployment whose runner cannot stream runs a per-record
+   * transform through {@link run} against a buffered batch instead, which is
+   * slower and holds more but computes the identical rows.
+   *
+   * Not a widening of {@link run}. The two differ in what the caller must hand
+   * over (an array against an iterable), in what comes back (rows against a
+   * stream of them), in when the counts are knowable, and in what the timeout
+   * measures — see the bundled runner, where a stream is bounded by a stall
+   * rather than by total wall clock. One method doing both would have four
+   * optional fields and a reader could not tell which combination was legal.
+   */
+  runStream?(
+    transform: Pick<CatalogTransform, 'language' | 'code' | 'mode'>,
+    records: AsyncIterable<unknown>,
+    options?: { timeoutMs?: number; context?: CatalogCodeContext },
+  ): Promise<TransformStream>;
   /** Languages this runner can actually execute in this environment. */
   available(): Promise<TransformLanguage[]>;
   /**
@@ -694,6 +992,21 @@ export interface TransformRunner {
    * difference into a traceback the transform's author cannot act on.
    */
   pythonPackages?(): Promise<string[]>;
+}
+
+/**
+ * Whether this runner can stream a per-record transform.
+ *
+ * The method rather than a flag, exactly as {@link supportsTransformRevisions}
+ * argues one interface along: a flag is a claim and a method is the thing
+ * itself. A runner that answers `false` still runs `'record'` transforms — the
+ * consumers buffer and call {@link TransformRunner.run} — so this is a question
+ * about *how much is held*, never about whether the load works.
+ */
+export function supportsTransformStreaming(
+  runner: TransformRunner,
+): runner is TransformRunner & Required<Pick<TransformRunner, 'runStream'>> {
+  return typeof runner.runStream === 'function';
 }
 
 export const TRANSFORM_RUNNER = Symbol('TRANSFORM_RUNNER');
@@ -6164,6 +6477,13 @@ export interface CatalogPipelineStore
     input: Pick<CatalogTransform, 'name' | 'language' | 'code'> & {
       id?: string;
       description?: string;
+      /**
+       * Absent leaves the stored mode alone rather than resetting it to
+       * `'batch'`, which is what a caller written before this field existed
+       * means and the only reading under which such a caller cannot silently
+       * change what a transform computes. See {@link TRANSFORM_MODES}.
+       */
+      mode?: TransformMode;
     },
     createdBy: string,
   ): Promise<CatalogTransform>;

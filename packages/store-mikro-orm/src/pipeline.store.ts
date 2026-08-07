@@ -23,6 +23,7 @@ import type {
   SecretContext,
   StoredLoadExpectation,
   TransformLanguage,
+  TransformMode,
   WorkflowEdge,
   WorkflowExecutionMode,
   WorkflowNode,
@@ -47,6 +48,7 @@ import {
   isReusableNodeKind,
   isSealedSecret,
   isTransformLanguage,
+  isTransformMode,
   isWorkflowBranchLabel,
   isWorkflowEdge,
   isWorkflowExecutionMode,
@@ -738,6 +740,7 @@ export class MySqlPipelineStore
     input: Pick<CatalogTransform, 'name' | 'language' | 'code'> & {
       id?: string;
       description?: string;
+      mode?: TransformMode;
     },
     createdBy: string,
   ): Promise<CatalogTransform> {
@@ -751,6 +754,7 @@ export class MySqlPipelineStore
         name: input.name,
         language: input.language,
         code: input.code,
+        mode: input.mode,
         version: 1,
         createdBy,
         createdAt: new Date(),
@@ -763,46 +767,16 @@ export class MySqlPipelineStore
     const superseded = existing
       ? { version: existing.version, code: existing.code, at: existing.updatedAt }
       : undefined;
-    const codeChanged = existing !== null && existing.code !== input.code;
+    const codeChanged = existing !== null && supersedes(existing, input);
     row.name = input.name;
     row.description = input.description;
     row.language = input.language;
     row.code = input.code;
+    if (input.mode !== undefined) row.mode = input.mode;
     if (codeChanged) row.version += 1;
 
     em.persist(row);
-    if (!existing) {
-      await recordRevision(em, {
-        subject: 'transform',
-        subjectId: row.id,
-        version: row.version,
-        body: row.code,
-        authoredBy: createdBy,
-        authoredAt: row.updatedAt,
-      });
-    } else if (codeChanged && superseded) {
-      // Attributed to the row's `createdBy` and dated to when it was last
-      // written. That is who created the transform rather than who last edited
-      // it — the row keeps no second actor — and it is recorded as the one fact
-      // there is rather than as the current editor, who demonstrably did not
-      // write this code.
-      await recordRevision(em, {
-        subject: 'transform',
-        subjectId: row.id,
-        version: superseded.version,
-        body: superseded.code,
-        authoredBy: row.createdBy,
-        authoredAt: superseded.at,
-      });
-      await recordRevision(em, {
-        subject: 'transform',
-        subjectId: row.id,
-        version: row.version,
-        body: row.code,
-        authoredBy: createdBy,
-        authoredAt: new Date(),
-      });
-    }
+    await archiveTransform(em, { row, superseded, codeChanged, createdBy });
     await em.flush();
     // After the flush, so it counts what was just written. See `pruneRevisions`.
     if (!existing || codeChanged) await pruneRevisions(em, 'transform', row.id);
@@ -2601,6 +2575,97 @@ function toConnector(row: ConnectorRow): CatalogConnector {
   };
 }
 
+/**
+ * Whether this save is a new version of the code, rather than an edit to the
+ * row around it.
+ *
+ * A rename is not a new version — see `saveTransform` on why inflating the
+ * number would make it useless for the question it answers. What *is* a new
+ * version, beyond the obvious, is a **mode change with the code untouched**: the
+ * mode decides what the same text means, called once with an array or once per
+ * record, so two runs recorded at one version could otherwise have computed
+ * different rows from byte-identical code. That is precisely the question
+ * `version` exists to answer, and leaving it alone would make the number a lie
+ * in the one case it most matters.
+ *
+ * An **absent** `mode` on the input is not a change to `'batch'`. A caller
+ * written before the field existed sends no mode, and reading that as "make it a
+ * batch" would let an old client silently undo a deliberate choice — the same
+ * reading `CatalogPipelineStore.saveTransform` documents.
+ */
+function supersedes(
+  existing: TransformRow,
+  input: { code: string; mode?: TransformMode },
+): boolean {
+  if (existing.code !== input.code) return true;
+  return input.mode !== undefined && existing.mode !== input.mode;
+}
+
+/**
+ * Write down the code this save produced, and the code it replaced.
+ *
+ * Lifted out of `saveTransform` rather than left inline, because what it does is
+ * one decision with three outcomes and reading it beside the row assignments
+ * made both harder to follow. Nothing about the rule changed:
+ *
+ * - **a new transform** archives its first code as version 1;
+ * - **a changed one** archives *two* — the version being superseded and the new
+ *   one. The first is the upgrade path: a transform that predates
+ *   `catalog_revision` has never had a revision written, and this is the last
+ *   moment its live code is still readable. `recordRevision` leaves an
+ *   already-recorded version alone, so from the second edit onwards that call is
+ *   a no-op;
+ * - **an unchanged one** archives nothing.
+ *
+ * The superseded version is attributed to the row's `createdBy` and dated to
+ * when it was last written. That is who created the transform rather than who
+ * last edited it — the row keeps no second actor — and it is recorded as the one
+ * fact there is rather than as the current editor, who demonstrably did not
+ * write this code.
+ *
+ * Everything is staged onto the caller's fork and lands in its single flush, so
+ * a version and the text it names are written together or not at all.
+ */
+async function archiveTransform(
+  em: EntityManager,
+  input: {
+    row: TransformRow;
+    superseded: { version: number; code: string; at: Date } | undefined;
+    codeChanged: boolean;
+    createdBy: string;
+  },
+): Promise<void> {
+  const { row, superseded, codeChanged, createdBy } = input;
+  if (!superseded) {
+    await recordRevision(em, {
+      subject: 'transform',
+      subjectId: row.id,
+      version: row.version,
+      body: row.code,
+      authoredBy: createdBy,
+      authoredAt: row.updatedAt,
+    });
+    return;
+  }
+  if (!codeChanged) return;
+  await recordRevision(em, {
+    subject: 'transform',
+    subjectId: row.id,
+    version: superseded.version,
+    body: superseded.code,
+    authoredBy: row.createdBy,
+    authoredAt: superseded.at,
+  });
+  await recordRevision(em, {
+    subject: 'transform',
+    subjectId: row.id,
+    version: row.version,
+    body: row.code,
+    authoredBy: createdBy,
+    authoredAt: new Date(),
+  });
+}
+
 function toTransform(row: TransformRow): CatalogTransform {
   return {
     id: row.id,
@@ -2608,6 +2673,14 @@ function toTransform(row: TransformRow): CatalogTransform {
     description: row.description,
     language: narrow(row.language, isTransformLanguage, 'Transform language', row.id),
     code: row.code,
+    // Absent stays absent rather than becoming `'batch'` here. The default
+    // belongs to `transformMode` and to nowhere else — a store that resolved it
+    // too would be a second copy of the rule, and the copy that drifts is the
+    // one that changes what a deployment's loads compute.
+    mode:
+      row.mode === undefined
+        ? undefined
+        : narrow(row.mode, isTransformMode, 'Transform mode', row.id),
     version: row.version,
     createdBy: row.createdBy,
     createdAt: row.createdAt.toISOString(),

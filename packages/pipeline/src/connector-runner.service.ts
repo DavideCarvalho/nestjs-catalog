@@ -2,9 +2,12 @@ import {
   CATALOG_PIPELINE_STORE,
   type CatalogConnector,
   type CatalogPipelineStore,
+  type CatalogTransform,
   type ConnectorRun,
   SubprocessTransformRunner,
   emitCatalog,
+  supportsTransformStreaming,
+  transformMode,
 } from '@dudousxd/nestjs-catalog';
 import {
   BadRequestException,
@@ -117,33 +120,36 @@ export interface ConnectorRunOptions {
  * button. Two systems believing they decide when a load runs is the failure
  * mode this design exists to avoid.
  *
- * **A connector without a transform reads a batch at a time. One with a
- * transform reads the lot.** That split is not a performance decision that
- * happened to land there; it is the transform contract, and it is written down
- * in two places already. `CatalogTransform.code` says the code is "the body of a
- * function over one batch ... a transform that needs to look up, deduplicate or
- * aggregate cannot do it one row at a time", and `WorkflowRunnerService`
- * repeats it where it holds a node's whole input for the same reason. So the
- * *whole fetch* is what a transform is promised, and chunking the calls would
- * silently redefine that promise as "five hundred rows": a transform that counts
- * would return one number per chunk, one that deduplicates would stop catching
- * duplicates that fell either side of a boundary, and one that sorts would
- * return the data in pieces. None of that fails. It commits, and the numbers are
- * wrong.
+ * ## What decides whether a read is bounded
  *
- * A per-connector opt-in was the alternative and is rejected. The flag would
+ * **The transform's declared mode, and nothing else.** A connector with no
+ * transform streams; one whose transform is `'record'` streams; one whose
+ * transform is `'batch'` reads the lot. That last case is not a performance
+ * decision that happened to land there — it is the batch contract, and it is
+ * written down in two places already. `TRANSFORM_MODES` says a batch transform
+ * is called once with everything precisely so that it can deduplicate, aggregate
+ * and join, and `WorkflowRunnerService` repeats it where it holds a node's whole
+ * input for the same reason. Chunking those calls would silently redefine the
+ * promise as "five hundred rows": a transform that counts would return one
+ * number per chunk, one that deduplicates would stop catching duplicates either
+ * side of a boundary, one that sorts would return the data in pieces. None of
+ * that fails. It commits, and the numbers are wrong.
+ *
+ * ## Why the mode lives on the transform and not here
+ *
+ * A per-**connector** opt-in was the alternative and is rejected. The flag would
  * live on the connector and the assumption it encodes would live in the
  * transform — two rows, versioned independently, edited by different people. The
  * day somebody adds a `dedupe` to a transform that six connectors read through,
  * a checkbox one of them ticked months earlier makes their load quietly wrong,
  * and nothing in the diff they wrote says so. If a transform is genuinely
- * row-wise, that is a fact about the transform and belongs beside it — a change
- * to the transform contract, made once, not a promise a connector makes on its
- * behalf.
+ * row-wise, that is a fact about *the transform*, and that is exactly where the
+ * mode now sits: one field, versioned with the code it describes, and a change
+ * to it bumps the version for the same reason a change to the code does.
  *
- * What a transformed connector gets instead is a run log that says why it is
- * holding everything, which is the part that was missing: the previous
- * behaviour was the same, and unexplained.
+ * A batch transform still gets the run log that says why it is holding
+ * everything, and it now names the way out — which is the half that was missing
+ * when there was no way out to name.
  */
 @Injectable()
 export class ConnectorRunnerService {
@@ -391,12 +397,14 @@ export class ConnectorRunnerService {
   /**
    * The read and the writes, and the one decision that separates them.
    *
-   * **A connector with no transform streams; one with a transform does not**, and
-   * which happens is decided here by the transform contract rather than by what
-   * the source was capable of. The reasoning is on {@link ConnectorRunnerService}
-   * and it is not a performance argument — a transform is promised the whole
-   * batch, and chunking the calls would change what an aggregating one computes
-   * without failing.
+   * **A read is bounded unless a whole-batch transform forces otherwise**, and
+   * which happens is decided here by the transform's declared mode rather than
+   * by what the source was capable of. The reasoning is on
+   * {@link ConnectorRunnerService} and it is not a performance argument — a
+   * `'batch'` transform is promised every record, and chunking the calls would
+   * change what an aggregating one computes without failing. A `'record'`
+   * transform is promised no such thing, so it streams: see
+   * {@link streamThroughTransform}.
    *
    * `logs` is appended to rather than returned, because the caller has already
    * started the run's log with what this run was allowed to say for itself and
@@ -444,6 +452,17 @@ export class ConnectorRunnerService {
     }
     into.noteTransformVersion(transform.version);
 
+    if (transformMode(transform) === 'record' && supportsTransformStreaming(this.transforms)) {
+      return this.streamThroughTransform(
+        connector,
+        principalId,
+        snapshotId,
+        source,
+        transform,
+        into,
+      );
+    }
+
     const records = await collect(source.records);
     logs.push(`Fetched ${records.length} records from ${connector.kind}.`, ...source.notes());
     // Only when the source could have streamed and was not allowed to. An
@@ -452,7 +471,7 @@ export class ConnectorRunnerService {
     // connector happens to have a transform on it.
     if (source.streamed) {
       logs.push(
-        `Held all ${records.length} records in memory: "${transform.name}" is a function over the whole batch, so this read could not be streamed. Drop the transform to have it read a batch at a time.`,
+        `Held all ${records.length} records in memory: "${transform.name}" is a function over the whole batch, so this read could not be streamed. Set the transform to per-record mode if it maps each record independently, or drop it to have this read a batch at a time.`,
       );
     }
 
@@ -492,6 +511,87 @@ export class ConnectorRunnerService {
       labels,
     );
     return { fetched: records.length, written: counts.written };
+  }
+
+  /**
+   * Source to child to snapshot, with nothing anywhere holding the dataset.
+   *
+   * This is the whole point of the per-record mode, and it is worth naming what
+   * each end of it contributes, because a stream is only as bounded as its
+   * *least* bounded link. The source yields as it parses; `runStream` writes
+   * those records to the child and pulls rows back as they are produced;
+   * `appendBatches` does not ask for the next row until the batch before it has
+   * been written. Back-pressure therefore reaches the socket or the file
+   * descriptor the source is reading from, and the peak is one source chunk plus
+   * one wire chunk plus one write batch — a constant, whatever the file weighs.
+   * `bench/transform-stream.mjs` in the catalog package measures exactly this:
+   * the buffering path's peak triples with the dataset and this one's does not
+   * move.
+   *
+   * ## The log lines move, and say more
+   *
+   * "Fetched N records" is written **after** the load rather than before it,
+   * because a streamed read does not know N until the last record has gone past
+   * — the same reason `RecordStream.state()` and `notes()` are functions. The
+   * order a reader sees is unchanged; only the moment the number becomes
+   * knowable is. `source.notes()` and `source.state()` are likewise correct only
+   * here, after the stream is drained, which is where the caller already asks
+   * for the watermark.
+   *
+   * ## What a failure leaves behind
+   *
+   * Whatever had been written sits in an **uncommitted** snapshot, exactly as
+   * every other mid-run failure's does. The commit is two levels up in `run` and
+   * is not reached, so nothing repoints the live view; and the watermark is
+   * saved only after that commit, so a stream that dies at record 60,000 cannot
+   * advance a watermark past rows that never landed — which is the rule #96
+   * established for sources and which applies here unchanged.
+   */
+  private async streamThroughTransform(
+    connector: CatalogConnector,
+    principalId: string,
+    snapshotId: string,
+    source: RecordStream,
+    transform: CatalogTransform,
+    into: { labels: Record<string, string>; logs: string[] },
+  ): Promise<{ fetched: number; written: number }> {
+    const { labels, logs } = into;
+    const admitted = allowlistedCodeEnv();
+    logs.push(...admitted.notes);
+
+    const stream = await this.transforms.runStream(transform, source.records, {
+      context: codeContext({
+        runId: snapshotId,
+        connectorId: connector.id,
+        environment: namedEnvironment(this.environmentName),
+        // Zero, and honestly so. A streamed read has no count until it has
+        // finished, and a transform reading `context.rowCount` on a streamed
+        // connector is asking a question this path genuinely cannot answer yet.
+        // Filling it with a guess would be worse than the zero, which at least
+        // cannot be mistaken for a measurement of anything.
+        rowCount: 0,
+        inputs: [],
+        env: admitted.env,
+      }),
+    });
+
+    const counts = await this.appendBatches(
+      connector,
+      principalId,
+      snapshotId,
+      stream.rows,
+      labels,
+    );
+    const summary = stream.summary();
+
+    logs.push(
+      `Fetched ${summary.recordsIn} records from ${connector.kind}.`,
+      ...source.notes(),
+      `Transform "${transform.name}" v${transform.version} ran per record over a stream, turning ${summary.recordsIn} records into ${summary.rowsOut} rows in ${summary.elapsedMs}ms. Nothing held the whole read.`,
+      ...capLines(summary.logs, TRANSFORM_LOG_LINES),
+    );
+
+    return { fetched: summary.recordsIn, written: counts.written };
   }
 
   /**

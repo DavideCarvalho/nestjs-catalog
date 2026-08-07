@@ -42,12 +42,24 @@ interface Observed {
   /** Whether the source had run to completion when the first batch was written. */
   drainedAtFirstWrite: boolean;
   transformCalls: number[];
+  /**
+   * How many records the streaming transform was handed before each row came
+   * back out of it.
+   *
+   * The per-record equivalent of `yieldedAtWrite`, one link further up the
+   * chain: a runner that collected the source and then streamed it into the
+   * child would still bound the *writes* and would be caught here, because the
+   * first row would come back only after every record had gone in.
+   */
+  fedAtFirstRow: number;
 }
 
 interface Options {
   rows?: number;
-  /** A connector that names a transform, which is what forbids streaming. */
+  /** A connector that names a transform. Whether that forbids streaming is the mode's call. */
   withTransform?: boolean;
+  /** The mode the named transform declares. Absent is `'batch'`, as everywhere. */
+  transformMode?: 'batch' | 'record';
   mode?: 'full' | 'incremental';
   /** Rows the source yields that are not objects, appended after the rest. */
   junk?: unknown[];
@@ -66,6 +78,7 @@ function harness(options: Options = {}) {
     batchSizes: [],
     drainedAtFirstWrite: false,
     transformCalls: [],
+    fedAtFirstRow: -1,
   };
 
   let yielded = 0;
@@ -120,6 +133,7 @@ function harness(options: Options = {}) {
         language: 'javascript',
         version: 7,
         code: '',
+        ...(options.transformMode === undefined ? {} : { mode: options.transformMode }),
         createdBy: 'ana',
         createdAt: '2026-01-01T00:00:00.000Z',
         updatedAt: '2026-01-01T00:00:00.000Z',
@@ -184,6 +198,33 @@ function harness(options: Options = {}) {
     run: (_transform: unknown, given: unknown[]) => {
       observed.transformCalls.push(given.length);
       return Promise.resolve({ rows: given.filter(isObject), logs: [], elapsedMs: 3 });
+    },
+    /**
+     * A stand-in for the subprocess, and deliberately a lazy one.
+     *
+     * It pulls one record and yields its row before pulling the next, which is
+     * what the real child does through the pipe. An implementation that
+     * collected `given` first would make every assertion below pass against a
+     * runner that buffers — so the fake has to have the property under test, and
+     * `fedAtFirstRow` is what checks that it does.
+     */
+    runStream: (_transform: unknown, given: AsyncIterable<unknown>) => {
+      let recordsIn = 0;
+      let rowsOut = 0;
+      async function* rows(): AsyncGenerator<Record<string, unknown>> {
+        for await (const record of given) {
+          recordsIn += 1;
+          observed.transformCalls.push(1);
+          if (!isObject(record)) continue;
+          if (observed.fedAtFirstRow === -1) observed.fedAtFirstRow = recordsIn;
+          rowsOut += 1;
+          yield record;
+        }
+      }
+      return Promise.resolve({
+        rows: rows(),
+        summary: () => ({ recordsIn, rowsOut, logs: ['mapped'], elapsedMs: 3 }),
+      });
     },
   };
 
@@ -350,6 +391,108 @@ describe('a connector that names a transform', () => {
 
     expect(run.logs.join('\n')).not.toContain('records in memory');
     expect(run.fetched).toBe(2);
+  });
+});
+
+describe('a connector whose transform is per-record', () => {
+  /*
+   * The path the whole change exists for. Everything the no-transform streaming
+   * tests above assert has to hold here too, because a rename standing between
+   * the source and the sink is the commonest graph in the system and cancelling
+   * the bound for it cancels it for nearly everything.
+   */
+
+  it('writes its first batch before the source has finished reading', async () => {
+    const { service, observed } = harness({ withTransform: true, transformMode: 'record' });
+
+    await service.run('c1', 'ana', 'snap-1');
+
+    expect(observed.drainedAtFirstWrite).toBe(false);
+    expect(observed.yieldedAtWrite[0]).toBe(BATCH);
+  });
+
+  it('never holds more than one batch, however many rows the source has', async () => {
+    const { service, observed } = harness({ withTransform: true, transformMode: 'record' });
+
+    await service.run('c1', 'ana', 'snap-1');
+
+    expect(maxOutstanding(observed)).toBeLessThanOrEqual(BATCH);
+    expect(observed.yieldedAtWrite).toHaveLength(ROWS / BATCH);
+  });
+
+  it('calls the code once per record rather than once with everything', async () => {
+    // The contract, asserted against its opposite one describe block down: the
+    // batch path records a single call of ROWS, and this records ROWS calls of
+    // one. Nothing else distinguishes the two.
+    const { service, observed } = harness({ withTransform: true, transformMode: 'record' });
+
+    await service.run('c1', 'ana', 'snap-1');
+
+    expect(observed.transformCalls).toHaveLength(ROWS);
+    expect(new Set(observed.transformCalls)).toEqual(new Set([1]));
+    expect(observed.fedAtFirstRow).toBe(1);
+  });
+
+  it('writes the same rows and reports the same counts as the buffered path', async () => {
+    // A faster transform that loses a row is a failure, and the junk rows put a
+    // non-object either side of nothing in particular so that the per-record
+    // filter and the whole-array one have to agree.
+    const streamed = harness({
+      withTransform: true,
+      transformMode: 'record',
+      junk: ['a string', 42, ['an array'], null],
+    });
+    const buffered = harness({ withTransform: true, junk: ['a string', 42, ['an array'], null] });
+
+    const streamedRun = await streamed.service.run('c1', 'ana', 'snap-1');
+    const bufferedRun = await buffered.service.run('c1', 'ana', 'snap-1');
+
+    expect(streamedRun.fetched).toBe(bufferedRun.fetched);
+    expect(streamedRun.written).toBe(bufferedRun.written);
+    expect(streamed.observed.batchSizes).toEqual(buffered.observed.batchSizes);
+  });
+
+  it('says on the run that it streamed, and does not say it held anything', async () => {
+    const { service } = harness({ withTransform: true, transformMode: 'record' });
+
+    const run = await service.run('c1', 'ana', 'snap-1');
+    const logs = run.logs.join('\n');
+
+    expect(logs).toContain('ran per record over a stream');
+    expect(logs).toContain('Nothing held the whole read');
+    expect(logs).not.toContain('records in memory');
+    // What the code logged still reaches the run, once for the whole stream.
+    expect(logs).toContain('mapped');
+  });
+
+  it('advances no watermark when the transform dies part way through', async () => {
+    // #96's rule, checked one node along. The commit is above this path and is
+    // never reached, so the watermark cannot move past rows that never landed.
+    const { service, savedState, observed } = harness({
+      withTransform: true,
+      transformMode: 'record',
+      mode: 'incremental',
+      finalState: () => ({ watermark: 'never' }),
+    });
+    // A child that dies mid-stream, at a record well past the first write.
+    const failing = {
+      rows: (async function* () {
+        for (let index = 0; index < 900; index += 1) yield { id: index };
+        throw new Error('the transform failed on record 901: Error: no');
+      })(),
+      summary: () => ({ recordsIn: 900, rowsOut: 900, logs: [], elapsedMs: 1 }),
+    };
+    Object.assign(service, {
+      transforms: Object.assign(Object.create(null), { runStream: () => Promise.resolve(failing) }),
+    });
+
+    const run = await service.run('c1', 'ana', 'snap-1');
+
+    expect(run.status).toBe('failed');
+    expect(run.error).toContain('failed on record 901');
+    // Rows written before it died are in the snapshot, which is never committed.
+    expect(observed.batchSizes.length).toBeGreaterThan(0);
+    expect(savedState).toEqual([]);
   });
 });
 

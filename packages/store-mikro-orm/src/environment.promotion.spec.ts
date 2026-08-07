@@ -269,6 +269,7 @@ function sourceSet(): CatalogPromotableSet {
         name: 'Normalise MVR',
         language: 'javascript',
         code: 'return records;',
+        mode: 'batch',
         version: 4,
       },
     ],

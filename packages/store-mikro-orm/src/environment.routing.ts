@@ -68,6 +68,7 @@ import type {
   SavedQuery,
   SnapshotRef,
   StoredLoadExpectation,
+  TransformMode,
 } from '@dudousxd/nestjs-catalog';
 import {
   CatalogRegistry,
@@ -433,6 +434,7 @@ export class RoutingPipelineStore implements CatalogPipelineStore {
     input: Pick<CatalogTransform, 'name' | 'language' | 'code'> & {
       id?: string;
       description?: string;
+      mode?: TransformMode;
     },
     createdBy: string,
   ): Promise<CatalogTransform> {

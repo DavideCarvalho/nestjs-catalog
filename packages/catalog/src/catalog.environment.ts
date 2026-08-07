@@ -35,6 +35,7 @@ import { createHash } from 'node:crypto';
 import type {
   ConnectorKind,
   TransformLanguage,
+  TransformMode,
   WorkflowEdge,
   WorkflowNode,
 } from './catalog.pipeline';
@@ -521,6 +522,17 @@ export interface PromotableTransform {
   description?: string;
   language: TransformLanguage;
   code: string;
+  /**
+   * Whether the code is called once with the batch or once per record.
+   *
+   * Carried, and **resolved** rather than left absent, unlike most optional
+   * fields on this shape. The mode decides what the same text means, so a
+   * promotion that dropped it would run the identical transform under a
+   * different contract in production than in dev — the one failure a promotion
+   * exists to make impossible. Resolved because a plan is a description of what
+   * the apply will do, and "absent, and the target will decide" is not one.
+   */
+  mode: TransformMode;
   /** The source's version, carried for the record only — see {@link planPromotion}. */
   version: number;
 }
@@ -821,7 +833,18 @@ function planTransforms(
   for (const transform of source.transforms) {
     if (!selected('transform', transform.id)) continue;
     const existing = targetTransforms.get(transform.id);
-    const fields = diffFields(existing, transform, ['name', 'description', 'language', 'code']);
+    // `mode` is compared, and forgetting it would be the quiet failure this
+    // whole field exists to prevent: a transform switched from batch to
+    // per-record with its code untouched is a real change to what it computes,
+    // and a plan that reported "nothing to release" would leave production
+    // running the other contract.
+    const fields = diffFields(existing, transform, [
+      'name',
+      'description',
+      'language',
+      'code',
+      'mode',
+    ]);
     changes.push({
       kind: 'transform',
       id: transform.id,

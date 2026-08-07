@@ -30,6 +30,7 @@ import {
   effectiveChanges,
   isPromotable,
   supportsWorkflows,
+  transformMode,
 } from '@dudousxd/nestjs-catalog';
 import type { EntityManager } from '@mikro-orm/mysql';
 import { BadRequestException, Logger } from '@nestjs/common';
@@ -69,6 +70,7 @@ export async function readPromotable(
         description: transform.description,
         language: transform.language,
         code: transform.code,
+        mode: transformMode(transform),
         version: transform.version,
       }),
     ),
@@ -471,6 +473,12 @@ async function promoteTransforms({
         description: transform.description,
         language: transform.language,
         code: transform.code,
+        // Carried, and it has to be: the mode decides what the code means, so
+        // promoting the text without it would run the same transform under a
+        // different contract in production than in dev. It is already resolved
+        // on the promotable shape — see PromotableTransform.mode — so this is
+        // the value the plan showed the operator, not a second resolution.
+        mode: transform.mode,
       },
       promotedBy,
     );
