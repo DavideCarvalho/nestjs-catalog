@@ -14,10 +14,10 @@ import {
   catalogConnectionProviders,
 } from './context';
 import { MikroOrmCatalogDirectory } from './directory.service';
-import { MySqlWarehouseStore } from './mysql-warehouse.store';
 import { CATALOG_STORE_OPTIONS, type CatalogStoreModuleOptions } from './options';
 import { MySqlPipelineStore } from './pipeline.store';
 import { StoredCatalogRegistry } from './stored-registry.service';
+import { MySqlWarehouseStore } from './warehouse.store';
 import { MySqlWorkspaceStore } from './workspace.store';
 
 /**

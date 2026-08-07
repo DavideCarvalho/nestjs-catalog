@@ -18,7 +18,7 @@ import {
   isCatalogTraceOutcome,
   traceOutcomeFilter,
 } from '@dudousxd/nestjs-catalog';
-import type { EntityManager } from '@mikro-orm/mysql';
+import type { EntityManager } from '@mikro-orm/sql';
 import {
   Inject,
   Injectable,

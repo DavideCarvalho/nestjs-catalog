@@ -6,7 +6,7 @@ import type {
   WorkflowNode,
 } from '@dudousxd/nestjs-catalog';
 import { SecretOpenFailedError, isSealedSecret } from '@dudousxd/nestjs-catalog';
-import type { EntityManager } from '@mikro-orm/mysql';
+import type { EntityManager } from '@mikro-orm/sql';
 import { BadRequestException, NotFoundException } from '@nestjs/common';
 import { describe, expect, it } from 'vitest';
 import { ConnectionRow, ConnectorRow, WorkflowRow } from './entities/pipeline';

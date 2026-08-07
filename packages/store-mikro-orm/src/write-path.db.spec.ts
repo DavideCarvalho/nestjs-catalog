@@ -9,8 +9,8 @@ import {
   ident,
   tableFor,
 } from './identifiers';
-import { MySqlWarehouseStore } from './mysql-warehouse.store';
 import { MySqlPipelineStore } from './pipeline.store';
+import { MySqlWarehouseStore } from './warehouse.store';
 
 /**
  * What replacing one batch of a large snapshot costs, and what an index does to

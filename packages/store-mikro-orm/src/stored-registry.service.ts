@@ -10,7 +10,7 @@ import {
   emitCatalog,
 } from '@dudousxd/nestjs-catalog';
 import type { MikroORM } from '@mikro-orm/core';
-import type { EntityManager } from '@mikro-orm/mysql';
+import type { EntityManager } from '@mikro-orm/sql';
 import { Inject, Injectable, Logger, type OnModuleInit } from '@nestjs/common';
 import { CATALOG_STORE_ENTITY_MANAGER, CATALOG_STORE_MIKRO_ORM } from './context';
 import { SnapshotRow } from './entities/governance';

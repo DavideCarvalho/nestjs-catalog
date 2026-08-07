@@ -1,5 +1,5 @@
 import { CATALOG_REVISION_LIMIT } from '@dudousxd/nestjs-catalog';
-import type { EntityManager } from '@mikro-orm/mysql';
+import type { EntityManager } from '@mikro-orm/sql';
 import { describe, expect, it } from 'vitest';
 import { TransformRow } from './entities/pipeline';
 import { RevisionRow, SavedQueryRow, revisionKey } from './entities/workspace';

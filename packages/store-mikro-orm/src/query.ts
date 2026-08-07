@@ -4,9 +4,10 @@ import type {
   CatalogQueryRequest,
   CatalogQueryResult,
 } from '@dudousxd/nestjs-catalog';
-import type { EntityManager } from '@mikro-orm/mysql';
+import type { EntityManager } from '@mikro-orm/sql';
 import { BadRequestException } from '@nestjs/common';
-import { SNAPSHOT_COLUMN, ident, outputAlias, physicalColumn, tableFor } from './identifiers';
+import { type CatalogSqlDialect, MYSQL_DIALECT } from './dialect';
+import { SNAPSHOT_COLUMN, outputAlias, physicalColumn, tableFor } from './identifiers';
 
 /**
  * `Mvr` -> `mvr`. The view a query writes in its FROM clause.
@@ -58,7 +59,9 @@ export async function refreshView(
   em: EntityManager,
   type: CatalogObjectTypeDef,
   snapshotId: string,
+  dialect: CatalogSqlDialect = MYSQL_DIALECT,
 ): Promise<void> {
+  const { ident } = dialect;
   const view = viewFor(type.name);
   const columns = type.properties.map(
     (p) => `${ident(physicalColumn(p.name))} AS ${ident(outputAlias(p.name))}`,
@@ -67,14 +70,30 @@ export async function refreshView(
   // without joining back to the snapshot table.
   columns.push(`${ident(SNAPSHOT_COLUMN)} AS ${ident('_snapshot')}`);
 
-  await em.getConnection().execute(
-    `CREATE OR REPLACE VIEW ${ident(view)} AS SELECT ${columns.join(', ')}
-       FROM ${ident(tableFor(type.name))} WHERE ${ident(SNAPSHOT_COLUMN)} = ${em.getPlatform().quoteValue(snapshotId)}`,
-  );
+  // A list of statements rather than one, because the two engines cannot do this
+  // with the same statement. MySQL replaces the view in place under a metadata
+  // lock; Postgres refuses `CREATE OR REPLACE VIEW` outright whenever the column
+  // list has grown anywhere but at the end — which is every type that gains a
+  // property, since `_snapshot` above is pinned last — and so drops and
+  // recreates inside a transaction instead. See `dialect.ts` for the measurement
+  // and for why the atomicity claim survives.
+  const statements = dialect.refreshViewStatements({
+    view,
+    select: columns.join(', '),
+    table: tableFor(type.name),
+    snapshotColumn: SNAPSHOT_COLUMN,
+    quotedSnapshotValue: em.getPlatform().quoteValue(snapshotId),
+  });
+  const connection = em.getConnection();
+  for (const statement of statements) await connection.execute(statement);
 }
 
-export async function dropView(em: EntityManager, typeName: string): Promise<void> {
-  await em.getConnection().execute(`DROP VIEW IF EXISTS ${ident(viewFor(typeName))}`);
+export async function dropView(
+  em: EntityManager,
+  typeName: string,
+  dialect: CatalogSqlDialect = MYSQL_DIALECT,
+): Promise<void> {
+  await em.getConnection().execute(`DROP VIEW IF EXISTS ${dialect.ident(viewFor(typeName))}`);
 }
 
 /**
@@ -162,6 +181,7 @@ export function relationsFor(types: CatalogObjectTypeDef[]): CatalogQueryRelatio
 export async function runReadOnlyQuery(
   em: EntityManager,
   request: CatalogQueryRequest,
+  dialect: CatalogSqlDialect = MYSQL_DIALECT,
 ): Promise<CatalogQueryResult> {
   const maxRows = request.maxRows ?? 1_000;
   const timeoutMs = request.timeoutMs ?? 15_000;
@@ -172,11 +192,20 @@ export async function runReadOnlyQuery(
   const budgetMs = Math.max(1000, Math.floor(timeoutMs));
   // Fetch one extra row: if it comes back, the cap cut the result short and the
   // UI can say so rather than quietly showing a prefix as if it were the whole.
-  const wrapped = `SELECT /*+ MAX_EXECUTION_TIME(${budgetMs}) */ * FROM (${request.sql.trim().replace(/;\s*$/, '')}) AS ${ident('q')} LIMIT ${maxRows + 1}`;
+  // The budget reaches the engine differently on each. MySQL rides an optimizer
+  // hint on the wrapper; Postgres has no such hint — the same comment there
+  // parses, runs, and enforces nothing — and takes `SET LOCAL statement_timeout`
+  // inside the transaction opened just below. `LOCAL` is what makes the two
+  // equivalent rather than merely similar: it is unset when the transaction
+  // ends, so neither form leaves residue on the pooled connection, which is the
+  // whole reason the session variable was rejected in the first place.
+  const budget = dialect.statementTimeout(budgetMs);
+  const wrapped = `SELECT ${budget.hint}* FROM (${request.sql.trim().replace(/;\s*$/, '')}) AS ${dialect.ident('q')} LIMIT ${maxRows + 1}`;
 
   const connection = em.getConnection();
   await connection.execute('START TRANSACTION READ ONLY');
   try {
+    if (budget.preamble) await connection.execute(budget.preamble);
     const rows = await connection.execute<Array<Record<string, unknown>>>(wrapped);
     const truncated = rows.length > maxRows;
     const page = truncated ? rows.slice(0, maxRows) : rows;
@@ -239,12 +268,21 @@ export async function runReadOnlyQuery(
 export async function* streamReadOnlyQuery(
   em: EntityManager,
   request: { sql: string; maxRows?: number; timeoutMs?: number },
+  dialect: CatalogSqlDialect = MYSQL_DIALECT,
 ): AsyncGenerator<Record<string, unknown>> {
   const connection = em.fork().getConnection();
   const trx = await connection.begin({ readOnly: true });
   try {
+    // Inside the transaction and before the stream, so a Postgres deployment's
+    // `SET LOCAL statement_timeout` is scoped to this handle and unset with it.
+    const preamble =
+      request.timeoutMs === undefined
+        ? undefined
+        : dialect.statementTimeout(Math.max(1000, Math.floor(request.timeoutMs))).preamble;
+    if (preamble) await connection.execute(preamble, [], 'run', trx);
+
     for await (const row of connection.stream<Record<string, unknown>>(
-      streamStatement(request),
+      streamStatement(request, dialect),
       [],
       trx,
     )) {
@@ -267,15 +305,18 @@ export async function* streamReadOnlyQuery(
  * `WITH`. Unwrapped when there is neither a budget nor a cap to attach, because
  * then the wrapper would be a subquery bought for nothing.
  */
-function streamStatement(request: { sql: string; maxRows?: number; timeoutMs?: number }): string {
+function streamStatement(
+  request: { sql: string; maxRows?: number; timeoutMs?: number },
+  dialect: CatalogSqlDialect,
+): string {
   const sql = request.sql.trim().replace(/;\s*$/, '');
   const hint =
     request.timeoutMs === undefined
       ? ''
-      : `/*+ MAX_EXECUTION_TIME(${Math.max(1000, Math.floor(request.timeoutMs))}) */ `;
+      : dialect.statementTimeout(Math.max(1000, Math.floor(request.timeoutMs))).hint;
   const limit = request.maxRows === undefined ? '' : ` LIMIT ${Math.max(0, request.maxRows)}`;
   if (hint === '' && limit === '') return sql;
-  return `SELECT ${hint}* FROM (${sql}) AS ${ident('q')}${limit}`;
+  return `SELECT ${hint}* FROM (${sql}) AS ${dialect.ident('q')}${limit}`;
 }
 
 /** JSON cannot carry BigInt or Date; neither can a table cell. */

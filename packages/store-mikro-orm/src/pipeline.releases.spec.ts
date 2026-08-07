@@ -1,4 +1,4 @@
-import type { EntityManager } from '@mikro-orm/mysql';
+import type { EntityManager } from '@mikro-orm/sql';
 import { BadRequestException, NotFoundException } from '@nestjs/common';
 import { describe, expect, it } from 'vitest';
 import { ConnectorRow, WorkflowReleaseRow, WorkflowRow } from './entities/pipeline';

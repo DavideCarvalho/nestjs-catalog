@@ -24,14 +24,14 @@
 import type { CatalogEnvironment, CatalogEnvironmentId } from '@dudousxd/nestjs-catalog';
 import { UnknownEnvironmentError } from '@dudousxd/nestjs-catalog';
 import type { MikroORM } from '@mikro-orm/core';
-import type { EntityManager } from '@mikro-orm/mysql';
+import type { EntityManager } from '@mikro-orm/sql';
 import { Logger } from '@nestjs/common';
 import { MySqlCatalogTraceStore } from './audit-recorder.service';
 import type { PromotionTarget } from './environment.promotion';
-import { MySqlWarehouseStore } from './mysql-warehouse.store';
 import { MySqlPipelineStore } from './pipeline.store';
 import { ensureCatalogSchema } from './schema';
 import { StoredCatalogRegistry } from './stored-registry.service';
+import { MySqlWarehouseStore } from './warehouse.store';
 import { MySqlWorkspaceStore } from './workspace.store';
 
 /**

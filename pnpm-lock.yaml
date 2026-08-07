@@ -407,6 +407,9 @@ importers:
       '@mikro-orm/postgresql':
         specifier: 7.0.17
         version: 7.0.17(@mikro-orm/core@7.0.17)
+      '@mikro-orm/sql':
+        specifier: 7.0.17
+        version: 7.0.17(@mikro-orm/core@7.0.17)
       '@nestjs/common':
         specifier: 11.1.19
         version: 11.1.19(reflect-metadata@0.2.2)(rxjs@7.8.2)

@@ -76,11 +76,44 @@ function nestMikroOrmToken(contextName: string): string {
  * which is precisely why positional injection cannot be made to work here and
  * an explicit token was needed.
  */
-export function catalogConnectionProviders(contextName?: string): Provider[] {
+export function catalogConnectionProviders(
+  contextName?: string,
+  /**
+   * The class `@mikro-orm/nestjs` registered as the default connection's
+   * `EntityManager`, when it is not the one imported above.
+   *
+   * **This is a Postgres-shaped hole and it is worth naming precisely.** The
+   * import above is `@mikro-orm/mysql`'s `EntityManager`, which is
+   * `@mikro-orm/sql`'s `SqlEntityManager` verbatim — that package adds no
+   * subclass of its own. `@mikro-orm/postgresql` *does*: it exports
+   * `PostgreSqlEntityManager as EntityManager`, a subclass. So on a Postgres
+   * host the token `@mikro-orm/nestjs` registers for the default connection is a
+   * class this file has never heard of, and `useExisting` against the base class
+   * resolves to nothing — a Nest resolution error at boot, which is at least
+   * loud, but it is a boot failure with no supported fix.
+   *
+   * Two supported fixes now exist, and the first is the better one:
+   *
+   * 1. **Give the connection a `contextName`.** That path is below, it binds to
+   *    string tokens, and it has never cared which driver is underneath. It is
+   *    also what a host mounting this catalog beside its own database wants
+   *    anyway.
+   * 2. **Pass the class**, for a host that owns its process and has exactly one
+   *    connection: `catalogConnectionProviders(undefined, EntityManager, MikroORM)`
+   *    with both imported from `@mikro-orm/postgresql`.
+   *
+   * Defaulted rather than required so that every existing MySQL wiring — which
+   * is every wiring that exists — keeps resolving through exactly the providers
+   * it resolved through before.
+   */
+  entityManagerToken: unknown = EntityManager,
+  /** The matching `MikroORM` class. Core's, unless the driver subclasses it. */
+  mikroOrmToken: unknown = MikroORM,
+): Provider[] {
   if (!contextName) {
     return [
-      { provide: CATALOG_STORE_ENTITY_MANAGER, useExisting: EntityManager },
-      { provide: CATALOG_STORE_MIKRO_ORM, useExisting: MikroORM },
+      { provide: CATALOG_STORE_ENTITY_MANAGER, useExisting: entityManagerToken },
+      { provide: CATALOG_STORE_MIKRO_ORM, useExisting: mikroOrmToken },
     ];
   }
 

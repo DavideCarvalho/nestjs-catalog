@@ -32,13 +32,13 @@ import {
   supportsWorkflows,
   transformMode,
 } from '@dudousxd/nestjs-catalog';
-import type { EntityManager } from '@mikro-orm/mysql';
+import type { EntityManager } from '@mikro-orm/sql';
 import { BadRequestException, Logger } from '@nestjs/common';
 import { ObjectTypeRow, PropertyRow, type StoredRelation, relationsOf } from './entities/model';
 import type { CatalogEnvironmentBundle } from './environment.bundle';
 import { tableFor } from './identifiers';
-import type { MySqlWarehouseStore } from './mysql-warehouse.store';
 import type { StoredCatalogRegistry } from './stored-registry.service';
+import type { MySqlWarehouseStore } from './warehouse.store';
 
 /**
  * Everything promotable in one environment.

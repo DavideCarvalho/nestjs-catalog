@@ -4,9 +4,9 @@ import type {
   CatalogPropertyDef,
   CatalogResolvedFilter,
 } from '@dudousxd/nestjs-catalog';
-import type { EntityManager } from '@mikro-orm/mysql';
+import type { EntityManager } from '@mikro-orm/sql';
 import { describe, expect, it, vi } from 'vitest';
-import { MySqlWarehouseStore } from './mysql-warehouse.store';
+import { MySqlWarehouseStore } from './warehouse.store';
 
 /**
  * What a filtered read and a historical read actually issue.

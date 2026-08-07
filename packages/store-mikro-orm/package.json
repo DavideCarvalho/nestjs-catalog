@@ -1,7 +1,7 @@
 {
   "name": "@dudousxd/nestjs-catalog-store-mikro-orm",
   "version": "0.17.0",
-  "description": "MikroORM warehouse store for @dudousxd/nestjs-catalog: a stored model, append-only snapshot loads, and its own tables managed at boot.",
+  "description": "MikroORM warehouse store for @dudousxd/nestjs-catalog, on MySQL or PostgreSQL: a stored model, append-only snapshot loads, and its own tables managed at boot.",
   "license": "MIT",
   "author": "Davide Carvalho",
   "repository": {
@@ -10,11 +10,14 @@
     "directory": "packages/store-mikro-orm"
   },
   "keywords": [
-    "nestjs",
     "catalog",
     "mikro-orm",
-    "warehouse",
-    "snapshots"
+    "mysql",
+    "nestjs",
+    "postgres",
+    "postgresql",
+    "snapshots",
+    "warehouse"
   ],
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -30,7 +33,9 @@
     "@mikro-orm/core": ">=6",
     "@mikro-orm/decorators": ">=7",
     "@mikro-orm/mysql": ">=6",
-    "@nestjs/common": ">=10"
+    "@nestjs/common": ">=10",
+    "@mikro-orm/sql": ">=7",
+    "@mikro-orm/postgresql": ">=6"
   },
   "devDependencies": {
     "@dudousxd/nestjs-catalog": "workspace:*",
@@ -41,6 +46,15 @@
     "@nestjs/common": "11.1.19",
     "@types/node": "25.6.0",
     "pg": "8.13.1",
-    "typescript": "5.9.3"
+    "typescript": "5.9.3",
+    "@mikro-orm/sql": "7.0.17"
+  },
+  "peerDependenciesMeta": {
+    "@mikro-orm/mysql": {
+      "optional": true
+    },
+    "@mikro-orm/postgresql": {
+      "optional": true
+    }
   }
 }
