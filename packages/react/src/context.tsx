@@ -6,6 +6,7 @@ import type {
   CatalogObjectPage,
   CatalogQueryRelation,
   CatalogQueryResult,
+  CatalogReusableNode,
   CatalogRevision,
   CatalogSearchResult,
   CatalogSnapshot,
@@ -22,6 +23,7 @@ import type {
   ObjectQueryParams,
   PropertyPatch,
   ResolvedLoadExpectation,
+  ReusableNodeBody,
   RowCountBound,
   SaveQueryInput,
   SavedQuery,
@@ -251,6 +253,70 @@ export interface ConnectionUse {
   name: string;
   status: CatalogWorkflow['status'];
   through: string;
+}
+
+/**
+ * One place a shared node body — or a transform — is used.
+ *
+ * The same shape for both, because they answer the same question about two
+ * stored objects and a second shape would be a second thing to keep in step.
+ * `CatalogReusableNodeUse` in core is the server's word for it; this is the same
+ * fields, re-declared here rather than imported for the reason
+ * {@link ConnectionUse} is: the transform route answers this shape too, and core
+ * has no type that covers both.
+ *
+ * Per **node**, not per graph. Three nodes of one graph using the same body are
+ * three places an edit lands, which is what somebody about to edit it is asking.
+ */
+export interface ReusableNodeUsage {
+  workflowId: string;
+  workflowName: string;
+  status: CatalogWorkflow['status'];
+  nodeId: string;
+  nodeName: string;
+  /**
+   * The version this node pinned, or absent for a reference that follows the
+   * latest.
+   *
+   * The field that turns a count into a decision. An unpinned node picks up this
+   * edit on its next run; a pinned one does not, until somebody edits that
+   * graph. A usage list without it would say "four graphs" and leave the reader
+   * unable to tell how many of them they are about to change.
+   */
+  pinnedVersion?: number;
+}
+
+/**
+ * A reusable node as the picker sees it: the body, plus how many places use it.
+ *
+ * The count is on the row rather than behind a request per row, because there is
+ * no library screen — the maintainer was explicit that reusable nodes belong
+ * where a node is added — so this list IS the picker, and a number that changes
+ * somebody's decision has to be there before the click.
+ */
+export interface ListedReusableNode extends CatalogReusableNode {
+  usedBy: number;
+}
+
+export interface ReusableNodeInput {
+  id?: string;
+  name: string;
+  description?: string;
+  body: ReusableNodeBody;
+}
+
+/**
+ * What lifting a node into the library answers with.
+ *
+ * `setOnNode` rather than an edited graph, and it is the server saying out loud
+ * what the caller still has to do: the node is not an instance of anything until
+ * `useId` is on it and the graph is saved. A call that had rewritten the graph
+ * itself would move its version for a reason its author cannot see in their own
+ * diff, which is the class of silence this whole feature exists to end.
+ */
+export interface SavedNodeAsReusable {
+  reusableNode: CatalogReusableNode;
+  setOnNode: { nodeId: string; useId: string };
 }
 
 /**
@@ -695,6 +761,20 @@ export interface CatalogClient {
    */
   listTransformRevisions(id: string): Promise<CatalogRevision[]>;
   /**
+   * Which graphs run this transform, and at which node within each.
+   *
+   * The answer to "how many places use this", asked of the shared object that
+   * already existed. Read in the transform editor rather than in a listing,
+   * because the number changes a decision exactly when somebody is about to edit
+   * code four other graphs depend on — which is not a moment they spend on a
+   * listing page.
+   *
+   * `pinnedVersion` is what turns the count into a decision rather than an
+   * alarm: an unpinned node moves the moment this is saved, a pinned one does
+   * not, and the two need different amounts of care.
+   */
+  listTransformWorkflows(id: string): Promise<ReusableNodeUsage[]>;
+  /**
    * Run code against sample records without storing anything.
    *
    * The difference between a transform somebody can iterate on and one they can
@@ -716,6 +796,40 @@ export interface CatalogClient {
    * rather than as a toast a minute later. Sharing the code is not the same as
    * trusting the client: this call is still made, and its refusal always wins.
    */
+  /**
+   * Node bodies saved under a name and used from several graphs, each with the
+   * number of places it is used.
+   *
+   * There is deliberately no library screen behind this. It is the source of the
+   * picker offered where a node is added, and the count rides along on every row
+   * rather than behind a request per row — a number that changes somebody's
+   * decision has to be there before the click.
+   *
+   * Refuses by name on a deployment whose store cannot hold reusable nodes,
+   * rather than answering an empty list. "There are none yet" and "there cannot
+   * be any here" look identical to somebody who has never seen one, and the
+   * first invites them to keep looking for the button.
+   */
+  listReusableNodes(): Promise<ListedReusableNode[]>;
+  saveReusableNode(input: ReusableNodeInput): Promise<CatalogReusableNode>;
+  deleteReusableNode(id: string): Promise<{ deleted: boolean }>;
+  /** Which graphs use it, and at which node within each. */
+  listReusableNodeWorkflows(id: string): Promise<ReusableNodeUsage[]>;
+  /**
+   * Lift one node of a saved graph into a reusable node, by reference.
+   *
+   * **It does not edit the graph.** It answers with the reusable node and the
+   * `useId` to put on that node; setting it and saving is one ordinary
+   * {@link CatalogClient.saveWorkflow}, which bumps the graph's version and
+   * shows a diff. A call that stored one thing and silently rewrote another
+   * would move a version for a reason its author cannot see in their own diff.
+   */
+  saveNodeAsReusable(
+    workflowId: string,
+    nodeId: string,
+    input: { name?: string; description?: string },
+  ): Promise<SavedNodeAsReusable>;
+
   listWorkflows(): Promise<CatalogWorkflow[]>;
   saveWorkflow(input: WorkflowInput): Promise<CatalogWorkflow>;
   /**
@@ -953,7 +1067,16 @@ export function CatalogProvider({
       saveTransform: (input) => transport.post<CatalogTransform>(pipeline.transforms(), input),
       deleteTransform: (id) => transport.delete<{ deleted: boolean }>(pipeline.transform(id)),
       listTransformRevisions: (id) => transport.get(pipeline.transformRevisions(id)),
+      listTransformWorkflows: (id) => transport.get(pipeline.transformWorkflows(id)),
       tryTransform: (input) => transport.post<TransformResult>(pipeline.tryTransform(), input),
+
+      listReusableNodes: () => transport.get(pipeline.reusableNodes()),
+      saveReusableNode: (input) =>
+        transport.post<CatalogReusableNode>(pipeline.reusableNodes(), input),
+      deleteReusableNode: (id) => transport.delete<{ deleted: boolean }>(pipeline.reusableNode(id)),
+      listReusableNodeWorkflows: (id) => transport.get(pipeline.reusableNodeWorkflows(id)),
+      saveNodeAsReusable: (workflowId, nodeId, input) =>
+        transport.post<SavedNodeAsReusable>(pipeline.saveNodeAsReusable(workflowId, nodeId), input),
 
       listWorkflows: () => transport.get(pipeline.workflows()),
       saveWorkflow: (input) => transport.post<CatalogWorkflow>(pipeline.workflows(), input),
@@ -1073,6 +1196,19 @@ export const catalogQueryKeys = {
    */
   transformRevisions: (id: string) =>
     ['nestjs-catalog', 'pipeline', 'transforms', id, 'revisions'] as const,
+  /**
+   * Which graphs run one transform, keyed UNDER `transforms` for the reason its
+   * neighbour above is: saving a graph is what changes this, and the list
+   * invalidation a save already performs has to reach it — a usage count that
+   * kept yesterday's number is worse than none, because it is read by somebody
+   * deciding whether an edit is safe.
+   */
+  transformWorkflows: (id: string) =>
+    ['nestjs-catalog', 'pipeline', 'transforms', id, 'workflows'] as const,
+  reusableNodes: ['nestjs-catalog', 'pipeline', 'reusable-nodes'] as const,
+  /** Keyed under `reusableNodes`, so saving one invalidates its usage list too. */
+  reusableNodeWorkflows: (id: string) =>
+    ['nestjs-catalog', 'pipeline', 'reusable-nodes', id, 'workflows'] as const,
   runs: (connectorId?: string) =>
     ['nestjs-catalog', 'pipeline', 'runs', connectorId ?? 'all'] as const,
   /**

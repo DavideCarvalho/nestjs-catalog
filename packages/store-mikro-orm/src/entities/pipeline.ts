@@ -475,6 +475,120 @@ export class WorkflowStageRow {
 }
 
 /**
+ * A node body saved once, under a name, and used from several graphs.
+ *
+ * ## Its own table, and why not a column on `catalog_workflow`
+ *
+ * Because the whole point is that it belongs to no graph. A body kept inside one
+ * graph and copied into the others is the shape this replaces: it works, right
+ * up until somebody asks how many workflows use "flip db sink" — and after a
+ * copy there is nothing left that says two nodes are the same node. Here the
+ * body has an id, a node carries that id, and the count is a query rather than a
+ * guess at which configurations look alike.
+ *
+ * ## Versioned like a transform, and archived in the same table
+ *
+ * {@link version} is bumped when {@link body} changes and not when the name or
+ * the description does, which is the rule `TransformRow` follows and for the
+ * same reason: a graph pins this number, so inflating it would make the pin
+ * meaningless. Each version's body is written into `catalog_revision` under the
+ * `reusable-node` subject — one table, one retention rule, which is the argument
+ * `RevisionRow` already makes for holding transforms and saved queries together.
+ * That archive is what makes a pin resolvable rather than merely recorded.
+ *
+ * The same two limits carry over verbatim. The archive is bounded per subject
+ * (`CATALOG_REVISION_LIMIT`), so a body edited more times than that can no
+ * longer produce its earliest versions — a graph pinned to one of them fails its
+ * run saying so, rather than silently running the latest. And a version whose
+ * body was overwritten *before* this table existed is not recoverable; that is
+ * vacuous today, because this table and its revisions shipped together, and it
+ * is written down because it will not be vacuous forever.
+ *
+ * ## No foreign key from a graph to here
+ *
+ * For the reason `ConnectorRow.connectionId` has none: a cascade would delete
+ * nodes out of graphs nobody meant to edit, and a SET NULL would leave a node
+ * claiming to be an instance of nothing. The store refuses the delete while any
+ * graph still references it, which is the same protection with an error that can
+ * name the graphs.
+ */
+@Entity({ tableName: 'catalog_reusable_node' })
+// One query beyond the primary key: "the reusable nodes of this kind", which is
+// what a picker asks when somebody adds a source. Bounded by the number of
+// reusable nodes rather than by anything that grows with data, so this is the
+// only index there is — and see `LoadExpectationRow` on why adding one later
+// would NOT reach a database that has already booted.
+@Index({ properties: ['kind'] })
+@Unique({ properties: ['name'] })
+export class ReusableNodeRow {
+  @PrimaryKey({ length: 64 })
+  id!: string;
+
+  /**
+   * What people ask for it by — "flip db sink".
+   *
+   * Unique, and enforced by the schema rather than by the store, which is the
+   * opposite of how `ConnectorRow.connectionId` is handled one class up. The
+   * difference is what the constraint would have to decide: there, a foreign key
+   * would have to pick a behaviour for a delete and both behaviours are wrong.
+   * Here it only has to refuse a second row, and two reusable nodes with the
+   * same name is a picker nobody can use — a state worth making unreachable
+   * rather than merely checked.
+   */
+  @Property({ length: 128 })
+  name!: string;
+
+  @Property({ length: 512, nullable: true })
+  description?: string;
+
+  /**
+   * `source` or `sink`. Narrowed on read against `isReusableNodeKind`, never
+   * cast.
+   *
+   * Redundant with `body.kind` and stored anyway, so that "the sinks" is an
+   * indexed query rather than a scan that parses every body. That is the same
+   * trade `WorkflowRow.targetType` makes, with the same caveat: the store writes
+   * both from one value, so they cannot be observed disagreeing.
+   */
+  @Property({ length: 16 })
+  kind!: string;
+
+  /**
+   * The body itself — a `ReusableNodeBody`.
+   *
+   * Typed as `Record<string, unknown>` and never as the union, exactly as
+   * {@link WorkflowRow.nodes} is and for the identical reason: MikroORM hands
+   * back whatever the column holds, so declaring the union here would make every
+   * read a silent, unchecked assertion about a value some earlier build wrote.
+   * `MySqlPipelineStore` narrows it with `isReusableNodeBody` and refuses what it
+   * does not recognise — folding an unreadable body onto a node as nothing would
+   * leave a node that runs whatever was cached on it while claiming to be an
+   * instance of this one.
+   *
+   * A **source** body carries a credential-bearing `config`, exactly as
+   * {@link ConnectorRow.config} does, and travels the same path: refused in
+   * plaintext, sealed under `encryptCredentials`, opened on the way out. The
+   * version is decided from the body BEFORE sealing, so a ciphertext that
+   * differs on every seal never registers as a new version — the same rule
+   * `WorkflowRow.graphHash` follows.
+   */
+  @Property({ type: 'json' })
+  body: Record<string, unknown> = {};
+
+  @Property()
+  version = 1;
+
+  @Property({ length: 128 })
+  createdBy!: string;
+
+  @Property({ onCreate: () => new Date() })
+  createdAt!: Date;
+
+  @Property({ onCreate: () => new Date(), onUpdate: () => new Date() })
+  updatedAt!: Date;
+}
+
+/**
  * A named, reusable way to reach a source.
  *
  * Its own table rather than a shape inside a connector's config, because the

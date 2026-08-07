@@ -47,6 +47,9 @@ import type {
   CatalogQueryStreamRequest,
   CatalogReadQuery,
   CatalogReadResult,
+  CatalogReusableNode,
+  CatalogReusableNodeStore,
+  CatalogReusableNodeUse,
   CatalogSnapshot,
   CatalogStageStore,
   CatalogStoreCapabilities,
@@ -72,7 +75,9 @@ import {
   isStreamingQueryStore,
   stampEnvironment,
   supportsLoadExpectations,
+  supportsReusableNodes,
   supportsSavedQueryRevisions,
+  supportsTransformPins,
   supportsTransformRevisions,
   supportsWorkflowStages,
   supportsWorkflows,
@@ -538,6 +543,64 @@ export class RoutingPipelineStore implements CatalogPipelineStore {
       : Promise.resolve([]);
   }
 
+  /**
+   * Probed and forwarded, and the empty answer is `undefined` rather than `[]`.
+   *
+   * `undefined` is the interface's word for "that version cannot be produced",
+   * and it is the right answer for a store that keeps no archive: the runner
+   * turns it into a failed node naming the pin, which is what a deployment that
+   * cannot honour pins should say. Resolving to the latest instead would be the
+   * silent substitution the pin exists to prevent, arrived at through a proxy.
+   */
+  getTransformAt(id: string, version: number): Promise<CatalogTransform | undefined> {
+    const inner = this.inner;
+    return supportsTransformPins(inner)
+      ? inner.getTransformAt(id, version)
+      : Promise.resolve(undefined);
+  }
+
+  listReusableNodes(): Promise<CatalogReusableNode[]> {
+    const inner = this.inner;
+    return supportsReusableNodes(inner) ? inner.listReusableNodes() : Promise.resolve([]);
+  }
+
+  getReusableNode(id: string): Promise<CatalogReusableNode | undefined> {
+    const inner = this.inner;
+    return supportsReusableNodes(inner) ? inner.getReusableNode(id) : Promise.resolve(undefined);
+  }
+
+  getReusableNodeAt(id: string, version: number): Promise<CatalogReusableNode | undefined> {
+    const inner = this.inner;
+    return supportsReusableNodes(inner)
+      ? inner.getReusableNodeAt(id, version)
+      : Promise.resolve(undefined);
+  }
+
+  /**
+   * Refuses out loud when the store behind it holds none, rather than resolving
+   * to a no-op — the distinction {@link saveWorkflowSchedule} draws just above.
+   *
+   * A read that has an honest empty answer may answer empty. This is a write,
+   * and a save that silently stored nothing would leave somebody looking at a
+   * console that says their reusable node exists, in a deployment where it does
+   * not, until the first graph that names it fails.
+   */
+  saveReusableNode(
+    input: Pick<CatalogReusableNode, 'name' | 'body'> & { id?: string; description?: string },
+    createdBy: string,
+  ): Promise<CatalogReusableNode> {
+    return requireReusableNodes(this.inner).saveReusableNode(input, createdBy);
+  }
+
+  deleteReusableNode(id: string): Promise<boolean> {
+    return requireReusableNodes(this.inner).deleteReusableNode(id);
+  }
+
+  reusableNodeUses(id: string): Promise<CatalogReusableNodeUse[]> {
+    const inner = this.inner;
+    return supportsReusableNodes(inner) ? inner.reusableNodeUses(id) : Promise.resolve([]);
+  }
+
   connectorsUsingWorkflow(id: string): Promise<CatalogConnector[]> {
     const inner = this.inner;
     return supportsWorkflows(inner) ? inner.connectorsUsingWorkflow(id) : Promise.resolve([]);
@@ -640,6 +703,17 @@ function requireLoadExpectations(
   if (!supportsLoadExpectations(store)) {
     throw new BadRequestException(
       "This environment's pipeline store cannot hold load expectations, so this one cannot be set here. The host's CATALOG_LOAD_EXPECTATIONS object is the only layer in this environment.",
+    );
+  }
+  return store;
+}
+
+function requireReusableNodes(
+  store: CatalogPipelineStore,
+): CatalogPipelineStore & CatalogReusableNodeStore {
+  if (!supportsReusableNodes(store)) {
+    throw new BadRequestException(
+      "This environment's pipeline store cannot hold reusable nodes, so a node saved here would exist nowhere. Configure every node of a graph in place in this environment.",
     );
   }
   return store;

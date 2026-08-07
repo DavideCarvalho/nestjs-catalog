@@ -157,7 +157,8 @@ export class AuditEventRow {
 }
 
 /**
- * The two things in this catalog whose text a person edits.
+ * The things in this catalog whose body a person edits, and whose previous
+ * bodies something else still names.
  *
  * One list, narrowed against by {@link isRevisionSubject}, for the reason every
  * other vocabulary in this codebase is: a second hand-maintained copy is what
@@ -165,11 +166,20 @@ export class AuditEventRow {
  * whichever member happened to be first — which here would mean a transform's
  * history answering with a saved query's.
  *
+ * `reusable-node` joined the list rather than getting a table of its own, and
+ * that is the argument `RevisionRow` already makes about the other two: the
+ * interesting part of an archive is not the rows, it is the *policy* — what a
+ * revision costs, when one is written, how many are kept — and two copies of a
+ * policy is how one of them ends up keeping fifty and the other five hundred.
+ * Its body is JSON rather than code or SQL, which the column does not care
+ * about: `RevisionRow.body` is text, and the store that writes it is the only
+ * thing that knows how to read it back.
+ *
  * A workflow graph is deliberately absent. See `CatalogWorkflow` in the catalog
  * package, which argues the exclusion where somebody looking for it will read
  * it.
  */
-export const REVISION_SUBJECTS = ['transform', 'saved-query'] as const;
+export const REVISION_SUBJECTS = ['transform', 'saved-query', 'reusable-node'] as const;
 
 export type RevisionSubject = (typeof REVISION_SUBJECTS)[number];
 

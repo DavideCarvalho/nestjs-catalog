@@ -364,6 +364,16 @@ export {
   // either otherwise.
   type ScheduledWorkflow,
   type TransformInput,
+  // Reusable nodes. `ListedReusableNode` is what the picker reads — a body plus
+  // the number of places it is used — and `ReusableNodeUsage` is the row of the
+  // list behind that number, which the transform routes answer with too. Named
+  // here because a host writing its own picker cannot type either otherwise, and
+  // because there is deliberately no library screen in this package to read them
+  // for it: reusable nodes are offered where a node is added, not in a tab.
+  type ListedReusableNode,
+  type ReusableNodeInput,
+  type ReusableNodeUsage,
+  type SavedNodeAsReusable,
   type WorkflowRunOptions,
   type WorkflowScheduleInput,
   useCatalogClient,

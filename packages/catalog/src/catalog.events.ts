@@ -27,6 +27,7 @@ export const CATALOG_EVENTS = [
   'connector.run.started',
   'connector.run.finished',
   'transform.changed',
+  'reusable-node.changed',
   'workflow.changed',
   'query.shared',
   'dashboard.shared',
@@ -61,6 +62,13 @@ export const CATALOG_EVENT_PHASE: Record<CatalogEvent, number> = {
   // one an earlier rank than the other would assert a causal order between two
   // edits that have none.
   'workflow.changed': 1,
+  // And the same rank again, for the same argument one step further out.
+  // Editing a reusable node is an authoring act that precedes the run being
+  // investigated, exactly as editing a transform or rewiring a graph is — and
+  // it is the one of the three that can change a load nobody edited, so a trace
+  // that could not place it beside the others would be missing the entry that
+  // explains the surprise.
+  'reusable-node.changed': 1,
   // Curation carries no snapshot id, so it never lands inside a trace and this
   // rank is never consulted. It is written out rather than left to the fallback
   // because the type demands every event have one, and a `Record` that has to
@@ -348,6 +356,31 @@ export interface CatalogEventPayloads {
     transformId: string;
     name: string;
     language: string;
+    version: number;
+    changedBy: string;
+  };
+  /**
+   * Someone changed a node body that several graphs share.
+   *
+   * The third authoring event, and the one that answers a question the other two
+   * cannot. `transform.changed` and `workflow.changed` both name something
+   * inside the graph that changed behaviour; this names a change **outside**
+   * every graph it affects. A load that started reading a different query last
+   * Tuesday, whose own graph has not been touched in a month, has its whole
+   * explanation here and nowhere else — which is precisely the silence that
+   * makes shared nodes dangerous and precisely what this event is for.
+   *
+   * It carries no list of the graphs downstream, deliberately. That list is a
+   * query (`GET reusable-nodes/:id/workflows`) and it is answered as of *now*,
+   * whereas an event is a record of one moment; freezing a list into the trail
+   * would produce a fact that is wrong by the following week and looks
+   * authoritative.
+   */
+  'reusable-node.changed': {
+    reusableNodeId: string;
+    name: string;
+    /** `source` or `sink` — see `REUSABLE_NODE_KINDS`. */
+    kind: string;
     version: number;
     changedBy: string;
   };
