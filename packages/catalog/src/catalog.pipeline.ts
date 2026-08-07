@@ -1156,6 +1156,13 @@ export interface WorkflowSinkNode extends WorkflowNodeBase, ReusableNodeRef {
  * answers are two documented shapes, and anything else fails the node naming
  * the workflow, the version and the child run id.
  *
+ * All of the paragraph above describes the **envelope** mode, which is the
+ * default and what every stored call node is. {@link callMode} names the other
+ * one: a plain call sends {@link config} verbatim, so a workflow that has never
+ * heard of this catalog can be called without being edited — and gives up the
+ * ability to hand rows back, because it is told no key to stage them under. See
+ * {@link WORKFLOW_CALL_MODES}.
+ *
  * ## `config` is not a credential store
  *
  * Named `config` rather than `input` so it travels the same path a source
@@ -1181,8 +1188,134 @@ export interface WorkflowCallNode extends WorkflowNodeBase {
    * to *this* graph and is a number. This one identifies somebody else's code.
    */
   callVersion: string;
-  /** Parameters the author typed, handed to the child under `input`. */
+  /**
+   * Parameters the author typed. Where they land depends on
+   * {@link WorkflowCallNode.callMode}: under `input` in an envelope call, and as
+   * the whole of the child's payload in a plain one.
+   */
   config: Record<string, unknown>;
+  /**
+   * Whether the child is handed a {@link WorkflowCallEnvelope} or the bare
+   * {@link config}. See {@link WORKFLOW_CALL_MODES}, which is where the choice
+   * is argued.
+   *
+   * Absent means `'envelope'`, which is what every call node stored before this
+   * field existed is and what every one of them has always done. Read it through
+   * {@link workflowCallMode} rather than defaulting it a second time — one
+   * default, no second copy to drift.
+   */
+  callMode?: WorkflowCallMode;
+}
+
+/**
+ * What a {@link WorkflowCallNode} puts on the wire, and the whole of it.
+ *
+ * ## Why there is a second mode at all
+ *
+ * The catalog could not call a workflow that does not know about the catalog.
+ * A `call` node wraps the author's `config` in a {@link WorkflowCallEnvelope},
+ * so a workflow that already exists — one registered years before this package,
+ * whose body reads `data["proc"]` — receives `{catalog: {...}, input: {proc:
+ * ...}}` and dies on the first key it looks for. The only repair available was
+ * to edit the callee, which inverts the dependency exactly the wrong way round:
+ * every workflow anybody wanted to call would have to start depending on this
+ * package's contract, and a Python workflow registered in another repository
+ * would have to be changed to be reachable from a graph.
+ *
+ * ## Why the nesting is not being loosened instead
+ *
+ * The envelope nests for one stated reason, which is on {@link
+ * WorkflowCallEnvelope}: an author's parameter called `runId` must not be able
+ * to shadow the run id. That reason is sound and it is not being weakened. It
+ * simply does not reach the plain mode, because a plain call sends **no catalog
+ * metadata at all** — there is no `runId`, no `nodeId`, no contract number on
+ * the wire, so there is nothing a parameter could shadow. The flat payload is
+ * not the envelope with its guard removed; it is a different, smaller promise.
+ *
+ * ## What the plain mode costs, which is not small
+ *
+ * No `runId` and no `nodeId` means the callee has no key to stage rows under.
+ * Rows travel through the stage store addressed by `(runId, nodeId, batch)` —
+ * see {@link WorkflowStageRef} — and a callee that was told neither cannot
+ * write where the next node would read. So a plain call **cannot return rows to
+ * the graph**, and that is not a convention anybody could follow more carefully:
+ * it is arithmetic. `validateWorkflow` refuses a plain call with an outbound
+ * edge for exactly this reason (`call-plain-has-output`), and its return value
+ * is not read as a row count — see {@link readWorkflowCallOutput} for the shape
+ * that is deliberately *not* consulted on this path.
+ *
+ * A plain call is therefore for its **effect**: run the thing, and let something
+ * else in the graph produce what gets committed.
+ *
+ * ## Why a mode on the node rather than a second node kind or a boolean
+ *
+ * A boolean is the shape {@link WORKFLOW_PREDICATE_KINDS} argues against one
+ * level down, and for the reason it gives: a `plain?: boolean` beside a future
+ * third wire format is two optional flags whose combinations nobody defined, and
+ * every reader invents its own rule for which wins. A closed list with an
+ * exhaustiveness guard ({@link unreachableCallMode}) makes a third format a
+ * compile error naming the files that have to answer for it.
+ *
+ * A second node *kind* was the other candidate and it is too big. The kind list
+ * is deliberately small and every entry earns it by doing something no wiring
+ * can express (see {@link WORKFLOW_NODE_KINDS}). A plain call does the same
+ * thing a call does at the level the graph reasons about — it hands this
+ * position to a workflow somebody else registered, pinned by name and version.
+ * What differs is the payload. Splitting the kind would duplicate `callName`,
+ * `callVersion`, `config`, the pin check, the picker, the plan entry and the
+ * canvas node for a difference of one field, and every place that today writes
+ * `node.kind === 'call'` would have to remember to write both — which is the
+ * hand-maintained list going quiet that {@link NODE_KIND_IS_REUSABLE} exists to
+ * stop.
+ */
+export const WORKFLOW_CALL_MODES = [
+  /**
+   * The child is handed a {@link WorkflowCallEnvelope}: the catalog's metadata
+   * under `catalog`, the author's parameters under `input`. The callee can stage
+   * rows back for the graph, and it has to have been written for this catalog.
+   */
+  'envelope',
+  /**
+   * The child is handed {@link WorkflowCallNode.config} verbatim, with nothing
+   * added and nothing wrapped. The callee needs to know nothing about the
+   * catalog — and cannot return rows to it.
+   */
+  'plain',
+] as const;
+
+export type WorkflowCallMode = (typeof WORKFLOW_CALL_MODES)[number];
+
+/** Same reason as {@link isConnectorKind}: one list, no second copy to drift. */
+export function isWorkflowCallMode(value: unknown): value is WorkflowCallMode {
+  return WORKFLOW_CALL_MODES.some((mode) => mode === value);
+}
+
+/**
+ * {@link unreachableNodeKind}, one level down, and for the identical reason.
+ *
+ * Every branch over {@link WorkflowCallMode} ends here, so a third wire format
+ * added to the list without a rule for building its payload, hashing it,
+ * validating it or reading its answer is a type error naming the file. It throws
+ * as well, because a mode arrives as JSON out of a column and a build older than
+ * the data is a thing that happens.
+ */
+export function unreachableCallMode(mode: never, where: string): never {
+  throw new Error(
+    `${where} has no rule for the call mode ${JSON.stringify(mode)}. It was added to WORKFLOW_CALL_MODES without teaching this code what to put on the wire for it, and guessing would send a workflow a payload nobody authored.`,
+  );
+}
+
+/**
+ * The mode this call node runs in, with the default applied once.
+ *
+ * Absent means `'envelope'` — that is what every node stored before the field
+ * existed is, and reading it as anything else would silently change what a
+ * deployment's graphs already do. One function so that the store, the runner,
+ * the hash and the canvas cannot each carry their own `?? 'envelope'` and have
+ * one of them drift.
+ */
+export function workflowCallMode(node: WorkflowCallNode): WorkflowCallMode {
+  return node.callMode ?? 'envelope';
 }
 
 /**
@@ -2991,6 +3124,18 @@ export interface WorkflowCallOutput {
  * schema for a workflow's output anywhere in the durable contract, and no way
  * to reach one if there were. So the check is here, at the one moment the
  * answer exists, and it names what it saw.
+ *
+ * ## Not called at all for a plain call, which is a decision and not an omission
+ *
+ * A plain call is handed no run id and no node id, so its callee could not have
+ * staged anything under `(runId, nodeId, batch)` even if it wanted to. Running
+ * this over its answer would be worse than pointless in both directions: a
+ * callee that happens to return `{batches, rowCount}` meaning something else
+ * entirely would have this graph go and read a stage that does not exist, and a
+ * callee returning one of the two would fail the node over a key it was never
+ * told about. So the plain path reports zero rows unconditionally and reads
+ * nothing — see `WorkflowRunnerService.callOutput`, which is where that is
+ * enforced rather than merely intended.
  */
 export function readWorkflowCallOutput(value: unknown): WorkflowCallOutput | undefined {
   if (typeof value !== 'object' || value === null) return undefined;
@@ -3175,6 +3320,13 @@ export const WORKFLOW_ISSUE_CODES = [
   'dead-end',
   'transform-not-named',
   'call-not-named',
+  /**
+   * A plain call wired into something. See {@link WORKFLOW_CALL_MODES}: a plain
+   * call is told no run id and no node id, so it has nowhere to stage rows and
+   * always passes on none — and every node that can sit downstream of a call
+   * consumes rows and nothing else.
+   */
+  'call-plain-has-output',
   'if-not-named',
   'if-threshold-invalid',
   'if-needs-one-input',
@@ -3250,12 +3402,18 @@ export function validateWorkflow(graph: WorkflowGraph): WorkflowValidationIssue[
 
   const { outgoing, incoming } = buildAdjacency(nodes, edges);
   const originators = nodes.filter(originatesRows);
+  // Deliberately a *different* set from `originators` — see `runsWithoutInput`.
+  const roots = nodes.filter(runsWithoutInput);
   const sinks = nodes.filter((node): node is WorkflowSinkNode => node.kind === 'sink');
 
   checkNodeWiring(nodes, incoming, outgoing, issues);
   checkEndpoints(originators, sinks, issues);
   checkBranches(edges, byId, issues);
-  checkFilterNarrowing({ nodes, edges }, originators, outgoing, issues);
+  checkPlainCallOutputs(nodes, outgoing, byId, issues);
+  // `roots` rather than `originators`, because this walks the graph forwards to
+  // find which sinks a filter can narrow and a plain call is a perfectly
+  // ordinary ancestor of nothing at all — it just never contributes rows.
+  checkFilterNarrowing({ nodes, edges }, roots, outgoing, issues);
 
   const looped = findCycle(nodes, incoming, outgoing);
   if (looped) {
@@ -3269,28 +3427,139 @@ export function validateWorkflow(graph: WorkflowGraph): WorkflowValidationIssue[
     return issues;
   }
 
-  checkReachability(nodes, originators, sinks, incoming, outgoing, issues);
+  checkReachability(nodes, roots, sinks, incoming, outgoing, issues);
 
   return issues;
 }
 
 /**
+ * A plain call may not feed anything, and this is where that is refused.
+ *
+ * ## The rule, stated once
+ *
+ * **A call node in `plain` mode must have no outbound edge.** Not "must not feed
+ * a sink", not "must not be the only thing feeding a sink" — no outbound edge at
+ * all, and the reason it collapses that far is that there is no weaker version
+ * of it that means anything. Every node kind that can sit downstream of a call —
+ * transform, if, filter, sink — consumes rows and *only* rows. There is no
+ * ordering-only wire in this model. So "a plain call with downstream nodes
+ * expecting rows" and "a plain call with an outbound edge" are the same set.
+ *
+ * ## How it lands against the rest of the validator
+ *
+ * Three rules had to move for this one to be statable, and each moved in a way
+ * that is narrower than it looks:
+ *
+ * - **`no-source`.** A plain call is no longer something that "reads": see
+ *   {@link originatesRows}. Without that, a graph of `plain call → sink` would
+ *   have passed the check that a graph has something producing rows, and then
+ *   committed an empty snapshot over whatever was live. It is refused here
+ *   first, and would be refused by `no-source` even if this check were deleted.
+ * - **`dead-end` — every path reaches the sink.** A plain call reaches no sink
+ *   by construction, so it is exempt, and the exemption is exactly one node
+ *   wide: nothing can be *behind* a plain call, because a plain call has no
+ *   outbound edge, so no other node's route to the sink can run through one.
+ *   The message `dead-end` carries is "it would be computed and thrown away",
+ *   and that is precisely what a plain call is not — its effect is the point,
+ *   and it has already happened by the time the sink commits.
+ * - **the one-sink rule.** Untouched. A graph still needs a sink and still needs
+ *   something that originates rows, and a plain call is now neither, so plain
+ *   calls cannot be a graph on their own — the rows come from a source or from
+ *   an envelope call, exactly as before.
+ *
+ * What a legal plain call looks like, then: `source → sink` with `source →
+ * plainCall` beside it — the effect runs after the source and the load commits
+ * the source's rows — or a plain call with nothing wired to it at all, which
+ * runs at some point in the topological order and is reported like any other
+ * node. Wiring a source into a plain call that is the source's *only* outbound
+ * edge is still refused, by `dead-end`, pointed at the source: those rows really
+ * would be fetched and dropped.
+ */
+function checkPlainCallOutputs(
+  nodes: readonly WorkflowNode[],
+  outgoing: ReadonlyMap<string, string[]>,
+  byId: ReadonlyMap<string, WorkflowNode>,
+  issues: WorkflowValidationIssue[],
+): void {
+  for (const node of nodes) {
+    if (node.kind !== 'call' || workflowCallMode(node) !== 'plain') continue;
+    const fed = outgoing.get(node.id) ?? [];
+    if (fed.length === 0) continue;
+    issues.push({
+      code: 'call-plain-has-output',
+      nodeIds: [node.id, ...fed],
+      message: `Call node "${node.name}" (${node.id}) is a plain call and is wired into ${listNodes(
+        fed,
+        byId,
+      )}, which cannot work. A plain call sends this node's parameters to ${
+        node.callName || 'the workflow it calls'
+      } verbatim and nothing else — no run id and no node id — so the workflow it calls is told no key to write rows under and this node always passes on zero. Everything downstream would run on an empty input and the load would commit an empty snapshot without anything failing. Unwire it: a plain call is run for its effect, and something else in this graph produces what gets committed. If the workflow you are calling is meant to produce rows for this graph, it needs the envelope instead, which is what tells it where to put them.`,
+    });
+  }
+}
+
+/** `"a" (n1) and "b" (n2)`, for a message that has to name several boxes. */
+function listNodes(ids: readonly string[], byId: ReadonlyMap<string, WorkflowNode>): string {
+  return ids
+    .map((id) => {
+      const node = byId.get(id);
+      return node ? `"${node.name}" (${id})` : `"${id}"`;
+    })
+    .join(' and ');
+}
+
+/**
  * Whether a node can produce rows without anything wired into it.
  *
- * A source obviously can. A **call** node can too, and this is the one rule the
- * `call` kind changes rather than extends: the workflow it hands off to may
- * itself read from a system, so a graph of `call → sink` is a real pipeline and
- * refusing it for having "no source" would be false. What is not weakened is
+ * A source obviously can. An **envelope call** node can too, and this is the one
+ * rule the `call` kind changes rather than extends: the workflow it hands off to
+ * may itself read from a system, so a graph of `call → sink` is a real pipeline
+ * and refusing it for having "no source" would be false. What is not weakened is
  * that a graph still needs *something* that originates rows and *something*
  * that commits them — a graph of transforms alone is still refused.
  *
- * Every call node counts, not only the ones with no inbound edge, and that is
- * the conservative direction: it makes this the root set for reachability too,
- * so a mid-graph call node cannot make everything downstream of it look
- * unreachable when its own upstream is fine.
+ * A **plain** call is not one of them, and that is the load-bearing half of this
+ * function now. A plain call is told no run id and no node id, so it has no key
+ * to stage rows under and cannot produce any — see {@link WORKFLOW_CALL_MODES}.
+ * Counting it here would let `plain call → sink` past `no-source` and commit an
+ * empty snapshot over whatever was live, which is the exact silence this file is
+ * arranged against.
+ *
+ * ## This used to be the reachability root set as well, and no longer is
+ *
+ * It said so, and the reason it gave was that it made the root set conservative.
+ * The plain mode splits the two questions, because the answers genuinely differ:
+ * a plain call **runs** with nothing wired into it (so it is a root, and calling
+ * it unreachable would be false — it would run) and **produces nothing** (so it
+ * is not something that reads). One function answering both would have to be
+ * wrong about one of them. See {@link runsWithoutInput} for the other half.
  */
 function originatesRows(node: WorkflowNode): boolean {
+  if (node.kind === 'source') return true;
+  return node.kind === 'call' && workflowCallMode(node) === 'envelope';
+}
+
+/**
+ * Whether a node runs whether or not anything is wired into it.
+ *
+ * The root set for reachability, which used to be {@link originatesRows} and is
+ * now its own question — see the note there. Every call node is one of these,
+ * both modes: a call with no inbound edge sits at in-degree zero in the
+ * topological order and is dispatched like anything else, so reporting it as
+ * "not reachable from any source, so it would never run" would be a message that
+ * is simply untrue.
+ *
+ * Every call node rather than only the unwired ones, for the reason the old
+ * function gave: it keeps a mid-graph call node from making everything
+ * downstream of it look unreachable when its own upstream is fine.
+ */
+function runsWithoutInput(node: WorkflowNode): boolean {
   return node.kind === 'source' || node.kind === 'call';
+}
+
+/** Whether this node is a call that can never hand rows back to the graph. */
+function isPlainCall(node: WorkflowNode): boolean {
+  return node.kind === 'call' && workflowCallMode(node) === 'plain';
 }
 
 /**
@@ -3893,17 +4162,22 @@ function peelTails(leftover: Set<string>, outgoing: ReadonlyMap<string, string[]
   return leftover;
 }
 
-/** Nodes that nothing reading reaches, and nodes that reach no sink. */
+/**
+ * Nodes that nothing reading reaches, and nodes that reach no sink.
+ *
+ * `roots` is {@link runsWithoutInput} and not {@link originatesRows}: this asks
+ * what would *run*, and a plain call runs whether anything feeds it or not.
+ */
 function checkReachability(
   nodes: readonly WorkflowNode[],
-  originators: readonly WorkflowNode[],
+  roots: readonly WorkflowNode[],
   sinks: readonly WorkflowSinkNode[],
   incoming: Map<string, string[]>,
   outgoing: Map<string, string[]>,
   issues: WorkflowValidationIssue[],
 ): void {
   const reachableFromSources = walk(
-    originators.map((node) => node.id),
+    roots.map((node) => node.id),
     outgoing,
   );
   const reachesASink = walk(
@@ -3912,7 +4186,7 @@ function checkReachability(
   );
 
   for (const node of nodes) {
-    if (originators.length > 0 && !reachableFromSources.has(node.id)) {
+    if (roots.length > 0 && !reachableFromSources.has(node.id)) {
       issues.push({
         code: 'unreachable',
         nodeIds: [node.id],
@@ -3920,6 +4194,14 @@ function checkReachability(
       });
       continue;
     }
+    // The one exemption the plain mode buys, and it is exactly one node wide.
+    // A plain call reaches no sink by construction — `call-plain-has-output`
+    // refuses it an outbound edge — so `dead-end` would fire on every one of
+    // them, with a message ("it would be computed and thrown away") that is
+    // false about it: the effect it was run for has happened. Nothing can hide
+    // behind this, because nothing can be downstream of a plain call, so no
+    // other node's route to the sink can run through one.
+    if (isPlainCall(node)) continue;
     if (sinks.length > 0 && !reachesASink.has(node.id)) {
       issues.push({
         code: 'dead-end',
@@ -4191,6 +4473,13 @@ function canonicalNode(node: WorkflowNode): string {
       node.callName,
       node.callVersion,
       sortedEntries(node.config),
+      // Appended only for the non-default mode, exactly as `edge.branch` above
+      // is appended only when there is a label. Every call node in every
+      // deployment today is an envelope call — whether it says so or says
+      // nothing — so every one of them hashes to the string it always did and
+      // no stored graph is renumbered by picking up this release. See
+      // `canonicalCallMode` for why the two spellings must fold together.
+      ...canonicalCallMode(workflowCallMode(node)),
     ]);
   }
   if (node.kind === 'if') {
@@ -4236,6 +4525,26 @@ function canonicalNode(node: WorkflowNode): string {
  * no version bump and no diff — which is precisely the silence this feature was
  * built to end.
  */
+/**
+ * The call mode, as zero or one trailing hash component.
+ *
+ * Zero for `envelope`, and that is the opposite choice from {@link
+ * canonicalReuse} beside it — for the opposite reason. There, absent and present
+ * mean genuinely different things ("follow the latest" against "pinned to v1"),
+ * so they must hash differently. Here absent and `'envelope'` are one behaviour
+ * spelled two ways: a node that says `callMode: 'envelope'` puts precisely the
+ * same bytes on the wire as a node that says nothing. A fingerprint that told
+ * them apart would report an edit when a canvas normalised the field, which is
+ * the cosmetic version bump {@link workflowGraphHash} exists to not do.
+ *
+ * `plain` earns its component, because it changes what the child receives.
+ */
+function canonicalCallMode(mode: WorkflowCallMode): unknown[] {
+  if (mode === 'envelope') return [];
+  if (mode === 'plain') return ['plain'];
+  return unreachableCallMode(mode, 'workflowGraphHash');
+}
+
 function canonicalReuse(node: ReusableNodeRef): unknown[] {
   if (node.useId === undefined) return [];
   return node.useVersion === undefined ? [node.useId] : [node.useId, node.useVersion];
@@ -4345,20 +4654,7 @@ export function isWorkflowNode(value: unknown): value is WorkflowNode {
   if (kind === 'sink') {
     return typeof Reflect.get(value, 'targetType') === 'string';
   }
-  if (kind === 'call') {
-    // Both strings, and the config object, exactly as strictly as a source's:
-    // a stored call node missing its version is a node that would run whatever
-    // is registered today, which is the failure the pin exists to remove — and
-    // a graph that half-narrows is a load that runs nine nodes of ten.
-    const config = Reflect.get(value, 'config');
-    return (
-      typeof Reflect.get(value, 'callName') === 'string' &&
-      typeof Reflect.get(value, 'callVersion') === 'string' &&
-      typeof config === 'object' &&
-      config !== null &&
-      !Array.isArray(config)
-    );
-  }
+  if (kind === 'call') return isCallNodeShape(value);
   if (kind === 'if') {
     // The predicate in full, refused rather than defaulted: a gate read back
     // without a test it recognises would have to invent one, and inventing one
@@ -4376,6 +4672,36 @@ export function isWorkflowNode(value: unknown): value is WorkflowNode {
     return isConnectorKind(sourceKind) && typeof config === 'object' && config !== null;
   }
   return isWorkflowNodeKindUnhandled(kind);
+}
+
+/**
+ * Everything a `call` node carries, checked as strictly as a source's.
+ *
+ * Its own function rather than a branch of {@link isWorkflowNode}, which the
+ * complexity bound will not hold any more of — and the split is where it should
+ * be, because this is the kind with the most to check.
+ *
+ * A stored call node missing its version is a node that would run whatever is
+ * registered today, which is the failure the pin exists to remove, and a graph
+ * that half-narrows is a load that runs nine nodes of ten. A `callMode` that is
+ * present and unrecognised is refused rather than dropped, for the reason an
+ * unrecognised `edge.branch` is: reading it back as the default would turn a
+ * plain call into an envelope call silently, and the callee would be handed a
+ * payload nobody authored. Absent is accepted and always will be — it is what
+ * every call node written before the field existed carries, and it means the
+ * envelope, which is what those nodes have always sent.
+ */
+function isCallNodeShape(value: object): boolean {
+  const callMode = Reflect.get(value, 'callMode');
+  if (callMode !== undefined && !isWorkflowCallMode(callMode)) return false;
+  const config = Reflect.get(value, 'config');
+  return (
+    typeof Reflect.get(value, 'callName') === 'string' &&
+    typeof Reflect.get(value, 'callVersion') === 'string' &&
+    typeof config === 'object' &&
+    config !== null &&
+    !Array.isArray(config)
+  );
 }
 
 /**

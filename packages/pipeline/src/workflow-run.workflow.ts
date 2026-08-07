@@ -3,6 +3,7 @@ import {
   type WorkflowCallEnvelope,
   type WorkflowNodeStepOutput,
   type WorkflowStageRef,
+  unreachableCallMode,
 } from '@dudousxd/nestjs-catalog';
 import { Workflow } from '@dudousxd/nestjs-durable';
 import { type WorkflowCtx, isWorkflowControlFlowSignal } from '@dudousxd/nestjs-durable-core';
@@ -289,9 +290,13 @@ export class CatalogWorkflowRunWorkflow {
    *
    * ## What the child gets, and what a hung one costs
    *
-   * The envelope is built from the plan and the stage refs — handles, never
+   * The payload is built from the plan and the stage refs — handles, never
    * rows — and is byte-identical on every attempt, which is what makes
-   * `startChild` idempotent by id.
+   * `startChild` idempotent by id. Which of the two shapes it takes is
+   * `WorkflowCallTarget.mode`, off the plan: see {@link callPayload}. In the
+   * plain mode nothing of the catalog's crosses at all, so the callee is told
+   * no key to stage rows under — which is why `validateWorkflow` refuses a
+   * plain call anything downstream.
    *
    * While the child runs, this run is `suspended` and costs nothing. It does
    * still hold its connector's singleton slot, and that is deliberate: the slot
@@ -315,7 +320,7 @@ export class CatalogWorkflowRunWorkflow {
    *
    * Calling a workflow does not lend it this one's serialisation. Whether two
    * loads calling the same workflow overlap is decided by *its* registration,
-   * on the key *its* `singleton.key` computes from the envelope above — and by
+   * on the key *its* `singleton.key` computes from the payload above — and by
    * the engine that owns the run. On the `attach`/convention path, which is
    * exactly how a cross-SDK body is reached, a synthesised registration carries
    * no singleton, no execution timeout and no input validation at all. A call
@@ -347,7 +352,7 @@ export class CatalogWorkflowRunWorkflow {
     target: WorkflowCallTarget,
     inputs: WorkflowStageRef[],
   ): Promise<WorkflowNodeStepOutput> {
-    const envelope = callEnvelope(ctx.runId, input, plan, entry, target, inputs);
+    const payload = callPayload(ctx.runId, input, plan, entry, target, inputs);
     // `ctx.now` rather than `Date.now`: recorded once and replayed, so a
     // recovered run reports the elapsed time of the call and not of the replay.
     const startedAt = await ctx.now();
@@ -362,13 +367,13 @@ export class CatalogWorkflowRunWorkflow {
         callVersion: target.version,
       };
 
-      await ctx.startChild(target.name, envelope, { childId: childRunId });
+      await ctx.startChild(target.name, payload, { childId: childRunId });
       // Before the join, so a wrong version is stopped while it is still
       // starting rather than after it has done a load's worth of work.
       const seen = await ctx.step(this.steps.checkCall, check);
 
       try {
-        const result = await ctx.child<unknown>(target.name, envelope, { childId: childRunId });
+        const result = await ctx.child<unknown>(target.name, payload, { childId: childRunId });
         // The row was not there the first time and the child has now finished,
         // which means it did start and nothing has checked its version. The
         // pin is worth less late than early — the work is done — but it still
@@ -404,13 +409,45 @@ export class CatalogWorkflowRunWorkflow {
 }
 
 /**
- * The one shape a called workflow is handed.
+ * What a called workflow is handed, in whichever of the two shapes it takes.
  *
  * Built from the plan and the stage refs and nothing else, so it is byte-
  * identical on every attempt of a call and on every replay of the run — which
  * is what lets `startChild` be idempotent by id and what keeps the body free of
- * any read that could answer differently the second time.
+ * any read that could answer differently the second time. That holds for both
+ * modes: `target.config` came off the plan's checkpoint, so a plain call's
+ * payload is as fixed as an envelope's.
+ *
+ * The mode comes off the plan too, and `?? 'envelope'` is applied here rather
+ * than by the caller so a replay of a run checkpointed before the field existed
+ * builds exactly the payload it built the first time.
  */
+function callPayload(
+  runId: string,
+  input: CatalogWorkflowRunInput,
+  plan: WorkflowPlanResult,
+  entry: WorkflowPlanEntry,
+  target: WorkflowCallTarget,
+  inputs: WorkflowStageRef[],
+): WorkflowCallEnvelope | Record<string, unknown> {
+  const mode = target.mode ?? 'envelope';
+  // The whole of the plain mode, and its whole point: the author's config goes
+  // across as the child's payload, unwrapped and with nothing of the catalog's
+  // added to it. A workflow that has never heard of this package sees exactly
+  // the argument bag it was written to read.
+  //
+  // The `WorkflowCallEnvelope` docblock argues the nesting on one ground — that
+  // an author's `runId` parameter must not shadow the run id — and that ground
+  // is untouched here rather than waived: a plain call sends no run id, no node
+  // id and no contract number, so there is no catalog key on the wire for a
+  // parameter to collide with. The price is on `WORKFLOW_CALL_MODES`, and
+  // `validateWorkflow` refuses the graphs that would pay it by accident.
+  if (mode === 'plain') return target.config;
+  if (mode !== 'envelope') return unreachableCallMode(mode, 'callPayload');
+  return callEnvelope(runId, input, plan, entry, target, inputs);
+}
+
+/** The envelope, unchanged: the one shape a catalog-aware callee is handed. */
 function callEnvelope(
   runId: string,
   input: CatalogWorkflowRunInput,

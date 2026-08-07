@@ -612,7 +612,16 @@ describe('the plan a call node is executed from', () => {
       // unconditionally. A plan that lost this map would make every node with a
       // labelled inbound wire look unconditional too.
       inputBranches: {},
-      call: { name: 'billing.reconcile', version: '2', config: { region: 'gov-west' } },
+      // The mode is resolved here rather than in the body, so a graph repointed
+      // between two nodes cannot change what a half-finished run puts on the
+      // wire. Spelled out even when it is the default, because a checkpoint is
+      // read by people as well as by the replay.
+      call: {
+        name: 'billing.reconcile',
+        version: '2',
+        config: { region: 'gov-west' },
+        mode: 'envelope',
+      },
     });
   });
 
@@ -676,5 +685,189 @@ describe('a call node arriving over HTTP', () => {
 
   it('is refused when it names no workflow at all', () => {
     expect(() => toGraph(canvasCall({ callName: undefined }))).toThrow(/no workflow to call/);
+  });
+});
+
+/**
+ * The other wire format: the config, on its own, to a workflow that has never
+ * heard of this catalog.
+ *
+ * The plans below wire the plain call to nothing, because that is the only
+ * shape `validateWorkflow` will store — a plain call is told no run id, so it
+ * has no key to stage rows under and nothing may read from it. See
+ * `WORKFLOW_CALL_MODES`.
+ */
+describe('a plain call node, executed by the workflow body', () => {
+  function plainPlan(overrides: Partial<WorkflowPlanResult> = {}): WorkflowPlanResult {
+    return {
+      runRowId: 'row-1',
+      workflowVersion: 3,
+      targetType: 'Mvr',
+      order: [
+        {
+          nodeId: 'c',
+          name: 'Run processing',
+          kind: 'call',
+          inputs: [],
+          call: {
+            name: 'processing',
+            version: '1',
+            config: { proc: 'mvr', base_id: 7, context: { tenant: 'usaf' } },
+            mode: 'plain',
+          },
+        },
+        { nodeId: 'out', name: 'Sink', kind: 'sink', inputs: [] },
+      ],
+      ...overrides,
+    };
+  }
+
+  // The whole feature, in one assertion: the workflow receives exactly the keys
+  // its author wrote and nothing of this catalog's. `data["proc"]` resolves.
+  it('hands the child the parameters verbatim, with no envelope around them', async () => {
+    const test = harness({ plan: plainPlan(), childResults: [{ context: { merged: true } }] });
+
+    await test.run();
+
+    expect(test.starts[0].input).toEqual({
+      proc: 'mvr',
+      base_id: 7,
+      context: { tenant: 'usaf' },
+    });
+    // No `catalog` key, so nothing the catalog knows crosses — which is exactly
+    // why an author's `runId` parameter has nothing here to shadow.
+    expect(Object.keys(Object(test.starts[0].input))).toEqual(['proc', 'base_id', 'context']);
+  });
+
+  it('reports zero rows and says why, whatever the child returned', async () => {
+    const test = harness({ plan: plainPlan(), childResults: [{ context: { merged: true } }] });
+
+    await test.run();
+
+    expect(test.finished[0].nodeOutcomes.c).toMatchObject({ status: 'succeeded', rows: 0 });
+    const logs = test.finished[0].logs.join(' ');
+    expect(logs).toContain('as a plain call');
+    expect(logs).toContain('wf-run-1.call.c.0');
+    expect(logs).toContain('nowhere to stage rows');
+  });
+
+  /**
+   * The decision this mode turns on, asserted rather than described.
+   *
+   * A callee that answers `{batches, rowCount}` meaning something of its own
+   * would, if that answer were read, send this graph off to read a stage that
+   * cannot exist — the callee was told no run id and no node id, so it could
+   * not have written one. So the answer is not read at all.
+   */
+  it('does not read a staging contract out of a plain call, even a complete one', async () => {
+    const test = harness({ plan: plainPlan(), childResults: [{ batches: 3, rowCount: 1_200 }] });
+
+    await test.run();
+
+    expect(test.finished[0].nodeOutcomes.c).toMatchObject({ status: 'succeeded', rows: 0 });
+    expect(test.finished[0].fetched).toBe(0);
+  });
+
+  it('does not fail a plain call over half a staging contract either', async () => {
+    // `{batches: 2}` fails an envelope call, and must not fail this one: it is
+    // a shape this graph never asked for and has no standing to judge.
+    const test = harness({ plan: plainPlan(), childResults: [{ batches: 2 }] });
+
+    await test.run();
+
+    expect(test.finished[0].status).toBe('succeeded');
+    expect(test.finished[0].nodeOutcomes.c).toMatchObject({ status: 'succeeded', rows: 0 });
+  });
+
+  it('still checks the version pin before joining', async () => {
+    // The pin is orthogonal to the payload, and dropping it here would be a
+    // silent second change riding along with this one.
+    const test = harness({ plan: plainPlan(), childResults: [{}] });
+
+    await test.run();
+
+    expect(test.checks).toEqual([
+      {
+        childRunId: 'wf-run-1.call.c.0',
+        nodeId: 'c',
+        nodeName: 'Run processing',
+        callName: 'processing',
+        callVersion: '1',
+      },
+    ]);
+  });
+
+  it('still fails the load when the child fails', async () => {
+    const test = harness({
+      plan: plainPlan(),
+      childResults: ['child "x" failed: KeyError: proc'],
+    });
+
+    await expect(test.run()).rejects.toThrow(/processing@1 failed as child run/);
+    expect(test.finished[0].status).toBe('failed');
+  });
+
+  // Backward compatibility, at the one place it is decided. A plan checkpointed
+  // before this field existed replays with no `mode`, and must build exactly the
+  // payload it built the first time.
+  it('sends the envelope for a plan entry that names no mode', async () => {
+    const test = harness({ childResults: [{ batches: 1, rowCount: 10 }] });
+
+    await test.run();
+
+    expect(Object.keys(Object(test.starts[0].input))).toEqual(['catalog', 'input']);
+  });
+
+  it('sends the envelope for a plan entry that names it explicitly', async () => {
+    const plan = planFor();
+    const entry = plan.order[0];
+    if (entry.call) entry.call.mode = 'envelope';
+    const test = harness({ plan, childResults: [{ batches: 1, rowCount: 10 }] });
+
+    await test.run();
+
+    expect(Object.keys(Object(test.starts[0].input))).toEqual(['catalog', 'input']);
+  });
+});
+
+/** The mode, across the boundary the canvas posts a graph through. */
+describe('a call node arriving from the canvas', () => {
+  function canvasNode(overrides: Record<string, unknown> = {}) {
+    return {
+      nodes: [
+        {
+          id: 'c',
+          label: 'Run processing',
+          kind: 'call',
+          callName: 'processing',
+          callVersion: '1',
+          config: { proc: 'mvr' },
+          ...overrides,
+        },
+        { id: 'out', label: 'Sink', kind: 'sink', targetType: 'Mvr' },
+      ],
+      edges: [],
+    };
+  }
+
+  it('keeps a plain call plain', () => {
+    expect(toGraph(canvasNode({ callMode: 'plain' })).nodes[0]).toMatchObject({
+      kind: 'call',
+      callMode: 'plain',
+    });
+  });
+
+  // Stored with no key at all rather than with an explicit default, which is
+  // what keeps `workflowGraphHash` still for every graph already in a database.
+  it('stores no mode at all when the canvas sent none', () => {
+    expect(toGraph(canvasNode()).nodes[0]).not.toHaveProperty('callMode');
+    expect(toGraph(canvasNode({ callMode: null })).nodes[0]).not.toHaveProperty('callMode');
+  });
+
+  // Refused at the boundary rather than defaulted, for the reason a bad version
+  // pin is: reading an unknown mode as the envelope would wrap a config that
+  // was authored to travel bare, and the callee would die on its first key.
+  it('is refused when it names a mode this build cannot send', () => {
+    expect(() => toGraph(canvasNode({ callMode: 'flat' }))).toThrow(/callMode of "flat"/);
   });
 });

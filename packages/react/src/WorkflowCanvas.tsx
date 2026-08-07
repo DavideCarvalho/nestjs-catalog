@@ -149,11 +149,13 @@ import {
   type CallableWorkflowRef,
   type CatalogWorkflow,
   WORKFLOW_BRANCH_LABELS,
+  WORKFLOW_CALL_MODES,
   WORKFLOW_FILTER_MAX_DEPTH,
   WORKFLOW_FILTER_MAX_VALUES,
   WORKFLOW_FILTER_OPERATORS,
   WORKFLOW_NODE_KINDS,
   type WorkflowBranchLabel,
+  type WorkflowCallMode,
   type WorkflowCallNode,
   type WorkflowEdge,
   type WorkflowEnvPredicate,
@@ -187,6 +189,7 @@ import {
   unreachableFilterPredicateKind,
   unreachableNodeKind,
   unreachablePredicateKind,
+  workflowCallMode,
   workflowNarrowedTypes,
 } from './workflow/model';
 import { WORKFLOW_NAME } from './workflow/name';
@@ -5091,6 +5094,10 @@ function CallInspector({
   // is the ONLY way this pair of fields can leave a node half-pinned, and the
   // person who just picked a name is the one who can finish it.
   const undecided = name.length > 0 && version.length === 0 && versionOptions.length > 0;
+  // Core's reader, not a `?? 'envelope'` of this screen's own: a second copy of
+  // the default is how the canvas and `workflowGraphHash` come to disagree, and
+  // the symptom is unsaved changes reported on a graph nobody edited.
+  const mode: WorkflowCallMode = workflowCallMode(node);
   // Two different silences, and telling somebody the wrong one is worse than
   // telling them nothing. An empty aggregate is a fact about the DEPLOYMENT and
   // the server's own sentence explains it; an empty aggregate is not what a
@@ -5158,6 +5165,21 @@ function CallInspector({
     const ref = forName.find((candidate) => candidate.version === option.value);
     if (!ref || ref.version === undefined || callableWorkflowBlock(ref)) return;
     onChange({ ...node, callName: ref.name, callVersion: ref.version });
+  };
+
+  /**
+   * Commit a wire format, refusing anything that is not one of the two.
+   *
+   * A `SelectField` hands back a bare string, and this is the graph being
+   * written rather than a row being rendered: the same standing `chooseVersion`
+   * takes about a blocked entry. An unrecognised value would be stored, refused
+   * at the save boundary by `readCallMode`, and reported as being about a field
+   * this screen wrote — so it is never written in the first place.
+   */
+  const chooseMode = (value: string) => {
+    const next = WORKFLOW_CALL_MODES.find((candidate) => candidate === value);
+    if (next === undefined) return;
+    onChange({ ...node, callMode: next });
   };
 
   return (
@@ -5229,6 +5251,22 @@ function CallInspector({
           ))}
         </div>
       )}
+      <SelectField
+        label="What it is sent"
+        ariaLabel="Whether the workflow is handed the catalog envelope or the parameters on their own"
+        value={mode}
+        onValueChange={chooseMode}
+        options={WORKFLOW_CALL_MODES.map((value) => ({
+          value,
+          label: CALL_MODE_COPY[value].label,
+        }))}
+        disabled={!canEdit}
+      />
+      <p className={cn('text-[11px] leading-relaxed', MUTED)}>
+        {/* The trade, said where the choice is made rather than only in the
+            refusal the save would produce. */}
+        {CALL_MODE_COPY[mode].note}
+      </p>
       <TextAreaField
         label="Parameters"
         value={text}
@@ -5240,7 +5278,7 @@ function CallInspector({
         hint={
           invalid
             ? 'That is not valid JSON yet, so it has not been saved onto the node.'
-            : 'A JSON object, handed to the workflow as `input`. Beside it, under `catalog`, it also gets this run’s id and the staged rows of whatever feeds this node — handles, never the rows themselves. Not a place for a password: name an env var the callee already reads.'
+            : CALL_MODE_COPY[mode].parameters
         }
       />
       <p className={cn('text-[11px] leading-relaxed', MUTED)}>
@@ -5256,6 +5294,36 @@ function CallInspector({
     </div>
   );
 }
+
+/**
+ * What each wire format is called on the screen, and what choosing it means.
+ *
+ * A record over every mode rather than a hand-written options array, for the
+ * reason {@link NODE_KIND_IS_REUSABLE} is one in core: a third format added to
+ * `WORKFLOW_CALL_MODES` without an entry here is a type error in this file
+ * naming the copy it has not been given, rather than a mode the runner can send
+ * and this inspector silently never offers. That is the add-node row that
+ * shipped the `filter` node with no way to create it, and it is not being
+ * repeated one field down.
+ *
+ * `unreachableCallMode` is not the guard here because a lookup table can be
+ * exhaustive at compile time, which is stronger — there is no branch to fall
+ * off the end of.
+ */
+const CALL_MODE_COPY = {
+  envelope: {
+    label: 'Envelope — written for this catalog',
+    note: 'The workflow is handed an envelope: the parameters under `input`, and beside them, under `catalog`, this run’s id and the staged rows of whatever feeds this node — handles, never the rows themselves. It can stage rows back for the next node, and it has to have been written for this catalog to read any of it.',
+    parameters:
+      'A JSON object, handed to the workflow as `input`. Beside it, under `catalog`, it also gets this run’s id and the staged rows of whatever feeds this node — handles, never the rows themselves. Not a place for a password: name an env var the callee already reads.',
+  },
+  plain: {
+    label: 'Plain — the parameters on their own',
+    note: 'The parameters go across on their own, exactly as typed, with nothing of this catalog added — so a workflow that has never heard of this catalog can be called without being changed. It is told no run id and no node id, so it has nowhere to write rows back to: this node always passes on none, whatever the workflow returns, and the graph will not save if you wire anything downstream of it. Run it for its effect, and let a source produce what gets committed.',
+    parameters:
+      'A JSON object, and the whole of what the workflow receives — its keys are the keys it reads. Not a place for a password: name an env var the callee already reads.',
+  },
+} as const satisfies Record<WorkflowCallMode, { label: string; note: string; parameters: string }>;
 
 /**
  * What identifies one announced entry among the others.
