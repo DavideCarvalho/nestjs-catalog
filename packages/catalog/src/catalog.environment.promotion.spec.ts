@@ -49,6 +49,7 @@ function transform(id: string, overrides: Partial<PromotableTransform> = {}): Pr
     name: id,
     language: 'javascript',
     code: 'rows => rows',
+    mode: 'batch',
     version: 1,
     ...overrides,
   };
@@ -238,6 +239,20 @@ describe('planPromotion / only connectors produce blockers and withheld', () => 
     expect(kinds(p)).toEqual(['objectType', 'transform', 'workflow']);
     expect(p.blockers).toEqual([]);
     expect(p.withheld).toEqual([]);
+  });
+
+  // The quiet failure the field exists to prevent, at the one boundary where it
+  // would be quietest: a transform switched to per-record with its code
+  // untouched is a real change to what it computes, and a plan reporting
+  // "nothing to release" would leave production running the other contract.
+  it('reports a mode change as an update even when the code is byte-identical', () => {
+    const source = set({ transforms: [transform('tx', { mode: 'record' })] });
+    const p = plan(source, set({ transforms: [transform('tx', { mode: 'batch' })] }));
+
+    const change = p.changes.find((entry) => entry.kind === 'transform');
+    expect(change?.action).toBe('update');
+    expect(change?.fields.map((diff) => diff.field)).toContain('mode');
+    expect(change?.fields.map((diff) => diff.field)).not.toContain('code');
   });
 
   it('is the connector that introduces withheld entries', () => {

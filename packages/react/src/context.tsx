@@ -31,6 +31,7 @@ import type {
   StoredLoadExpectation,
   TraceQuery,
   TransformLanguage,
+  TransformMode,
   TransformResult,
   TypePatch,
 } from '@dudousxd/nestjs-catalog/client';
@@ -239,6 +240,16 @@ export interface TransformInput {
   description?: string;
   language: TransformLanguage;
   code: string;
+  /**
+   * Whether the code is called once with the batch or once per record.
+   *
+   * Optional, and **absent means "leave whatever is stored alone"** rather than
+   * "make it a batch". A caller written before this field existed sends no mode,
+   * and the store reads that as no instruction — so an older client saving a
+   * rename cannot silently undo somebody's deliberate choice. See
+   * `TRANSFORM_MODES`.
+   */
+  mode?: TransformMode;
 }
 
 /**
@@ -811,6 +822,15 @@ export interface CatalogClient {
     language: TransformLanguage;
     code: string;
     records: unknown[];
+    /**
+     * Which contract to run the sample under.
+     *
+     * Sent by the editor, because a pane that tried a per-record transform as a
+     * batch would hand it the whole array as its `record` and show empty rows
+     * for correct code — through the one screen whose value is that it predicts
+     * what the load will do.
+     */
+    mode?: TransformMode;
   }): Promise<TransformResult>;
 
   /**

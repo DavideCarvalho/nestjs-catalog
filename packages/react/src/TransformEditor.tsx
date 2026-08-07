@@ -1,9 +1,16 @@
 import type {
   CatalogTransform,
   TransformLanguage,
+  TransformMode,
   TransformResult,
 } from '@dudousxd/nestjs-catalog/client';
-import { isTransformLanguage, transformShape } from '@dudousxd/nestjs-catalog/client';
+import {
+  isTransformLanguage,
+  isTransformMode,
+  recordModeRefusal,
+  transformMode,
+  transformShape,
+} from '@dudousxd/nestjs-catalog/client';
 import { useMutation } from '@tanstack/react-query';
 import { ArrowLeft, Play } from 'lucide-react';
 import { type KeyboardEvent, useState } from 'react';
@@ -78,6 +85,65 @@ return [{
     "critical": int(r["risk"]) >= 80,
 } for r in records]`,
 };
+
+/**
+ * Starter code for the per-record mode.
+ *
+ * A second table rather than a branch inside the first, so that adding a
+ * language without a per-record starter is a type error in the same way adding
+ * one without a batch starter already is.
+ *
+ * Python is absent from this table and cannot be here: its harness writes
+ * `def transform(records, context):` and there is no second `def` yet, which is
+ * why `recordModeRefusal` refuses the combination outright. The type says so —
+ * the key set is the two languages the mode can actually run in — rather than
+ * carrying a starter for a mode the server will reject.
+ */
+const RECORD_STARTERS: Record<'javascript' | 'typescript', string> = {
+  typescript: `import type { CatalogRecordTransformFunction } from '@dudousxd/nestjs-catalog/client';
+
+// One record in, one row out. This runs once per record over a stream, so
+// nothing anywhere holds the whole read — see the mode selector above.
+type Source = { tag: string; risk: string; kind: string };
+
+const transform: CatalogRecordTransformFunction<Source> = ({ record, context }) => ({
+  assetId: record.tag,
+  riskScore: Number(record.risk),
+  vehicleTypeName: record.kind.toUpperCase(),
+  critical: Number(record.risk) >= 80,
+});
+
+export default transform;`,
+  javascript: `// One record in, one row out — this runs once per record over a stream.
+// Return an array to turn one record into several, or null to drop it.
+export default function transform({ record, context }) {
+  return {
+    assetId: record.tag,
+    riskScore: Number(record.risk),
+    vehicleTypeName: String(record.kind).toUpperCase(),
+    critical: Number(record.risk) >= 80,
+  };
+}`,
+};
+
+/**
+ * What an empty editor opens with, for this language in this mode.
+ *
+ * One function so the two tables are consulted in one place. A per-record
+ * Python transform has no starter because it has no harness; it falls back to
+ * the batch one, and `recordModeRefusal` is what tells the author why the
+ * combination cannot be saved — a starter that pretended otherwise would be the
+ * editor teaching a shape the server refuses.
+ */
+function starterFor(language: TransformLanguage, mode: TransformMode): string {
+  if (mode === 'record' && language !== 'python') return RECORD_STARTERS[language];
+  return STARTERS[language];
+}
+
+/** Every starter, so "has this been edited" can be asked without listing them. */
+function isUntouchedStarter(code: string): boolean {
+  return Object.values(STARTERS).includes(code) || Object.values(RECORD_STARTERS).includes(code);
+}
 
 const SAMPLE = `[
   { "tag": "AF93E00073", "risk": "88", "kind": "truck" },
@@ -167,15 +233,24 @@ function TryOutput({ result, error }: { result: TransformResult | undefined; err
  * Not shown for Python, which has one shape and no rule: its harness writes the
  * `def` itself, so there is nothing here for an author to have got wrong.
  */
-function ShapeBadge({ language, code }: { language: TransformLanguage; code: string }) {
+function ShapeBadge({
+  language,
+  code,
+  mode,
+}: { language: TransformLanguage; code: string; mode: TransformMode }) {
   if (language === 'python') return null;
   const shape = transformShape(code);
   const isModule = shape === 'module';
+  // The argument named in the tooltip follows the selected mode, because that is
+  // what the harness will actually pass. A badge that said `{ records, context }`
+  // beside a per-record selector would be reassuring somebody about a call that
+  // is not going to happen.
+  const argument = mode === 'record' ? '{ record, context }' : '{ records, context }';
   return (
     <Tooltip
       content={
         isModule
-          ? 'A top-level `export`, so this is imported as a module and its default export (or an export named `transform`) is called with one object: { records, context }. Fields can be added to that object later without changing this signature.'
+          ? `A top-level \`export\`, so this is imported as a module and its default export (or an export named \`transform\`) is called with one object: ${argument}. Fields can be added to that object later without changing this signature.`
           : 'No top-level `export`, so this runs as the body of a function that already has `records` and `context` in scope. Supported and unchanged — `export default function transform({ records, context })` is the shape that can gain fields later.'
       }
     >
@@ -203,12 +278,22 @@ function ShapeBadge({ language, code }: { language: TransformLanguage; code: str
 function SaveBar({
   transform,
   nameIsEmpty,
+  refused,
   pending,
   error,
   onSave,
 }: {
   transform: CatalogTransform | undefined;
   nameIsEmpty: boolean;
+  /**
+   * Whether the language and mode chosen cannot run together.
+   *
+   * Disabled rather than left clickable-and-rejected, because the sentence
+   * explaining it is already on screen above this button: letting the click
+   * through would replace a note the author can act on with a toast saying the
+   * same thing after the fact.
+   */
+  refused: boolean;
   pending: boolean;
   error: unknown;
   onSave: () => void;
@@ -218,7 +303,7 @@ function SaveBar({
       <button
         type="button"
         onClick={onSave}
-        disabled={pending || nameIsEmpty}
+        disabled={pending || nameIsEmpty || refused}
         className={cn(
           'rounded-md border px-3 py-1.5 text-xs disabled:opacity-40',
           RULE,
@@ -254,8 +339,9 @@ export function TransformEditor({
   const [language, setLanguage] = useState<TransformLanguage>(
     transform?.language ?? languages[0] ?? 'javascript',
   );
+  const [mode, setMode] = useState<TransformMode>(transform ? transformMode(transform) : 'batch');
   const [code, setCode] = useState(
-    transform?.code ?? STARTERS[transform?.language ?? 'javascript'],
+    transform?.code ?? starterFor(transform?.language ?? 'javascript', 'batch'),
   );
   const [sample, setSample] = useState(SAMPLE);
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -272,7 +358,11 @@ export function TransformEditor({
         // person reading it would go looking at their transform.
         throw new Error('The sample is not valid JSON.');
       }
-      return client.tryTransform({ language, code, records });
+      // The mode goes with it, so the pane runs the code under the contract the
+      // author has selected rather than under whichever one the server would
+      // default to. A per-record transform tried as a batch is handed the whole
+      // array as its `record` and shows empty rows for correct code.
+      return client.tryTransform({ language, code, records, mode });
     },
   });
 
@@ -283,10 +373,15 @@ export function TransformEditor({
         name: name.trim(),
         language,
         code,
+        mode,
         description: description.trim() || undefined,
       }),
     onSuccess: onSaved,
   });
+
+  // The same question the controller asks, from the same function, so the
+  // editor and the server cannot disagree about which combinations are legal.
+  const refusal = recordModeRefusal({ language, code, mode });
 
   // `preventDefault` is what claims the key. The editor's default keymap binds
   // ⌘↵ to "insert a blank line", and `CodeEditor` only withholds a keystroke
@@ -333,9 +428,7 @@ export function TransformEditor({
             setLanguage(value);
             // Only replace untouched starter code — silently discarding
             // somebody's work because they changed a dropdown would be rude.
-            if (Object.values(STARTERS).includes(code)) {
-              setCode(STARTERS[value]);
-            }
+            if (isUntouchedStarter(code)) setCode(starterFor(value, mode));
           }}
           options={languages.map((option) => ({
             value: option,
@@ -344,6 +437,38 @@ export function TransformEditor({
         />
       </div>
 
+      <div className="grid gap-3 sm:grid-cols-3">
+        <SelectField
+          label="Called"
+          ariaLabel="Called"
+          value={mode}
+          onValueChange={(value) => {
+            if (!isTransformMode(value)) return;
+            setMode(value);
+            if (isUntouchedStarter(code)) setCode(starterFor(language, value));
+          }}
+          options={[
+            { value: 'batch', label: 'once with the whole batch' },
+            { value: 'record', label: 'once per record (streams)' },
+          ]}
+        />
+        <p className={cn('sm:col-span-2 self-center text-xs leading-relaxed', MUTED)}>
+          {mode === 'record'
+            ? 'Each record is mapped on its own and the rows are written as they are produced, so nothing holds the whole read. Return one object, an array of them, or null to drop the record. Aggregating, deduplicating and sorting need the whole batch and cannot be written this way.'
+            : 'The code is called once with every record, which is what aggregating, deduplicating, sorting and joining need. The whole read is held in memory while it runs.'}
+        </p>
+      </div>
+
+      {/* Refused by the server as well, and with this same sentence. Shown here
+          because a refusal an author reads after pressing save is a refusal
+          they read once they have stopped thinking about the choice that
+          caused it. */}
+      {refusal ? (
+        <p className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200">
+          {refusal}
+        </p>
+      ) : null}
+
       <div className="grid gap-3 lg:grid-cols-2">
         <div className={cn('overflow-hidden rounded-lg border', RULE, PANEL)}>
           <div className={cn('flex items-center justify-between border-b px-3 py-1.5', RULE)}>
@@ -351,7 +476,7 @@ export function TransformEditor({
               <span className={cn('font-mono text-[10px] uppercase tracking-[0.14em]', MUTED)}>
                 Code
               </span>
-              <ShapeBadge language={language} code={code} />
+              <ShapeBadge language={language} code={code} mode={mode} />
             </div>
             <span className={cn('font-mono text-[10px]', MUTED)}>
               {language === 'python' && pythonPackages.length > 0
@@ -417,6 +542,7 @@ export function TransformEditor({
 
       <div className="flex flex-wrap items-center gap-2">
         <SaveBar
+          refused={refusal !== undefined}
           transform={transform}
           nameIsEmpty={name.trim().length === 0}
           pending={save.isPending}
