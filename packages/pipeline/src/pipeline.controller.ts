@@ -1373,14 +1373,18 @@ export function createPipelineController(
         // between the two reads.
         version,
         // Almost always absent — the console posts an empty body. Present when
-        // somebody is re-driving a load they already own the identity of.
+        // somebody is re-driving a load they already own the identity of, and
+        // it must be a load that FAILED: this doubles as the durable run id, so
+        // an id whose run already succeeded is replayed rather than re-run and
+        // answers with the earlier run's counts. See the field's own docblock on
+        // `WorkflowLauncher.run`.
         snapshotId: body?.snapshotId,
-        // Forwarded, never defaulted, and the conditional spread is what keeps
-        // the two states apart: absent means nobody said anything, and a present
-        // empty string means somebody sent the field with nothing behind it,
-        // which the sink refuses with a 400 asking for a reason. Flattening them
-        // here would turn that refusal into silence.
-        ...(body && 'expectShrink' in body ? { expectShrink: body.expectShrink } : {}),
+        // Forwarded, never defaulted, and the three states are kept apart:
+        // absent means nobody said anything, a present empty string means
+        // somebody sent the field with nothing behind it — which the sink
+        // refuses with a 400 asking for a reason — and anything that is not a
+        // string at all is refused here, before the run opens.
+        ...readRunExpectShrink(body, head),
       });
       return toRunView(workflow, run);
     }
@@ -1811,6 +1815,48 @@ function readRunVersion(body: { version?: unknown } | undefined, head: CatalogWo
     );
   }
   return found;
+}
+
+/**
+ * The shrink acknowledgement `POST workflows/:id/run` should carry — or none.
+ *
+ * Three states, and they have to stay three. **Absent** means nobody said
+ * anything and the row-count bound decides. **A present empty string** means
+ * somebody sent the field with nothing behind it, which the sink refuses with a
+ * 400 asking for a reason — a refusal this must not flatten into silence, which
+ * is why the return is a spreadable object rather than a `string | undefined`.
+ * **Anything that is not a string** is neither, and is refused here.
+ *
+ * The refusal is the point of the function. The field is typed `string` and was
+ * never checked, so `{"expectShrink": true}` passed straight through the route,
+ * through the launcher and into `labelsFor`, which called `.trim()` on it and
+ * died with `TypeError: expectShrink.trim is not a function`. That is a 500 for
+ * what is plainly a bad request — but the worse half is *when* it lands: the
+ * labels are built at the sink, so the whole source had already been read,
+ * renamed and filtered before anything looked at the value. A caller with a
+ * checkbox wired to the wrong field paid for the entire load to find out.
+ *
+ * Checked here rather than in `labelsFor` because this is where an untrusted
+ * body stops being untrusted. `labelsFor` keeps its own rule about a *blank*
+ * reason for the reason its docblock gives — three callers reach it and only one
+ * of them is this route — and the two rules do not overlap: one is about the
+ * type of the field, the other about what a string of spaces is worth.
+ */
+function readRunExpectShrink(
+  body: { expectShrink?: unknown } | undefined,
+  head: CatalogWorkflow,
+): { expectShrink?: string } {
+  if (!body || !('expectShrink' in body)) return {};
+  const found = body.expectShrink;
+  // Not reachable over HTTP — JSON has no `undefined` — but an in-process caller
+  // can spell absence this way, and it means the same thing as not sending it.
+  if (found === undefined) return {};
+  if (typeof found !== 'string') {
+    throw new BadRequestException(
+      `"${head.name}" was asked to expect a shrink and given ${JSON.stringify(found)} as the reason, and a reason is text. It is stored in the snapshot's labels and is the only answer anybody will have in six months to "why was this load allowed to lose most of the data?". Say what happened at the source, or leave the field out and let the bound decide.`,
+    );
+  }
+  return { expectShrink: found };
 }
 
 /**

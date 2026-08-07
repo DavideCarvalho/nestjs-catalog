@@ -2525,6 +2525,34 @@ function narrow<T extends string>(
 }
 
 /**
+ * Narrow a stored string that is allowed to be ABSENT, loudly for a value.
+ *
+ * Absent is not the same as unrecognised. `narrow` is right to refuse the
+ * second — a value this build does not know means the data is newer than the
+ * code — but absent means the opposite, and the two arrive here through the
+ * same argument.
+ *
+ * **Absent is `null` as often as it is `undefined`, and that is the whole
+ * reason this exists.** A nullable column that was never written hydrates as
+ * `null`, not `undefined`: the property is declared optional so TypeScript
+ * shows `string | undefined`, but the driver hands back the SQL NULL. A check
+ * spelled `=== undefined` therefore passes `null` straight into `narrow`, which
+ * refuses it with a message blaming the data for being newer than the build
+ * when it is simply not there. That is not an upgrade-only hazard: a row
+ * written today without the field takes the same path on the very next read.
+ * `== null` is deliberate here and covers both.
+ */
+function narrowOptional<T extends string>(
+  value: string | null | undefined,
+  guard: (candidate: unknown) => candidate is T,
+  field: string,
+  id: string,
+): T | undefined {
+  if (value == null) return undefined;
+  return narrow(value, guard, field, id);
+}
+
+/**
  * A workflow's status, with an ABSENT one read as `ready`.
  *
  * Absent is not the same as unrecognised, and `narrow` is right to refuse the
@@ -2677,10 +2705,14 @@ function toTransform(row: TransformRow): CatalogTransform {
     // belongs to `transformMode` and to nowhere else — a store that resolved it
     // too would be a second copy of the rule, and the copy that drifts is the
     // one that changes what a deployment's loads compute.
-    mode:
-      row.mode === undefined
-        ? undefined
-        : narrow(row.mode, isTransformMode, 'Transform mode', row.id),
+    //
+    // Absent means `null` here, not just `undefined`: the column is nullable, so
+    // a transform saved without a mode — which is every transform the create
+    // route makes, today, on a current database — comes back holding SQL NULL.
+    // This line used to test `=== undefined` alone, and the `null` fell through
+    // to `narrow`, which refused it as a mode written by a newer catalog. One
+    // such row failed the whole list endpoint and every run that reached it.
+    mode: narrowOptional(row.mode, isTransformMode, 'Transform mode', row.id),
     version: row.version,
     createdBy: row.createdBy,
     createdAt: row.createdAt.toISOString(),
