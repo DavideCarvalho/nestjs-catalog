@@ -103,6 +103,20 @@ import {
   toFlowNodes,
 } from './workflow/graph';
 import {
+  type EditAction,
+  type HistoricDraft,
+  HistoryControls,
+  keepKnown,
+  namesOf,
+  nodeEditAction,
+  reverted,
+  snapshotOf,
+  undone,
+  useUndoShortcut,
+  useUnsavedGuard,
+  withEdit,
+} from './workflow/history';
+import {
   PublishControls,
   RunControls,
   SchedulePanel,
@@ -371,24 +385,33 @@ const ARIA_LABELS = {
   'minimap.ariaLabel': `Overview of the ${WORKFLOW_NAME.singular}`,
 };
 
-interface Draft {
+/**
+ * The graph being edited, and everything the screen knows about it that the
+ * server does not.
+ *
+ * `dirty`, `past` and `baseline` come from {@link HistoricDraft} — the three
+ * fields that describe the gap between this drawing and the stored one. They
+ * live in `workflow/history.tsx` with the functions that maintain them, so that
+ * "what counts as one undoable action" is answered in one file rather than
+ * spread across every call site that edits a node.
+ */
+interface Draft extends HistoricDraft {
   /** Absent until the server has stored it once. */
   id?: string;
-  name: string;
-  description: string;
-  nodes: WorkflowNode[];
-  edges: WorkflowEdge[];
   /** Which stored version this was loaded from, for the "v2 next" hint. */
   version?: number;
-  dirty: boolean;
 }
 
 function blankDraft(): Draft {
-  return { name: '', description: '', nodes: [], edges: [], dirty: false };
+  const empty = { name: '', description: '', nodes: [], edges: [] };
+  // A blank canvas has a baseline too, and it is the blank canvas: Reset on a
+  // never-saved graph means "clear it", which is exactly what going back to
+  // "nothing has been stored" should mean.
+  return { ...empty, dirty: false, past: [], baseline: snapshotOf(empty) };
 }
 
 function draftFrom(workflow: CatalogWorkflow): Draft {
-  return {
+  const loaded = {
     id: workflow.id,
     name: workflow.name,
     description: workflow.description ?? '',
@@ -412,7 +435,12 @@ function draftFrom(workflow: CatalogWorkflow): Draft {
     edges: workflow.edges.map((edge) => ({ from: edge.from, to: edge.to })),
     version: workflow.version,
     dirty: false,
+    past: [],
   };
+  // The baseline holds the SAME arrays the draft starts with, which is what
+  // makes undoing all the way back compare equal to it and go genuinely clean.
+  // See `sameSnapshot`.
+  return { ...loaded, baseline: snapshotOf(loaded) };
 }
 
 export interface WorkflowCanvasProps {
@@ -959,7 +987,12 @@ function CanvasActions({
   running,
   durabilityDetail,
   acknowledging,
+  reducedMotion,
+  resetting,
   onAcknowledgingChange,
+  onResettingChange,
+  onUndo,
+  onReset,
   onSave,
   onRun,
   onLifecycleChange,
@@ -983,7 +1016,12 @@ function CanvasActions({
   running: boolean;
   durabilityDetail: string;
   acknowledging: boolean;
+  reducedMotion: boolean;
+  resetting: boolean;
   onAcknowledgingChange: (open: boolean) => void;
+  onResettingChange: (open: boolean) => void;
+  onUndo: () => void;
+  onReset: () => void;
   onSave: () => void;
   onRun: (options?: WorkflowRunOptions) => void;
   onLifecycleChange: (workflow: CatalogWorkflow) => void;
@@ -991,6 +1029,22 @@ function CanvasActions({
 }) {
   return (
     <div className="flex flex-wrap items-center gap-1.5">
+      {/*
+       * Before Save, and in this order, because they are the three answers to
+       * one question — "what about the work I have not saved?". Take back the
+       * last bit of it, throw all of it away, or commit it. The unsaved chip
+       * sits at the end of the group, directly against the button that resolves
+       * it.
+       */}
+      <HistoryControls
+        draft={draft}
+        canEdit={canEdit}
+        reducedMotion={reducedMotion}
+        resetting={resetting}
+        onResettingChange={onResettingChange}
+        onUndo={onUndo}
+        onReset={onReset}
+      />
       <Tooltip content={saveHint(blocked, unfinished)}>
         <Button
           size="sm"
@@ -1846,6 +1900,15 @@ function Canvas({
   const [inspecting, setInspecting] = useState<string | null>(null);
   const [editingCodeFor, setEditingCodeFor] = useState<string | null>(null);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
+  /**
+   * Whether the "throw away every unsaved edit" dialog is open.
+   *
+   * Held here rather than inside the controls because Reset is destructive of
+   * work in exactly the way deleting the workflow is destructive of the
+   * workflow, and this screen keeps every "are you sure" at the level that owns
+   * the thing being destroyed.
+   */
+  const [resetting, setResetting] = useState(false);
   const [run, setRun] = useState<WorkflowRun | null>(null);
   /**
    * Whether the details rail is on screen.
@@ -1981,9 +2044,28 @@ function Canvas({
     return () => window.cancelAnimationFrame(frame);
   }, [draftId, fitView]);
 
-  const edit = useCallback((change: (current: Draft) => Draft) => {
-    setDraft((current) => ({ ...change(current), dirty: true }));
-  }, []);
+  /**
+   * Every change to the drawing, through one door — and every one of them
+   * recorded so it can be taken back.
+   *
+   * The action is REQUIRED rather than optional, which is the only thing keeping
+   * the undo announcement honest: a default would let a new call site add an
+   * entry that reverts something and says nothing about what.
+   *
+   * It may be a function of the current draft, for the labels that need to name
+   * a node. Computing those here would mean this callback depends on
+   * `draft.nodes` and is rebuilt on every graph change, which React Flow feels;
+   * computing them inside the updater keeps the dependency list empty and keeps
+   * the whole thing pure.
+   */
+  const edit = useCallback(
+    (change: (current: Draft) => Draft, action: EditAction | ((current: Draft) => EditAction)) => {
+      setDraft((current) =>
+        withEdit(current, change(current), typeof action === 'function' ? action(current) : action),
+      );
+    },
+    [],
+  );
 
   const transformIds = useMemo(
     () => new Set(transforms.map((transform) => transform.id)),
@@ -2088,19 +2170,40 @@ function Canvas({
       const { positions, removed } = nodeMovesAndRemovals(changes);
       if (positions.size === 0 && removed.size === 0) return;
 
-      edit((current) => ({
-        ...current,
-        nodes: current.nodes
-          .filter((node) => !removed.has(node.id))
-          .map((node) => {
-            const position = positions.get(node.id);
-            return position ? { ...node, position } : node;
-          }),
-        // A removed node takes its wiring with it. Leaving the edges behind
-        // would produce edges pointing at nothing, which React Flow silently
-        // drops from the canvas while the save still sends them.
-        edges: current.edges.filter((edge) => !removed.has(edge.from) && !removed.has(edge.to)),
-      }));
+      // The drag's own answer to "is this still one gesture". React Flow sets it
+      // on every frame while the pointer is down and clears it on the frame that
+      // drops the node, so a drag across the canvas is one undo step however
+      // many hundred position changes it emitted and however long it took.
+      const dragging = changes.some(
+        (change) => change.type === 'position' && change.dragging === true,
+      );
+
+      edit(
+        (current) => ({
+          ...current,
+          nodes: current.nodes
+            .filter((node) => !removed.has(node.id))
+            .map((node) => {
+              const position = positions.get(node.id);
+              return position ? { ...node, position } : node;
+            }),
+          // A removed node takes its wiring with it. Leaving the edges behind
+          // would produce edges pointing at nothing, which React Flow silently
+          // drops from the canvas while the save still sends them.
+          edges: current.edges.filter((edge) => !removed.has(edge.from) && !removed.has(edge.to)),
+        }),
+        (current) =>
+          removed.size > 0
+            ? // A deletion is never folded into a move: it is the one change on
+              // this canvas somebody is most likely to want back, and it must
+              // not disappear into the drag that happened just before it.
+              { label: `deleting ${namesOf(current.nodes, removed)}` }
+            : {
+                label: `moving ${namesOf(current.nodes, positions.keys())}`,
+                run: 'move',
+                continuing: dragging,
+              },
+      );
 
       if (removed.size > 0) {
         // Housekeeping, not a rule: a node that no longer exists cannot be
@@ -2122,10 +2225,15 @@ function Canvas({
         changes.filter((change) => change.type === 'remove').map((c) => c.id),
       );
       if (removed.size === 0) return;
-      edit((current) => ({
-        ...current,
-        edges: current.edges.filter((edge) => !removed.has(edgeId(edge))),
-      }));
+      edit(
+        (current) => ({
+          ...current,
+          edges: current.edges.filter((edge) => !removed.has(edgeId(edge))),
+        }),
+        {
+          label: `removing ${removed.size} connection${removed.size === 1 ? '' : 's'}`,
+        },
+      );
       setAnnouncement(`${removed.size} connection${removed.size === 1 ? '' : 's'} removed.`);
     },
     [edit],
@@ -2171,10 +2279,18 @@ function Canvas({
   const disconnect = useCallback(
     (edge: WorkflowEdge) => {
       const id = edgeId(edge);
-      edit((current) => ({
-        ...current,
-        edges: current.edges.filter((candidate) => edgeId(candidate) !== id),
-      }));
+      edit(
+        (current) => ({
+          ...current,
+          edges: current.edges.filter((candidate) => edgeId(candidate) !== id),
+        }),
+        (current) => ({
+          label: `disconnecting ${namesOf(current.nodes, [edge.from])} from ${namesOf(
+            current.nodes,
+            [edge.to],
+          )}`,
+        }),
+      );
       markStarted(edge.from, edge.to);
       setAnnouncement('Connection removed.');
     },
@@ -2191,7 +2307,12 @@ function Canvas({
    */
   const setBranch = useCallback(
     (edge: WorkflowEdge, branch: WorkflowBranchLabel) => {
-      edit((current) => ({ ...current, edges: edgeOnBranch(current.edges, edge, branch) }));
+      edit(
+        (current) => ({ ...current, edges: edgeOnBranch(current.edges, edge, branch) }),
+        (current) => ({
+          label: `putting ${namesOf(current.nodes, [edge.to])} on the "${branch}" branch`,
+        }),
+      );
       markStarted(edge.from, edge.to);
       setAnnouncement(
         `${nodeLabelIn(draft.nodes, edge.to)} is now on the "${branch}" branch of ${nodeLabelIn(
@@ -2213,10 +2334,15 @@ function Canvas({
       // Appended rather than inserted anywhere else: a node with several inbound
       // edges receives its inputs in the order the edges appear in this array,
       // and that order is part of what the graph produces.
-      edit((current) => ({
-        ...current,
-        edges: [...current.edges, newEdge(current.nodes, current.edges, from, to)],
-      }));
+      edit(
+        (current) => ({
+          ...current,
+          edges: [...current.edges, newEdge(current.nodes, current.edges, from, to)],
+        }),
+        (current) => ({
+          label: `connecting ${namesOf(current.nodes, [from])} to ${namesOf(current.nodes, [to])}`,
+        }),
+      );
       markStarted(from, to);
       setAnnouncement(
         `${nodeLabelIn(draft.nodes, from)} now feeds ${nodeLabelIn(draft.nodes, to)}.`,
@@ -2380,10 +2506,18 @@ function Canvas({
       return { nodeId, created };
     },
     onSuccess: ({ nodeId, created }) => {
-      edit((current) => ({
-        ...current,
-        nodes: runningTransform(current.nodes, nodeId, created.id),
-      }));
+      edit(
+        (current) => ({
+          ...current,
+          nodes: runningTransform(current.nodes, nodeId, created.id),
+        }),
+        // Only the half of this that lives in the draft. The transform itself
+        // was created on the server and stays there — undoing this unpicks the
+        // node from it, which is the part of the act this canvas owns.
+        (current) => ({
+          label: `pointing ${namesOf(current.nodes, [nodeId])} at "${created.name}"`,
+        }),
+      );
       markStarted(nodeId);
       // Written into the cache as well as invalidated: the code sheet below
       // resolves the transform out of this list, and opening it before the
@@ -2411,21 +2545,27 @@ function Canvas({
     },
   });
 
-  const addNode = useCallback((kind: WorkflowNodeKind) => {
-    const id = newLocalId(kind);
-    setDraft((current) => {
-      const node = newNodeOfKind(
-        kind,
-        id,
-        nextPosition(current.nodes),
-        uniqueName(current.nodes, kind),
+  const addNode = useCallback(
+    (kind: WorkflowNodeKind) => {
+      const id = newLocalId(kind);
+      edit(
+        (current) => {
+          const node = newNodeOfKind(
+            kind,
+            id,
+            nextPosition(current.nodes),
+            uniqueName(current.nodes, kind),
+          );
+          return { ...current, nodes: [...current.nodes, node] };
+        },
+        { label: `adding a ${kind} node` },
       );
-      return { ...current, nodes: [...current.nodes, node], dirty: true };
-    });
-    setUnstarted((current) => new Set([...current, id]));
-    setInspecting(id);
-    setAnnouncement(`A ${kind} node was added. Its inspector is open.`);
-  }, []);
+      setUnstarted((current) => new Set([...current, id]));
+      setInspecting(id);
+      setAnnouncement(`A ${kind} node was added. Its inspector is open.`);
+    },
+    [edit],
+  );
 
   /**
    * Make the next node and wire it in, as one action.
@@ -2452,11 +2592,17 @@ function Canvas({
         return;
       }
       const { node, from } = made;
-      edit((current) => ({
-        ...current,
-        nodes: [...current.nodes, node],
-        edges: [...current.edges, newEdge(current.nodes, current.edges, fromId, node.id)],
-      }));
+      edit(
+        (current) => ({
+          ...current,
+          nodes: [...current.nodes, node],
+          edges: [...current.edges, newEdge(current.nodes, current.edges, fromId, node.id)],
+        }),
+        // ONE entry, for two graph changes. The node and the wire are a single
+        // gesture — "put the next box here" — and undoing them separately would
+        // leave a node somebody never asked for on its own on the canvas.
+        { label: `adding ${nodeName(node)} wired from ${nodeName(from)}` },
+      );
       setUnstarted((current) => new Set([...current, node.id]));
       menu.close();
       setInspecting(node.id);
@@ -2468,15 +2614,79 @@ function Canvas({
   );
 
   const tidy = useCallback(() => {
-    edit((current) => ({
-      ...current,
-      nodes: layout(current.nodes, current.edges),
-    }));
+    edit(
+      (current) => ({
+        ...current,
+        nodes: layout(current.nodes, current.edges),
+      }),
+      // One entry, and a big one: Tidy moves every node at once, and it is
+      // precisely the control somebody presses on a layout they had arranged by
+      // hand and then wants back.
+      { label: 'tidying the layout' },
+    );
     window.requestAnimationFrame(() => fitView({ padding: fitPadding, duration: 200 }));
     setAnnouncement(
       'The nodes were laid out left to right by dependency, with every sink in the last column.',
     );
   }, [edit, fitView, fitPadding]);
+
+  /**
+   * One action back.
+   *
+   * Announced with the name of what it took back, because undo is the one
+   * control here whose effect is routinely invisible: the node it just put back
+   * may be off screen, and a revert nobody can see is indistinguishable from a
+   * button that did nothing.
+   *
+   * The step is computed out here rather than inside the updater so the label is
+   * available to say — and so nothing sets state from inside a `setState`
+   * updater, which React is free to replay.
+   */
+  const undo = useCallback(() => {
+    const step = undone(draft);
+    if (!step) {
+      setAnnouncement('There is nothing to take back — this drawing is as it was loaded.');
+      return;
+    }
+    setDraft(step.draft);
+    // The inspector is open on a node that may have just stopped existing, and
+    // a sheet describing a deleted node is worse than no sheet.
+    setInspecting((current) =>
+      current && step.draft.nodes.some((node) => node.id === current) ? current : null,
+    );
+    setUnstarted((current) => keepKnown(current, step.draft.nodes));
+    const left = step.draft.past.length;
+    setAnnouncement(
+      `Undone: ${step.label}. ${left === 0 ? 'Nothing left to take back.' : `${left} ${left === 1 ? 'action' : 'actions'} left to take back.`}`,
+    );
+  }, [draft]);
+
+  /**
+   * All the way back to the version the server last stored.
+   *
+   * Deliberately NOT "undo until the stack is empty". Save halfway through a
+   * session and the baseline moves to that save, so this returns to the saved
+   * v2 — whereas undoing forty times would walk straight past it back to the v1
+   * the tab was opened on. Which of the two somebody means by "reset" is not in
+   * doubt, and the confirmation says which one this is.
+   */
+  const reset = useCallback(() => {
+    const back = reverted(draft);
+    setDraft(back);
+    setResetting(false);
+    setInspecting(null);
+    setSelectedNodeIds([]);
+    setSelectedEdgeIds([]);
+    setUnstarted(new Set<string>());
+    setAnnouncement(
+      draft.id
+        ? `Reset. The drawing is back to v${draft.version ?? 1}, as the server stored it. Nothing on the server was changed.`
+        : 'Reset. The canvas is empty again, which is where this unsaved workflow started.',
+    );
+  }, [draft]);
+
+  useUndoShortcut({ enabled: canEdit, onUndo: undo, onSay: setAnnouncement });
+  useUnsavedGuard(draft.dirty);
 
   const durability = describeDurability(capabilities?.durable);
   // Asked about EVERY problem, not about `live`. This is the guarantee: a graph
@@ -2668,7 +2878,15 @@ function Canvas({
               loadedRef.current = null;
               setSelected(value);
             }}
-            onRename={(name) => edit((current) => ({ ...current, name }))}
+            // Typing is one action, not one per keystroke: consecutive edits
+            // sharing the `rename` run fold together while the run is open. See
+            // `RUN_WINDOW_MS`.
+            onRename={(name) =>
+              edit((current) => ({ ...current, name }), {
+                label: 'renaming this workflow',
+                run: 'rename',
+              })
+            }
           />
 
           <div className="flex max-w-full flex-col items-end gap-2">
@@ -2683,7 +2901,12 @@ function Canvas({
                 running={runIt.isPending}
                 durabilityDetail={durability.detail}
                 acknowledging={acknowledging}
+                reducedMotion={reducedMotion}
+                resetting={resetting}
                 onAcknowledgingChange={setAcknowledging}
+                onResettingChange={setResetting}
+                onUndo={undo}
+                onReset={reset}
                 onSave={saveNow}
                 onRun={runNow}
                 onLifecycleChange={onLifecycleChange}
@@ -2885,18 +3108,17 @@ function Canvas({
           // updater below: an updater is called again on every re-render React
           // decides to replay, and a `setState` in one is a side effect that
           // would fire with it.
-          if (
-            readsDifferently(
-              draft.nodes.find((node) => node.id === next.id),
-              next,
-            )
-          ) {
+          const before = draft.nodes.find((node) => node.id === next.id);
+          if (readsDifferently(before, next)) {
             forgetShape(next.id);
           }
-          edit((current) => ({
-            ...current,
-            nodes: current.nodes.map((node) => (node.id === next.id ? next : node)),
-          }));
+          edit(
+            (current) => ({
+              ...current,
+              nodes: current.nodes.map((node) => (node.id === next.id ? next : node)),
+            }),
+            nodeEditAction(before, next),
+          );
         }}
         onConnect={connect}
         onConnectToNew={connectToNew}
@@ -2906,11 +3128,14 @@ function Canvas({
         creatingTransform={createTransform.isPending}
         createTransformError={createTransform.error}
         onDelete={(nodeId) => {
-          edit((current) => ({
-            ...current,
-            nodes: current.nodes.filter((node) => node.id !== nodeId),
-            edges: current.edges.filter((edge) => edge.from !== nodeId && edge.to !== nodeId),
-          }));
+          edit(
+            (current) => ({
+              ...current,
+              nodes: current.nodes.filter((node) => node.id !== nodeId),
+              edges: current.edges.filter((edge) => edge.from !== nodeId && edge.to !== nodeId),
+            }),
+            (current) => ({ label: `deleting ${namesOf(current.nodes, [nodeId])}` }),
+          );
           setInspecting(null);
           setAnnouncement('Node removed, along with its connections.');
         }}
