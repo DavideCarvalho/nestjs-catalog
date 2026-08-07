@@ -56,7 +56,7 @@ import type {
 } from '@dudousxd/nestjs-catalog/client';
 import { WORKFLOW_NODE_WIDTH, workflowColumnX } from '@dudousxd/nestjs-catalog/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { afterEach, describe, expect, it } from 'vitest';
 import { installCodeSurfaceDom } from '../../../test/jsdom-code-surface';
@@ -473,7 +473,14 @@ describe('the width a node is drawn at', () => {
     const { transport } = fakeTransport(answersFor([wholeWorkflow()]));
     await openCanvas(transport);
 
-    const label = screen.getAllByText('Feed')[0];
+    // Scoped to the canvas, not to the first 'Feed' in the document. The name is
+    // on the canvas AND in the rail's wiring list, and the rail is chrome that is
+    // now ahead of the graph in the DOM — so an unscoped `[0]` reads the rail's
+    // button, which has no width of its own and never did. The assertion is about
+    // the box that gets drawn.
+    const canvas = document.querySelector('.react-flow');
+    if (!(canvas instanceof HTMLElement)) throw new Error('The canvas did not render');
+    const label = within(canvas).getAllByText('Feed')[0];
     const box = label.closest('[style*="width"]');
     if (!(box instanceof HTMLElement)) throw new Error('The node sets no width of its own');
 

@@ -34,10 +34,13 @@ import {
   Code2,
   Database,
   ExternalLink,
+  Filter,
   GitBranch,
+  Info,
   LayoutGrid,
   Link2,
   Loader2,
+  PanelRight,
   Play,
   Plug,
   Plus,
@@ -46,8 +49,9 @@ import {
   Trash2,
   TriangleAlert,
   Unplug,
+  X,
 } from 'lucide-react';
-import { useReducedMotion } from 'motion/react';
+import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
 import type { ReactNode } from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { connectionOptionsFor } from './ConnectionPanel';
@@ -173,6 +177,148 @@ import {
 const MUTED = 'text-zinc-400 dark:text-zinc-500';
 const RULE = 'border-zinc-200 dark:border-zinc-800';
 const PANEL = 'bg-white dark:bg-zinc-900';
+/**
+ * A card INSIDE a floating panel.
+ *
+ * Deliberately not {@link PANEL}. An opaque white card on a translucent panel
+ * cancels the blur it is sitting on and the rail stops reading as one surface —
+ * it becomes four white boxes with a frosted gap between them.
+ */
+const SUBPANEL = 'bg-zinc-50/60 dark:bg-zinc-950/40';
+
+/**
+ * What a thing floating ON the canvas looks like.
+ *
+ * Translucent with a blur rather than opaque, and that is the whole point of the
+ * layout this belongs to: a panel that blanks out what is behind it turns the
+ * canvas back into a box with a border, only now the box is a worse shape. The
+ * graph stays perceptible through the chrome, so the surface reads as continuous
+ * and the panels read as sitting on it.
+ */
+const FLOATING = cn(
+  'rounded-xl border shadow-lg shadow-zinc-950/5 dark:shadow-zinc-950/40',
+  'border-zinc-200/80 bg-white/85 backdrop-blur-md',
+  'dark:border-zinc-800/80 dark:bg-zinc-900/85',
+);
+
+/**
+ * How much of the canvas the floating chrome covers, per edge, in CSS pixels.
+ *
+ * ONE definition, read by two things that would otherwise drift: the Tailwind
+ * insets the chrome is positioned with, and the per-side `fitView` padding the
+ * graph is fitted into. That second use is what makes a full-bleed canvas
+ * honest — React Flow fits the graph to the *viewport*, so without this it
+ * would happily centre a node underneath the action cluster and leave somebody
+ * dragging a box out from under a panel to read it.
+ *
+ * Deliberately generous rather than measured. Measuring the real panels every
+ * frame would be a ResizeObserver feeding a value into a fit that then moves
+ * the panels' backdrop, and the loop that produces is worse than 20px of slack.
+ */
+const CHROME = {
+  top: 150,
+  bottom: 90,
+  side: 28,
+  /** The rail's width plus its gutter, when it is open. */
+  rail: 336,
+};
+
+/**
+ * Per-side `fitView` padding, in the units React Flow accepts.
+ *
+ * Spelled as a template-literal type rather than `string` so that a value built
+ * here has to be a length React Flow can parse. `string` would typecheck and
+ * then be ignored at runtime, which is the failure mode this shape exists to
+ * make impossible.
+ */
+type PaddingPx = `${number}px`;
+interface FitPadding {
+  top: PaddingPx;
+  right: PaddingPx;
+  bottom: PaddingPx;
+  left: PaddingPx;
+}
+
+/** {@link CHROME} as the padding `fitView` wants. The right edge is the only side that moves. */
+function chromeFitPadding(railOpen: boolean): FitPadding {
+  return {
+    top: `${CHROME.top}px`,
+    bottom: `${CHROME.bottom}px`,
+    left: `${CHROME.side}px`,
+    right: `${railOpen ? CHROME.rail : CHROME.side}px`,
+  };
+}
+
+/**
+ * Whether the details rail starts on screen.
+ *
+ * Read once, from the width at mount, rather than subscribed to. A live media
+ * query would reopen a panel somebody had just closed because they turned their
+ * tablet, which is worse than the panel being open on a narrow screen they can
+ * shut it on.
+ *
+ * `typeof window` guards server rendering, where there is no width to ask about
+ * and a bare `window` is a crash rather than a layout bug. Open is the right
+ * answer there: it is what hydrates into on a desktop, and a panel that appears
+ * after hydration is a worse first paint than one that was always there.
+ */
+function railOpenByDefault(): boolean {
+  return typeof window === 'undefined' ? true : window.innerWidth >= 1024;
+}
+
+/**
+ * Every kind of node, and how it is offered.
+ *
+ * A `Record` over `WorkflowNodeKind` rather than a hand-written row of buttons,
+ * and that is a bug fix rather than a tidy-up: `filter` shipped complete — model,
+ * validator, executor, inspector, its own colour on the canvas — and could not be
+ * added from this screen at all, because the row that offers the kinds was six
+ * JSX elements somebody had typed out and only five of them had been typed. Every
+ * other exhaustiveness guard in this file caught its case; none of them could
+ * catch a list maintained by hand.
+ *
+ * So the row maps {@link WORKFLOW_NODE_KINDS} and looks each kind up here. A new
+ * kind now fails to compile in this file until somebody says how it is offered,
+ * which is the only way a palette stays complete.
+ *
+ * The icons match `KIND_STYLE` in `workflow/nodes.tsx` on purpose — the thing you
+ * press to make a box should wear the box's own mark — and `if` and `filter` keep
+ * the distinction that file argues for: a fork decides which boxes run, a funnel
+ * takes rows away. They are the two that must never be confused at a glance, so
+ * they never share an icon or a sentence.
+ */
+const ADD_NODE: Record<WorkflowNodeKind, { icon: typeof Plug; label: string; hint: string }> = {
+  source: {
+    icon: Plug,
+    label: 'Source',
+    hint: 'Reads records out of a system: a kind, an optional named connection, and a config.',
+  },
+  transform: {
+    icon: Repeat,
+    label: 'Transform',
+    hint: 'Code that reshapes whatever is wired into it.',
+  },
+  sink: {
+    icon: Database,
+    label: 'Sink',
+    hint: 'Writes and commits one object type. Several are fine — each commits independently.',
+  },
+  call: {
+    icon: ExternalLink,
+    label: 'Call',
+    hint: 'Hands this step to a durable workflow that already exists, by name and pinned version. It runs as a child of this load, with its own retries.',
+  },
+  if: {
+    icon: GitBranch,
+    label: 'If',
+    hint: 'Sends the rows down one of two branches, depending on an environment variable where the load runs. The other branch is skipped — a sink on it commits nothing and leaves what is published alone.',
+  },
+  filter: {
+    icon: Filter,
+    label: 'Filter',
+    hint: 'Drops the rows that fail a test you write here. Unlike an If, every box still runs — there are simply fewer rows in them from this point on.',
+  },
+};
 
 /**
  * The value the workflow picker uses for "start a fresh one".
@@ -844,10 +990,10 @@ function CanvasActions({
   onAskDelete: () => void;
 }) {
   return (
-    <div className="flex flex-wrap items-start gap-2 self-end pb-1">
+    <div className="flex flex-wrap items-center gap-1.5">
       <Tooltip content={saveHint(blocked, unfinished)}>
-        <button
-          type="button"
+        <Button
+          size="sm"
           onClick={onSave}
           disabled={
             !canEdit ||
@@ -855,16 +1001,20 @@ function CanvasActions({
             draft.name.trim().length === 0 ||
             (!draft.dirty && Boolean(draft.id))
           }
+          // The amber is the whole signal — a graph that would never run says so
+          // on the button before it is pressed — so it has to survive the
+          // variant's own background. `cn` is tailwind-merge, so the later
+          // `bg-*` wins rather than fighting.
           className={cn(
-            'flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs disabled:opacity-40',
+            'shrink-0',
             blocked
-              ? 'bg-amber-600 text-white'
-              : 'bg-zinc-950 text-zinc-50 dark:bg-zinc-100 dark:text-zinc-950',
+              ? 'bg-amber-600 text-white hover:bg-amber-500 dark:bg-amber-600 dark:text-white dark:hover:bg-amber-500'
+              : 'bg-zinc-950 text-zinc-50 hover:bg-zinc-800 dark:bg-zinc-100 dark:text-zinc-950 dark:hover:bg-zinc-200',
           )}
         >
           {saving ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />}
           {draft.dirty ? 'Save' : 'Saved'}
-        </button>
+        </Button>
       </Tooltip>
       {stored && (
         <PublishControls
@@ -903,7 +1053,18 @@ function CanvasActions({
   );
 }
 
-/** The four things that can be put on the canvas, and the button that tidies them. */
+/**
+ * The tool dock: every kind that can be put on the canvas, and the tidy control.
+ *
+ * Bottom centre, floating, because it is the one piece of chrome somebody
+ * touches continuously while drawing and the bottom edge is where every canvas
+ * tool that has ever been good keeps its tools. It is also the only corner React
+ * Flow's own overlays do not claim.
+ *
+ * The kinds come from {@link WORKFLOW_NODE_KINDS} through {@link ADD_NODE}, so
+ * the dock cannot fall behind the model — see the note on `ADD_NODE` for the bug
+ * that made that necessary.
+ */
 function AddNodeBar({
   refreshing,
   onAdd,
@@ -914,56 +1075,37 @@ function AddNodeBar({
   onTidy: () => void;
 }) {
   return (
-    <div className="flex shrink-0 flex-wrap items-center gap-2 px-6 pt-3">
-      <AddButton
-        icon={Plug}
-        label="Source"
-        hint="Reads records out of a system: a kind, an optional named connection, and a config."
-        onClick={() => onAdd('source')}
-      />
-      <AddButton
-        icon={Repeat}
-        label="Transform"
-        hint="Code that reshapes whatever is wired into it."
-        onClick={() => onAdd('transform')}
-      />
-      <AddButton
-        icon={Database}
-        label="Sink"
-        hint="Writes and commits one object type. Several are fine — each commits independently."
-        onClick={() => onAdd('sink')}
-      />
-      <AddButton
-        icon={ExternalLink}
-        label="Call"
-        hint="Hands this step to a durable workflow that already exists, by name and pinned version. It runs as a child of this load, with its own retries."
-        onClick={() => onAdd('call')}
-      />
-      <AddButton
-        icon={GitBranch}
-        label="If"
-        hint="Sends the rows down one of two branches, depending on an environment variable where the load runs. The other branch is skipped — a sink on it commits nothing and leaves what is published alone."
-        onClick={() => onAdd('if')}
-      />
+    <div
+      className={cn(
+        'pointer-events-auto flex max-w-full items-center gap-1 overflow-x-auto p-1.5',
+        FLOATING,
+      )}
+    >
+      {WORKFLOW_NODE_KINDS.map((kind) => (
+        <AddButton key={kind} kind={kind} onClick={() => onAdd(kind)} />
+      ))}
+
+      <span className={cn('mx-1 h-6 w-px shrink-0 bg-zinc-200 dark:bg-zinc-800')} aria-hidden />
+
       <Tooltip content="Lay the nodes out left to right by dependency, with every sink in the last column.">
-        <button
-          type="button"
+        <Button
+          variant="ghost"
+          size="sm"
           onClick={onTidy}
-          className={cn(
-            'flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs',
-            RULE,
-            MUTED,
-            'hover:bg-zinc-50 dark:hover:bg-zinc-800',
-          )}
+          aria-label="Tidy the layout"
+          className="shrink-0"
         >
           <LayoutGrid size={12} />
-          Tidy
-        </button>
+          {/* The word goes when the dock has to fit a phone. The accessible name
+              above is unconditional, so nothing is lost to a screen reader. */}
+          <span className="hidden md:inline">Tidy</span>
+        </Button>
       </Tooltip>
+
       {refreshing && (
         // A background refetch says so without replacing anything: the graph on
         // screen stays exactly where it is.
-        <span className={cn('ml-auto font-mono text-[10px]', MUTED)}>refreshing…</span>
+        <span className={cn('shrink-0 px-1 font-mono text-[10px]', MUTED)}>refreshing…</span>
       )}
     </div>
   );
@@ -1044,6 +1186,7 @@ function GraphSurface({
   wiring,
   wiringRefusal,
   nodeMenu,
+  fitPadding,
 }: {
   loading: boolean;
   failed: boolean;
@@ -1071,22 +1214,43 @@ function GraphSurface({
   wiringRefusal: string | null;
   /** The wiring menu, which has to be a child of `ReactFlow` to be placed. */
   nodeMenu: ReactNode;
+  /**
+   * The region the graph is fitted into, as per-side padding.
+   *
+   * See {@link CHROME}. Without it, `fitView` fits to the whole viewport and
+   * puts nodes under the floating panels.
+   */
+  fitPadding: FitPadding;
 }) {
+  /*
+   * Memoised because they are context values read by every node and every edge
+   * on the canvas. Written inline, as they were, each of these was a fresh
+   * object on every render of the screen — and this screen now re-renders for
+   * things the graph does not care about, like opening the rail. A new context
+   * value re-renders every consumer, which on a large graph is every box and
+   * every wire, for a panel sliding in at the side.
+   */
+  const nodeHandlers = useMemo(
+    () => ({ onInspect, onEditCode, canEdit, wiring }),
+    [onInspect, onEditCode, canEdit, wiring],
+  );
+  const edgeHandlers = useMemo(() => ({ onDisconnect, canEdit }), [onDisconnect, canEdit]);
+
   return (
-    <div
-      className={cn(
-        'relative h-[55vh] min-h-[15rem] shrink-0 overflow-hidden rounded-lg border',
-        'lg:h-auto lg:min-h-0 lg:flex-1 lg:shrink',
-        RULE,
-      )}
-    >
+    /*
+     * The surface IS the screen: pinned to all four edges, with the chrome
+     * layered over it by a sibling. Nothing here is a box in a column any more,
+     * so there is no border and no rounded corner — a full-bleed canvas that
+     * draws its own frame is a canvas pretending to still be a widget.
+     */
+    <div className="absolute inset-0">
       {loading && <CanvasSkeleton />}
 
       {failed && <CanvasFailure error={error} onRetry={onRetry} />}
 
       {!loading && !failed && (
-        <WorkflowNodeProvider handlers={{ onInspect, onEditCode, canEdit, wiring }}>
-          <WorkflowEdgeProvider handlers={{ onDisconnect, canEdit }}>
+        <WorkflowNodeProvider handlers={nodeHandlers}>
+          <WorkflowEdgeProvider handlers={edgeHandlers}>
             <ReactFlow
               className={CANVAS_THEME}
               nodes={flowNodes}
@@ -1122,21 +1286,39 @@ function GraphSurface({
               ariaLabelConfig={ARIA_LABELS}
               aria-label={`${WORKFLOW_NAME.title} canvas. ${draft.nodes.length} nodes, ${draft.edges.length} connections.`}
               fitView
+              fitViewOptions={{ padding: fitPadding }}
             >
               <Background variant={BackgroundVariant.Dots} gap={18} size={1} />
-              {/* Rounded and lifted, so the two overlays read as panels sitting
-                  on the canvas rather than as browser chrome bolted to it. The
-                  colours are still React Flow's variables, which `CANVAS_THEME`
-                  already themes both ways. */}
+              {/* Both of React Flow's own overlays moved to the bottom-left
+                  corner, stacked. The right edge belongs to the rail now and the
+                  bottom centre to the dock, so a minimap left in its default
+                  bottom-right corner would sit underneath a panel. Rounded and
+                  lifted to match everything else floating here; the colours are
+                  still React Flow's variables, which `CANVAS_THEME` themes both
+                  ways. */}
               <Controls
                 showInteractive={false}
-                className="!overflow-hidden !rounded-lg !border !border-zinc-200 !shadow-sm dark:!border-zinc-800 [&>button]:!border-none"
+                position="bottom-left"
+                className={cn(
+                  '!bottom-[9.5rem] !overflow-hidden !rounded-lg !border !border-zinc-200',
+                  '!shadow-sm dark:!border-zinc-800 [&>button]:!border-none',
+                  // Below `lg` the minimap is gone, so the zoom controls drop
+                  // back down into the corner it vacated.
+                  '!bottom-0 lg:!bottom-[9.5rem]',
+                )}
               />
               <MiniMap
                 pannable
                 zoomable
+                position="bottom-left"
                 nodeColor={(node) => miniMapColor(node.data)}
-                className="!overflow-hidden !rounded-lg !border !border-zinc-200 !shadow-sm dark:!border-zinc-800"
+                // An overview is worth least on the screen with least room for
+                // it: below `lg` it would cover a sixth of the canvas to
+                // describe the other five.
+                className={cn(
+                  '!hidden lg:!block',
+                  '!overflow-hidden !rounded-lg !border !border-zinc-200 !shadow-sm dark:!border-zinc-800',
+                )}
               />
               <PendingWireLine pending={wiring.pending} />
               <WiringHint
@@ -1666,6 +1848,41 @@ function Canvas({
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [run, setRun] = useState<WorkflowRun | null>(null);
   /**
+   * Whether the details rail is on screen.
+   *
+   * Open by default where there is room for it, and that default is the answer
+   * to "the problems have to stay visible": they are visible, in full, from the
+   * first paint on any screen that can afford 19rem. Closing it is a choice
+   * somebody makes to get the room back, and the toggle then carries the problem
+   * count so the *fact* of a problem never depends on the panel being open.
+   *
+   * Read once, from the width at mount, rather than subscribed to. A live media
+   * query would reopen a panel somebody had just closed because they turned
+   * their tablet, which is worse than the panel being open on a narrow screen
+   * they can shut it on. `globalThis.innerWidth` guards the case where there is
+   * no window at all — this component is rendered on a server by anybody using
+   * SSR, and a bare `window` there is a crash rather than a layout bug.
+   */
+  const [railOpen, setRailOpen] = useState(railOpenByDefault);
+
+  /**
+   * The region of the viewport the graph should be fitted into.
+   *
+   * See {@link CHROME}. The right edge is the only side that moves, because the
+   * rail is the only panel that comes and goes.
+   *
+   * Declared up here with the state rather than beside its use, because both
+   * `fitView` call sites below name it in a dependency array — and a `const` read
+   * by a hook that runs earlier in the body is a temporal-dead-zone crash, not a
+   * lint warning.
+   *
+   * Toggling the rail deliberately does NOT re-fit. That would throw away a
+   * viewport somebody had panned to, in response to an action about a panel; the
+   * new padding applies at the next fit that was going to happen anyway —
+   * opening a graph, or pressing Tidy.
+   */
+  const fitPadding = useMemo<FitPadding>(() => chromeFitPadding(railOpen), [railOpen]);
+  /**
    * Whether the "this load is expected to shrink" dialog is open.
    *
    * Here rather than inside `RunControls` because there are two ways in and only
@@ -1751,9 +1968,16 @@ function Canvas({
   // `draftId` is the trigger, not a value the body reads — which is exactly why
   // the rule calls it unnecessary. Dropping it would fit the view once on mount
   // and never again, leaving every workflow opened afterwards off-screen.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: draftId is what the effect watches for, not something its body uses
+  // `fitPadding` is read by the body but deliberately kept OUT of the deps: it
+  // changes when the rail is toggled, and re-fitting there would yank the
+  // viewport away from wherever somebody had panned to, as the side effect of
+  // opening a panel. The padding it fits with is whatever is current at the next
+  // graph swap, which is the moment a fit is wanted.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: draftId is what the effect watches for, not something its body uses; fitPadding is read but must not re-trigger it
   useEffect(() => {
-    const frame = window.requestAnimationFrame(() => fitView({ padding: 0.25, duration: 200 }));
+    const frame = window.requestAnimationFrame(() =>
+      fitView({ padding: fitPadding, duration: 200 }),
+    );
     return () => window.cancelAnimationFrame(frame);
   }, [draftId, fitView]);
 
@@ -2093,6 +2317,11 @@ function Canvas({
       client.runWorkflow(id, options),
     onSuccess: (result) => {
       setRun(result);
+      // The answer to a run is written in the rail, so a run that finishes while
+      // the rail is put away would report itself into a panel nobody can see.
+      // Pressing Run is the clearest possible statement that somebody wants the
+      // outcome, so this is the one place the screen opens it on their behalf.
+      setRailOpen(true);
       // A run writes rows, so the catalog snapshot every other screen reads is
       // now stale. Invalidating it here is what stops the object explorer
       // showing yesterday's counts beside a run that just finished.
@@ -2243,11 +2472,11 @@ function Canvas({
       ...current,
       nodes: layout(current.nodes, current.edges),
     }));
-    window.requestAnimationFrame(() => fitView({ padding: 0.25, duration: 200 }));
+    window.requestAnimationFrame(() => fitView({ padding: fitPadding, duration: 200 }));
     setAnnouncement(
       'The nodes were laid out left to right by dependency, with every sink in the last column.',
     );
-  }, [edit, fitView]);
+  }, [edit, fitView, fitPadding]);
 
   const durability = describeDurability(capabilities?.durable);
   // Asked about EVERY problem, not about `live`. This is the guarantee: a graph
@@ -2385,183 +2614,235 @@ function Canvas({
 
   return (
     /*
-     * The screen lives inside the viewport: a header sized to its content and a
-     * canvas that takes whatever is left.
+     * THE CANVAS IS THE SCREEN.
      *
-     * `min-h-0` on both this column and the row below it is the load-bearing
-     * part. A flex child defaults to `min-height: auto`, which means "at least
-     * as tall as my content" and makes it refuse to shrink — so a canvas with a
-     * minimum height pushed itself past the bottom of a `main` that does not
-     * scroll, and there was no way to reach the lower half of it. Fit View could
-     * not save that: it fits the graph into a box, and half the box was off
-     * screen. See `QueryConsole` for the same pattern.
+     * One positioned box filling whatever the host gives it, with exactly two
+     * layers in it: the graph, pinned to all four edges, and the chrome floating
+     * over the graph. Nothing is in normal flow and nothing scrolls — a
+     * full-bleed canvas that can be scrolled away from is a canvas that is not
+     * actually the screen.
+     *
+     * What that buys, and it is the whole point: the drawing surface is now the
+     * entire viewport instead of the ~55% left over after a header, a button row
+     * and a column of panels had taken their share.
+     *
+     * What it costs is occlusion — a panel over the canvas covers graph. Three
+     * things pay that back. The chrome is compact and translucent, so what is
+     * behind it stays perceptible. Everything permanent is either an
+     * always-needed control or dismissible. And `fitView` is given the chrome's
+     * own insets (see `CHROME`), so the graph is fitted into the region nothing
+     * covers rather than into the raw viewport — which is what stops a node
+     * being centred underneath the action cluster.
      */
-    <div className="flex h-full min-h-0 flex-col">
-      <div className="shrink-0 px-6 pt-5">
-        <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-          <p className={cn('font-mono text-[11px] uppercase tracking-[0.18em]', MUTED)}>
-            {eyebrow}
-          </p>
-          <h1 className="text-xl font-semibold tracking-tight">{title}</h1>
-          {stored && <WorkflowStatusBadge workflow={stored} />}
-          <CommitsBadge produces={produces} />
-        </div>
-        <p className="mt-0.5 max-w-3xl text-xs text-zinc-500 dark:text-zinc-400">{intro}</p>
-
-        <DurabilityBanner durability={durability} />
-        {workflows.isSuccess && workflows.data.length === 0 && <NothingDrawnYet />}
-
-        <div className="mt-2.5 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-          <SelectField
-            label={WORKFLOW_NAME.title}
-            ariaLabel={`Which ${WORKFLOW_NAME.singular} to edit`}
-            value={selected}
-            onValueChange={(value) => {
+    <div className="relative h-full min-h-0 w-full overflow-hidden">
+      {/*
+       * The chrome, over the graph.
+       *
+       * DOM order is chrome-then-canvas on purpose, and the canvas is the layer
+       * underneath by position rather than by being later in the document. That
+       * gives a keyboard user the order they want: the controls that act on the
+       * whole graph, then the dock that adds to it, then the rail that lists it,
+       * and only then the nodes themselves — instead of tabbing through every
+       * box on a large canvas to reach Save.
+       *
+       * `pointer-events-none` on the container with `pointer-events-auto` on each
+       * panel is what keeps the gaps between the panels part of the canvas: the
+       * empty space in this overlay is space you can pan and marquee-select
+       * through, exactly as if the overlay were not there.
+       */}
+      <div className="pointer-events-none absolute inset-0 z-20 flex flex-col gap-3 p-3 sm:p-4">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <WorkflowCard
+            eyebrow={eyebrow}
+            title={title}
+            intro={intro}
+            stored={stored}
+            produces={produces}
+            durability={durability}
+            selected={selected}
+            workflowOptions={workflowOptions}
+            workflowsPending={workflows.isPending}
+            draftName={draft.name}
+            canEdit={canEdit}
+            onSelect={(value) => {
               loadedRef.current = null;
               setSelected(value);
             }}
-            options={workflowOptions}
-            disabled={workflows.isPending}
+            onRename={(name) => edit((current) => ({ ...current, name }))}
           />
-          <TextField
-            label="Name"
-            value={draft.name}
-            onChange={(name) => edit((current) => ({ ...current, name }))}
-            placeholder="Fleet readiness"
-            disabled={!canEdit}
-          />
-          <CanvasActions
-            draft={draft}
-            stored={stored}
-            canEdit={canEdit}
-            blocked={blocked}
-            unfinished={unfinished}
-            saving={save.isPending}
-            running={runIt.isPending}
-            durabilityDetail={durability.detail}
-            acknowledging={acknowledging}
-            onAcknowledgingChange={setAcknowledging}
-            onSave={saveNow}
-            onRun={runNow}
-            onLifecycleChange={onLifecycleChange}
-            onAskDelete={() => setConfirmingDelete(true)}
-          />
+
+          <div className="flex max-w-full flex-col items-end gap-2">
+            <div className={cn('pointer-events-auto flex items-start gap-2 p-1.5', FLOATING)}>
+              <CanvasActions
+                draft={draft}
+                stored={stored}
+                canEdit={canEdit}
+                blocked={blocked}
+                unfinished={unfinished}
+                saving={save.isPending}
+                running={runIt.isPending}
+                durabilityDetail={durability.detail}
+                acknowledging={acknowledging}
+                onAcknowledgingChange={setAcknowledging}
+                onSave={saveNow}
+                onRun={runNow}
+                onLifecycleChange={onLifecycleChange}
+                onAskDelete={() => setConfirmingDelete(true)}
+              />
+              <span className="h-6 w-px shrink-0 bg-zinc-200 dark:bg-zinc-800" aria-hidden />
+              <RailToggle open={railOpen} problems={live} onToggle={() => setRailOpen((o) => !o)} />
+            </div>
+
+            {/*
+             * The refusals, under the buttons that caused them. They were under
+             * the header before, which is the same place relative to the
+             * controls — and it is still the place somebody who has just pressed
+             * Run is looking.
+             */}
+            {/* `empty:hidden` rather than a guard listing the three things that
+                can fill it: React renders each `false` as nothing, so with none
+                of them present this is a genuinely childless element and the
+                selector matches. One place to change when a fourth is added. */}
+            <div className="pointer-events-auto w-[min(26rem,100%)] empty:hidden">
+              {save.error && <RefusalNote lead="The server refused it:" error={save.error} />}
+              {runIt.error && <RefusalNote lead="The run could not start:" error={runIt.error} />}
+              {/*
+               * The row-count bound turning a load away, with the one control
+               * that answers it. Rendered from both surfaces because a refused
+               * sink can arrive either way: as a rejected request when the
+               * graph ran inline, or as a failed node on a run that otherwise
+               * returned.
+               */}
+              <ShrinkRefusalNote
+                run={run}
+                error={runIt.error}
+                onAcknowledge={() => setAcknowledging(true)}
+              />
+            </div>
+          </div>
         </div>
 
-        {save.error && <RefusalNote lead="The server refused it:" error={save.error} />}
-        {runIt.error && <RefusalNote lead="The run could not start:" error={runIt.error} />}
         {/*
-         * The row-count bound turning a load away, with the one control that
-         * answers it. Rendered from both surfaces because a refused sink can
-         * arrive either way: as a rejected request when the graph ran inline,
-         * or as a failed node on a run that otherwise returned.
+         * The dock, bottom centre — and placed HERE in the DOM, above the rail,
+         * rather than where it is drawn.
+         *
+         * The one deliberate departure from "DOM order is reading order" on this
+         * screen, and it is an operability call. The rail is a list that grows
+         * with the graph: every wire, every problem, every sink in the last run
+         * is a stop in it. Leaving the dock after all of that means a keyboard
+         * user tabs past forty controls to reach "add a source", which is the
+         * control they came to use. Tools before the read-out is the order that
+         * preserves meaning; a bottom-centre dock and a right-edge panel have no
+         * left-to-right relationship for the swap to violate.
          */}
-        <ShrinkRefusalNote
-          run={run}
-          error={runIt.error}
-          onAcknowledge={() => setAcknowledging(true)}
-        />
-      </div>
-
-      {canEdit && (
-        <AddNodeBar
-          refreshing={workflows.isFetching && !workflows.isPending}
-          onAdd={addNode}
-          onTidy={tidy}
-        />
-      )}
-
-      {/*
-       * Stacked below the canvas on a narrow screen rather than hidden. The
-       * rail is where the problems are written out and where connections can be
-       * removed without a pointer, so hiding it under a breakpoint would make
-       * the screen less operable on exactly the devices where a drag is hardest.
-       *
-       * Narrow: this column scrolls, and the canvas takes a fixed share of the
-       * viewport so the rail below it is reachable. Wide: nothing scrolls, and
-       * the canvas is `flex-1 min-h-0` so it grows with the window.
-       */}
-      <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-6 pb-5 pt-3 lg:flex-row lg:overflow-hidden">
-        <GraphSurface
-          loading={workflows.isPending}
-          failed={workflows.isError}
-          error={workflows.error}
-          onRetry={() => workflows.refetch()}
-          canEdit={canEdit}
-          draft={draft}
-          flowNodes={flowNodes}
-          flowEdges={flowEdges}
-          onInspect={setInspecting}
-          onEditCode={setEditingCodeFor}
-          onNodesChange={onNodesChange}
-          onEdgesChange={onEdgesChange}
-          onConnect={onConnect}
-          isValidConnection={isValidConnection}
-          onConnectEnd={announceRefusedDrop}
-          onNodeEnter={menu.onNodeEnter}
-          onNodeLeave={menu.onNodeLeave}
-          // Clicking empty canvas puts away everything that is half-open: the
-          // wiring menu, and a wire that was started and never landed. React
-          // Flow only fires this for clicks on the pane ITSELF, so finishing a
-          // wire on a handle does not also cancel it on the way past.
-          onPaneClick={() => {
-            menu.close();
-            wiring.cancel();
-          }}
-          onDisconnect={disconnect}
-          wiring={wiring}
-          wiringRefusal={wiringRefusal}
-          nodeMenu={
-            <NodeWiringMenu
-              node={menu.anchor}
-              draft={draft}
-              canEdit={canEdit}
-              open={menu.open}
-              onOpenChange={menu.onOpenChange}
-              onHoverChange={menu.onHoverChange}
-              onConnect={connect}
-              onConnectToNew={connectToNew}
-              onDisconnect={disconnect}
+        {canEdit && (
+          <div className="absolute inset-x-0 bottom-3 flex justify-center px-3 sm:bottom-4 sm:px-4">
+            <AddNodeBar
+              refreshing={workflows.isFetching && !workflows.isPending}
+              onAdd={addNode}
+              onTidy={tidy}
             />
-          }
-        />
+          </div>
+        )}
 
-        <WiringRail
-          draft={draft}
-          problems={live}
-          pending={pending}
-          run={run}
-          canEdit={canEdit}
-          onInspect={setInspecting}
-          onDisconnect={disconnect}
-        >
-          {/*
-           * The two things that only exist once a graph is STORED, and that is
-           * why they are here rather than in the header: a schedule on nothing
-           * and a run history of nothing are both headings that would be empty
-           * for the whole of the time somebody spends drawing.
-           *
-           * Keyed by id so switching pipeline resets the cron and the enabled
-           * switch — held locally, and without the key one graph's schedule
-           * would appear inside another's.
-           */}
-          {stored && (
-            <>
-              <SchedulePanel
-                key={stored.id}
-                workflow={stored}
+        {/*
+         * The middle band: nothing but the rail, pushed to the right edge.
+         * `pb-14` keeps its foot clear of the dock, which is out of the flow now
+         * and would otherwise be overlapped at the widths where a 19rem rail and
+         * a centred dock both reach the same pixels.
+         */}
+        <div className="flex min-h-0 flex-1 justify-end pb-14">
+          <AnimatePresence initial={false}>
+            {railOpen && (
+              <WiringRail
+                draft={draft}
+                problems={live}
+                pending={pending}
+                run={run}
                 canEdit={canEdit}
-                onScheduled={onLifecycleChange}
-              />
-              <RunsAsPanel
-                workflowId={stored.id}
-                status={stored.status}
-                transforms={graphTransforms}
-              />
-            </>
-          )}
-        </WiringRail>
+                reducedMotion={reducedMotion}
+                onInspect={setInspecting}
+                onDisconnect={disconnect}
+                onClose={() => setRailOpen(false)}
+              >
+                {/*
+                 * The two things that only exist once a graph is STORED, and
+                 * that is why they are here rather than in the card: a schedule
+                 * on nothing and a run history of nothing are both headings that
+                 * would be empty for the whole of the time somebody spends
+                 * drawing.
+                 *
+                 * Keyed by id so switching pipeline resets the cron and the
+                 * enabled switch — held locally, and without the key one graph's
+                 * schedule would appear inside another's.
+                 */}
+                {stored && (
+                  <>
+                    <SchedulePanel
+                      key={stored.id}
+                      workflow={stored}
+                      canEdit={canEdit}
+                      onScheduled={onLifecycleChange}
+                    />
+                    <RunsAsPanel
+                      workflowId={stored.id}
+                      status={stored.status}
+                      transforms={graphTransforms}
+                    />
+                  </>
+                )}
+              </WiringRail>
+            )}
+          </AnimatePresence>
+        </div>
       </div>
+
+      <GraphSurface
+        loading={workflows.isPending}
+        failed={workflows.isError}
+        error={workflows.error}
+        onRetry={() => workflows.refetch()}
+        canEdit={canEdit}
+        draft={draft}
+        flowNodes={flowNodes}
+        flowEdges={flowEdges}
+        onInspect={setInspecting}
+        onEditCode={setEditingCodeFor}
+        onNodesChange={onNodesChange}
+        onEdgesChange={onEdgesChange}
+        onConnect={onConnect}
+        isValidConnection={isValidConnection}
+        onConnectEnd={announceRefusedDrop}
+        onNodeEnter={menu.onNodeEnter}
+        onNodeLeave={menu.onNodeLeave}
+        // Clicking empty canvas puts away everything that is half-open: the
+        // wiring menu, and a wire that was started and never landed. React
+        // Flow only fires this for clicks on the pane ITSELF, so finishing a
+        // wire on a handle does not also cancel it on the way past.
+        onPaneClick={() => {
+          menu.close();
+          wiring.cancel();
+        }}
+        onDisconnect={disconnect}
+        wiring={wiring}
+        wiringRefusal={wiringRefusal}
+        nodeMenu={
+          <NodeWiringMenu
+            node={menu.anchor}
+            draft={draft}
+            canEdit={canEdit}
+            open={menu.open}
+            onOpenChange={menu.onOpenChange}
+            onHoverChange={menu.onHoverChange}
+            onConnect={connect}
+            onConnectToNew={connectToNew}
+            onDisconnect={disconnect}
+          />
+        }
+        fitPadding={fitPadding}
+      />
+
+      {workflows.isSuccess && workflows.data.length === 0 && <NothingDrawnYet />}
 
       {/*
        * Everything the canvas does, said out loud once.
@@ -2688,37 +2969,41 @@ function Canvas({
   );
 }
 
-function AddButton({
-  icon: Icon,
-  label,
-  hint,
-  onClick,
-}: {
-  icon: typeof Plug;
-  label: string;
-  hint: string;
-  onClick: () => void;
-}) {
+/**
+ * "a" or "an", for a name that is now generated rather than typed out.
+ *
+ * Worth the three lines: the row used to carry six hand-written labels, and the
+ * moment they were derived from the kind the sixth one read "Add a if node".
+ * That string is not decoration — it is the whole accessible name of the button,
+ * so the only person it is wrong for is the one who cannot see the icon.
+ */
+function article(word: string): string {
+  return /^[aeiou]/i.test(word) ? 'an' : 'a';
+}
+
+function AddButton({ kind, onClick }: { kind: WorkflowNodeKind; onClick: () => void }) {
+  const { icon: Icon, label, hint } = ADD_NODE[kind];
+  const noun = label.toLowerCase();
   return (
     <Tooltip content={hint}>
-      <button
-        type="button"
+      <Button
+        variant="ghost"
+        size="sm"
         onClick={onClick}
-        // The visible text is the noun alone, because three buttons reading
-        // "Add a source" / "Add a transform" / "Add a sink" in a row is three
+        // The visible text is the noun alone, because six buttons reading
+        // "Add a source" / "Add a transform" / "Add a sink" in a row is six
         // copies of one word. The accessible name has to say what the control
         // does: heard on its own, "Sink" is a heading, not a button.
-        aria-label={`Add a ${label.toLowerCase()} node`}
-        className={cn(
-          'flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs',
-          RULE,
-          'hover:bg-zinc-50 dark:hover:bg-zinc-800',
-        )}
+        aria-label={`Add ${article(noun)} ${noun} node`}
+        className="shrink-0 text-zinc-600 dark:text-zinc-300"
       >
         <Plus size={11} />
         <Icon size={12} />
-        {label}
-      </button>
+        {/* Below `md` the dock is icons: six labelled buttons do not fit a phone
+            and a dock that scrolls sideways to reach `filter` is a dock that
+            hides it again, which is the failure this row was just fixed for. */}
+        <span className="hidden md:inline">{label}</span>
+      </Button>
     </Tooltip>
   );
 }
@@ -2780,6 +3065,180 @@ function CanvasSkeleton() {
 }
 
 /**
+ * Show or hide the details rail, and say what is in it while it is hidden.
+ *
+ * The count is the load-bearing part. A rail that can be closed is a rail that
+ * can hide the problems list, and "there are two errors" is not something
+ * somebody should have to open a panel to discover — so the closed state carries
+ * the number and the colour, and opening it is what gets the sentences. The
+ * accessible name says the same thing in words, because a red 2 on a button is
+ * not information if you cannot see it.
+ */
+function RailToggle({
+  open,
+  problems,
+  onToggle,
+}: {
+  open: boolean;
+  problems: WorkflowProblem[];
+  onToggle: () => void;
+}) {
+  const badge = problemBadge(problems);
+  const hint = open
+    ? 'Hide the wiring, problems, schedule and run history, and give the canvas the room.'
+    : `Show the wiring, problems, schedule and run history.${badge ? ` ${badge.sentence}` : ''}`;
+  const name = open
+    ? 'Hide the details panel'
+    : `Show the details panel${badge ? `, ${badge.summary}` : ''}`;
+
+  return (
+    <Tooltip content={hint}>
+      <Button
+        variant="ghost"
+        size="sm"
+        onClick={onToggle}
+        aria-expanded={open}
+        aria-label={name}
+        className="shrink-0"
+      >
+        <PanelRight size={12} />
+        {/* The count only while the panel is away: repeating it beside an open
+            list of the same problems is the same fact twice. */}
+        {!open && badge && (
+          <span className={cn('rounded px-1 font-mono text-[10px]', badge.tone)}>
+            {badge.count}
+          </span>
+        )}
+      </Button>
+    </Tooltip>
+  );
+}
+
+/**
+ * The one number a closed rail has to carry, or nothing at all.
+ *
+ * Errors win over warnings rather than being summed: a graph with one error and
+ * six warnings is an error, and "7" beside a neutral chip would be the button
+ * averaging two different facts into one that is neither.
+ *
+ * Split out of {@link RailToggle} because the three shapes it produces — a
+ * count, a colour and two grammatical forms — were four nested ternaries inside
+ * JSX, which is how a badge ends up saying "1 errors".
+ */
+function problemBadge(
+  problems: WorkflowProblem[],
+): { count: number; summary: string; sentence: string; tone: string } | null {
+  const errors = problems.filter((problem) => problem.level === 'error').length;
+  const warnings = problems.length - errors;
+
+  if (errors > 0) {
+    return {
+      count: errors,
+      summary: `${errors} ${errors === 1 ? 'error' : 'errors'}`,
+      sentence: `There ${errors === 1 ? 'is' : 'are'} ${errors} ${errors === 1 ? 'error' : 'errors'}.`,
+      tone: 'bg-red-100 text-red-700 dark:bg-red-950 dark:text-red-300',
+    };
+  }
+  if (warnings > 0) {
+    return {
+      count: warnings,
+      summary: `${warnings} ${warnings === 1 ? 'warning' : 'warnings'}`,
+      sentence: `There ${warnings === 1 ? 'is' : 'are'} ${warnings} ${warnings === 1 ? 'warning' : 'warnings'}.`,
+      tone: 'bg-amber-100 text-amber-700 dark:bg-amber-950 dark:text-amber-300',
+    };
+  }
+  return null;
+}
+
+/**
+ * Which graph this is, and the two fields that name it — top-left, floating.
+ *
+ * The corner a document's identity lives in, in every tool shaped like this one.
+ * What is deliberately NOT here is the description paragraph: it explains the
+ * screen to somebody arriving at it and says nothing to somebody mid-draw, so it
+ * costs three lines of canvas forever to be read once. It is still reachable
+ * from the button beside the title, and still read out in full to a screen
+ * reader, which is the one audience a tooltip would have failed.
+ */
+function WorkflowCard({
+  eyebrow,
+  title,
+  intro,
+  stored,
+  produces,
+  durability,
+  selected,
+  workflowOptions,
+  workflowsPending,
+  draftName,
+  canEdit,
+  onSelect,
+  onRename,
+}: {
+  eyebrow: string;
+  title: string;
+  intro: string;
+  stored: CatalogWorkflow | undefined;
+  produces: string[];
+  durability: ReturnType<typeof describeDurability>;
+  selected: string;
+  workflowOptions: SelectOption[];
+  workflowsPending: boolean;
+  draftName: string;
+  canEdit: boolean;
+  onSelect: (value: string) => void;
+  onRename: (name: string) => void;
+}) {
+  return (
+    <div className={cn('pointer-events-auto w-[min(24rem,100%)] p-3', FLOATING)}>
+      <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+        <p className={cn('font-mono text-[10px] uppercase tracking-[0.18em]', MUTED)}>{eyebrow}</p>
+        <h1 className="text-sm font-semibold tracking-tight">{title}</h1>
+        {stored && <WorkflowStatusBadge workflow={stored} />}
+        <CommitsBadge produces={produces} />
+        <Tooltip content={intro}>
+          <Button
+            variant="ghost"
+            size="icon"
+            aria-label="What this screen is for"
+            className="ml-auto h-5 w-5"
+          >
+            <Info size={11} />
+          </Button>
+        </Tooltip>
+      </div>
+      {/*
+       * The paragraph the tooltip carries, kept in the accessible tree.
+       * A tooltip is a pointer affordance first and is announced unevenly; the
+       * text is short and there is no reason for a screen-reader user to get a
+       * worse version of the screen than a hovering one.
+       */}
+      <p className="sr-only">{intro}</p>
+
+      <div className="mt-2.5 grid gap-2">
+        <SelectField
+          label={WORKFLOW_NAME.title}
+          ariaLabel={`Which ${WORKFLOW_NAME.singular} to edit`}
+          value={selected}
+          onValueChange={onSelect}
+          options={workflowOptions}
+          disabled={workflowsPending}
+        />
+        <TextField
+          label="Name"
+          value={draftName}
+          onChange={onRename}
+          placeholder="Fleet readiness"
+          disabled={!canEdit}
+        />
+      </div>
+
+      <DurabilityBanner durability={durability} />
+    </div>
+  );
+}
+
+/**
  * That there are none, said rather than drawn as a blank canvas.
  *
  * The zero case used to be nearly unreachable: a deployment that had connectors
@@ -2801,21 +3260,36 @@ function CanvasSkeleton() {
  */
 function NothingDrawnYet() {
   return (
-    <div
-      className={cn(
-        'mt-2.5 flex flex-wrap items-baseline gap-x-2 rounded-md border border-dashed px-2.5 py-1.5',
-        RULE,
-      )}
-    >
-      <p className={cn('font-mono text-[10px] uppercase tracking-[0.14em]', MUTED)}>
-        No {WORKFLOW_NAME.plural} yet
-      </p>
-      <p className={cn('text-[11px] leading-relaxed', MUTED)}>
-        Nothing is missing — this deployment has never had one drawn. Add a source, wire it into a
-        sink and save, and it becomes the first. If this deployment has connectors already loading
-        data, they are not shown here and nothing turns them into {WORKFLOW_NAME.plural}
-        automatically.
-      </p>
+    /*
+     * Centred ON the canvas rather than stated above it, now that the canvas is
+     * the screen. An empty surface is where somebody is already looking, and it
+     * is the thing being explained.
+     *
+     * `pointer-events-none` throughout: it carries no control — the one that
+     * creates a workflow is the picker in the card — and a plate over the middle
+     * of the canvas that swallowed a pan would make the empty state feel like a
+     * broken canvas, which is precisely the reading it exists to prevent.
+     */
+    <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center p-6">
+      <div
+        className={cn(
+          'max-w-md rounded-xl border border-dashed px-4 py-3 text-center backdrop-blur-sm',
+          RULE,
+        )}
+      >
+        <p className={cn('font-mono text-[10px] uppercase tracking-[0.14em]', MUTED)}>
+          No {WORKFLOW_NAME.plural} yet
+        </p>
+        <p className={cn('mt-1.5 text-[11px] leading-relaxed', MUTED)}>
+          Nothing is missing — this deployment has never had one drawn. Add a source, wire it into a
+          sink and save, and it becomes the first. If this deployment has connectors already loading
+          data, they are not shown here and nothing turns them into {WORKFLOW_NAME.plural}{' '}
+          {/* The explicit space is load-bearing: JSX drops the newline between an
+              expression and the text after it, so this read "workflowsautomatically"
+              on screen. Invisible in the source, obvious the moment it is rendered. */}
+          automatically.
+        </p>
+      </div>
     </div>
   );
 }
@@ -2840,13 +3314,14 @@ function CanvasFailure({
         <p className="mt-1 font-mono text-[11px] text-red-600 dark:text-red-400">
           {error instanceof Error ? error.message : 'No reason was given.'}
         </p>
-        <button
-          type="button"
+        <Button
+          variant="outline"
+          size="sm"
           onClick={onRetry}
-          className="mt-3 rounded-md border border-red-300 px-3 py-1 text-xs text-red-700 dark:border-red-800 dark:text-red-300"
+          className="mt-3 border-red-300 text-red-700 dark:border-red-800 dark:text-red-300"
         >
           Try again
-        </button>
+        </Button>
       </div>
     </div>
   );
@@ -2870,8 +3345,10 @@ function WiringRail({
   pending,
   run,
   canEdit,
+  reducedMotion,
   onInspect,
   onDisconnect,
+  onClose,
   children,
 }: {
   draft: Draft;
@@ -2879,8 +3356,11 @@ function WiringRail({
   pending: WorkflowProblem[];
   run: WorkflowRun | null;
   canEdit: boolean;
+  reducedMotion: boolean;
   onInspect: (nodeId: string) => void;
   onDisconnect: (edge: WorkflowEdge) => void;
+  /** Put the rail away. The same state the toggle beside the actions holds. */
+  onClose: () => void;
   /**
    * Whatever only makes sense for a graph the server has: its schedule, and the
    * connector it runs as. A slot rather than props, because the rail has no
@@ -2898,187 +3378,243 @@ function WiringRail({
   const sinks = draft.nodes.filter((node) => node.kind === 'sink');
 
   return (
-    <aside
-      className="flex w-full shrink-0 flex-col gap-3 lg:w-72 lg:min-h-0 lg:overflow-y-auto"
+    /*
+     * Floating over the right edge of the canvas rather than beside it in a
+     * column, and NOT a modal sheet.
+     *
+     * The distinction matters for exactly one reason, which `ui/sheet.tsx` spells
+     * out from the other direction: a panel that covers the canvas while a
+     * keyboard user tabs into what is behind it leaks focus onto controls they
+     * cannot see. That argument is about a panel that HIDES things. This one
+     * hides nothing — it is always open when it is rendered, everything in it is
+     * operable, and Tab flowing between it and the canvas is the correct order
+     * rather than a leak. So no focus trap, and deliberately no Escape handler
+     * either: Escape on this screen already means "put the half-drawn wire away"
+     * (see `workflow/wiring.tsx`), and a second meaning would take that key away
+     * from the gesture that needs it most.
+     *
+     * `dismissible` is the whole reason it may float: an always-on 19rem panel is
+     * 19rem of canvas somebody never agreed to spend.
+     */
+    <motion.aside
+      initial={reducedMotion ? false : { opacity: 0, x: 24 }}
+      animate={{ opacity: 1, x: 0 }}
+      exit={reducedMotion ? { opacity: 0 } : { opacity: 0, x: 24 }}
+      transition={reducedMotion ? { duration: 0 } : { type: 'spring', stiffness: 420, damping: 34 }}
+      className={cn(
+        'pointer-events-auto flex max-h-full w-[min(19rem,calc(100vw-2rem))] flex-col',
+        'overflow-y-auto p-3',
+        FLOATING,
+      )}
       aria-label={`${WORKFLOW_NAME.title} wiring and problems`}
     >
-      <section className={cn('rounded-lg border p-3', RULE, PANEL)}>
-        <h2 className={cn('font-mono text-[10px] uppercase tracking-[0.14em]', MUTED)}>Wiring</h2>
-        {draft.edges.length === 0 ? (
-          <p className={cn('mt-2 text-[11px]', MUTED)}>Nothing is wired together yet.</p>
-        ) : (
-          <ul className="mt-2 space-y-1">
-            {draft.edges.map((edge) => (
-              <li key={edgeId(edge)} className="flex items-center gap-1.5 text-[11px]">
-                <button
-                  type="button"
-                  onClick={() => onInspect(edge.from)}
-                  className="truncate hover:underline"
-                >
-                  {label(edge.from)}
-                </button>
-                <ArrowRight size={10} className={cn('shrink-0', MUTED)} />
-                <button
-                  type="button"
-                  onClick={() => onInspect(edge.to)}
-                  className="truncate hover:underline"
-                >
-                  {label(edge.to)}
-                </button>
-                {canEdit && (
-                  <Tooltip content="Remove this connection.">
-                    <button
-                      type="button"
-                      onClick={() => onDisconnect(edge)}
-                      aria-label={`Disconnect ${label(edge.from)} from ${label(edge.to)}`}
-                      className="ml-auto shrink-0 rounded p-0.5 text-zinc-400 hover:text-red-600"
-                    >
-                      <Unplug size={11} />
-                    </button>
-                  </Tooltip>
-                )}
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
+      <div className="mb-2 flex shrink-0 items-center gap-2">
+        {/* A label, not a heading. The `aside` already carries the accessible
+            name, and the sections below are the headings — adding one above
+            them would put a level in the outline that names nothing new. */}
+        <p className={cn('font-mono text-[10px] uppercase tracking-[0.14em]', MUTED)}>Details</p>
+        <Tooltip content="Put this panel away and give the canvas the room.">
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={onClose}
+            aria-label="Hide the details panel"
+            className="ml-auto h-5 w-5"
+          >
+            <X size={11} />
+          </Button>
+        </Tooltip>
+      </div>
+      <div className="flex flex-col gap-3">
+        {/*
+         * Ordered by what somebody needs soonest, which is not the order these
+         * grew in. The rail scrolls, and on a stored graph the schedule and the
+         * connector panel are tall enough to push whatever is under them out of
+         * sight — so Problems, the one thing that must never need scrolling to,
+         * used to sit fifth and below the fold. Outstanding work and problems
+         * now come first, the wiring after them, and the two stored-only panels
+         * last, where being scrolled to is what they deserve.
+         */}
+        <PendingWork pending={pending} label={label} onInspect={onInspect} />
 
-      {children}
-
-      <PendingWork pending={pending} label={label} onInspect={onInspect} />
-
-      <section className={cn('rounded-lg border p-3', RULE, PANEL)}>
-        <h2 className={cn('font-mono text-[10px] uppercase tracking-[0.14em]', MUTED)}>Problems</h2>
-        {problems.length === 0 ? (
-          <p className={cn('mt-2 text-[11px]', MUTED)}>
-            {/* Deliberately not "valid". These are the same rules the server
+        <section className={cn('rounded-lg border p-3', RULE, SUBPANEL)}>
+          <h2 className={cn('font-mono text-[10px] uppercase tracking-[0.14em]', MUTED)}>
+            Problems
+          </h2>
+          {problems.length === 0 ? (
+            <p className={cn('mt-2 text-[11px]', MUTED)}>
+              {/* Deliberately not "valid". These are the same rules the server
                 runs, but it knows things they cannot see — which types exist,
                 who may write to them — and its answer is the one that counts. */}
-            Nothing to flag here. The server checks it again on save.
-          </p>
-        ) : (
-          <ul className="mt-2 space-y-2">
-            {[...errors, ...warnings].map((problem) => (
-              <li
-                key={`${problem.code}:${problem.nodeIds.join(',')}`}
-                className="flex gap-1.5 text-[11px] leading-relaxed"
-              >
-                {problem.level === 'error' ? (
-                  <CircleAlert size={11} className="mt-0.5 shrink-0 text-red-500" />
-                ) : (
-                  <TriangleAlert size={11} className="mt-0.5 shrink-0 text-amber-500" />
-                )}
-                <span>
-                  {problem.message}
-                  {problem.nodeIds.length > 0 && (
-                    <span className="ml-1">
-                      {problem.nodeIds.map((nodeId) => (
-                        <button
-                          key={nodeId}
-                          type="button"
-                          onClick={() => onInspect(nodeId)}
-                          className={cn(
-                            'mr-1 rounded border px-1 font-mono text-[9px]',
-                            RULE,
-                            MUTED,
-                          )}
-                        >
-                          {label(nodeId)}
-                        </button>
-                      ))}
-                    </span>
+              Nothing to flag here. The server checks it again on save.
+            </p>
+          ) : (
+            <ul className="mt-2 space-y-2">
+              {[...errors, ...warnings].map((problem) => (
+                <li
+                  key={`${problem.code}:${problem.nodeIds.join(',')}`}
+                  className="flex gap-1.5 text-[11px] leading-relaxed"
+                >
+                  {problem.level === 'error' ? (
+                    <CircleAlert size={11} className="mt-0.5 shrink-0 text-red-500" />
+                  ) : (
+                    <TriangleAlert size={11} className="mt-0.5 shrink-0 text-amber-500" />
                   )}
-                </span>
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
+                  <span>
+                    {problem.message}
+                    {problem.nodeIds.length > 0 && (
+                      <span className="ml-1">
+                        {problem.nodeIds.map((nodeId) => (
+                          <button
+                            key={nodeId}
+                            type="button"
+                            onClick={() => onInspect(nodeId)}
+                            className={cn(
+                              'mr-1 rounded border px-1 font-mono text-[9px]',
+                              RULE,
+                              MUTED,
+                            )}
+                          >
+                            {label(nodeId)}
+                          </button>
+                        ))}
+                      </span>
+                    )}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
 
-      {run && (
-        <section className={cn('rounded-lg border p-3', RULE, PANEL)}>
-          <h2 className={cn('font-mono text-[10px] uppercase tracking-[0.14em]', MUTED)}>
-            Last run
-          </h2>
-          <p className="mt-1 text-[11px]">
-            {run.status}
-            {/* Read from the run, not from capabilities: a deployment can gain
+        {run && (
+          <section className={cn('rounded-lg border p-3', RULE, SUBPANEL)}>
+            <h2 className={cn('font-mono text-[10px] uppercase tracking-[0.14em]', MUTED)}>
+              Last run
+            </h2>
+            <p className="mt-1 text-[11px]">
+              {run.status}
+              {/* Read from the run, not from capabilities: a deployment can gain
                 or lose its durable engine between runs, and this run is what it
                 was when it happened. */}
-            <span className={cn('ml-1 font-mono text-[10px]', MUTED)}>
-              {run.durable ? 'checkpointed per node' : 'ran inline, no checkpoints'}
-            </span>
-          </p>
+              <span className={cn('ml-1 font-mono text-[10px]', MUTED)}>
+                {run.durable ? 'checkpointed per node' : 'ran inline, no checkpoints'}
+              </span>
+            </p>
 
-          {/*
-           * What each sink committed, called out separately from the node list.
-           *
-           * A graph may commit several types, and each sink commits its own
-           * independently — there is no transaction across them. So "the run
-           * succeeded" is not a fact about the run: `Mvr` can be live while
-           * `Subwo` failed, and a single status line would say the opposite of
-           * what happened to one of them. The overall status above is failed if
-           * any sink failed; this is where somebody reads which.
-           */}
-          {sinks.length > 0 && (
-            <div className="mt-2">
-              <h3 className={cn('font-mono text-[10px] uppercase tracking-[0.14em]', MUTED)}>
-                Committed
-              </h3>
-              <ul className="mt-1 space-y-1">
-                {sinks.map((sink) => {
-                  const outcome = run.nodes.find((node) => node.nodeId === sink.id);
-                  const type =
-                    sink.kind === 'sink' && sink.targetType ? sink.targetType : 'no type';
-                  return (
-                    <li key={sink.id} className="flex items-center gap-1.5 text-[11px]">
-                      <span className="truncate font-mono text-[10px]">{type}</span>
-                      <span
-                        className={cn(
-                          'ml-auto shrink-0 font-mono text-[10px]',
-                          outcome?.status === 'failed'
-                            ? 'text-red-500'
-                            : outcome?.status === 'succeeded'
-                              ? 'text-emerald-600 dark:text-emerald-400'
-                              : MUTED,
-                        )}
+            {/*
+             * What each sink committed, called out separately from the node list.
+             *
+             * A graph may commit several types, and each sink commits its own
+             * independently — there is no transaction across them. So "the run
+             * succeeded" is not a fact about the run: `Mvr` can be live while
+             * `Subwo` failed, and a single status line would say the opposite of
+             * what happened to one of them. The overall status above is failed if
+             * any sink failed; this is where somebody reads which.
+             */}
+            {sinks.length > 0 && (
+              <div className="mt-2">
+                <h3 className={cn('font-mono text-[10px] uppercase tracking-[0.14em]', MUTED)}>
+                  Committed
+                </h3>
+                <ul className="mt-1 space-y-1">
+                  {sinks.map((sink) => {
+                    const outcome = run.nodes.find((node) => node.nodeId === sink.id);
+                    const type =
+                      sink.kind === 'sink' && sink.targetType ? sink.targetType : 'no type';
+                    return (
+                      <li key={sink.id} className="flex items-center gap-1.5 text-[11px]">
+                        <span className="truncate font-mono text-[10px]">{type}</span>
+                        <span
+                          className={cn(
+                            'ml-auto shrink-0 font-mono text-[10px]',
+                            outcome?.status === 'failed'
+                              ? 'text-red-500'
+                              : outcome?.status === 'succeeded'
+                                ? 'text-emerald-600 dark:text-emerald-400'
+                                : MUTED,
+                          )}
+                        >
+                          {outcome
+                            ? outcome.status === 'succeeded' && typeof outcome.rows === 'number'
+                              ? `${outcome.rows} rows`
+                              : outcome.status
+                            : 'no outcome recorded'}
+                        </span>
+                      </li>
+                    );
+                  })}
+                </ul>
+                <p className={cn('mt-1 text-[10px] leading-relaxed', MUTED)}>
+                  Each sink commits on its own. One committing and another failing is a failed run
+                  that nevertheless wrote something, not a partial success that will be rolled back.
+                </p>
+              </div>
+            )}
+
+            <ul className="mt-2 space-y-1">
+              {run.nodes.map((node) => (
+                <li key={node.nodeId} className="flex items-center gap-1.5 font-mono text-[10px]">
+                  <span className="truncate">{label(node.nodeId)}</span>
+                  <span
+                    className={cn(
+                      'ml-auto shrink-0',
+                      node.status === 'failed' ? 'text-red-500' : MUTED,
+                    )}
+                  >
+                    {node.replayed ? 'replayed' : node.status}
+                  </span>
+                </li>
+              ))}
+            </ul>
+            {run.error && <p className="mt-2 text-[11px] text-red-600">{run.error}</p>}
+          </section>
+        )}
+
+        <section className={cn('rounded-lg border p-3', RULE, SUBPANEL)}>
+          <h2 className={cn('font-mono text-[10px] uppercase tracking-[0.14em]', MUTED)}>Wiring</h2>
+          {draft.edges.length === 0 ? (
+            <p className={cn('mt-2 text-[11px]', MUTED)}>Nothing is wired together yet.</p>
+          ) : (
+            <ul className="mt-2 space-y-1">
+              {draft.edges.map((edge) => (
+                <li key={edgeId(edge)} className="flex items-center gap-1.5 text-[11px]">
+                  <button
+                    type="button"
+                    onClick={() => onInspect(edge.from)}
+                    className="truncate hover:underline"
+                  >
+                    {label(edge.from)}
+                  </button>
+                  <ArrowRight size={10} className={cn('shrink-0', MUTED)} />
+                  <button
+                    type="button"
+                    onClick={() => onInspect(edge.to)}
+                    className="truncate hover:underline"
+                  >
+                    {label(edge.to)}
+                  </button>
+                  {canEdit && (
+                    <Tooltip content="Remove this connection.">
+                      <button
+                        type="button"
+                        onClick={() => onDisconnect(edge)}
+                        aria-label={`Disconnect ${label(edge.from)} from ${label(edge.to)}`}
+                        className="ml-auto shrink-0 rounded p-0.5 text-zinc-400 hover:text-red-600"
                       >
-                        {outcome
-                          ? outcome.status === 'succeeded' && typeof outcome.rows === 'number'
-                            ? `${outcome.rows} rows`
-                            : outcome.status
-                          : 'no outcome recorded'}
-                      </span>
-                    </li>
-                  );
-                })}
-              </ul>
-              <p className={cn('mt-1 text-[10px] leading-relaxed', MUTED)}>
-                Each sink commits on its own. One committing and another failing is a failed run
-                that nevertheless wrote something, not a partial success that will be rolled back.
-              </p>
-            </div>
-          )}
-
-          <ul className="mt-2 space-y-1">
-            {run.nodes.map((node) => (
-              <li key={node.nodeId} className="flex items-center gap-1.5 font-mono text-[10px]">
-                <span className="truncate">{label(node.nodeId)}</span>
-                <span
-                  className={cn(
-                    'ml-auto shrink-0',
-                    node.status === 'failed' ? 'text-red-500' : MUTED,
+                        <Unplug size={11} />
+                      </button>
+                    </Tooltip>
                   )}
-                >
-                  {node.replayed ? 'replayed' : node.status}
-                </span>
-              </li>
-            ))}
-          </ul>
-          {run.error && <p className="mt-2 text-[11px] text-red-600">{run.error}</p>}
+                </li>
+              ))}
+            </ul>
+          )}
         </section>
-      )}
-    </aside>
+
+        {children}
+      </div>
+    </motion.aside>
   );
 }
 
@@ -3109,7 +3645,7 @@ function PendingWork({
   if (byNode.size === 0) return null;
 
   return (
-    <section className={cn('rounded-lg border p-3', RULE, PANEL)}>
+    <section className={cn('rounded-lg border p-3', RULE, SUBPANEL)}>
       <h2 className={cn('font-mono text-[10px] uppercase tracking-[0.14em]', MUTED)}>
         Still to do
       </h2>
