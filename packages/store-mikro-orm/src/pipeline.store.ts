@@ -1943,6 +1943,66 @@ export class MySqlPipelineStore
     return decodeStageRows(row.rows);
   }
 
+  /**
+   * The batch exactly as the column holds it, undecoded.
+   *
+   * Two lines shorter than `readStage` and that is the whole feature: decoding is
+   * what costs, because it rebuilds one object per row with one string key per
+   * column. The `rename` node is the only caller and it does not want objects —
+   * it wants `shapes`, which is where the column names live once. See
+   * `renameStagePayload`.
+   *
+   * `undefined` for a batch that is not there, rather than `[]`, because the two
+   * are different facts here: `readStage` can honestly say "no rows", and a
+   * payload reader cannot invent an encoding for a row that was never written.
+   */
+  async readStagePayload(ref: {
+    runId: string;
+    nodeId: string;
+    batch: number;
+  }): Promise<unknown> {
+    const em = this.em.fork();
+    const row = await em.findOne(WorkflowStageRow, {
+      id: stageKey(ref.runId, ref.nodeId, ref.batch),
+    });
+    return row?.rows;
+  }
+
+  /**
+   * The other half, and idempotent per `(runId, nodeId, batch)` exactly as
+   * {@link writeStage} is — the same statement, the same merge, the same reason.
+   *
+   * `rows` is passed rather than counted, because counting would mean decoding
+   * the payload, which is the work this pair exists to skip. The caller knows the
+   * number: it came back on {@link StageRenameResult}.
+   */
+  async writeStagePayload(input: {
+    runId: string;
+    nodeId: string;
+    batch: number;
+    payload: unknown;
+    rows: number;
+  }): Promise<{ written: number }> {
+    const em = this.em.fork();
+    await em
+      .createQueryBuilder(WorkflowStageRow)
+      .insert({
+        id: stageKey(input.runId, input.nodeId, input.batch),
+        runId: input.runId,
+        nodeId: input.nodeId,
+        batch: input.batch,
+        rows: input.payload,
+        rowCount: input.rows,
+        createdAt: new Date(),
+      })
+      .onConflict('id')
+      // The field-name form, for the reason `writeStage` gives.
+      .merge(['rows', 'rowCount'])
+      .execute();
+
+    return { written: input.rows };
+  }
+
   async dropStages(runId: string): Promise<number> {
     const em = this.em.fork();
     return em.nativeDelete(WorkflowStageRow, { runId });

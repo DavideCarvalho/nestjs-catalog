@@ -20,6 +20,8 @@ import {
   isWorkflowCallMode,
   isWorkflowFilterPredicate,
   isWorkflowNodeKind,
+  isWorkflowRenameUnnamed,
+  renameColumnRefusals,
   unreachableNodeKind,
   workflowRunOrder,
 } from '@dudousxd/nestjs-catalog';
@@ -227,6 +229,10 @@ function toNode(raw: unknown): WorkflowNode {
 
   if (kind === 'filter') {
     return toFilterNode(raw, { id, name, position });
+  }
+
+  if (kind === 'rename') {
+    return toRenameNode(raw, { id, name, position });
   }
 
   // Everything below is a source. Written as a refusal rather than as a fallthrough
@@ -533,6 +539,63 @@ function toFilterNode(
     // that comparison over whitespace. Absent stays absent: an empty list and no
     // list mean the same thing here, and storing `[]` would be a second spelling.
     narrows: Array.isArray(narrows) ? readNarrowedTypes(narrows) : undefined,
+  };
+}
+
+/**
+ * A rename node as it arrived over HTTP, refused rather than repaired.
+ *
+ * The map is checked entry by entry against `renameColumnRefusals` — the same
+ * function `validateWorkflow` and the canvas call — so a graph posted by curl and
+ * one saved from the screen are refused by one sentence. Repairing it is the one
+ * thing this must not do: dropping an unreadable entry would store a rename that
+ * silently does less than it says, and the symptom of *that* is a column of
+ * NULLs under a name somebody put in an object type on purpose.
+ *
+ * `unnamed` absent means `keep`, and is stored absent rather than normalised to
+ * the word, so there is one spelling of the default and picking up this release
+ * cannot renumber a stored graph. A value that is present and unrecognised is
+ * refused: reading it as `keep` would turn a projection into a pass-through and
+ * commit every column the author meant to remove.
+ */
+function toRenameNode(
+  raw: unknown,
+  base: { id: string; name: string; position?: { x: number; y: number } },
+): WorkflowNode {
+  const columns = readUnknown(raw, 'columns');
+  if (typeof columns !== 'object' || columns === null || Array.isArray(columns)) {
+    throw new BadRequestException(
+      `Rename node "${base.name}" (${base.id}) carries no map of columns, so there is nothing for it to rename. Send \`columns\` as an object of old name to new name.`,
+    );
+  }
+  const map: Record<string, string> = {};
+  for (const [from, to] of Object.entries(columns)) {
+    if (typeof to !== 'string') {
+      throw new BadRequestException(
+        `Rename node "${base.name}" (${base.id}) renames ${JSON.stringify(from)} to ${JSON.stringify(to)}, and a column's new name has to be a string.`,
+      );
+    }
+    map[from] = to;
+  }
+  const refusals = renameColumnRefusals(map);
+  if (refusals.length > 0) {
+    throw new BadRequestException(
+      `Rename node "${base.name}" (${base.id}) cannot be stored as it is. ${refusals.join(' ')}`,
+    );
+  }
+
+  const unnamed = readUnknown(raw, 'unnamed');
+  if (unnamed !== undefined && unnamed !== null && !isWorkflowRenameUnnamed(unnamed)) {
+    throw new BadRequestException(
+      `Rename node "${base.name}" (${base.id}) says its unnamed columns are ${JSON.stringify(unnamed)}, and the only two answers are "keep" and "drop". Reading an unrecognised one as "keep" would pass on every column this node was meant to remove.`,
+    );
+  }
+
+  return {
+    ...base,
+    kind: 'rename',
+    columns: map,
+    unnamed: unnamed === 'drop' ? 'drop' : undefined,
   };
 }
 

@@ -21,15 +21,21 @@ import {
   type WorkflowNodeOutcome,
   type WorkflowNodeStepInput,
   type WorkflowNodeStepOutput,
+  type WorkflowRenameNode,
   type WorkflowRowCountPredicate,
   type WorkflowSinkNode,
   type WorkflowSourceNode,
+  type StageRenamePlan,
   type WorkflowStageRef,
   type WorkflowTransformNode,
   applyReusableNode,
+  decodeStageRows,
   emitCatalog,
+  encodeStageRows,
   readWorkflowCallOutput,
+  renameStagePayload,
   supportsReusableNodes,
+  supportsStagePayloads,
   supportsTransformPins,
   supportsWorkflowReleases,
   supportsWorkflowStages,
@@ -40,6 +46,7 @@ import {
   workflowCallMode,
   workflowFilterMatches,
   workflowNodeRuns,
+  workflowRenameUnnamed,
   workflowRunOrder,
 } from '@dudousxd/nestjs-catalog';
 import {
@@ -507,6 +514,9 @@ export class WorkflowRunnerService {
     }
     if (node.kind === 'filter') {
       return this.runFilter(node, input, startedAt);
+    }
+    if (node.kind === 'rename') {
+      return this.runRename(node, input, startedAt);
     }
     if (node.kind === 'call') {
       // Not executable from here, and refused rather than approximated.
@@ -1480,6 +1490,126 @@ export class WorkflowRunnerService {
   }
 
   /**
+   * Renaming columns, one staged batch at a time, without decoding a row.
+   *
+   * ## Why this is not `readStage().map()`
+   *
+   * It could be, and it would be correct and about twenty times slower than it
+   * needs to be. A staged batch is a shape dictionary: the column names live
+   * once, in `shapes`, and the data lives in positional arrays that do not care
+   * what the columns are called. `readStage` decodes that into one object per
+   * row with one string key per column — which is precisely the work a rename
+   * does not need done. So this reads the **payload** and hands it to
+   * `renameStagePayload`, which rewrites `shapes` and hands the same `values`
+   * arrays back by reference.
+   *
+   * For a 103,087-row load that is tens of strings instead of a hundred thousand
+   * objects, and it is the whole reason the node exists as a kind rather than as
+   * a transform somebody writes in four lines of JavaScript.
+   *
+   * **It stops being true when `unnamed` is `drop`.** Dropping a column removes
+   * a position from every row, so `values` is rebuilt and the cost is back to
+   * O(rows). Both are supported, they are genuinely different operations, and
+   * the run log says which one happened rather than leaving it to be inferred.
+   *
+   * ## The fallback, and why it exists rather than a hard requirement
+   *
+   * `readStagePayload`/`writeStagePayload` are optional members of
+   * {@link CatalogStageStore}, so a store written against the shipped interface
+   * does not stop working when this node ships. When they are absent the rows
+   * are read, re-encoded, renamed by *the same function*, and decoded back. That
+   * round trip is the slow path and it is taken deliberately: two
+   * implementations of "what does this rename mean" is how a fallback ends up
+   * disagreeing with the fast path about a collision.
+   *
+   * ## What it never does
+   *
+   * Hold the load. It reads one batch, rewrites it, writes it, and moves on —
+   * so a `source → rename → sink` graph never has more than one batch of rows in
+   * the heap at once, and nothing here scales with the size of the load except
+   * the number of iterations. That is a property of the operation rather than of
+   * this implementation: a rename is per record and cannot aggregate, sort or
+   * deduplicate, which is exactly what a transform node cannot promise.
+   *
+   * Batch numbering is a position in the ordered list of input batches, not a
+   * running count — the rule {@link runSink} states — so a retried rename writes
+   * the same numbers over the same stage and each one replaces itself.
+   */
+  private async runRename(
+    node: WorkflowRenameNode,
+    input: WorkflowNodeStepInput,
+    startedAt: number,
+  ): Promise<WorkflowNodeStepOutput> {
+    const store = this.requireStore();
+    const logs: string[] = [];
+    const plan: StageRenamePlan = {
+      columns: new Map(Object.entries(node.columns)),
+      dropUnnamed: workflowRenameUnnamed(node) === 'drop',
+    };
+    const fast = supportsStagePayloads(store);
+
+    const matched = new Set<string>();
+    let rows = 0;
+    let batch = 0;
+    let shapesRewritten = 0;
+    // Starts true and is turned off by any batch that had to move a value, so a
+    // run whose store took the fallback path cannot report the fast one.
+    let metadataOnly = fast;
+
+    for (const ref of input.inputs) {
+      for (let number = 1; number <= ref.batches; number += 1) {
+        batch += 1;
+        const source = { runId: ref.runId, nodeId: ref.nodeId, batch: number };
+        // `readStage` answers `[]` for a batch that is not there and
+        // `readStagePayload` answers `undefined`; both mean "nothing was staged
+        // here", and both are written back as an empty batch so the tail stays
+        // aligned with what this node claims to have produced.
+        const stored = fast
+          ? await store.readStagePayload(source)
+          : encodeStageRows(await store.readStage(source));
+        if (stored === undefined) {
+          await store.writeStage({ runId: input.runId, nodeId: node.id, batch, rows: [] });
+          continue;
+        }
+
+        const renamed = renameStagePayload(stored, plan);
+        for (const column of renamed.matched) matched.add(column);
+        rows += renamed.rows;
+        shapesRewritten += renamed.shapesRewritten;
+        if (!renamed.metadataOnly) metadataOnly = false;
+
+        if (fast) {
+          await store.writeStagePayload({
+            runId: input.runId,
+            nodeId: node.id,
+            batch,
+            payload: renamed.payload,
+            rows: renamed.rows,
+          });
+        } else {
+          await store.writeStage({
+            runId: input.runId,
+            nodeId: node.id,
+            batch,
+            rows: decodeStageRows(renamed.payload),
+          });
+        }
+      }
+    }
+
+    logs.push(...renameLogLines(node, { rows, batches: batch, shapesRewritten, metadataOnly, matched }));
+    await this.clearStaleTail(input.runId, node.id, batch, logs);
+
+    return {
+      nodeId: node.id,
+      output: { runId: input.runId, nodeId: node.id, batches: batch, rowCount: rows },
+      rows,
+      elapsedMs: Date.now() - startedAt,
+      logs: safeLogLines(logs, LOG_LINES_PER_NODE),
+    };
+  }
+
+  /**
    * The only node that writes, and the only node that commits.
    *
    * It publishes through `appendRowsAsSystem` and `commitAsSystem` — the same
@@ -2154,6 +2284,54 @@ function branchSkipReason(
  * The order is the order somebody reads them in: what happened, then why fewer
  * rows survived than expected, then what it means for what is published.
  */
+/**
+ * What a rename did, including what it cost — which is the unusual part.
+ *
+ * Most nodes report what happened to the rows. This one reports **how** as
+ * well, and it has to: the whole argument for the kind is that a pure rename
+ * moves no data, and a claim like that is worth nothing if a run cannot say
+ * whether it held this time. So the line names the mechanism — shapes rewritten
+ * against rows rebuilt — and a reader who sees the second one on a node they
+ * thought was a pure rename has the answer in front of them (`unnamed: drop`, or
+ * a store that cannot hand over a payload).
+ *
+ * The unmatched columns are said out loud for the reason `property-names.ts`
+ * exists: a source column that was in **no** row is almost always a typo in a
+ * header, and its symptom is a target column that is absent everywhere, a sink
+ * that writes NULL into every row, and a green run. Not a failure, because a
+ * column that is legitimately absent from one drop is a real thing, but never
+ * silent.
+ */
+function renameLogLines(
+  node: WorkflowRenameNode,
+  outcome: {
+    rows: number;
+    batches: number;
+    shapesRewritten: number;
+    metadataOnly: boolean;
+    matched: ReadonlySet<string>;
+  },
+): string[] {
+  const named = Object.keys(node.columns);
+  const lines = [
+    `"${node.name}" renamed ${named.length} column${named.length === 1 ? '' : 's'} across ${outcome.rows} rows in ${outcome.batches} batches.`,
+    outcome.metadataOnly
+      ? `No values were moved: ${outcome.shapesRewritten} staged column list${outcome.shapesRewritten === 1 ? ' was' : 's were'} rewritten and every row's data was left exactly where it was.`
+      : workflowRenameUnnamed(node) === 'drop'
+        ? `Every row was rebuilt, because this node drops the columns it does not name — removing a column removes a position from each row, so the data has to move. Set it to keep unnamed columns if you only meant to rename.`
+        : `Every row was rebuilt, because this deployment's stage store cannot hand a batch over without decoding it. The rename is the same; only the cost is.`,
+  ];
+
+  const unmatched = named.filter((column) => !outcome.matched.has(column));
+  if (unmatched.length > 0 && outcome.rows > 0) {
+    lines.push(
+      `${unmatched.map((column) => JSON.stringify(column)).join(', ')} ${unmatched.length === 1 ? 'was' : 'were'} not found in any row, so ${unmatched.length === 1 ? 'the column it renames to is' : 'the columns they rename to are'} absent from everything this node passed on. Check the spelling against the source's own headers — a sink writing a column that is not in the record commits NULL into every row and reports success.`,
+    );
+  }
+
+  return lines;
+}
+
 function filterLogLines(
   node: WorkflowFilterNode,
   counts: { rowsIn: number; kept: number; incomparable: ReadonlyMap<string, number> },
