@@ -453,6 +453,27 @@ export function toFlowEdges(
 }
 
 /**
+ * The arrowhead, hoisted out of the edge builder — and this is a bug fix, not tidying.
+ *
+ * React Flow keeps one `<defs>` of marker definitions, derived from the markers
+ * its edges reference. `toFlowEdges` is memoised on `draft.nodes`, so **every
+ * frame of a node drag rebuilds the whole edge array**, and a fresh
+ * `{ type, width, height }` literal per edge per frame churned that registry:
+ * for the instant the defs were being rebuilt, `marker-end="url(#…)"` pointed at
+ * nothing. The line survived — it is a `path` — and the arrowhead vanished,
+ * which is exactly what somebody dragging a node reported seeing.
+ *
+ * One frozen object, referenced by every edge, gives the registry a stable
+ * identity to dedupe on. Frozen rather than merely `const` because it is now
+ * shared by every edge on the canvas, and a mutation would move all of them.
+ */
+const ARROW_END = Object.freeze({
+  type: MarkerType.ArrowClosed,
+  width: 14,
+  height: 14,
+});
+
+/**
  * One wire, drawn.
  *
  * Split out of the `map` above so the styling decisions — arrowhead, branch
@@ -481,7 +502,7 @@ function toFlowEdge(
     animated: context.flowing,
     // An arrowhead, because "the output of this feeds that" is directional and
     // a plain line says only that two nodes are related.
-    markerEnd: { type: MarkerType.ArrowClosed, width: 14, height: 14 },
+    markerEnd: ARROW_END,
     label: edge.branch,
     labelStyle: branch ? { fill: branch.text, fontSize: 10, fontWeight: 600 } : undefined,
     // The word sits on the wire, so it takes the canvas behind it rather than a
