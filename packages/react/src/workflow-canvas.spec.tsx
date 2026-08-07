@@ -48,7 +48,15 @@ import type {
   CatalogWorkflow,
 } from '@dudousxd/nestjs-catalog/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import {
+  cleanup,
+  createEvent,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { afterEach, describe, expect, it } from 'vitest';
 import { installCodeSurfaceDom } from '../../../test/jsdom-code-surface';
@@ -920,6 +928,111 @@ describe('the actions menu on a node', () => {
     await waitFor(() =>
       expect(panel('Wiring').getByText(/Nothing is wired together yet/)).toBeDefined(),
     );
+  });
+
+  /**
+   * A press, with the one field jsdom will not put on a `MouseEvent`.
+   *
+   * `event.view` is the whole reason this helper exists rather than a `fireEvent.mouseDown(pill)`
+   * call. d3-zoom's `mousedowned` reads it — `dragDisable(event.view)` dereferences
+   * `view.document` — and it does so on the line BEFORE the `nopropagation(event)` that is the
+   * actual bug. jsdom leaves `view` null on anything Testing Library constructs, so without this
+   * d3-zoom throws there, the exception is swallowed as an uncaught error, propagation continues
+   * untouched, and the press reaches React exactly as if the bug had been fixed. The test would
+   * pass on the broken code, which is the failure mode this whole file is about.
+   *
+   * It has to be assigned after construction: `new MouseEvent(type, { view })` is refused with
+   * *"member view is not of type Window"*, because the `window` this environment exposes — the
+   * same object `document.defaultView` returns — is a plain object rather than a jsdom `Window`,
+   * so jsdom's own converter rejects it. Nothing else about the event is faked.
+   */
+  function pressEvent(target: Element, type: 'mousedown' | 'mouseup'): Event {
+    const event = createEvent[type === 'mousedown' ? 'mouseDown' : 'mouseUp'](target, {
+      // floating-ui reads both: a press it cannot recognise as a primary click would fall through
+      // to `useClick`'s click path and hide the bug again.
+      button: 0,
+      detail: 1,
+    });
+    Object.defineProperty(event, 'view', { value: target.ownerDocument.defaultView });
+    return event;
+  }
+
+  /**
+   * THE REGRESSION, AND WHAT THESE TWO TESTS REALLY COVER
+   * ------------------------------------------------------
+   * Reported as "clicking Actions does nothing". It did nothing in a real browser while every
+   * test above this line was green, and the gap between those two facts is what these are for.
+   *
+   * `NodeToolbar` renders as a direct child of `.react-flow__renderer` — the element React Flow
+   * hands to d3-zoom — rather than inside the node it points at. d3-zoom's `mousedowned` opens
+   * with `nopropagation(event)`, which is `stopImmediatePropagation`, and React delegates its
+   * listeners to the ROOT container, an ancestor of that element. So the `mousedown` died before
+   * React ever saw it. Base UI's `Menu.Trigger` opens on **mousedown** (`useClick({ event:
+   * 'mousedown' })`), so the pill was inert; the trash button beside it opens on `click`, which
+   * d3-zoom leaves alone — which is why the toolbar looked half-working rather than broken.
+   *
+   * **Why the suite missed it:** `openMenuOn` above fires `click` and nothing else. With no
+   * preceding `mousedown`, floating-ui's `useClick` falls through to its click path and opens the
+   * menu — a route no pointer takes.
+   *
+   * **What the first test really exercises.** The real thing, and this was checked rather than
+   * assumed: with `nopan` removed it goes red, and it goes red for the right reason — d3-zoom is
+   * genuinely live here (`__zoom` is on the renderer), React Flow's real zoom filter runs, and it
+   * is the real `stopImmediatePropagation` that keeps the menu shut. The one prop it has to hand
+   * jsdom is `event.view`; see `pressEvent`. What it still cannot see is geometry — whether the
+   * popup lands on screen, and whether anything overlaps the pill, are browser questions, and
+   * they were answered in a browser instead. That measurement is the real evidence: before the
+   * fix, a Chrome `Input.dispatchMouseEvent` on the pill produced pointerdown/mousedown/click at
+   * `document` capture, *no* mouseup (d3-zoom takes that one on the window), and zero
+   * `[role=menu]` nodes ever added to the document.
+   *
+   * The second test names the cause rather than the symptom, so a refactor that keeps the menu
+   * openable by some other route still cannot quietly drop the guard.
+   */
+  it('opens on a press, not only on a synthetic click', async () => {
+    const { transport } = fakeTransport(answersFor([wholeWorkflow()]));
+    await openCanvas(transport);
+
+    const node = document.querySelector('.react-flow__node[aria-label^="source node, Feed"]');
+    if (!node) throw new Error('No source node on the canvas');
+    fireEvent.mouseEnter(node);
+
+    const pill = await screen.findByLabelText(/^Actions for /);
+    fireEvent(pill, pressEvent(pill, 'mousedown'));
+    fireEvent(pill, pressEvent(pill, 'mouseup'));
+
+    expect(await screen.findByRole('menu')).toBeDefined();
+  });
+
+  it('keeps the toolbar out of the canvas pan gesture', async () => {
+    // The fix, named. `nopan` is React Flow's own escape hatch: its zoom filter refuses the
+    // gesture outright when the event's target sits inside an element carrying it, so
+    // `mousedowned` returns before it stops anything and the press reaches React.
+    //
+    // Found from the pill rather than by querying the toolbar class, so a second toolbar
+    // appearing elsewhere cannot satisfy this. The edge's × wrapper in `edges.tsx` has carried
+    // the same guard since it shipped; this toolbar was the one control inside the flow without
+    // it.
+    const { transport } = fakeTransport(answersFor([wholeWorkflow()]));
+    await openCanvas(transport);
+
+    const node = document.querySelector('.react-flow__node[aria-label^="source node, Feed"]');
+    if (!node) throw new Error('No source node on the canvas');
+    fireEvent.mouseEnter(node);
+
+    const pill = await screen.findByLabelText(/^Actions for /);
+    const toolbar = pill.closest('.react-flow__node-toolbar');
+    if (!(toolbar instanceof HTMLElement)) throw new Error('The pill has no React Flow toolbar');
+    expect(toolbar.classList.contains('nopan')).toBe(true);
+
+    // And the trash button is under the same guard, which is the point of putting it on the
+    // container rather than on the pill: pressing and dragging from it used to pan the canvas
+    // too. Scoped to the toolbar because the wiring rail offers its own "Delete" labels.
+    expect(
+      within(toolbar)
+        .getByLabelText(/^Delete /)
+        .closest('.nopan'),
+    ).toBe(toolbar);
   });
 });
 
