@@ -187,6 +187,45 @@ describe('POST workflows/:id/run and a deliberate collapse', () => {
   });
 
   /**
+   * A reason that is not text is refused here, before anything is read.
+   *
+   * The field is typed `string` and was checked nowhere, so `true` travelled
+   * from the body to the sink and died there with
+   * `TypeError: expectShrink.trim is not a function` — a 500 for a plainly bad
+   * request, raised *after* the whole source had been read, renamed and
+   * filtered, because the labels are built at the write. Refusing at the
+   * boundary makes it cost nothing, and the assertion that matters as much as
+   * the 400 is that the launcher was never called at all.
+   */
+  it('refuses a reason that is not text, and refuses it before the run opens', async () => {
+    await request(app.getHttpServer())
+      .post('/catalog/pipeline/workflows/w1/run')
+      .send({ snapshotId: 's1', expectShrink: true })
+      .expect(400);
+
+    expect(spy.calls).toEqual([]);
+  });
+
+  it('says what was sent and what a reason is', async () => {
+    const response = await request(app.getHttpServer())
+      .post('/catalog/pipeline/workflows/w1/run')
+      .send({ expectShrink: 42 });
+
+    expect(response.status).toBe(400);
+    expect(response.body.message).toContain('42');
+    expect(response.body.message).toContain('a reason is text');
+  });
+
+  it('refuses null too, which is neither absent nor a reason', async () => {
+    await request(app.getHttpServer())
+      .post('/catalog/pipeline/workflows/w1/run')
+      .send({ snapshotId: 's1', expectShrink: null })
+      .expect(400);
+
+    expect(spy.calls).toEqual([]);
+  });
+
+  /**
    * The route that used to carry this is gone, and that has to stay asserted.
    *
    * If `POST connectors/:id/run` ever came back it would be a second way to run
