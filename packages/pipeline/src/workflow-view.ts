@@ -175,7 +175,14 @@ function toNode(raw: unknown): WorkflowNode {
         `Transform node "${name}" (${id}) names no transform, so there would be no code for it to run.`,
       );
     }
-    return { id, name, kind, transformId, position };
+    return {
+      id,
+      name,
+      kind,
+      transformId,
+      transformVersion: readVersion(raw, 'transformVersion', { id, name }),
+      position,
+    };
   }
 
   if (kind === 'sink') {
@@ -194,7 +201,15 @@ function toNode(raw: unknown): WorkflowNode {
     // coordinates answers 201 and drops them. The read is already done above for
     // every node, so this was one branch forgetting to hand it back rather than
     // a decision about sinks.
-    return { id, name, kind, targetType: type, mode: readMode(raw), position };
+    return {
+      id,
+      name,
+      kind,
+      targetType: type,
+      mode: readMode(raw),
+      ...readReuse(raw, { id, name }),
+      position,
+    };
   }
 
   const config = readRecord(raw, 'config');
@@ -241,8 +256,72 @@ function toNode(raw: unknown): WorkflowNode {
     connectionId: readString(raw, 'connectionId'),
     secretEnvVar: readString(raw, 'secretEnvVar'),
     mode: readMode(raw),
+    ...readReuse(raw, { id, name }),
     position,
   };
+}
+
+/**
+ * The reusable reference a node arrived carrying, refused rather than dropped.
+ *
+ * Both halves, because both are silent when they go missing. A `useId` that this
+ * boundary quietly dropped would store a node that looks identical and is not
+ * the same node: the graph would keep running, and it would stop appearing in
+ * the count of what uses that reusable node — so the next person editing it
+ * would be told nobody was downstream. And a dropped `useVersion` turns a pinned
+ * node into one that follows the latest, which is exactly the substitution the
+ * pin exists to prevent, arrived at by a payload passing through a version of
+ * this file that had not heard of it.
+ *
+ * Spread into the node rather than assigned, so a node with no reference carries
+ * no keys at all. `{ useId: undefined }` and `{}` are the same object to
+ * `validateWorkflow` and different ones to `JSON.stringify`, and the second is
+ * what lands in the column.
+ */
+function readReuse(
+  raw: unknown,
+  base: { id: string; name: string },
+): { useId?: string; useVersion?: number } {
+  const useId = readString(raw, 'useId');
+  const useVersion = readVersion(raw, 'useVersion', base);
+  if (useId === undefined) {
+    if (useVersion !== undefined) {
+      throw new BadRequestException(
+        `Node "${base.name}" (${base.id}) is pinned to version ${useVersion} but names no reusable node, so there is nothing for that version to be a version of. Either name one or drop the pin.`,
+      );
+    }
+    return {};
+  }
+  return useVersion === undefined ? { useId } : { useId, useVersion };
+}
+
+/**
+ * A version pin, refused unless it is a whole number of at least one.
+ *
+ * The same refusal `validateWorkflow` makes, made here as well for the reason
+ * {@link toRowCountPredicate} gives about its threshold: a draft is stored
+ * without validating, and a pin arriving as the *string* `"3"` — which is what
+ * an unparsed form field is — matches no stored version, so it would be
+ * discovered by a run that stops halfway through a load rather than by the
+ * person who typed it.
+ *
+ * `null` is folded in with absent, because that is what a JSON round trip of an
+ * unset optional field produces, and absent means "follow the latest" — which is
+ * what every node in every deployment does today.
+ */
+function readVersion(
+  raw: unknown,
+  key: string,
+  base: { id: string; name: string },
+): number | undefined {
+  const found = readUnknown(raw, key);
+  if (found === undefined || found === null) return undefined;
+  if (typeof found !== 'number' || !Number.isInteger(found) || found < 1) {
+    throw new BadRequestException(
+      `Node "${base.name}" (${base.id}) carries a ${key} of ${JSON.stringify(found)}, and a version is a whole number of at least 1. Leave it out for the node to follow the latest; a pin no stored version can equal would fail this node partway through a load.`,
+    );
+  }
+  return found;
 }
 
 /**

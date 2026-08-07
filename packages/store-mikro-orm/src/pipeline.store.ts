@@ -3,6 +3,8 @@ import type {
   CatalogConnection,
   CatalogConnector,
   CatalogPipelineStore,
+  CatalogReusableNode,
+  CatalogReusableNodeUse,
   CatalogRevision,
   CatalogSecretVault,
   CatalogStageStore,
@@ -13,6 +15,7 @@ import type {
   ConnectorKind,
   ConnectorRun,
   DeleteReconciliation,
+  ReusableNodeBody,
   RowCountBound,
   SealedSecret,
   SecretContext,
@@ -22,19 +25,24 @@ import type {
   WorkflowExecutionMode,
   WorkflowNode,
   WorkflowNodeOutcome,
+  WorkflowSinkNode,
   WorkflowSourceNode,
   WorkflowStatus,
 } from '@dudousxd/nestjs-catalog';
 import {
+  CATALOG_REVISION_LIMIT,
   CATALOG_SECRET_VAULT,
   RefusingSecretVault,
   SecretOpenFailedError,
   SecretSealFailedError,
   SecretVaultNotConfiguredError,
+  applyReusableNode,
   decodeStageRows,
   emitCatalog,
   encodeStageRows,
   isConnectorKind,
+  isReusableNodeBody,
+  isReusableNodeKind,
   isSealedSecret,
   isTransformLanguage,
   isWorkflowBranchLabel,
@@ -63,14 +71,16 @@ import {
   ConnectorRow,
   ConnectorRunRow,
   LoadExpectationRow,
+  ReusableNodeRow,
   TransformRow,
   WorkflowRow,
   WorkflowStageRow,
 } from './entities/pipeline';
-import { CATALOG_STORE_OPTIONS, type CatalogStoreModuleOptions } from './options';
 // One revision table, so one implementation of what a revision costs. See the
 // block those are declared under: a second copy of the retention rule in this
 // file is how the two subjects end up keeping different amounts of history.
+import { RevisionRow, revisionKey } from './entities/workspace';
+import { CATALOG_STORE_OPTIONS, type CatalogStoreModuleOptions } from './options';
 import { pruneRevisions, readRevisions, recordRevision } from './workspace.store';
 
 @Injectable()
@@ -818,6 +828,311 @@ export class MySqlPipelineStore
     });
   }
 
+  /**
+   * The code at one version, which is what a pinned transform node runs.
+   *
+   * A primary-key read of `catalog_revision` rather than a filter over
+   * {@link listTransformRevisions}, because this is on the hot path of every
+   * pinned node of every run and that method reads up to
+   * `CATALOG_REVISION_LIMIT` whole code bodies to keep one of them.
+   *
+   * The fall-back is the current row, and **only when the version matches it**.
+   * That is the same equivalence `readRevisions` relies on for a subject that
+   * predates the archive — the synthesised head is byte-for-byte what the next
+   * save's backfill will store — narrowed to the one case where it is a fact
+   * rather than a guess. Any other version answers `undefined`, which the runner
+   * turns into a failed node: a pin that cannot be produced must not quietly
+   * become the latest, which is the substitution the pin exists to prevent.
+   */
+  async getTransformAt(id: string, version: number): Promise<CatalogTransform | undefined> {
+    const em = this.em.fork();
+    const row = await em.findOne(TransformRow, { id });
+    if (!row) return undefined;
+    if (row.version === version) return toTransform(row);
+    const revision = await em.findOne(RevisionRow, {
+      id: revisionKey('transform', id, version),
+    });
+    if (!revision) return undefined;
+    // The body of that version over the row's current metadata. The name and the
+    // language are not versioned — only the code is — so this is the row as it
+    // is, showing the code as it was, which is exactly what a run at that
+    // version executed.
+    return { ...toTransform(row), version, code: revision.body };
+  }
+
+  /* --- reusable nodes --------------------------------------------------- */
+
+  async listReusableNodes(): Promise<CatalogReusableNode[]> {
+    const em = this.em.fork();
+    const rows = await em.find(ReusableNodeRow, {}, { orderBy: { name: 'asc' } });
+    const opened: CatalogReusableNode[] = [];
+    // Sequentially, for the reason `withOpenConfigs` gives: a vault is a network
+    // call to somebody else's rate limit, and a `Promise.all` over a list turns
+    // one page load into a burst.
+    for (const row of rows) opened.push(await this.withOpenBody(toReusableNode(row)));
+    return opened;
+  }
+
+  async getReusableNode(id: string): Promise<CatalogReusableNode | undefined> {
+    const em = this.em.fork();
+    const row = await em.findOne(ReusableNodeRow, { id });
+    return row ? this.withOpenBody(toReusableNode(row)) : undefined;
+  }
+
+  /** The body at one version. The sibling of {@link getTransformAt}, same contract. */
+  async getReusableNodeAt(id: string, version: number): Promise<CatalogReusableNode | undefined> {
+    const em = this.em.fork();
+    const row = await em.findOne(ReusableNodeRow, { id });
+    if (!row) return undefined;
+    if (row.version === version) return this.withOpenBody(toReusableNode(row));
+    const revision = await em.findOne(RevisionRow, {
+      id: revisionKey('reusable-node', id, version),
+    });
+    if (!revision) return undefined;
+    const body = readReusableBody(parseJson(revision.body), id, version);
+    // The name and the description are not versioned — only the body is — so a
+    // pinned graph shows the library's current name for the thing beside the
+    // body it actually runs. Renaming a reusable node is deliberately not a new
+    // version of it; see `ReusableNodeRow.version`.
+    return this.withOpenBody({ ...toReusableNode(row), version, body });
+  }
+
+  /**
+   * Save a node body under a name. Bumps the version when the **body** changed.
+   *
+   * ## Why the comparison is made on the plaintext
+   *
+   * The body is sealed on the way into the column, and a seal is not
+   * deterministic — the same URL seals to different ciphertext every time. So a
+   * comparison against the stored column would report a change on every save,
+   * inflating the version and making every pin to it meaningless within a day.
+   * The stored body is therefore opened and compared as authored, which is the
+   * same rule `saveWorkflow` follows when it hashes the graph *before* sealing,
+   * and for the identical reason.
+   *
+   * The cost is one vault open per save of a reusable node holding a credential.
+   * Saves are a person pressing a button; this is not a hot path.
+   *
+   * ## What is archived, and when
+   *
+   * Exactly what `saveTransform` archives, in the same table, through the same
+   * helpers: on create, the first body as version 1; on a change, both the
+   * superseded version and the new one. The superseded write is the upgrade path
+   * for a row that predates the archive and is a no-op from the second edit
+   * onwards, because `recordRevision` leaves an already-recorded version alone.
+   *
+   * The **sealed** body is what goes into the revision, not the plaintext. A
+   * revision is a row in the same database as everything else here, and an
+   * archive that stored credentials in the clear would hand a dump exactly what
+   * sealing exists to withhold.
+   */
+  async saveReusableNode(
+    input: Pick<CatalogReusableNode, 'name' | 'body'> & { id?: string; description?: string },
+    createdBy: string,
+  ): Promise<CatalogReusableNode> {
+    if (!isReusableNodeBody(input.body)) {
+      throw new BadRequestException(
+        `"${input.name}" was saved with a body this service cannot execute. A reusable node stands for a source — which needs a source kind and a config — or for a sink, which needs the object type it commits.`,
+      );
+    }
+    const em = this.em.fork();
+    const existing = input.id ? await em.findOne(ReusableNodeRow, { id: input.id }) : null;
+    await assertNameIsFree(em, input.name, existing);
+
+    const id = input.id ?? randomUUID();
+    const body = input.body;
+    // Read and opened before anything below writes, which is the whole reason it
+    // is a copy: `row` IS `existing`, so one line later there is nowhere left to
+    // read the superseded body from.
+    const superseded = existing
+      ? {
+          version: existing.version,
+          body: existing.body,
+          at: existing.updatedAt,
+          authored: await this.openReusableBody(toReusableNode(existing)),
+        }
+      : undefined;
+    const bodyChanged =
+      superseded !== undefined &&
+      canonicalReusableBody(superseded.authored) !== canonicalReusableBody(body);
+
+    const sealed = await this.sealReusableBody(body, id);
+    this.assertNoNewPlaintextCredential(
+      bodyConfig(sealed),
+      superseded
+        ? bodyConfig(readReusableBody(superseded.body, id, superseded.version))
+        : undefined,
+      `"${input.name}"`,
+    );
+
+    const row =
+      existing ??
+      em.create(ReusableNodeRow, {
+        id,
+        name: input.name,
+        kind: body.kind,
+        body: {},
+        version: 1,
+        createdBy,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+    row.name = input.name;
+    row.description = input.description;
+    row.kind = body.kind;
+    row.body = { ...sealed };
+    if (bodyChanged) row.version += 1;
+
+    em.persist(row);
+    if (!existing) {
+      await recordRevision(em, {
+        subject: 'reusable-node',
+        subjectId: row.id,
+        version: row.version,
+        body: JSON.stringify(row.body),
+        authoredBy: createdBy,
+        authoredAt: row.updatedAt,
+      });
+    } else if (bodyChanged && superseded) {
+      // Attributed to the row's `createdBy` and dated to when it was last
+      // written, for the reason `saveTransform` gives one method along: that is
+      // who created it rather than who last edited it, the row keeps no second
+      // actor, and recording the current editor would name somebody who
+      // demonstrably did not author this body.
+      await recordRevision(em, {
+        subject: 'reusable-node',
+        subjectId: row.id,
+        version: superseded.version,
+        body: JSON.stringify(superseded.body),
+        authoredBy: row.createdBy,
+        authoredAt: superseded.at,
+      });
+      await recordRevision(em, {
+        subject: 'reusable-node',
+        subjectId: row.id,
+        version: row.version,
+        body: JSON.stringify(row.body),
+        authoredBy: createdBy,
+        authoredAt: new Date(),
+      });
+    }
+    await em.flush();
+    // After the flush, so it counts what was just written. See `pruneRevisions`.
+    if (!existing || bodyChanged) await pruneRevisions(em, 'reusable-node', row.id);
+
+    if (!existing || bodyChanged) {
+      emitCatalog('reusable-node.changed', {
+        reusableNodeId: row.id,
+        name: row.name,
+        kind: row.kind,
+        version: row.version,
+        changedBy: createdBy,
+      });
+    }
+
+    // The body the caller authored, not the sealed one. Handing back ciphertext
+    // is how a console round trip writes `[object Object]` over a password — the
+    // failure `openCredentials` documents in full.
+    return { ...toReusableNode(row), body };
+  }
+
+  /**
+   * Refuses while any graph still uses it.
+   *
+   * The same refusal `deleteConnection` makes, with the same reasoning and the
+   * same shape of message: deleting one out from under its graphs turns each of
+   * them into a load that fails at run time, discovered on a schedule rather
+   * than at the moment somebody decided.
+   *
+   * **Leaves its revisions**, exactly as `deleteTransform` does. A pinned graph
+   * that is deleted after this one would otherwise take the only remaining copy
+   * of a body with it, and they are bounded per subject either way.
+   */
+  async deleteReusableNode(id: string): Promise<boolean> {
+    const uses = await this.reusableNodeUses(id);
+    if (uses.length > 0) {
+      const named = uses
+        .slice(0, 5)
+        .map((use) => `"${use.workflowName}" (node "${use.nodeName}")`)
+        .join(', ');
+      throw new BadRequestException(
+        `${uses.length} ${uses.length === 1 ? 'graph uses' : 'graphs use'} this reusable node: ${named}${uses.length > 5 ? `, and ${uses.length - 5} more` : ''}. Point them elsewhere before deleting it, or their next run fails with a node that stands for nothing.`,
+      );
+    }
+    const em = this.em.fork();
+    return (await em.nativeDelete(ReusableNodeRow, { id })) > 0;
+  }
+
+  /**
+   * Which graphs use a reusable node, and at which node within each.
+   *
+   * A scan of `catalog_workflow` reading the stored node arrays, which is
+   * bounded by the number of graphs a deployment has authored and never by
+   * anything that grows with data. A `JSON_CONTAINS` predicate would push it
+   * into MySQL and is not worth the portability: this store's own tests run
+   * against a container and a host may point it at anything MikroORM's MySQL
+   * driver speaks.
+   *
+   * On the store rather than derived in a controller from `listWorkflows`,
+   * which is how `connections/:id/workflows` answers the same question one
+   * object over. The difference is what that method does on the way out: it
+   * **opens every sealed credential in every graph**, one vault round trip per
+   * sealed value. This reads the rows and never opens anything, because a
+   * reference is an id and counting ids needs no plaintext. A count rendered
+   * beside every entry of a picker cannot cost a burst of KMS calls.
+   *
+   * Several nodes of one graph using the same reusable node produce several
+   * entries, unlike `connections/:id/workflows`, which reports a graph once.
+   * That is deliberate and it is the difference between the two questions:
+   * deleting a connection breaks a graph exactly once, but "how many places use
+   * this node" is asked by somebody about to edit it, and three nodes in one
+   * graph are three places it lands.
+   */
+  async reusableNodeUses(id: string): Promise<CatalogReusableNodeUse[]> {
+    const em = this.em.fork();
+    const rows = await em.find(WorkflowRow, {}, { orderBy: { name: 'asc' } });
+    const uses: CatalogReusableNodeUse[] = [];
+    for (const row of rows) {
+      for (const raw of row.nodes) {
+        if (!isWorkflowNode(raw)) continue;
+        if (raw.kind !== 'source' && raw.kind !== 'sink') continue;
+        if (raw.useId !== id) continue;
+        uses.push({
+          workflowId: row.id,
+          workflowName: row.name,
+          status: narrowStatus(row.status, row.id),
+          nodeId: raw.id,
+          nodeName: raw.name,
+          pinnedVersion: raw.useVersion,
+        });
+      }
+    }
+    return uses;
+  }
+
+  /** One reusable node, with its body's credential opened. */
+  private async withOpenBody(node: CatalogReusableNode): Promise<CatalogReusableNode> {
+    const body = await this.openReusableBody(node);
+    return body === node.body ? node : { ...node, body };
+  }
+
+  private async openReusableBody(node: CatalogReusableNode): Promise<ReusableNodeBody> {
+    if (node.body.kind !== 'source') return node.body;
+    const config = await this.openCredentials(node.body.config, 'reusable-node', node.id);
+    return config === node.body.config ? node.body : { ...node.body, config };
+  }
+
+  private async sealReusableBody(
+    body: ReusableNodeBody,
+    id: string,
+  ): Promise<Record<string, unknown>> {
+    if (body.kind !== 'source') return { ...body };
+    return {
+      ...body,
+      config: await this.sealCredentials(body.config, 'reusable-node', id),
+    };
+  }
+
   async listWorkflows(): Promise<CatalogWorkflow[]> {
     const em = this.em.fork();
     const rows = await em.find(WorkflowRow, {}, { orderBy: { name: 'asc' } });
@@ -886,7 +1201,6 @@ export class MySqlPipelineStore
     },
     createdBy: string,
   ): Promise<CatalogWorkflow> {
-    const nodes = input.nodes ?? [];
     const edges = input.edges ?? [];
 
     const em = this.em.fork();
@@ -894,6 +1208,14 @@ export class MySqlPipelineStore
     // A new graph starts as a draft. An existing one keeps the status it has —
     // a save is an edit, never a promotion, and never a demotion either.
     const status = existing ? narrowStatus(existing.status, existing.id) : 'draft';
+
+    // Before everything below, because everything below reads the node's own
+    // fields: the validator, the sink's type, the hash and the seal. See
+    // `resolveReusableNodes` on why the resolved fields are stored beside the
+    // reference rather than instead of it.
+    const nodes = await resolveReusableNodes(em, input.nodes ?? [], (node) =>
+      this.withOpenBody(node),
+    );
 
     assertStaysRunnable(status, { nodes, edges }, input.name);
 
@@ -2053,7 +2375,205 @@ async function assertTransformsExist(em: EntityManager, nodes: WorkflowNode[]): 
         `Node "${node.name}" (${node.id}) runs transform ${node.transformId}, which does not exist. Saving it would leave a graph that fails partway through a load rather than at the moment it was drawn.`,
       );
     }
+    if (node.transformVersion === undefined) continue;
+    if (node.transformVersion === transform.version) continue;
+    const pinned = await em.findOne(RevisionRow, {
+      id: revisionKey('transform', node.transformId, node.transformVersion),
+    });
+    if (!pinned) {
+      throw new BadRequestException(
+        `Node "${node.name}" (${node.id}) is pinned to v${node.transformVersion} of transform "${transform.name}", and that version's code can no longer be produced — it either predates this catalog's revision archive or has been superseded more than ${CATALOG_REVISION_LIMIT} times. A pin nobody can resolve fails halfway through a load, so it is refused here instead. Pin a version the history still holds, or leave it unset to follow the latest (v${transform.version}).`,
+      );
+    }
   }
+}
+
+/**
+ * Every node that names a reusable one, with that node's body folded on.
+ *
+ * ## Why the fold happens at save time as well as at run time
+ *
+ * Because the rest of this file reads the node's own fields and has to keep
+ * being allowed to. `targetTypeOf` lifts the sink's type into an indexed column;
+ * `assertStaysRunnable` runs the pure validator; the canvas draws the node
+ * without a round trip. Storing a node that carried only a `useId` would make
+ * every one of those a lookup, and the pure validator could not do it at all.
+ *
+ * So what is stored is the reference **and** the resolved fields, and the fields
+ * are a cache rather than a copy — the same arrangement `toGraph` already
+ * documents for a source that names a connector, with the same consequence:
+ * execution re-reads the stored object, so an edit reaches an unpinned graph on
+ * its next run. The reference is what survives, which is what makes
+ * {@link MySqlPipelineStore.reusableNodeUses} exact rather than a guess at which
+ * configurations look alike.
+ *
+ * ## Refused rather than dropped
+ *
+ * A reference to a reusable node that does not exist is a 400 at save time, for
+ * the reason `assertTransformsExist` gives: a graph that fails at the moment it
+ * was drawn is fixable, and one that fails partway through a scheduled load at
+ * three in the morning is an incident. A pin to a version the archive can no
+ * longer produce is refused for the same reason and with the same wording.
+ */
+async function resolveReusableNodes(
+  em: EntityManager,
+  nodes: WorkflowNode[],
+  open: (node: CatalogReusableNode) => Promise<CatalogReusableNode>,
+): Promise<WorkflowNode[]> {
+  // Returns the array it was handed when nothing references anything, so every
+  // graph in every deployment today takes exactly the path it takes now.
+  if (!nodes.some(referencesReusableNode)) return nodes;
+  const resolved: WorkflowNode[] = [];
+  for (const node of nodes) {
+    if (!referencesReusableNode(node)) {
+      resolved.push(node);
+      continue;
+    }
+    const row = await em.findOne(ReusableNodeRow, { id: node.useId });
+    if (!row) {
+      throw new BadRequestException(
+        `Node "${node.name}" (${node.id}) uses reusable node ${node.useId}, which does not exist. Saving it would leave a graph whose node stands for nothing, failing partway through a load rather than at the moment it was drawn.`,
+      );
+    }
+    const held = await open(toReusableNode(row));
+    const body = await bodyAtVersion(em, held, node.useVersion, node);
+    // `applyReusableNode` throws a plain `Error` on a kind mismatch or on a sink
+    // whose type has moved, because it is pure and lives in a package that knows
+    // nothing about HTTP. Both are things the caller did, so they are re-thrown
+    // as the 400 they are rather than surfacing as a 500 about an internal fold.
+    try {
+      resolved.push(applyReusableNode(node, body));
+    } catch (error) {
+      throw new BadRequestException(error instanceof Error ? error.message : String(error));
+    }
+  }
+  return resolved;
+}
+
+/** The pinned body, or the current one when the reference follows the latest. */
+async function bodyAtVersion(
+  em: EntityManager,
+  held: CatalogReusableNode,
+  version: number | undefined,
+  node: WorkflowNode,
+): Promise<ReusableNodeBody> {
+  if (version === undefined || version === held.version) return held.body;
+  const revision = await em.findOne(RevisionRow, {
+    id: revisionKey('reusable-node', held.id, version),
+  });
+  if (!revision) {
+    throw new BadRequestException(
+      `Node "${node.name}" (${node.id}) is pinned to v${version} of reusable node "${held.name}", and that version can no longer be produced — it either predates this catalog's revision archive or has been superseded more than ${CATALOG_REVISION_LIMIT} times. A pin nobody can resolve fails halfway through a load, so it is refused here instead. Pin a version the history still holds, or leave it unset to follow the latest (v${held.version}).`,
+    );
+  }
+  return readReusableBody(parseJson(revision.body), held.id, version);
+}
+
+/**
+ * Whether this node names a reusable one, narrowed off the union.
+ *
+ * Written as a narrowing over `kind` rather than as a property check, so a node
+ * kind that becomes reusable without gaining the fields is a type error here
+ * instead of a check that quietly answers `false` forever.
+ */
+function referencesReusableNode(
+  node: WorkflowNode,
+): node is (WorkflowSourceNode | WorkflowSinkNode) & { useId: string } {
+  if (node.kind !== 'source' && node.kind !== 'sink') return false;
+  return typeof node.useId === 'string' && node.useId.length > 0;
+}
+
+/**
+ * Refuse a name another reusable node already holds.
+ *
+ * The column is `@Unique` as well, and this is not a duplicate of it: the
+ * constraint is what makes the state unreachable, and this is what makes the
+ * refusal a sentence naming the row that holds the name — which is the only
+ * thing somebody staring at a form can act on. A driver-level duplicate-key
+ * error names an index.
+ */
+async function assertNameIsFree(
+  em: EntityManager,
+  name: string,
+  existing: ReusableNodeRow | null,
+): Promise<void> {
+  const taken = await em.findOne(ReusableNodeRow, { name });
+  if (!taken || taken.id === existing?.id) return;
+  throw new BadRequestException(
+    `There is already a reusable node called "${name}" (${taken.id}). They are picked by name when somebody adds a node, so two with the same one is a list nobody can choose from.`,
+  );
+}
+
+function toReusableNode(row: ReusableNodeRow): CatalogReusableNode {
+  return {
+    id: row.id,
+    name: row.name,
+    description: row.description,
+    kind: narrow(row.kind, isReusableNodeKind, 'Reusable node kind', row.id),
+    body: readReusableBody(row.body, row.id, row.version),
+    version: row.version,
+    createdBy: row.createdBy,
+    createdAt: row.createdAt.toISOString(),
+    updatedAt: row.updatedAt.toISOString(),
+  };
+}
+
+/**
+ * A stored body, narrowed rather than asserted.
+ *
+ * Throws on anything this build cannot read, for the reason `WorkflowRow.nodes`
+ * is narrowed node by node: folding an unreadable body onto a node as nothing at
+ * all would leave a node running whatever was cached on it while the console
+ * claims it is an instance of the library's — which is the silent substitution
+ * this whole feature is arranged against.
+ */
+function readReusableBody(value: unknown, id: string, version: number): ReusableNodeBody {
+  if (isReusableNodeBody(value)) return value;
+  throw new Error(
+    `Reusable node ${id} holds a v${version} body this build cannot read. It was written by a different version of this package, and folding it onto a node as nothing would leave that node running whatever it happened to be carrying.`,
+  );
+}
+
+function parseJson(body: string): unknown {
+  try {
+    return JSON.parse(body);
+  } catch {
+    // Answering `undefined` rather than rethrowing, so the refusal comes from
+    // `readReusableBody` and names the reusable node and the version — which is
+    // what an operator can act on — instead of a `SyntaxError` about position 41.
+    return undefined;
+  }
+}
+
+/**
+ * The body as one canonical string, for deciding whether a save changed it.
+ *
+ * Keys sorted at both levels, so a console that rewrites the object in a
+ * different order does not register as an edit and bump a version that graphs
+ * have pinned. The same rule and the same reason as `sortedEntries` inside
+ * `workflowGraphHash`.
+ */
+function canonicalReusableBody(body: ReusableNodeBody): string {
+  return JSON.stringify(body, Object.keys(flatten(body)).sort());
+}
+
+/** Every key that appears anywhere in the body, so `JSON.stringify`'s replacer sees them all. */
+function flatten(value: unknown, into: Record<string, true> = {}): Record<string, true> {
+  if (typeof value !== 'object' || value === null) return into;
+  for (const [key, nested] of Object.entries(value)) {
+    into[key] = true;
+    flatten(nested, into);
+  }
+  return into;
+}
+
+/** A source body's config, or `undefined` for a sink. Feeds the plaintext refusal. */
+function bodyConfig(body: ReusableNodeBody | Record<string, unknown>): Record<string, unknown> {
+  const config = Reflect.get(body, 'config');
+  if (typeof config !== 'object' || config === null || Array.isArray(config)) return {};
+  const record: Record<string, unknown> = {};
+  for (const key of Object.keys(config)) record[key] = Reflect.get(config, key);
+  return record;
 }
 
 /**

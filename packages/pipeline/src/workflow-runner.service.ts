@@ -1,9 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import {
   CATALOG_PIPELINE_STORE,
+  CATALOG_REVISION_LIMIT,
   type CatalogConnector,
   type CatalogPipelineStore,
   type CatalogStageStore,
+  type CatalogTransform,
   type CatalogWorkflow,
   type CatalogWorkflowStore,
   type ConnectorRun,
@@ -23,8 +25,11 @@ import {
   type WorkflowSourceNode,
   type WorkflowStageRef,
   type WorkflowTransformNode,
+  applyReusableNode,
   emitCatalog,
   readWorkflowCallOutput,
+  supportsReusableNodes,
+  supportsTransformPins,
   supportsWorkflowStages,
   supportsWorkflows,
   unreachableNodeKind,
@@ -1146,12 +1151,7 @@ export class WorkflowRunnerService {
     startedAt: number,
   ): Promise<WorkflowNodeStepOutput> {
     const logs: string[] = [];
-    const transform = await this.requireStore().getTransform(node.transformId);
-    if (!transform) {
-      throw new NotFoundException(
-        `Node "${node.name}" runs transform ${node.transformId}, which is gone. A node pointing at code that no longer exists must fail rather than pass its input through under a shape nobody chose.`,
-      );
-    }
+    const transform = await this.resolveTransform(node);
 
     // Everything at once, because that is the transform contract: the code is a
     // function over a batch of records precisely so that it can deduplicate,
@@ -1383,13 +1383,19 @@ export class WorkflowRunnerService {
    * rows arrive rather than two to keep in agreement.
    */
   private async runSink(
-    node: WorkflowSinkNode,
+    drawn: WorkflowSinkNode,
     workflow: CatalogWorkflow,
     input: WorkflowNodeStepInput,
     startedAt: number,
   ): Promise<WorkflowNodeStepOutput> {
     const logs: string[] = [];
     const store = this.requireStore();
+    // Resolved before anything is written, and `applyReusableNode` refuses a
+    // body whose `targetType` has moved away from the one on the node. So the
+    // type this commits into is always the type the graph was grant-checked
+    // against when it was saved — a shared sink cannot repoint a load into a
+    // type nobody here was granted, and the attempt fails naming both.
+    const node = await this.applyReuse(drawn);
     const labels = sinkLabels(workflow.name, input.expectShrink);
     if (labels[EXPECT_SHRINK_LABEL]) {
       // Said in the run's own log, because the label lives on the snapshot and
@@ -1616,7 +1622,18 @@ export class WorkflowRunnerService {
     node: WorkflowSourceNode,
   ): Promise<{ connector: CatalogConnector; owner?: CatalogConnector }> {
     const store = this.requireStore();
-    const named = node.config.connectorId;
+    // Before the connector and the connection are folded in, because the
+    // reusable body is what says which connector or connection this node reads
+    // through. Resolved now rather than trusted off the node, which is the same
+    // rule `applyConnection` follows one line down and for the same reason: an
+    // edit to a shared node has to take effect on the next run, and that is the
+    // whole point of naming one once.
+    // `read` rather than `node` from here down: everything about *what this
+    // reads* comes off the resolved node, and only its identity — the id, which
+    // is the durable step name, and the name, which is cosmetic and the graph's
+    // — comes off the node as drawn.
+    const read = await this.applyReuse(node);
+    const named = read.config.connectorId;
     const now = new Date().toISOString();
 
     if (typeof named === 'string' && named.length > 0) {
@@ -1635,38 +1652,137 @@ export class WorkflowRunnerService {
         );
       }
       const resolved = applyConnection(owner, connection);
-      const { connectorId: _ignored, ...overrides } = node.config;
+      const { connectorId: _ignored, ...overrides } = read.config;
       return {
         connector: {
           ...resolved,
           config: { ...resolved.config, ...overrides },
-          secretEnvVar: node.secretEnvVar ?? resolved.secretEnvVar,
+          secretEnvVar: read.secretEnvVar ?? resolved.secretEnvVar,
         },
         owner,
       };
     }
 
-    const connection = node.connectionId ? await store.getConnection(node.connectionId) : undefined;
-    if (node.connectionId && !connection) {
+    const connection = read.connectionId ? await store.getConnection(read.connectionId) : undefined;
+    if (read.connectionId && !connection) {
       throw new NotFoundException(
-        `Source "${node.name}" reads through a connection that no longer exists (${node.connectionId}).`,
+        `Source "${node.name}" reads through a connection that no longer exists (${read.connectionId}).`,
       );
     }
     const inline: CatalogConnector = {
       id: node.id,
       name: node.name,
-      kind: node.sourceKind,
+      kind: read.sourceKind,
       targetType: '',
-      config: node.config,
-      connectionId: node.connectionId,
-      secretEnvVar: node.secretEnvVar,
-      mode: node.mode,
+      config: read.config,
+      connectionId: read.connectionId,
+      secretEnvVar: read.secretEnvVar,
+      mode: read.mode,
       enabled: true,
       createdBy: 'workflow',
       createdAt: now,
       updatedAt: now,
     };
     return { connector: applyConnection(inline, connection) };
+  }
+
+  /**
+   * The reusable body this node stands for, folded on — or the node unchanged.
+   *
+   * ## Why this happens at run time and not only at save time
+   *
+   * `MySqlPipelineStore.saveWorkflow` already folds, so the stored node carries
+   * resolved fields and everything that reads them keeps working. Those fields
+   * are a **cache**. This is the read of record, and the difference between the
+   * two is the whole reason a reusable node is worth having: a graph that
+   * follows the latest picks up an edit to "the nightly warehouse pull" on its
+   * next run, without four graphs each needing to be opened and re-saved. That
+   * is the identical rule `resolveSourceNode` states for a connector one method
+   * up — "execution re-reads the connector, so an edited connector takes effect
+   * on the next run".
+   *
+   * A **pinned** reference resolves the version it named, and if that version
+   * can no longer be produced the node fails. It does not fall back to the
+   * latest. That is the stand `WorkflowRunSteps.checkCall` takes about a call's
+   * version, in the same words: a pin nobody could honour is not a pin, and
+   * running the newest thing available while the graph says otherwise is exactly
+   * the substitution somebody wrote the pin down to prevent.
+   *
+   * ## And why a missing reusable node is fatal rather than a fall-back
+   *
+   * The node still carries the cached fields, so "just use those" is available
+   * and is wrong. The graph says this node is an instance of something; if that
+   * something is gone, what the node would run is a stale copy nobody can see or
+   * edit, on a schedule. `deleteReusableNode` refuses while any graph references
+   * one, so reaching this is already a repair job — and it should look like one.
+   */
+  private async applyReuse<T extends WorkflowSourceNode | WorkflowSinkNode>(node: T): Promise<T> {
+    if (node.useId === undefined) return node;
+    const store = this.requireStore();
+    if (!supportsReusableNodes(store)) {
+      throw new BadRequestException(
+        `Node "${node.name}" (${node.id}) uses reusable node ${node.useId}, and this deployment's catalog store cannot hold reusable nodes — so there is nothing to resolve it against. The fields cached on the node would run, and a node running a stale copy that nobody can see or edit is worse than a load that stops.`,
+      );
+    }
+    const held =
+      node.useVersion === undefined
+        ? await store.getReusableNode(node.useId)
+        : await store.getReusableNodeAt(node.useId, node.useVersion);
+    if (!held) {
+      throw new NotFoundException(
+        node.useVersion === undefined
+          ? `Node "${node.name}" (${node.id}) uses reusable node ${node.useId}, which is gone. A node standing for something that no longer exists must fail rather than quietly run the copy cached on it.`
+          : `Node "${node.name}" (${node.id}) is pinned to v${node.useVersion} of reusable node ${node.useId}, and that version can no longer be produced — it has been superseded more than ${CATALOG_REVISION_LIMIT} times, or the reusable node is gone. Running the latest instead is the substitution the pin was written down to prevent, so this load stops. Repoint the node, which is an edit to this graph and a new version of it.`,
+      );
+    }
+    const folded = applyReusableNode(node, held.body);
+    // Narrowed rather than asserted, even though `applyReusableNode` already
+    // refuses a kind mismatch. The fold returns the union, and a `kind` that
+    // came back different from the one that went in would mean the fold changed
+    // what this node is — which is worth catching here rather than discovering
+    // as a source being handed to the sink's code path.
+    if (folded.kind !== node.kind) {
+      throw new BadRequestException(
+        `Resolving reusable node ${node.useId} turned "${node.name}" (${node.id}) from a ${node.kind} into a ${folded.kind}.`,
+      );
+    }
+    return { ...node, ...folded, kind: node.kind };
+  }
+
+  /**
+   * The code a transform node runs: the version it pinned, or the latest.
+   *
+   * The unpinned branch is byte-for-byte what this method replaced, and that
+   * matters — every transform node in every deployment is unpinned, and a
+   * release that changed what they run would be a behaviour change dressed as a
+   * feature. What is new is that following the latest is now one of two stated
+   * positions rather than the only one, and the other is honoured strictly:
+   * `getTransformAt` answers `undefined` for a version it cannot produce, and
+   * that becomes a failed node instead of the newest code.
+   */
+  private async resolveTransform(node: WorkflowTransformNode): Promise<CatalogTransform> {
+    const store = this.requireStore();
+    if (node.transformVersion === undefined) {
+      const latest = await store.getTransform(node.transformId);
+      if (!latest) {
+        throw new NotFoundException(
+          `Node "${node.name}" runs transform ${node.transformId}, which is gone. A node pointing at code that no longer exists must fail rather than pass its input through under a shape nobody chose.`,
+        );
+      }
+      return latest;
+    }
+    if (!supportsTransformPins(store)) {
+      throw new BadRequestException(
+        `Node "${node.name}" (${node.id}) is pinned to v${node.transformVersion} of transform ${node.transformId}, and this deployment's catalog store keeps no history to resolve that from. A pin nobody can check is not a pin, so this run stops rather than using whichever version happens to be current.`,
+      );
+    }
+    const pinned = await store.getTransformAt(node.transformId, node.transformVersion);
+    if (!pinned) {
+      throw new NotFoundException(
+        `Node "${node.name}" (${node.id}) is pinned to v${node.transformVersion} of transform ${node.transformId}, and that version's code can no longer be produced — it predates this catalog's revision archive, or it has been superseded more than ${CATALOG_REVISION_LIMIT} times. Running the current version instead is exactly the substitution the pin was written down to prevent, so this load stops.`,
+      );
+    }
+    return pinned;
   }
 
   /**

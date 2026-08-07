@@ -6,9 +6,13 @@ import {
   type CatalogConnector,
   type CatalogPipelineStore,
   type CatalogPrincipal,
+  type CatalogReusableNode,
+  type CatalogReusableNodeStore,
   type CatalogWorkflow,
+  REUSABLE_NODE_KINDS,
   RequireHuman,
   RequireScopes,
+  type ReusableNodeBody,
   SubprocessTransformRunner,
   TRANSFORM_LANGUAGES,
   type WorkflowNode,
@@ -16,8 +20,12 @@ import {
   emitCatalog,
   hasScope,
   isConnectorKind,
+  isReusableNodeBody,
   isTransformLanguage,
+  nodeKindIsReusable,
+  reusableNodeBodyOf,
   supportsLoadExpectations,
+  supportsReusableNodes,
   supportsTransformRevisions,
 } from '@dudousxd/nestjs-catalog';
 import type { LoadExpectationInput } from '@dudousxd/nestjs-catalog/client';
@@ -130,6 +138,25 @@ export function createPipelineController(
       @Inject(CATALOG_PIPELINE_ENVIRONMENT)
       private readonly environmentName?: CatalogEnvironmentNameResolver,
     ) {}
+
+    /**
+     * The store, narrowed, or a sentence saying this deployment cannot.
+     *
+     * A refusal rather than an empty list, and the difference matters most on
+     * the read routes: an empty picker and "this deployment does not hold
+     * reusable nodes" look identical to somebody who has never seen one, and the
+     * first invites them to keep looking for the button. The same distinction
+     * `transforms/:id/revisions` draws between a store that keeps no history and
+     * a transform that has never changed.
+     */
+    private requireReusableNodes(): CatalogPipelineStore & CatalogReusableNodeStore {
+      if (!supportsReusableNodes(this.pipeline)) {
+        throw new BadRequestException(
+          "This catalog's pipeline store cannot hold reusable nodes, so a node saved here would exist nowhere. Every node of a graph is configured in place in this deployment.",
+        );
+      }
+      return this.pipeline;
+    }
 
     /** What this deployment can actually execute, and whether a run survives a crash. */
     @Get('capabilities')
@@ -850,6 +877,244 @@ export function createPipelineController(
      * secret nested inside one is as untouched here as it is on a connector, and
      * for the same stated reason.
      */
+    /**
+     * Which graphs run this transform, and at which node.
+     *
+     * The question the maintainer actually asked — "how many places use this
+     * node" — pointed at the only shared object that already existed. It is
+     * answerable at all because a transform node references code **by id**
+     * rather than carrying a copy of it, which is the same property
+     * `reusable-nodes/:id/workflows` depends on one route down and the reason
+     * saving a node as reusable does not deep-copy.
+     *
+     * Shaped after `connections/:id/workflows` rather than inventing a third
+     * shape for the third thing that answers this. What differs is the grain: a
+     * connection reports each graph once, because deleting it breaks a graph
+     * exactly once, and this reports each *node*, because whoever is reading it
+     * is about to edit code and three nodes in one graph are three places it
+     * lands. `pinned` is what turns the count into a decision — an unpinned node
+     * moves the moment this is saved, a pinned one does not.
+     *
+     * Declared above `transforms/:id/revisions`? No: literal segments beat
+     * parameters in Nest's matcher only within the same position, and these two
+     * differ in the *third* segment, so neither can shadow the other.
+     */
+    @Get('transforms/:id/workflows')
+    @RequireScopes('catalog:read')
+    async transformUsers(@Param('id') id: string) {
+      const store = this.workflows.requireStore();
+      const using = [];
+      for (const workflow of await store.listWorkflows()) {
+        for (const node of workflow.nodes) {
+          if (node.kind !== 'transform' || node.transformId !== id) continue;
+          using.push({
+            workflowId: workflow.id,
+            workflowName: workflow.name,
+            status: workflow.status,
+            nodeId: node.id,
+            nodeName: node.name,
+            pinnedVersion: node.transformVersion,
+          });
+        }
+      }
+      return using;
+    }
+
+    /**
+     * The reusable nodes, each with the number of places it is used.
+     *
+     * The count is on the list rather than behind a second request per entry,
+     * and that is the whole design of this feature rather than a convenience.
+     * There is deliberately no library screen — the maintainer was explicit that
+     * reusable nodes belong where a node is added, not in a tab — so this list
+     * IS the picker, and a number that changes somebody's decision has to be on
+     * the row they are about to click. A count fetched lazily per row would
+     * arrive after the click.
+     *
+     * Redacted like `connections` and `connectors`, and for the identical
+     * reason: a reusable **source** body carries the same `config.url` those
+     * two were redacted for. The softest scope in the system must not read the
+     * strongest secret in it through whichever route was thought of last.
+     */
+    @Get('reusable-nodes')
+    @RequireScopes('catalog:read')
+    async reusableNodes() {
+      const store = this.requireReusableNodes();
+      const nodes = await store.listReusableNodes();
+      const listed = [];
+      for (const node of nodes) {
+        listed.push({
+          ...redactReusableNode(node),
+          usedBy: (await store.reusableNodeUses(node.id)).length,
+        });
+      }
+      return listed;
+    }
+
+    /** Which graphs use this reusable node, and at which node within each. */
+    @Get('reusable-nodes/:id/workflows')
+    @RequireScopes('catalog:read')
+    reusableNodeUsers(@Param('id') id: string) {
+      return this.requireReusableNodes().reusableNodeUses(id);
+    }
+
+    /**
+     * Save a node body under a name, or edit one that already exists.
+     *
+     * ## No per-type check, and that is not an oversight
+     *
+     * A reusable **sink** body names an object type, and this route does not ask
+     * whether the caller may write it. The same argument `saveTransform` makes
+     * one route up applies with one extra step: nothing here commits anything.
+     * A body only becomes a load when a graph adopts it, and `POST workflows`
+     * calls `assertMayWriteTypes` over that graph's sinks — with the resolved
+     * type, because `saveWorkflow` folds before it validates. `applyReusableNode`
+     * then refuses to let the type move under a graph afterwards. So the grant
+     * check is at the place that can enforce it, once, and gating this route as
+     * well would stop somebody naming a type they cannot write while changing
+     * nothing about who can load into it.
+     *
+     * ## Editing something other graphs use creates a version
+     *
+     * It does not refuse. See `CatalogPipelineStore.saveReusableNode` for why
+     * refusing would let a pin take a shared node hostage. What the editor gets
+     * instead is `reusable-nodes/:id/workflows`, read at the moment they are
+     * about to press save.
+     */
+    @Post('reusable-nodes')
+    @RequireScopes('catalog:write')
+    async saveReusableNode(
+      @Req() request: { principal?: CatalogPrincipal },
+      @Body() body: { id?: string; name?: unknown; description?: unknown; body?: unknown },
+    ) {
+      const principal = requirePrincipal(request);
+      const store = this.requireReusableNodes();
+      const name = typeof body.name === 'string' ? body.name.trim() : '';
+      if (!name) {
+        throw new BadRequestException(
+          'A reusable node needs a name. It is what somebody types when they reach for it while drawing a graph, so an unnamed one could never be found.',
+        );
+      }
+      if (!isReusableNodeBody(body.body)) {
+        throw new BadRequestException(
+          `"${name}" was sent with a body this service cannot execute. A reusable node stands for a source — which needs a source kind and a config — or for a sink, which needs the object type it commits.`,
+        );
+      }
+      // The other half of redacting the read, exactly as `saveWorkflow` does one
+      // level up: a console reads a reusable source, edits its query, and posts
+      // the whole body back — so what it sends for the URL is the placeholder it
+      // was shown, and storing that verbatim would replace a working credential
+      // with the word REDACTED.
+      const stored = body.id ? await store.getReusableNode(body.id) : undefined;
+      const saved = await store.saveReusableNode(
+        {
+          id: body.id,
+          name,
+          description:
+            typeof body.description === 'string' && body.description.length > 0
+              ? body.description
+              : undefined,
+          body: restoreReusableNodeSecrets(body.body, stored),
+        },
+        principal.id,
+      );
+      return redactReusableNode(saved);
+    }
+
+    /**
+     * Refuses while any graph still uses it, and the refusal names them.
+     *
+     * The store makes the refusal rather than this route, so a host reaching the
+     * store directly gets it too — the same arrangement `deleteConnection` has.
+     */
+    @Delete('reusable-nodes/:id')
+    @RequireScopes('catalog:write')
+    deleteReusableNode(@Param('id') id: string) {
+      return this.requireReusableNodes()
+        .deleteReusableNode(id)
+        .then((deleted: boolean) => ({ deleted }));
+    }
+
+    /**
+     * Lift one node of a graph into a reusable node, by reference.
+     *
+     * The gesture the maintainer asked for — "salvar nós reutilizáveis" — and it
+     * lives beside `workflows/:id/nodes/:nodeId/discover` because it is the same
+     * shape of thing: an action on one node of one graph.
+     *
+     * **It does not deep-copy, and it does not edit the graph either.** It
+     * stores the body and answers with the reusable node; the caller then sets
+     * `useId` on that node and saves the graph, which is one ordinary
+     * `POST workflows` that bumps the graph's version and shows a diff. Doing
+     * the edit here would mean a route that stores one thing and silently
+     * rewrites another, and the graph's version would move for a reason its
+     * author could not see in their own diff — which is the class of silence
+     * this whole feature exists to end.
+     *
+     * The kind is checked here rather than trusted from the screen, because
+     * `nodeKindIsReusable` is what a screen asks before offering the button and
+     * a route that assumed the screen asked is a route that can be curled.
+     */
+    @Post('workflows/:id/nodes/:nodeId/save-as-reusable')
+    @RequireScopes('catalog:write')
+    async saveNodeAsReusable(
+      @Req() request: { principal?: CatalogPrincipal },
+      @Param('id') id: string,
+      @Param('nodeId') nodeId: string,
+      @Body() body: { name?: unknown; description?: unknown },
+    ) {
+      const principal = requirePrincipal(request);
+      const store = this.requireReusableNodes();
+      const workflow = await this.workflows.requireStore().getWorkflow(id);
+      if (!workflow) throw new NotFoundException(`No workflow ${id}`);
+      const node = workflow.nodes.find((candidate) => candidate.id === nodeId);
+      if (!node) {
+        throw new NotFoundException(`Workflow "${workflow.name}" has no node ${nodeId}.`);
+      }
+      if (!nodeKindIsReusable(node.kind)) {
+        throw new BadRequestException(
+          `"${node.name}" is a ${node.kind} node, and ${REUSABLE_NODE_KINDS.join(' and ')} nodes are the ones worth saving under a name. See REUSABLE_NODE_KINDS, which says why each of the others is not — the short version is that a transform and a call already reference a stored object, and a predicate is about the rows in front of it.`,
+        );
+      }
+      const lifted = reusableNodeBodyOf(node);
+      if (!lifted) {
+        // Unreachable while the check above and `reusableNodeBodyOf` agree, and
+        // refused rather than assumed for the reason every other narrowing on
+        // this controller is: the two are in different packages and this is the
+        // seam where a disagreement between them would otherwise become a 500.
+        throw new BadRequestException(
+          `"${node.name}" is a ${node.kind} node and this service could not lift a reusable body out of it.`,
+        );
+      }
+      const name =
+        typeof body.name === 'string' && body.name.trim().length > 0 ? body.name.trim() : node.name;
+      const saved = await store.saveReusableNode(
+        {
+          name,
+          description:
+            typeof body.description === 'string' && body.description.length > 0
+              ? body.description
+              : undefined,
+          // The stored graph's node, not the request's: the graph is where the
+          // authoritative configuration lives, and lifting from a body the
+          // caller sent would let one request store a source pointing somewhere
+          // the graph never did, under a name four other graphs are about to
+          // adopt.
+          body: lifted,
+        },
+        principal.id,
+      );
+      return {
+        reusableNode: redactReusableNode(saved),
+        /**
+         * What the caller has to do next, said out loud rather than left to be
+         * inferred from the absence of a change: the node is not yet an instance
+         * of anything until the graph is saved with this on it.
+         */
+        setOnNode: { nodeId: node.id, useId: saved.id },
+      };
+    }
+
     @Get('workflows')
     @RequireScopes('catalog:read')
     async workflowList() {
@@ -1329,6 +1594,47 @@ function redactWorkflow(workflow: CatalogWorkflow): CatalogWorkflow {
  * reused for a sink, say — also passes through: there is no config on the other
  * side to have shown anybody.
  */
+/**
+ * One reusable node, as a screen may see it.
+ *
+ * The sibling of {@link redactWorkflow}, and it exists for the same reason a
+ * source node's config had to be redacted at all: a reusable **source** body is
+ * a connector's vocabulary — a kind, an optional connection, a config — so its
+ * `config.url` is `postgres://user:pass@host/db`, the exact string
+ * `config-secrets.ts` was written because `GET connections` was serving.
+ *
+ * A **sink** body is returned as-is rather than spread, because the union makes
+ * "has a config" a narrowing instead of a hopeful property check, and a sink
+ * body has none.
+ */
+function redactReusableNode(node: CatalogReusableNode): CatalogReusableNode {
+  if (node.body.kind !== 'source') return node;
+  return { ...node, body: { ...node.body, config: redactConfigSecrets(node.body.config) } };
+}
+
+/**
+ * Put back every credential the caller was only ever shown a redaction of.
+ *
+ * One level shallower than {@link restoreWorkflowSecrets} — there is one body
+ * rather than an array of nodes — so there is no id matching to do. What is
+ * still checked is the **kind**: a body that arrived as a sink where a source
+ * was stored has no config to restore into, and a previous kind's config is not
+ * a placeholder for this one's.
+ *
+ * A reusable node the caller is creating has nothing stored, so nothing is
+ * restored and whatever arrived is what was meant — which is the `stored`-absent
+ * branch of `restoreRedactedSecrets`, and it is the store's own refusal that
+ * decides whether a fresh plaintext password may be written at all.
+ */
+function restoreReusableNodeSecrets(
+  body: ReusableNodeBody,
+  stored: CatalogReusableNode | undefined,
+): ReusableNodeBody {
+  if (body.kind !== 'source') return body;
+  if (stored?.body.kind !== 'source') return body;
+  return { ...body, config: restoreRedactedSecrets(body.config, stored.body.config) };
+}
+
 function restoreWorkflowSecrets(
   nodes: WorkflowNode[],
   stored: CatalogWorkflow | undefined,

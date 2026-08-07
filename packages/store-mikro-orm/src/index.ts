@@ -5,6 +5,7 @@ import {
   ConnectorRow,
   ConnectorRunRow,
   LoadExpectationRow,
+  ReusableNodeRow,
   TransformRow,
   WorkflowRow,
   WorkflowStageRow,
@@ -34,6 +35,7 @@ export {
   ConnectorRow,
   ConnectorRunRow,
   LoadExpectationRow,
+  ReusableNodeRow,
   TransformRow,
   WorkflowRow,
   WorkflowStageRow,
@@ -155,4 +157,10 @@ export const catalogStoreEntities = [
   // until the first read — `catalog_connection` is never created and every
   // connection query dies on missing metadata rather than on a missing table.
   ConnectionRow,
+  // Reachable from nothing for the last time in this list, and the most easily
+  // missed of the lot: a workflow node holds a reusable node's id inside a JSON
+  // column, so there is no property anywhere for discovery to walk. Absent here,
+  // `catalog_reusable_node` is never created and the first picker load dies on
+  // missing metadata rather than on a missing table.
+  ReusableNodeRow,
 ];

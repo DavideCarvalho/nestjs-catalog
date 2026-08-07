@@ -295,6 +295,14 @@ export type {
   WorkflowStageRef,
   WorkflowTransformNode,
   WorkflowValidationIssue,
+  CatalogReusableNode,
+  CatalogReusableNodeUse,
+  ReusableNodeBody,
+  ReusableNodeKind,
+  ReusableNodeRef,
+  ReusableSinkBody,
+  ReusableSourceBody,
+  VersionPinCopy,
 } from './catalog.pipeline';
 
 // Values, not types: a form that offers the kinds should read them from here
@@ -319,6 +327,28 @@ export {
   // runner does, so the two cannot disagree about what "no rows" looks like.
   readWorkflowCallOutput,
   WORKFLOW_CALL_CONTRACT,
+  // Reusable nodes, and the two directions a screen needs them in: the fold onto
+  // a node, so a picker can show what choosing one will do without a round trip,
+  // and the lift off a node, so "save this as reusable" sends the same body the
+  // server would have derived. One implementation of each rather than a copy per
+  // screen, for the reason `validateWorkflow` is shipped here at all — the
+  // alternative is a console that shows one thing and a server that stores
+  // another.
+  applyReusableNode,
+  reusableNodeBodyOf,
+  isReusableNodeBody,
+  isReusableNodeKind,
+  REUSABLE_NODE_KINDS,
+  // Which kinds may be offered a "save as reusable" affordance at all. Read
+  // rather than restated, because a hand-written list on a screen is exactly how
+  // the `filter` node shipped with no way to create it.
+  NODE_KIND_IS_REUSABLE,
+  nodeKindIsReusable,
+  unreachableReusableNodeKind,
+  // One wording for "pinned" and "follows the latest", so an inspector cannot
+  // describe following as though it were pinning — which is the whole
+  // misunderstanding the pin exists to end.
+  describeVersionPin,
 } from './catalog.pipeline';
 
 /**

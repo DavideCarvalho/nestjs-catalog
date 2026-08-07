@@ -206,7 +206,43 @@ export interface PipelineRoutes {
    * traceable and the code did not.
    */
   transformRevisions(id: string): string;
+  /**
+   * Which graphs run this transform, and at which node within each.
+   *
+   * The sibling of {@link PipelineRoutes.connectionWorkflows}, one shared object
+   * over. Both are pressed by somebody about to change something and wondering
+   * who is downstream, and both are answerable only because the reference is by
+   * id rather than by copy.
+   *
+   * A sub-resource rather than a count on `transforms`, unlike
+   * {@link PipelineRoutes.reusableNodes} which does carry one. The difference is
+   * where the number is read: a reusable node's count is rendered on the row of
+   * a picker somebody is about to click, and a transform's is read once, in an
+   * editor already open on one transform.
+   */
+  transformWorkflows(id: string): string;
   tryTransform(): string;
+  /**
+   * Node bodies saved under a name and used from several graphs. GET lists
+   * (each with a `usedBy` count), POST creates or updates one.
+   *
+   * There is deliberately **no library screen** behind this, and no tab. The
+   * maintainer was explicit that reusable nodes belong where a node is added
+   * rather than in a listing of their own, so this list is the picker's source:
+   * the count rides along on every row, because a number that changes somebody's
+   * decision has to be there before the click rather than one request after it.
+   */
+  reusableNodes(): string;
+  reusableNode(id: string): string;
+  /**
+   * Which graphs use this reusable node, and at which node within each.
+   *
+   * Reports each *node*, not each graph — three nodes in one graph are three
+   * places an edit lands, which is the question somebody about to edit a shared
+   * body is actually asking. {@link PipelineRoutes.connectionWorkflows} reports
+   * each graph once, because deleting a connection breaks a graph once.
+   */
+  reusableNodeWorkflows(id: string): string;
   /**
    * Authored graphs of transforms. GET lists, POST creates or updates.
    *
@@ -255,6 +291,18 @@ export interface PipelineRoutes {
    */
   discoverSourceSchema(id: string, nodeId: string): string;
   /**
+   * Lift one node of a graph into a reusable node, by reference.
+   *
+   * Beside `.../discover` because it is the same shape of thing: an action on
+   * one node of one graph. It stores the body and answers with the reusable
+   * node and the `useId` to put on that node — **it does not edit the graph**,
+   * because a route that stored one thing and silently rewrote another would
+   * move a graph's version for a reason its author cannot see in their own diff.
+   * The caller sets `useId` and saves the graph, which is one ordinary
+   * {@link PipelineRoutes.workflows} POST.
+   */
+  saveNodeAsReusable(id: string, nodeId: string): string;
+  /**
    * Every per-type load expectation an operator has stored.
    *
    * Keyed by object type and nothing else. A connector, a workflow sink and an
@@ -296,7 +344,11 @@ export function pipelineRoutes(basePath: string = DEFAULT_PIPELINE_BASE_PATH): P
     transforms: () => `${base}/transforms`,
     transform: (id) => `${base}/transforms/${encodeURIComponent(id)}`,
     transformRevisions: (id) => `${base}/transforms/${encodeURIComponent(id)}/revisions`,
+    transformWorkflows: (id) => `${base}/transforms/${encodeURIComponent(id)}/workflows`,
     tryTransform: () => `${base}/transforms/try`,
+    reusableNodes: () => `${base}/reusable-nodes`,
+    reusableNode: (id) => `${base}/reusable-nodes/${encodeURIComponent(id)}`,
+    reusableNodeWorkflows: (id) => `${base}/reusable-nodes/${encodeURIComponent(id)}/workflows`,
     workflows: () => `${base}/workflows`,
     workflow: (id) => `${base}/workflows/${encodeURIComponent(id)}`,
     publishWorkflow: (id) => `${base}/workflows/${encodeURIComponent(id)}/publish`,
@@ -305,6 +357,8 @@ export function pipelineRoutes(basePath: string = DEFAULT_PIPELINE_BASE_PATH): P
     workflowSchedule: (id) => `${base}/workflows/${encodeURIComponent(id)}/schedule`,
     discoverSourceSchema: (id, nodeId) =>
       `${base}/workflows/${encodeURIComponent(id)}/nodes/${encodeURIComponent(nodeId)}/discover`,
+    saveNodeAsReusable: (id, nodeId) =>
+      `${base}/workflows/${encodeURIComponent(id)}/nodes/${encodeURIComponent(nodeId)}/save-as-reusable`,
     loadExpectations: () => expectations.expectations(),
     loadExpectation: (typeName) => expectations.expectation(typeName),
   };

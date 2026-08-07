@@ -13,7 +13,7 @@
 // query's SQL — and neither of them owns it. This is a type-only import, and the
 // edge only ever points this way: `catalog.workspace.ts` knows nothing about
 // pipelines.
-import type { CatalogRevision } from './catalog.workspace';
+import { CATALOG_REVISION_LIMIT, type CatalogRevision } from './catalog.workspace';
 
 /**
  * Where a connector pulls from.
@@ -1014,7 +1014,7 @@ export function workflowRowY(row: number): number {
  * vocabularies would let them disagree. Credentials stay out of the catalog
  * here exactly as they do everywhere else.
  */
-export interface WorkflowSourceNode extends WorkflowNodeBase {
+export interface WorkflowSourceNode extends WorkflowNodeBase, ReusableNodeRef {
   kind: 'source';
   /** Named `sourceKind` rather than `kind`, which the union already uses. */
   sourceKind: ConnectorKind;
@@ -1037,6 +1037,56 @@ export interface WorkflowTransformNode extends WorkflowNodeBase {
    * logic used at three points in a graph is versioned once and fixed once.
    */
   transformId: string;
+  /**
+   * Which version of that code to run. Absent follows the latest.
+   *
+   * ## The claim this field exists to make true
+   *
+   * The line above says a shared transform is "versioned once and fixed once",
+   * and until this field there was nothing here to fix it *to*. A transform node
+   * named a `transformId` and nothing else, `runTransform` resolved it with
+   * `getTransform`, and `getTransform` answers with whatever is in the row
+   * today. So editing a transform changed every graph that referenced it, at
+   * once, with nothing in anybody else's diff and nothing in their run history
+   * to explain the change — the graph's fingerprint does not move (see
+   * `workflowGraphHash`, which excludes the transform's version on purpose and
+   * still does) so there is not even a new graph version to look at.
+   *
+   * That was survivable only because almost nothing was shared. It stops being
+   * survivable the moment reusable nodes make sharing the point, which is why
+   * this landed with them rather than after them.
+   *
+   * The precedent is {@link WorkflowCallNode.callVersion}, whose docblock makes
+   * the same argument about somebody else's workflow: the version is authored,
+   * and a run that would have used a different one is refused rather than
+   * quietly run. This is that rule pointed at code stored in the same database.
+   *
+   * ## Why absent is allowed to mean "latest" rather than being backfilled
+   *
+   * Because that is what every graph already in a deployment means, exactly, and
+   * a backfill would be a behaviour change dressed as a migration. Pinning the
+   * live version at upgrade time freezes graphs whose authors have been relying
+   * on edits reaching them; pinning nothing but *refusing* an unpinned node
+   * stops every scheduled load on the deployment. Both are an upgrade that
+   * changes what runs, and neither is a decision this package gets to make for
+   * somebody. So absent keeps meaning precisely what it has always meant, and
+   * the repair is that following is now a **stated** position with a pinned
+   * alternative beside it, rather than the only position and an unstated one.
+   *
+   * What does change is that it is no longer silent: `describeTransformPin`
+   * turns either state into a sentence a screen can render, so "this follows
+   * whatever that code becomes" is something the author is told rather than
+   * something they find out.
+   *
+   * ## What a pin costs
+   *
+   * A pinned version is resolved out of `catalog_revision`, which is bounded per
+   * subject (`CATALOG_REVISION_LIMIT`). A pin to a version that has been evicted
+   * cannot be honoured, and the run fails saying so rather than falling back to
+   * the latest — a pin nobody could check is not a pin, which is the sentence
+   * `WorkflowRunSteps.checkCall` already stands on.
+   */
+  transformVersion?: number;
 }
 
 /**
@@ -1050,9 +1100,17 @@ export interface WorkflowTransformNode extends WorkflowNodeBase {
  * convenience that two workflows already provide. Branching inside the graph
  * stays fully supported; every path simply has to arrive here.
  */
-export interface WorkflowSinkNode extends WorkflowNodeBase {
+export interface WorkflowSinkNode extends WorkflowNodeBase, ReusableNodeRef {
   kind: 'sink';
-  /** Which object type the rows become. */
+  /**
+   * Which object type the rows become.
+   *
+   * Stays on the node even when the node is an instance of a reusable one, and
+   * that is the one field a reusable body may **not** move under a graph. See
+   * {@link ReusableNodeRef} — the write grants a graph was checked against are
+   * checked against this string, so a reusable sink that could repoint it would
+   * be a way to write a type the author was never granted.
+   */
   targetType: string;
   /**
    * Whether the commit replaces the dataset or merges into it. Exactly the
@@ -2045,6 +2103,388 @@ export type WorkflowNode =
   | WorkflowIfNode
   | WorkflowFilterNode;
 
+/* --- reusable nodes ------------------------------------------------------ */
+
+/**
+ * The node kinds that can be saved once and used in several graphs.
+ *
+ * Source and sink, and the reason is that those two are the only kinds whose
+ * *composition* is worth a name. A connection is already a shared object, and it
+ * answers "which database" — but nobody reaches for "the warehouse" when they
+ * draw a graph, they reach for "the nightly MVR pull from the warehouse", which
+ * is the connection **plus** the query, plus whether it reads everything or only
+ * what changed, plus what the thing is called. That composition had nowhere to
+ * live, so it was retyped per graph and the fourteenth copy was the one with the
+ * typo in the `WHERE` clause.
+ *
+ * A transform is deliberately **not** here, and that is not an omission: a
+ * transform is already a stored object referenced by id
+ * ({@link WorkflowTransformNode.transformId}), so a reusable transform node
+ * would be a second way to say the same thing. What it was missing is a version
+ * pin, which is {@link WorkflowTransformNode.transformVersion}, not this.
+ *
+ * `call`, `if` and `filter` are not here either, and the record below is where
+ * each of them says so — see {@link NODE_KIND_IS_REUSABLE}.
+ */
+export const REUSABLE_NODE_KINDS = ['source', 'sink'] as const;
+
+export type ReusableNodeKind = (typeof REUSABLE_NODE_KINDS)[number];
+
+/** Same reason as {@link isConnectorKind}: one list, no second copy to drift. */
+export function isReusableNodeKind(value: unknown): value is ReusableNodeKind {
+  return REUSABLE_NODE_KINDS.some((kind) => kind === value);
+}
+
+/**
+ * Whether each node kind may be saved as a reusable node.
+ *
+ * A record over every kind rather than a shorter list of the two that can,
+ * because this codebase keeps being bitten by hand-maintained lists going quiet
+ * — most recently the add-node row that shipped the `filter` node with no way to
+ * create it. A kind added to {@link WORKFLOW_NODE_KINDS} without an entry here
+ * is a type error in this file naming the decision it has not made.
+ *
+ * The second `satisfies` is the other half of the same guard, in the other
+ * direction: anything named in {@link REUSABLE_NODE_KINDS} has to be `true`
+ * here, so the list and this table cannot come apart. Adding `'filter'` to that
+ * list without a `ReusableFilterBody` therefore fails to compile twice — once
+ * here, and once at every narrowing over {@link ReusableNodeBody}.
+ *
+ * Why each `false`:
+ *
+ * - `transform` — already a reference to a stored object. See
+ *   {@link REUSABLE_NODE_KINDS}.
+ * - `call` — already a reference to somebody else's registered workflow, pinned
+ *   by name and version. There is nothing left to name.
+ * - `if` and `filter` — a predicate is *about* the rows in front of it. A gate
+ *   saved under a name and dropped into another graph tests a column that graph
+ *   may not have, and a filter is worse: {@link WorkflowFilterNode.narrows} is
+ *   an acknowledgement about *this* graph's sinks, so a shared one would carry
+ *   somebody else's acknowledgement into a graph they never saw.
+ */
+export const NODE_KIND_IS_REUSABLE = {
+  source: true,
+  transform: false,
+  sink: true,
+  call: false,
+  if: false,
+  filter: false,
+} as const satisfies Record<WorkflowNodeKind, boolean> & Record<ReusableNodeKind, true>;
+
+/** Whether this kind can be saved as a reusable node. Reads {@link NODE_KIND_IS_REUSABLE}. */
+export function nodeKindIsReusable(kind: WorkflowNodeKind): boolean {
+  return NODE_KIND_IS_REUSABLE[kind];
+}
+
+/**
+ * What a node carries when it is an instance of a reusable one.
+ *
+ * ## By reference, and that is the whole feature
+ *
+ * The cheap version of "save this node" copies its fields into the next graph
+ * and forgets where they came from. It is cheaper in every way except the one
+ * that was asked for: "quantos workflows tão usando quais nós" is unanswerable
+ * about a copy, because after the copy there is nothing left that says the two
+ * nodes are the same node. So the id stays on the node, `GET
+ * reusable-nodes/:id/workflows` counts by it, and the count is exact rather than
+ * a guess at which configurations look alike.
+ *
+ * ## The fields stay on the node as well, and are not the authority
+ *
+ * A source node that names a reusable node still carries its own `sourceKind`,
+ * `config` and the rest. That is a **cache**, not a copy — the identical
+ * arrangement `toGraph` already documents for a source that names a connector:
+ * the fields are kept so that `validateWorkflow` stays pure and the canvas can
+ * draw the node without a round trip, and execution re-reads the stored object,
+ * so an edit takes effect on the next run.
+ *
+ * ## Which is exactly why {@link version} exists
+ *
+ * "An edit takes effect on the next run" is the useful behaviour and the
+ * dangerous one, and which of the two it is depends on whether the person
+ * editing knows who else is downstream. So the reference states its position:
+ *
+ * - **absent** — follows the latest. What a connector reference has always
+ *   meant, and the right default for "the warehouse pull" that four graphs
+ *   share and all four want fixed at once.
+ * - **present** — pinned. The reusable node may move on and this graph does not,
+ *   until somebody edits *this* graph, which is a new version of it with a diff
+ *   to read.
+ *
+ * Both are in the graph fingerprint, so changing position is an edit; neither is
+ * silent, which was the whole complaint. This is the same rule
+ * {@link WorkflowTransformNode.transformVersion} states for transforms, and it
+ * is stated twice on purpose rather than shared: they are two different stored
+ * objects and a reader arriving at either should not have to find the other.
+ */
+export interface ReusableNodeRef {
+  /**
+   * The reusable node this is an instance of, or absent for a node configured
+   * in place. Both remain first-class, indefinitely: a one-off source is not a
+   * failure to reuse something.
+   */
+  useId?: string;
+  /** The pinned version of that reusable node. Absent follows the latest. */
+  useVersion?: number;
+}
+
+/**
+ * The part of a source node that is worth saving under a name.
+ *
+ * Everything a source needs to read, and nothing that belongs to the graph it
+ * sits in. Absent here, on purpose: `id`, which has to be unique within one
+ * graph and is also a durable step name, and `position`, which is where somebody
+ * dragged the box on one canvas.
+ *
+ * `name` is absent too, and that is the less obvious one. A reusable node has a
+ * name — it is how "flip db sink" is a thing anybody can ask for — but it lives
+ * on {@link CatalogReusableNode} rather than in the body, because a graph is
+ * allowed to call its instance something else. Folding the name in would rename
+ * every node in every graph the moment somebody tidied up the library's naming,
+ * and a node's name is documented as cosmetic precisely so that it is nobody
+ * else's business.
+ */
+export interface ReusableSourceBody {
+  kind: 'source';
+  sourceKind: ConnectorKind;
+  connectionId?: string;
+  config: Record<string, unknown>;
+  secretEnvVar?: string;
+  mode?: 'full' | 'incremental';
+}
+
+/**
+ * The part of a sink node that is worth saving under a name.
+ *
+ * `targetType` is in here, so "the Mvr full reload" is a thing that can be named
+ * — and it is also the field {@link applyReusableNode} refuses to move under a
+ * graph that already committed to a different one. Both are true at once and
+ * they are not in tension: a graph adopting this body *takes* the type at the
+ * moment it is saved, and is grant-checked for it then. What may not happen is
+ * the type changing afterwards, under a graph whose author is not looking, into
+ * one they were never granted.
+ */
+export interface ReusableSinkBody {
+  kind: 'sink';
+  targetType: string;
+  mode?: 'full' | 'incremental';
+}
+
+export type ReusableNodeBody = ReusableSourceBody | ReusableSinkBody;
+
+/**
+ * {@link unreachableNodeKind}, for reusable bodies, and for the identical
+ * reason: every branch over {@link ReusableNodeBody} ends here, so a body added
+ * to the union without a rule for folding it onto a node is a type error naming
+ * the file rather than a graph that saves and then runs a node nobody
+ * configured. It throws as well, because these arrive as JSON out of a column.
+ */
+export function unreachableReusableNodeKind(body: never, where: string): never {
+  const kind = typeof body === 'string' ? body : Reflect.get(Object(body), 'kind');
+  throw new Error(
+    `${where} does not handle a reusable node body of kind ${JSON.stringify(kind)}. The reusable kinds and every decision made per kind are meant to move together.`,
+  );
+}
+
+/**
+ * A node body saved once, under a name, and used from several graphs.
+ *
+ * Versioned exactly as a {@link CatalogTransform} is, and archived in the same
+ * `catalog_revision` table under its own subject — one table, one retention
+ * rule, which is the argument `RevisionRow` already makes for holding transforms
+ * and saved queries together. That is what makes
+ * {@link ReusableNodeRef.version} resolvable rather than merely a number: a
+ * graph pinned to v2 can still be handed v2's body after v3 exists.
+ *
+ * There is no library screen and there is deliberately not going to be one. A
+ * reusable node is offered where a node is added and its usage count is shown on
+ * the node itself, because the number changes a decision exactly at the moment
+ * somebody is about to change something four other graphs depend on — which is
+ * not a moment they spend on a listing page.
+ */
+export interface CatalogReusableNode {
+  id: string;
+  /**
+   * What people ask for it by — "flip db sink". Unique across reusable nodes,
+   * enforced in the store, because two of them called the same thing is a
+   * picker that cannot be used.
+   */
+  name: string;
+  description?: string;
+  /** Which node kind this stands for. Redundant with `body.kind` and indexed. */
+  kind: ReusableNodeKind;
+  body: ReusableNodeBody;
+  /**
+   * Counts saves that changed the **body**, exactly as a transform's counts
+   * saves that changed the code: renaming a reusable node is not a new version
+   * of it, and inflating the number would make a pin to it meaningless.
+   */
+  version: number;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
+ * How many graphs use a reusable node, and which.
+ *
+ * Shaped after `GET connections/:id/workflows`, which answers the same question
+ * for a connection, because an operator asking either is about to do the same
+ * thing: change something and want to know who is downstream. A count on its own
+ * would be a number to be alarmed by; the list is what makes it actionable.
+ */
+export interface CatalogReusableNodeUse {
+  workflowId: string;
+  workflowName: string;
+  status: WorkflowStatus;
+  /** The node within that graph, and the position its reference states. */
+  nodeId: string;
+  nodeName: string;
+  /** The pinned version, or absent for a reference that follows the latest. */
+  pinnedVersion?: number;
+}
+
+/**
+ * Fold a reusable body onto the node that references it.
+ *
+ * The one implementation, called by the store when a graph is saved and by the
+ * runner when one is executed, so the node a canvas draws and the node that runs
+ * cannot describe different reads. Pure, and it takes the body rather than
+ * fetching one, for the reason `validateWorkflow` is pure: this file is imported
+ * by the browser entry point.
+ *
+ * ## What it refuses
+ *
+ * A sink body whose `targetType` differs from the one already on the node. That
+ * is not a tidiness check — it is the same shape as `WorkflowRunSteps.checkCall`
+ * and it is load-bearing for the same reason. A graph's sinks are checked
+ * against the author's write grants (`assertMayWriteTypes`) using the type on
+ * the node, at save time. If a reusable body could repoint that afterwards, then
+ * editing a shared sink would write into a type that nobody with access to this
+ * graph was ever granted — and it would do it on a schedule, with the graph's
+ * own diff showing nothing. So the disagreement fails, naming both types, and
+ * the repair is that the referencing graph is re-saved and re-checked.
+ *
+ * A mismatched *kind* is refused for the plainer reason that there is nothing
+ * sensible to do with it: a sink body on a source node is a reference somebody
+ * repointed at the wrong object, and folding half of it in would produce a node
+ * that is neither.
+ */
+export function applyReusableNode(node: WorkflowNode, body: ReusableNodeBody): WorkflowNode {
+  if (body.kind === 'source') {
+    if (node.kind !== 'source') {
+      throw new Error(reusableKindMismatch(node, body.kind));
+    }
+    return {
+      ...node,
+      sourceKind: body.sourceKind,
+      connectionId: body.connectionId,
+      config: body.config,
+      secretEnvVar: body.secretEnvVar,
+      mode: body.mode,
+    };
+  }
+  if (body.kind === 'sink') {
+    if (node.kind !== 'sink') {
+      throw new Error(reusableKindMismatch(node, body.kind));
+    }
+    if (node.targetType.length > 0 && node.targetType !== body.targetType) {
+      throw new Error(
+        `Sink "${node.name}" (${node.id}) commits ${node.targetType}, and the reusable node it uses now commits ${body.targetType}. A graph is checked against the types its sinks write at the moment it is saved, so a shared sink is not allowed to repoint one afterwards — that would write into a type nobody here was granted. Re-save this graph to adopt ${body.targetType}, which checks the grants again, or pin this node to the version that still commits ${node.targetType}.`,
+      );
+    }
+    return { ...node, targetType: body.targetType, mode: body.mode };
+  }
+  return unreachableReusableNodeKind(body, 'applyReusableNode');
+}
+
+function reusableKindMismatch(node: WorkflowNode, bodyKind: ReusableNodeKind): string {
+  return `Node "${node.name}" (${node.id}) is a ${node.kind} node and the reusable node it names is a ${bodyKind}. A reference that changed kind under a graph would leave a node that is neither, so this is refused rather than half-applied.`;
+}
+
+/** Whether a stored value is a reusable body this build can execute. */
+export function isReusableNodeBody(value: unknown): value is ReusableNodeBody {
+  if (typeof value !== 'object' || value === null) return false;
+  const kind = Reflect.get(value, 'kind');
+  if (kind === 'source') {
+    const config = Reflect.get(value, 'config');
+    return (
+      isConnectorKind(Reflect.get(value, 'sourceKind')) &&
+      typeof config === 'object' &&
+      config !== null &&
+      !Array.isArray(config)
+    );
+  }
+  if (kind === 'sink') {
+    const targetType = Reflect.get(value, 'targetType');
+    return typeof targetType === 'string' && targetType.length > 0;
+  }
+  // Refused rather than defaulted, exactly as `isWorkflowNode` refuses a kind it
+  // does not know: a body read back as something this build has no rule for
+  // would be folded onto a node as nothing at all, and the node would then run
+  // whatever was cached on it while claiming to be an instance of the library's.
+  return false;
+}
+
+/**
+ * The body a node is currently carrying, ready to be saved under a name.
+ *
+ * The other direction of {@link applyReusableNode}, and the reason
+ * save-as-reusable cannot silently deep-copy: this is what gets stored, the node
+ * keeps a `useId` pointing at it, and nothing anywhere duplicates a graph.
+ *
+ * Answers `undefined` for a kind that cannot be reusable rather than throwing,
+ * because the caller is a route answering a person who pressed a button on a
+ * node — {@link nodeKindIsReusable} is what a screen asks before offering it,
+ * and the route repeats the question rather than trusting the screen asked.
+ */
+export function reusableNodeBodyOf(node: WorkflowNode): ReusableNodeBody | undefined {
+  if (node.kind === 'source') {
+    return {
+      kind: 'source',
+      sourceKind: node.sourceKind,
+      connectionId: node.connectionId,
+      config: node.config,
+      secretEnvVar: node.secretEnvVar,
+      mode: node.mode,
+    };
+  }
+  if (node.kind === 'sink') {
+    return { kind: 'sink', targetType: node.targetType, mode: node.mode };
+  }
+  return undefined;
+}
+
+/**
+ * What a node's version discipline is, as a sentence a screen can render.
+ *
+ * Here rather than in the console for the reason `describeDurability`'s siblings
+ * are: a screen that worked out its own wording would eventually describe
+ * "follows the latest" as though it were a pin, which is the misunderstanding
+ * this whole field exists to remove. One sentence, one place, and the console
+ * renders it.
+ */
+export interface VersionPinCopy {
+  pinned: boolean;
+  label: string;
+  detail: string;
+}
+
+export function describeVersionPin(version: number | undefined, subject: string): VersionPinCopy {
+  if (version === undefined) {
+    return {
+      pinned: false,
+      label: 'follows the latest',
+      detail: `This node runs whatever ${subject} says today. An edit to it reaches this graph on the next run, with no new version of this graph and nothing in its diff — which is what you want when the point is that everybody moves together, and is worth pinning against when it is not.`,
+    };
+  }
+  return {
+    pinned: true,
+    label: `pinned to v${version}`,
+    detail: `This node runs v${version} of ${subject} and stays there while it is edited elsewhere. Moving to a newer version is an edit to this graph, so it has a diff and a version of its own. A pin to a version that has been superseded more than ${CATALOG_REVISION_LIMIT} times can no longer be produced, and the run fails saying so rather than quietly using the latest.`,
+  };
+}
+
 /**
  * Which side of an {@link WorkflowIfNode} a wire leaves by.
  *
@@ -2658,6 +3098,15 @@ export const WORKFLOW_ISSUE_CODES = [
   'filter-predicate-invalid',
   'filter-narrows-unacknowledged',
   'filter-narrows-nothing',
+  /**
+   * A version pin that is not a version — `0`, `2.5`, `"3"`, `-1`.
+   *
+   * One code for both pins, because they are one mistake: a threshold that
+   * cannot name a version can only ever fail to resolve, and it fails inside a
+   * durable step halfway through a load rather than on the canvas. The same
+   * argument `if-threshold-invalid` makes one field along.
+   */
+  'version-pin-invalid',
 ] as const;
 
 export type WorkflowIssueCode = (typeof WORKFLOW_ISSUE_CODES)[number];
@@ -2890,7 +3339,71 @@ function checkNodeWiring(
     }
     const unconfigured = nodeIsUnconfigured(node);
     if (unconfigured) issues.push(unconfigured);
+    checkVersionPins(node, issues);
   }
+}
+
+/**
+ * Every version pin on this node names a version that could exist.
+ *
+ * Both pins in one place, because they are one rule and splitting it is how one
+ * of the two ends up accepting `0`. Checked here rather than only at the HTTP
+ * boundary because `validateWorkflow` is what the canvas runs, so this is the
+ * difference between a refusal on the screen where the number was typed and a
+ * 400 after pressing Save.
+ *
+ * A pin has to be a whole number of at least one, matching what a version
+ * actually is: {@link CatalogTransform.version} and
+ * {@link CatalogReusableNode.version} both start at 1 and count up in ones.
+ * `"3"` — which is what an unparsed form field sends — is refused rather than
+ * coerced, for the reason `if-threshold-invalid` refuses it: a pin that no
+ * stored version can equal resolves to nothing, and it does so inside a durable
+ * step in the middle of a load.
+ *
+ * A `useVersion` with no `useId` is caught here too, as an invalid pin rather
+ * than as its own code: it pins a reference that does not exist, so the number
+ * can never be looked up.
+ */
+function checkVersionPins(node: WorkflowNode, issues: WorkflowValidationIssue[]): void {
+  if (node.kind === 'transform') {
+    const invalid = badPin(node.transformVersion);
+    if (invalid) {
+      issues.push({
+        code: 'version-pin-invalid',
+        nodeIds: [node.id],
+        message: `Transform node "${node.name}" (${node.id}) is pinned to version ${invalid} of its code, and a version is a whole number of at least 1. Leave it unset for the node to follow the latest.`,
+      });
+    }
+    return;
+  }
+  if (!nodeKindIsReusable(node.kind)) return;
+  // Narrowed off the union rather than read off `node` with a property check,
+  // so a kind that becomes reusable without gaining the fields is a type error
+  // here and not a check that silently passes.
+  if (node.kind !== 'source' && node.kind !== 'sink') return;
+  const invalid = badPin(node.useVersion);
+  if (invalid) {
+    issues.push({
+      code: 'version-pin-invalid',
+      nodeIds: [node.id],
+      message: `Node "${node.name}" (${node.id}) is pinned to version ${invalid} of the reusable node it uses, and a version is a whole number of at least 1. Leave it unset for the node to follow the latest.`,
+    });
+    return;
+  }
+  if (node.useVersion !== undefined && node.useId === undefined) {
+    issues.push({
+      code: 'version-pin-invalid',
+      nodeIds: [node.id],
+      message: `Node "${node.name}" (${node.id}) is pinned to version ${node.useVersion} but names no reusable node, so there is nothing for that version to be a version of.`,
+    });
+  }
+}
+
+/** The offending value, rendered, or `undefined` when the pin is fine or absent. */
+function badPin(version: number | undefined): string | undefined {
+  if (version === undefined) return undefined;
+  if (typeof version === 'number' && Number.isInteger(version) && version >= 1) return undefined;
+  return JSON.stringify(version);
 }
 
 /**
@@ -3554,14 +4067,30 @@ function canonicalNode(node: WorkflowNode): string {
       // Sorted keys, so a canvas that rewrites the object in a different order
       // does not look like an edit.
       sortedEntries(node.config),
+      // Appended only when there is a reference, exactly as `edge.branch` above
+      // is appended only when there is a label, and for the same reason: adding
+      // reusable nodes to this file must not renumber the version of a single
+      // graph that did not change. Every source drawn before they existed
+      // hashes to the string it always did.
+      ...canonicalReuse(node),
     ]);
   }
   if (node.kind === 'transform') {
-    // The transform's *version* is deliberately not in here. Editing a
-    // transform is already recorded as a new transform version, and folding it
-    // in would bump every graph that references it — which would say the wiring
-    // changed when it did not.
-    return JSON.stringify([node.id, node.kind, node.transformId]);
+    // The transform's *version as stored* is deliberately not in here, and that
+    // has not changed: editing a transform is recorded as a new transform
+    // version, and folding it in would bump every graph that references it,
+    // which would claim the wiring changed when it did not.
+    //
+    // What IS in here is the *pin* — which is the opposite choice for the
+    // opposite reason, and the same one `call` makes one branch down. Moving a
+    // node from v3 to v5, or off a pin onto the latest, changes what the load
+    // runs as surely as rewiring it does, and is a decision somebody made in
+    // this graph. Appended rather than always present, so an unpinned node —
+    // which is every transform node in every deployment today — hashes to
+    // exactly the string it always did.
+    return node.transformVersion === undefined
+      ? JSON.stringify([node.id, node.kind, node.transformId])
+      : JSON.stringify([node.id, node.kind, node.transformId, node.transformVersion]);
   }
   if (node.kind === 'call') {
     // The called version IS in here, and that is the opposite choice from a
@@ -3597,9 +4126,34 @@ function canonicalNode(node: WorkflowNode): string {
     ]);
   }
   if (node.kind === 'sink') {
-    return JSON.stringify([node.id, node.kind, node.targetType, node.mode ?? 'full']);
+    return JSON.stringify([
+      node.id,
+      node.kind,
+      node.targetType,
+      node.mode ?? 'full',
+      ...canonicalReuse(node),
+    ]);
   }
   return unreachableNodeKind(node, 'workflowGraphHash');
+}
+
+/**
+ * The reusable reference, as zero, one or two trailing hash components.
+ *
+ * Zero when there is no reference, which is what makes this additive: every
+ * graph stored before reusable nodes existed produces the same canonical string
+ * it always did, so no version is renumbered by a deployment picking up this
+ * release. One when the reference follows the latest. Two when it is pinned.
+ *
+ * "Follows the latest" and "pinned to v1" hash differently, and they must:
+ * moving a node off a pin is a real change to what it will run next month, and a
+ * fingerprint that could not see it would let somebody unpin a shared sink with
+ * no version bump and no diff — which is precisely the silence this feature was
+ * built to end.
+ */
+function canonicalReuse(node: ReusableNodeRef): unknown[] {
+  if (node.useId === undefined) return [];
+  return node.useVersion === undefined ? [node.useId] : [node.useId, node.useVersion];
 }
 
 /**
@@ -3695,11 +4249,11 @@ function fnv1a(input: string, offset: number): string {
  */
 export function isWorkflowNode(value: unknown): value is WorkflowNode {
   if (typeof value !== 'object' || value === null) return false;
-  const id = Reflect.get(value, 'id');
-  const name = Reflect.get(value, 'name');
   const kind = Reflect.get(value, 'kind');
-  if (typeof id !== 'string' || typeof name !== 'string') return false;
   if (!isWorkflowNodeKind(kind)) return false;
+  // Everything every kind carries, checked once before the narrowing below
+  // rather than inside the branches that could carry it. See {@link hasNodeBase}.
+  if (!hasNodeBase(value)) return false;
   if (kind === 'transform') {
     return typeof Reflect.get(value, 'transformId') === 'string';
   }
@@ -3756,6 +4310,46 @@ export function isWorkflowNode(value: unknown): value is WorkflowNode {
 function isNarrowsList(value: unknown): boolean {
   if (value === undefined) return true;
   return Array.isArray(value) && value.every((type) => typeof type === 'string');
+}
+
+/**
+ * A version pin as it comes back out of a JSON column: absent, or a whole number
+ * of at least one.
+ *
+ * The same rule {@link checkVersionPins} states, applied at the read boundary,
+ * because the two answer different questions about the same field. The validator
+ * tells an author their graph will not run; this decides whether a graph stored
+ * by some other build can be read at all. Absent is accepted and always will be
+ * — it is what every node written before pins existed carries, and it means
+ * "follows the latest", which is exactly what those nodes have always done.
+ */
+function isOptionalVersion(value: unknown): boolean {
+  if (value === undefined) return true;
+  return typeof value === 'number' && Number.isInteger(value) && value >= 1;
+}
+
+/**
+ * Everything every node kind carries, whatever kind it is: its identity, and
+ * the things it points at outside itself.
+ *
+ * Checked once, before {@link isWorkflowNode} narrows per kind, rather than in
+ * the branches that could carry each field. The references are declared on two
+ * members of the union and a node arriving as JSON does not respect that, so a
+ * single check is both cheaper and stricter than two — and a kind that becomes
+ * reusable later inherits it rather than having to remember it.
+ *
+ * A pin read back as `"3"` or as `0` names no stored version, and the resolution
+ * happens inside a durable step in the middle of a load. So it is refused where
+ * a graph is read out of a column rather than surviving as far as the run that
+ * cannot honour it.
+ */
+function hasNodeBase(value: object): boolean {
+  if (typeof Reflect.get(value, 'id') !== 'string') return false;
+  if (typeof Reflect.get(value, 'name') !== 'string') return false;
+  if (!isOptionalVersion(Reflect.get(value, 'transformVersion'))) return false;
+  if (!isOptionalVersion(Reflect.get(value, 'useVersion'))) return false;
+  const useId = Reflect.get(value, 'useId');
+  return useId === undefined || typeof useId === 'string';
 }
 
 /**
@@ -4001,6 +4595,62 @@ export function supportsTransformRevisions(
   return typeof store.listTransformRevisions === 'function';
 }
 
+/**
+ * Whether this store can produce one particular version of a transform's code.
+ *
+ * Separate from {@link supportsTransformRevisions}, and not implied by it: one
+ * answers "can a screen show the history", the other "can a run honour a pin".
+ * A store could reasonably have the first and not the second, and folding them
+ * together would let a graph be saved with a pin this deployment cannot resolve
+ * — discovered mid-load rather than at the moment the pin was set.
+ */
+export function supportsTransformPins(
+  store: CatalogPipelineStore,
+): store is CatalogPipelineStore & Required<Pick<CatalogPipelineStore, 'getTransformAt'>> {
+  return typeof store.getTransformAt === 'function';
+}
+
+/**
+ * The four reads and two writes a reusable node needs, as one derived type.
+ *
+ * `Required<Pick<...>>` rather than a second interface, which is the lesson
+ * {@link CatalogLoadExpectationStore} records: these are optional members OF the
+ * pipeline store, so writing them out again here would be a copy that can drift.
+ */
+export type CatalogReusableNodeStore = Required<
+  Pick<
+    CatalogPipelineStore,
+    | 'listReusableNodes'
+    | 'getReusableNode'
+    | 'getReusableNodeAt'
+    | 'saveReusableNode'
+    | 'deleteReusableNode'
+    | 'reusableNodeUses'
+  >
+>;
+
+/**
+ * Whether this store can hold reusable nodes.
+ *
+ * All six, and never a subset. A store with `getReusableNode` but no
+ * `reusableNodeUses` could serve a picker and could not answer the question the
+ * feature exists for — and the shape of that failure is a console offering to
+ * share a node while being unable to say who already depends on it, which is
+ * worse than not offering at all.
+ */
+export function supportsReusableNodes(
+  store: CatalogPipelineStore,
+): store is CatalogPipelineStore & CatalogReusableNodeStore {
+  return (
+    typeof store.listReusableNodes === 'function' &&
+    typeof store.getReusableNode === 'function' &&
+    typeof store.getReusableNodeAt === 'function' &&
+    typeof store.saveReusableNode === 'function' &&
+    typeof store.deleteReusableNode === 'function' &&
+    typeof store.reusableNodeUses === 'function'
+  );
+}
+
 export function supportsWorkflowStages(
   store: CatalogPipelineStore,
 ): store is CatalogPipelineStore & CatalogStageStore {
@@ -4118,6 +4768,90 @@ export interface CatalogPipelineStore
    * that bound costs.
    */
   listTransformRevisions?(id: string): Promise<CatalogRevision[]>;
+
+  /**
+   * The code at one particular version, which is what a pin resolves through.
+   *
+   * Separate from {@link listTransformRevisions} rather than left to a caller
+   * filtering that list, and the difference is the whole point: this is on the
+   * hot path of every pinned transform node of every run, and reading up to
+   * {@link CATALOG_REVISION_LIMIT} whole code bodies to keep one of them is a
+   * cost paid per node per run. It is also a different answer — the list falls
+   * back to a synthesised head for a subject that predates the revision table,
+   * and this must not, because "the only version we can produce is the current
+   * one" is exactly the case a pin needs to be told about rather than handed.
+   *
+   * `undefined` means the version cannot be produced: it predates the archive,
+   * or it has fallen off the far end of the per-subject cap. The runner turns
+   * that into a failed node rather than a fall-back to the latest, which is the
+   * same stand `WorkflowRunSteps.checkCall` takes — a pin nobody could check is
+   * not a pin.
+   *
+   * **Optional**, mixed in exactly as its neighbour above is and for the same
+   * reason. {@link supportsTransformPins} is how a caller asks; a store without
+   * it can still run graphs, and a graph with a pinned node is refused there
+   * with a sentence rather than by a method that is missing at run time.
+   */
+  getTransformAt?(id: string, version: number): Promise<CatalogTransform | undefined>;
+
+  /**
+   * Node bodies saved under a name and used from several graphs.
+   *
+   * **Optional**, mixed in for the reason every optional member here is: a store
+   * written against the previous shape of this interface still satisfies it, and
+   * a purely additive feature must not turn that into a compile error — or,
+   * worse, into a run-time discovery, since the `supports*` probes narrow
+   * structurally. {@link supportsReusableNodes} is how a caller asks.
+   *
+   * A deployment whose store implements none of these behaves exactly as it does
+   * today: every node is configured in place, which is what they all are.
+   */
+  listReusableNodes?(): Promise<CatalogReusableNode[]>;
+  getReusableNode?(id: string): Promise<CatalogReusableNode | undefined>;
+  /**
+   * The body at one particular version, for a reference that pinned one.
+   *
+   * The sibling of {@link getTransformAt}, with the same contract and the same
+   * `undefined`: a version the archive can no longer produce is reported as
+   * absent and never substituted with the latest.
+   */
+  getReusableNodeAt?(id: string, version: number): Promise<CatalogReusableNode | undefined>;
+  /**
+   * Bumps {@link CatalogReusableNode.version} when the **body** changed, and
+   * archives it, exactly as {@link saveTransform} does for code.
+   *
+   * Editing a reusable node that other graphs pin therefore creates a new
+   * version rather than refusing. Refusing was the other candidate and it is the
+   * wrong one: this is the only editor there is, so a refusal would strand
+   * whoever owns the node the moment anybody else pinned it, and would make
+   * pinning a way to take something hostage. Creating a version costs the pinned
+   * graphs nothing — they resolve through the archive and keep running the body
+   * they named — and what the editor gets instead of a refusal is the count of
+   * who is downstream, at the moment they are about to press save.
+   */
+  saveReusableNode?(
+    input: Pick<CatalogReusableNode, 'name' | 'body'> & { id?: string; description?: string },
+    createdBy: string,
+  ): Promise<CatalogReusableNode>;
+  /**
+   * Refuses while any graph still references it.
+   *
+   * The same refusal {@link deleteConnection} makes and for the same reason:
+   * deleting one out from under its graphs turns every one of them into a load
+   * that fails at run time, discovered on a schedule rather than at the moment
+   * somebody decided.
+   */
+  deleteReusableNode?(id: string): Promise<boolean>;
+  /**
+   * Which graphs use a reusable node, and at which node within each.
+   *
+   * On the store rather than derived in a controller from `listWorkflows`,
+   * unlike `connections/:id/workflows` which does exactly that. The difference
+   * is that this number is rendered *beside every entry of a picker*, so
+   * deriving it would mean parsing every graph in the deployment once per
+   * reusable node offered. A store can answer it from the rows it holds.
+   */
+  reusableNodeUses?(id: string): Promise<CatalogReusableNodeUse[]>;
 
   /**
    * Per-type load expectations as an operator set them.

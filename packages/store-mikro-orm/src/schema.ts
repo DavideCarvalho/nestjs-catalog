@@ -8,6 +8,7 @@ import {
   ConnectorRow,
   ConnectorRunRow,
   LoadExpectationRow,
+  ReusableNodeRow,
   TransformRow,
   WorkflowRow,
   WorkflowStageRow,
@@ -46,6 +47,11 @@ const OWNED = [
   // settable before the first load — so there is no relation for discovery to
   // walk and this list is the only thing that creates the table.
   LoadExpectationRow,
+  // And once more, for the reason the four above give: a workflow node holds a
+  // reusable node's *id* rather than a relation — deliberately, so that deleting
+  // one cannot cascade a node out of somebody else's graph — so discovery can
+  // reach this from nothing either.
+  ReusableNodeRow,
 ];
 
 /**

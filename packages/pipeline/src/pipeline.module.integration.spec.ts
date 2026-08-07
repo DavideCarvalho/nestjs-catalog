@@ -252,9 +252,19 @@ describe('CatalogPipelineModule.forRoot (integration)', () => {
     const pipeline = routes.filter((route) => route.includes('/api/catalog-service/pipeline'));
     const publish = routes.filter((route) => route.includes('/api/catalog-service/publish'));
 
-    // 27 + 4. Pinned as a total rather than route-by-route so that a route which
+    // 33 + 4. Pinned as a total rather than route-by-route so that a route which
     // moves prefix — the failure mode this whole file is about — cannot be
     // mistaken for a route that was merely renamed.
+    //
+    // 27 -> 33 with reusable nodes and the two usage answers. Four hold the
+    // objects (`GET`/`POST reusable-nodes`, `DELETE reusable-nodes/:id`, and
+    // `POST workflows/:id/nodes/:nodeId/save-as-reusable`, which lifts one node
+    // of a graph into one BY REFERENCE and deliberately does not edit the
+    // graph); two answer "how many places use this" —
+    // `GET reusable-nodes/:id/workflows` and `GET transforms/:id/workflows`.
+    // There is no route for a library screen because there is no library
+    // screen: reusable nodes are offered where a node is added, and the count
+    // belongs on the node.
     //
     // 26 -> 27 with `GET callable-workflows`, which serves what the live fleet
     // announces it can execute — the list behind the call node's picker. Its own
@@ -271,7 +281,7 @@ describe('CatalogPipelineModule.forRoot (integration)', () => {
     // how a type gets its shape and had to survive the move rather than be
     // rebuilt afterwards. `GET connections/:id/connectors` became
     // `GET connections/:id/workflows`, which is a rename and not a count change.
-    expect(pipeline).toHaveLength(27);
+    expect(pipeline).toHaveLength(33);
     expect(publish).toHaveLength(4);
 
     // The workflow routes named explicitly, because they are the whole authoring
@@ -288,6 +298,11 @@ describe('CatalogPipelineModule.forRoot (integration)', () => {
         'POST /api/catalog-service/pipeline/workflows/:id/publish',
         'PUT /api/catalog-service/pipeline/workflows/:id/schedule',
         'POST /api/catalog-service/pipeline/workflows/:id/nodes/:nodeId/discover',
+        // Beside `discover` because it is the same shape of thing: an action on
+        // one node of one graph. Named explicitly for the reason the others are
+        // — a usage count nobody can reach is a feature that shipped without a
+        // way to use it, which is exactly how the `filter` node landed.
+        'POST /api/catalog-service/pipeline/workflows/:id/nodes/:nodeId/save-as-reusable',
         'GET /api/catalog-service/pipeline/connections/:id/workflows',
       ]),
     );
