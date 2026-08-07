@@ -93,6 +93,21 @@ export function newNodeOfKind(
       position,
     };
   }
+  if (kind === 'rename') {
+    // One entry with both halves blank, and the validator refuses it by name
+    // from the moment the node is dropped — the same stance `filter` takes and
+    // for the same reason. An empty map is representable and is exactly the
+    // dangerous state: with unnamed columns kept it is a node that draws as
+    // finished and does nothing, and with them dropped it deletes every column
+    // of every row. So the node starts visibly incomplete rather than
+    // invisibly inert.
+    //
+    // `unnamed` is left absent, which means keep. A rename that started by
+    // dropping everything it does not name would be a projection wearing the
+    // word "rename", and somebody would find that out by looking at a committed
+    // snapshot.
+    return { id, name, kind: 'rename', columns: { '': '' }, position };
+  }
   if (kind === 'sink') {
     return { id, name, kind: 'sink', targetType: '', position };
   }

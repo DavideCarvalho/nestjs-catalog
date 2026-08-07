@@ -412,9 +412,7 @@ export interface StageRenameResult {
 export function renameStagePayload(stored: unknown, plan: StageRenamePlan): StageRenameResult {
   const payload = classifyStagePayload(stored);
   const wasColumnar = payload.encoding === 'columnar/v1';
-  const batch = wasColumnar
-    ? payload.batch
-    : encodeStageRows(payload.rows.filter(isRowRecord));
+  const batch = wasColumnar ? payload.batch : encodeStageRows(payload.rows.filter(isRowRecord));
 
   const matched = new Set<string>();
   const shapes: string[][] = [];
@@ -454,7 +452,13 @@ export function renameStagePayload(stored: unknown, plan: StageRenamePlan): Stag
     : batch.shapeOf.map((at, index) => pick(batch.values[index] ?? [], keeps[at] ?? []));
 
   return {
-    payload: { enc: STAGE_ENCODING, v: STAGE_ENCODING_VERSION, shapes, shapeOf: batch.shapeOf, values },
+    payload: {
+      enc: STAGE_ENCODING,
+      v: STAGE_ENCODING_VERSION,
+      shapes,
+      shapeOf: batch.shapeOf,
+      values,
+    },
     rows: batch.shapeOf.length,
     metadataOnly,
     shapesRewritten,

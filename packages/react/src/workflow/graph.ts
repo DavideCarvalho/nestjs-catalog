@@ -19,6 +19,7 @@ import {
   type WorkflowIfPredicate,
   type WorkflowNode,
   type WorkflowNodeKind,
+  type WorkflowRenameNode,
   type WorkflowRunNode,
   type WorkflowSourceNode,
   nodeName,
@@ -27,6 +28,7 @@ import {
   unreachableNodeKind,
   unreachablePredicateKind,
   workflowCallMode,
+  workflowRenameUnnamed,
 } from './model';
 import { type WorkflowProblem, edgeId } from './validate';
 
@@ -111,6 +113,7 @@ function subtitleFor(node: WorkflowNode, describe: NodeDescriptions): string {
   if (node.kind === 'call') return callSubtitle(node);
   if (node.kind === 'if') return ifSubtitle(node);
   if (node.kind === 'filter') return filterSubtitle(node);
+  if (node.kind === 'rename') return renameSubtitle(node);
   if (node.kind === 'transform') {
     return describe.transformName(node.transformId) ?? 'no transform chosen';
   }
@@ -150,6 +153,31 @@ function filterSubtitle(node: WorkflowFilterNode): string {
   const leaves = countFilterLeaves(predicate);
   if (leaves > FILTER_FACE_LEAVES) return `keeps rows matching ${leaves} conditions`;
   return `keeps ${describeFilterPredicate(predicate)}`;
+}
+
+/**
+ * A rename's face: how many columns, and whether anything else survives.
+ *
+ * The disposition is on the face rather than only in the inspector because it is
+ * the difference between a node that renames and a node that also *deletes* —
+ * and a graph where those two look identical is one where a column disappears
+ * from a published type with nothing on the canvas to point at.
+ *
+ * One rename is spelled out, because the overwhelmingly common node has one or
+ * two entries and `Mgmt Cd -> mgmtCd` is the whole content of it.
+ */
+function renameSubtitle(node: WorkflowRenameNode): string {
+  const entries = Object.entries(node.columns ?? {}).filter(
+    ([from, to]) => from.length > 0 && to.length > 0,
+  );
+  const dropped = workflowRenameUnnamed(node) === 'drop';
+  if (entries.length === 0) return 'no columns named';
+  const first = entries[0];
+  const what =
+    entries.length === 1 && first
+      ? `${first[0]} \u2192 ${first[1]}`
+      : `renames ${entries.length} columns`;
+  return dropped ? `${what}, drops the rest` : what;
 }
 
 /** How many comparisons a predicate is made of, groups not counted. */
@@ -408,6 +436,7 @@ export function defaultLabel(kind: WorkflowNodeKind): string {
   if (kind === 'call') return 'Call';
   if (kind === 'if') return 'If';
   if (kind === 'filter') return 'Filter';
+  if (kind === 'rename') return 'Rename';
   if (kind === 'transform') return 'Transform';
   return unreachableNodeKind(kind, 'defaultLabel');
 }

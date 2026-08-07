@@ -362,6 +362,15 @@ const NODE_FACTORIES: NodeFactories = {
   // impossible: the template would be shipping a graph that shrinks a published
   // type, with nobody having chosen it.
   filter: (id, name, init) => ({ id, name, kind: 'filter', ...init }),
+  // `rename` arrived fourth, and the map stopped the build a fourth time.
+  //
+  // Unused by every template below for the same reason `filter` is, one step
+  // sharper: a rename map is a list of one source system's own spellings of its
+  // own headers. `Mgmt Cd` is a fact about one Air Force fleet export and about
+  // nothing else, so a template that prefilled one would be renaming columns
+  // that do not exist in whatever the reader wired up — and the symptom of that
+  // is not an error, it is a target column absent from every row.
+  rename: (id, name, init) => ({ id, name, kind: 'rename', ...init }),
 };
 
 /* -------------------------------------------------------------------------- */

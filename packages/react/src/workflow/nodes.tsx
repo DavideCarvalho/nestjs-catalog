@@ -11,6 +11,7 @@ import {
   Loader2,
   Plug,
   Repeat,
+  TextCursorInput,
   TriangleAlert,
 } from 'lucide-react';
 import { motion, useReducedMotion } from 'motion/react';
@@ -153,6 +154,19 @@ const KIND_STYLE: Record<
     wash: 'bg-rose-50/70 dark:bg-rose-950/30',
     icon: Filter,
     noun: 'filter',
+  },
+  // Teal and a label-shaped mark. A rename is the one node that changes neither
+  // which rows exist nor which boxes run — it changes what the columns are
+  // *called* — so it deliberately shares nothing with the two subtraction
+  // colours beside it. It also has to be told apart from a transform at a
+  // glance, because the whole reason it is not one is that it is cheap and
+  // provable, and a canvas where the two read alike hides exactly that.
+  rename: {
+    accent: 'bg-gradient-to-b from-teal-400 to-teal-600',
+    chip: 'text-teal-700 dark:text-teal-300',
+    wash: 'bg-teal-50/70 dark:bg-teal-950/30',
+    icon: TextCursorInput,
+    noun: 'rename',
   },
 };
 

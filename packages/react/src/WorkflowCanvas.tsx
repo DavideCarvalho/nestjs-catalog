@@ -50,6 +50,7 @@ import {
   Plus,
   Repeat,
   Save,
+  TextCursorInput,
   Trash2,
   TriangleAlert,
   Unplug,
@@ -154,6 +155,7 @@ import {
   WORKFLOW_FILTER_MAX_VALUES,
   WORKFLOW_FILTER_OPERATORS,
   WORKFLOW_NODE_KINDS,
+  WORKFLOW_RENAME_MAX_COLUMNS,
   type WorkflowBranchLabel,
   type WorkflowCallMode,
   type WorkflowCallNode,
@@ -170,6 +172,7 @@ import {
   type WorkflowNode,
   type WorkflowNodeKind,
   type WorkflowPredicateKind,
+  type WorkflowRenameNode,
   type WorkflowRowCountPredicate,
   type WorkflowRun,
   type WorkflowSinkNode,
@@ -182,15 +185,19 @@ import {
   isWorkflowFilterPredicateKind,
   isWorkflowNodeKind,
   isWorkflowPredicateKind,
+  isWorkflowRenameUnnamed,
   newLocalId,
   nodeName,
   producedTypes,
+  renameColumnRefusals,
   unreachableFilterOperator,
   unreachableFilterPredicateKind,
   unreachableNodeKind,
   unreachablePredicateKind,
   workflowCallMode,
+  workflowKnownColumns,
   workflowNarrowedTypes,
+  workflowRenameUnnamed,
 } from './workflow/model';
 import { WORKFLOW_NAME } from './workflow/name';
 import { WorkflowNodeProvider, workflowNodeTypes } from './workflow/nodes';
@@ -667,6 +674,11 @@ const ADD_NODE: Record<WorkflowNodeKind, { icon: typeof Plug; label: string; hin
     icon: Filter,
     label: 'Filter',
     hint: 'Drops the rows that fail a test you write here. Unlike an If, every box still runs — there are simply fewer rows in them from this point on.',
+  },
+  rename: {
+    icon: TextCursorInput,
+    label: 'Rename',
+    hint: 'Renames columns, and nothing else. No code, no child process — a pure rename rewrites the staged column list and leaves every row exactly where it is. It can also drop the columns you do not name, which does cost a pass over the rows.',
   },
 };
 
@@ -1369,6 +1381,10 @@ function miniMapColor(data: { kind?: unknown } | undefined): string {
   // rows disappear in this graph", and a gate and a filter are the two boxes
   // that answer that question in completely different ways.
   if (kind === 'filter') return '#f43f5e';
+  // Teal-500, the rename's own accent. Deliberately not the violet a transform
+  // gets: a rename is the node that is *provably* cheap, and an overview where
+  // it reads as another piece of user code hides the one thing worth seeing.
+  if (kind === 'rename') return '#14b8a6';
   return '#8b5cf6';
 }
 
@@ -5745,6 +5761,205 @@ function RowCountPredicateFields({
  * question is live — offering them on a filter that narrows nothing would train
  * people to flip them.
  */
+/**
+ * The rename node's form: a list of columns, and one decision about the rest.
+ *
+ * ## Why the list is local state and the record is not
+ *
+ * The model is a `Record<string, string>`, which is the right shape to store —
+ * a key cannot appear twice, so "two renames of the same source column" is
+ * unrepresentable rather than merely refused. It is the wrong shape to *edit*:
+ * a half-typed key is a key, and rebuilding the record on every keystroke would
+ * collapse two rows the moment they were briefly equal — most obviously the two
+ * blank rows you get by pressing "Add column" twice.
+ *
+ * So the rows are held here, in order, and the record is derived from them. The
+ * one thing that can diverge is two rows naming the same source column, and
+ * that is said out loud below rather than silently resolved.
+ *
+ * ## What the panel can tell somebody that a transform's could not
+ *
+ * Which columns actually reach this node — sometimes. `workflowKnownColumns` is
+ * exact downstream of a rename that drops what it does not name, unknown
+ * everywhere else, and the difference is stated rather than papered over. This
+ * is the whole payoff of the node being data instead of code, so the panel
+ * should say it in as many words.
+ */
+function RenameInspector({
+  node,
+  graph,
+  canEdit,
+  onChange,
+}: {
+  node: WorkflowRenameNode;
+  graph: WorkflowGraph;
+  canEdit: boolean;
+  onChange: (node: WorkflowNode) => void;
+}) {
+  const map: Record<string, string> = node.columns ?? {};
+  const [rows, setRows] = useState<Array<{ from: string; to: string }>>(() => {
+    const entries = Object.entries(map).map(([from, to]) => ({ from, to }));
+    return entries.length > 0 ? entries : [{ from: '', to: '' }];
+  });
+
+  const commit = (next: Array<{ from: string; to: string }>) => {
+    setRows(next);
+    const columns: Record<string, string> = {};
+    for (const row of next) columns[row.from] = row.to;
+    onChange({ ...node, columns });
+  };
+
+  const setUnnamed = (value: string) => {
+    if (!isWorkflowRenameUnnamed(value)) return;
+    // Stored absent for `keep`, so the default has one spelling and picking up
+    // this release cannot renumber a graph nobody edited. The boundary
+    // normalises the same way.
+    onChange({ ...node, unnamed: value === 'drop' ? 'drop' : undefined });
+  };
+
+  const dropping = workflowRenameUnnamed(node) === 'drop';
+  const known = workflowKnownColumns(graph, node.id);
+  const refusals = renameColumnRefusals(map);
+  const duplicated = rows
+    .map((row) => row.from)
+    .filter((from, at, all) => from.length > 0 && all.indexOf(from) !== at);
+
+  return (
+    <div className="space-y-3">
+      <FieldGroup
+        title="Columns"
+        hint={
+          <>
+            The name the records arrive with, and the name they leave with. The old name is whatever
+            the source actually calls it — <code>Mgmt Cd</code> and <code>VEH Type Name</code> are
+            fine. The new one has to be a name a column can have: letters, digits and underscore,
+            starting with a letter or an underscore.
+          </>
+        }
+      >
+        {rows.map((row, index) => (
+          <div
+            // Positional keys. Rows have no id, the only edits are
+            // replace-in-place, append and remove, and there is no draft state
+            // below this point to preserve.
+            // biome-ignore lint/suspicious/noArrayIndexKey: see above
+            key={index}
+            className="flex items-end gap-2"
+          >
+            <div className="min-w-0 flex-1">
+              <TextField
+                label={index === 0 ? 'In the source' : ''}
+                value={row.from}
+                placeholder="Mgmt Cd"
+                disabled={!canEdit}
+                onChange={(from) =>
+                  commit(rows.map((each, at) => (at === index ? { ...each, from } : each)))
+                }
+              />
+            </div>
+            <div className="min-w-0 flex-1">
+              <TextField
+                label={index === 0 ? 'Becomes' : ''}
+                value={row.to}
+                placeholder="mgmtCd"
+                disabled={!canEdit}
+                onChange={(to) =>
+                  commit(rows.map((each, at) => (at === index ? { ...each, to } : each)))
+                }
+              />
+            </div>
+            {canEdit && rows.length > 1 && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="shrink-0"
+                onClick={() => commit(rows.filter((_, at) => at !== index))}
+              >
+                Remove
+              </Button>
+            )}
+          </div>
+        ))}
+        {canEdit && (
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => commit([...rows, { from: '', to: '' }])}
+            disabled={rows.length >= WORKFLOW_RENAME_MAX_COLUMNS}
+          >
+            Add column
+          </Button>
+        )}
+      </FieldGroup>
+
+      <SelectField
+        label="Columns you did not name"
+        ariaLabel="What happens to the columns this node does not rename"
+        value={workflowRenameUnnamed(node)}
+        onValueChange={setUnnamed}
+        disabled={!canEdit}
+        options={[
+          { value: 'keep', label: 'Pass through unchanged', hint: 'no data moves' },
+          { value: 'drop', label: 'Drop them', hint: 'rebuilds every row' },
+        ]}
+      />
+
+      {/* The cost, said before the run says it. A pure rename rewrites the
+          staged column list and leaves the values exactly where they are;
+          dropping a column removes a position from every row, so the data has
+          to move. Both are fine and they are not the same node, which is the
+          only reason this sentence is here rather than in a docblock. */}
+      <p className={cn('text-[11px] leading-relaxed', MUTED)}>
+        {dropping ? (
+          <>
+            This node <strong>also removes</strong> every column it does not name, so what reaches
+            the sink is exactly the {Object.keys(map).length} new name
+            {Object.keys(map).length === 1 ? '' : 's'} above. That is a projection as well as a
+            rename, and it costs a pass over the rows — a staged batch keeps its values in
+            positional arrays, and taking a column out moves every one of them.
+          </>
+        ) : (
+          <>
+            Nothing else changes. A staged batch names its columns once and keeps the values in
+            positional arrays, so renaming one rewrites a handful of strings and{' '}
+            <strong>moves no data at all</strong> — which is why this is a node rather than four
+            lines of JavaScript in a transform.
+          </>
+        )}
+      </p>
+
+      {refusals.length > 0 && (
+        <p className="text-[11px] leading-relaxed text-amber-600 dark:text-amber-400">
+          {refusals.join(' ')}
+        </p>
+      )}
+
+      {duplicated.length > 0 && (
+        <p className="text-[11px] leading-relaxed text-amber-600 dark:text-amber-400">
+          {duplicated.map((from) => `“${from}”`).join(', ')} appears more than once on the left. A
+          column can only be renamed to one thing, so only the last row naming it is stored.
+        </p>
+      )}
+
+      {known ? (
+        <p className={cn('text-[11px] leading-relaxed', MUTED)}>
+          A rename above this node drops the columns it does not name, so the graph knows exactly
+          what arrives here:{' '}
+          <span className="font-mono">{[...known].join(', ') || 'nothing at all'}</span>. A row on
+          the left naming anything else is refused when this graph is saved, rather than found out
+          when the column comes back empty.
+        </p>
+      ) : (
+        <p className={cn('text-[11px] leading-relaxed', MUTED)}>
+          The graph cannot say which columns reach this node — a source discovers its shape against
+          the live system, and a transform is code. So the old names are taken on trust, and the run
+          says out loud if one of them was in no row.
+        </p>
+      )}
+    </div>
+  );
+}
+
 function FilterInspector({
   node,
   graph,
@@ -6513,6 +6728,21 @@ function KindInspector({
     // `WorkflowFilterNode.narrows`.
     return (
       <FilterInspector
+        key={node.id}
+        node={node}
+        graph={graph}
+        canEdit={canEdit}
+        onChange={onChange}
+      />
+    );
+  }
+  if (node.kind === 'rename') {
+    // Given the whole graph for the same reason the filter inspector is, and
+    // with a different question in mind: the one thing a declarative rename
+    // buys is that the graph can sometimes say exactly which columns reach this
+    // node. See `workflowKnownColumns`.
+    return (
+      <RenameInspector
         key={node.id}
         node={node}
         graph={graph}

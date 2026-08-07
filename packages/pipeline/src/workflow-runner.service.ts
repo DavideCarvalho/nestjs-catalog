@@ -9,6 +9,7 @@ import {
   type CatalogWorkflow,
   type CatalogWorkflowStore,
   type ConnectorRun,
+  type StageRenamePlan,
   SubprocessTransformRunner,
   type WorkflowBranchLabel,
   type WorkflowCallMode,
@@ -25,7 +26,6 @@ import {
   type WorkflowRowCountPredicate,
   type WorkflowSinkNode,
   type WorkflowSourceNode,
-  type StageRenamePlan,
   type WorkflowStageRef,
   type WorkflowTransformNode,
   applyReusableNode,
@@ -1597,7 +1597,9 @@ export class WorkflowRunnerService {
       }
     }
 
-    logs.push(...renameLogLines(node, { rows, batches: batch, shapesRewritten, metadataOnly, matched }));
+    logs.push(
+      ...renameLogLines(node, { rows, batches: batch, shapesRewritten, metadataOnly, matched }),
+    );
     await this.clearStaleTail(input.runId, node.id, batch, logs);
 
     return {
@@ -2318,8 +2320,8 @@ function renameLogLines(
     outcome.metadataOnly
       ? `No values were moved: ${outcome.shapesRewritten} staged column list${outcome.shapesRewritten === 1 ? ' was' : 's were'} rewritten and every row's data was left exactly where it was.`
       : workflowRenameUnnamed(node) === 'drop'
-        ? `Every row was rebuilt, because this node drops the columns it does not name — removing a column removes a position from each row, so the data has to move. Set it to keep unnamed columns if you only meant to rename.`
-        : `Every row was rebuilt, because this deployment's stage store cannot hand a batch over without decoding it. The rename is the same; only the cost is.`,
+        ? 'Every row was rebuilt, because this node drops the columns it does not name — removing a column removes a position from each row, so the data has to move. Set it to keep unnamed columns if you only meant to rename.'
+        : "Every row was rebuilt, because this deployment's stage store cannot hand a batch over without decoding it. The rename is the same; only the cost is.",
   ];
 
   const unmatched = named.filter((column) => !outcome.matched.has(column));

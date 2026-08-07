@@ -4983,25 +4983,7 @@ function canonicalNode(node: WorkflowNode): string {
       [...(node.narrows ?? [])].sort(),
     ]);
   }
-  if (node.kind === 'rename') {
-    // Sorted by source column, so a canvas that rewrites the object in a
-    // different order is not an edit — the same rule the `sortedEntries` above
-    // applies to a source's config, and it is safe here for a reason specific to
-    // this node: the map is applied *simultaneously*, so its order changes
-    // nothing about the result.
-    //
-    // `unnamed` is appended only when it is `drop`, exactly as `edge.branch` is
-    // appended only when there is a label. Every rename that keeps its unnamed
-    // columns — whether it says so or says nothing — hashes to one string, so
-    // normalising the field on a canvas cannot renumber a graph. It has to be in
-    // there at all because it decides which columns reach the sink.
-    return JSON.stringify([
-      node.id,
-      node.kind,
-      sortedEntries(node.columns),
-      ...(workflowRenameUnnamed(node) === 'drop' ? ['drop'] : []),
-    ]);
-  }
+  if (node.kind === 'rename') return canonicalRename(node);
   if (node.kind === 'sink') {
     return JSON.stringify([
       node.id,
@@ -5012,6 +4994,29 @@ function canonicalNode(node: WorkflowNode): string {
     ]);
   }
   return unreachableNodeKind(node, 'workflowGraphHash');
+}
+
+/**
+ * A rename, canonicalised.
+ *
+ * Sorted by source column, so a canvas that rewrites the object in a different
+ * order is not an edit — the rule `sortedEntries` applies to a source's config,
+ * and it is safe here for a reason specific to this node: the map is applied
+ * *simultaneously*, so its order changes nothing about the result.
+ *
+ * `unnamed` is appended only when it is `drop`, exactly as `edge.branch` is
+ * appended only when there is a label. Every rename that keeps its unnamed
+ * columns — whether it says so or says nothing — hashes to one string, so
+ * normalising the field on a canvas cannot renumber a graph. It is in there at
+ * all because it decides which columns reach the sink.
+ */
+function canonicalRename(node: WorkflowRenameNode): string {
+  return JSON.stringify([
+    node.id,
+    node.kind,
+    sortedEntries(node.columns),
+    ...(workflowRenameUnnamed(node) === 'drop' ? ['drop'] : []),
+  ]);
 }
 
 /**
@@ -5303,19 +5308,24 @@ function checkColumnsProduced(graph: WorkflowGraph, issues: WorkflowValidationIs
     issues.push({
       code: 'column-not-produced',
       nodeIds: [node.id],
-      message: `${node.kind === 'filter' ? 'Filter' : 'Rename'} "${node.name}" (${node.id}) names ${missing
-        .map((column) => JSON.stringify(column))
-        .join(
-          ', ',
-        )}, and nothing upstream produces ${missing.length === 1 ? 'that column' : 'those columns'}. A rename above this node drops every column it does not name, so what reaches here is exactly ${[
-        ...known,
-      ]
-        .map((column) => JSON.stringify(column))
-        .join(
-          ', ',
-        )}. ${node.kind === 'filter' ? 'A test on a column that is not there matches no row — not even a "does not equal" test — so this load would come out empty and every node would report success.' : 'A rename of a column that is not there does nothing, so the column it was meant to produce is absent and a sink writing it commits NULL into every row.'}`,
+      message: missingColumnMessage(node, missing, known),
     });
   }
+}
+
+/** The sentence {@link checkColumnsProduced} says, per kind. */
+function missingColumnMessage(
+  node: WorkflowFilterNode | WorkflowRenameNode,
+  missing: readonly string[],
+  known: ReadonlySet<string>,
+): string {
+  const quoted = (names: Iterable<string>) =>
+    [...names].map((column) => JSON.stringify(column)).join(', ');
+  const consequence =
+    node.kind === 'filter'
+      ? 'A test on a column that is not there matches no row — not even a "does not equal" test — so this load would come out empty and every node would report success.'
+      : 'A rename of a column that is not there does nothing, so the column it was meant to produce is absent and a sink writing it commits NULL into every row.';
+  return `${node.kind === 'filter' ? 'Filter' : 'Rename'} "${node.name}" (${node.id}) names ${quoted(missing)}, and nothing upstream produces ${missing.length === 1 ? 'that column' : 'those columns'}. A rename above this node drops every column it does not name, so what reaches here is exactly ${quoted(known)}. ${consequence}`;
 }
 
 function sortedEntries(config: Record<string, unknown>): Array<[string, unknown]> {
@@ -5371,23 +5381,29 @@ export function isWorkflowNode(value: unknown): value is WorkflowNode {
       ? isWorkflowFilterPredicate(Reflect.get(value, 'predicate'))
       : false;
   }
-  if (kind === 'rename') {
-    // `unnamed` absent is accepted and always will be — it is what every rename
-    // written before the field existed carries, and it means `keep`. A value
-    // that is present and unrecognised is refused rather than defaulted, for the
-    // reason an unrecognised `edge.branch` is: reading it back as `keep` would
-    // turn a projection into a pass-through silently, and the sink would commit
-    // every column the author meant to remove.
-    const unnamed = Reflect.get(value, 'unnamed');
-    if (unnamed !== undefined && !isWorkflowRenameUnnamed(unnamed)) return false;
-    return isWorkflowRenameColumns(Reflect.get(value, 'columns'));
-  }
+  if (kind === 'rename') return isRenameNodeShape(value);
   if (kind === 'source') {
     const sourceKind = Reflect.get(value, 'sourceKind');
     const config = Reflect.get(value, 'config');
     return isConnectorKind(sourceKind) && typeof config === 'object' && config !== null;
   }
   return isWorkflowNodeKindUnhandled(kind);
+}
+
+/**
+ * Everything a `rename` node carries.
+ *
+ * `unnamed` absent is accepted and always will be — it is what every rename
+ * written before the field existed carries, and it means `keep`. A value that is
+ * present and unrecognised is refused rather than defaulted, for the reason an
+ * unrecognised `edge.branch` is: reading it back as `keep` would turn a
+ * projection into a pass-through silently, and the sink would commit every
+ * column the author meant to remove.
+ */
+function isRenameNodeShape(value: object): boolean {
+  const unnamed = Reflect.get(value, 'unnamed');
+  if (unnamed !== undefined && !isWorkflowRenameUnnamed(unnamed)) return false;
+  return isWorkflowRenameColumns(Reflect.get(value, 'columns'));
 }
 
 /**
