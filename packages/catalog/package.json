@@ -1,6 +1,6 @@
 {
   "name": "@dudousxd/nestjs-catalog",
-  "version": "0.16.0",
+  "version": "0.17.0",
   "description": "A metadata registry for NestJS: object types, properties and relations, derived from your ORM and enriched with decorators.",
   "license": "MIT",
   "author": "Davide Carvalho",

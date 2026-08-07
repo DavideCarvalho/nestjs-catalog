@@ -1,5 +1,207 @@
 # @dudousxd/nestjs-catalog-react
 
+## 0.20.0
+
+### Minor Changes
+
+- d3336f3: The activity list stops shipping every event payload it never draws
+
+  `GET catalog/events/traces` answered the console's default page with **10.46 MB**
+  of JSON, and the screen re-asks every ten seconds. 4.31 MB of that was
+  `catalog_audit_event.detail` — the event payloads — read from the database,
+  parsed into 28,105 objects, serialised again, and then not drawn: the list
+  renders a waterfall, which needs when each event happened and whether it failed,
+  and the payload is read only when somebody expands a trace.
+
+  The shape of the data is why it is so lopsided. A page carries every span of
+  every trace on it, which is deliberate — a trace shown with only the spans a
+  filter hit is a story with the middle torn out. But on the dev trail a trace
+  averages 452 events and the widest carry 1,992, so a 50-trace page is 28,105
+  spans, or 22% of the entire audit table, to draw 50 cards.
+
+  So the list now selects the two fields grading actually reads —
+  `$.error` and `$.status`, extracted in the database — instead of the payload
+  they come from, and `getTrace` keeps carrying the payload for the one trace a
+  reader opened. `CatalogTraceSpan.detail` is therefore optional: present from
+  `getTrace`, absent from `listTraces`.
+
+  Nothing on the screen is poorer for it. Every step is still listed, in order,
+  with its timing, its error and the card's error banner; `failed` and `error` are
+  derived by the identical rule on both paths, which a db spec holds by grading
+  the same trace through each and comparing span for span. Expanding a card
+  fetches the trace that has the payloads, so the one line per step that
+  summarises one is unchanged — it just arrives when it is looked at. A host whose
+  client predates `getTrace` keeps a working steps pane, one line per step poorer.
+
+  Measured through the store against a real trail of 127,835 events, minimum of
+  three runs: the default 50-trace page 10.46 MB → 6.07 MB and 3,807 ms →
+  3,149 ms; the 25-trace page 3.19 MB → 1.86 MB and 1,283 ms → 915 ms;
+  `outcome=failed` 1,774 ms → 1,557 ms; `getTrace` unchanged at 229 ms. Those
+  absolute timings are a `db.t4g.medium` reached over a WAN and do not transfer,
+  but the bytes do.
+
+  `minor`, not `patch`: `CatalogTraceSpan.detail` becomes optional and
+  `CatalogClient` gains `getTrace`. Published shapes changed, so a consumer
+  dereferencing a list span's payload has to guard it.
+
+- 163d657: The workflow canvas is the screen, and the tooling floats on it
+
+  The canvas was a box in a column. Above it sat a heading, a description
+  paragraph, a checkpointing notice, a picker, a name field and a row of buttons;
+  beside it, a 18rem column of panels. On a 1600×1000 window the surface somebody
+  actually draws on got a little over half the viewport, and the half it got was
+  the wrong shape — wide graphs ran out of room sideways while a third of the
+  screen held text that is read once.
+
+  So the layout is inverted. The React Flow surface is pinned to all four edges of
+  whatever the host gives it, and everything else floats over it: the graph's
+  identity and its two fields top-left, the save/publish/run cluster top-right, the
+  node dock bottom-centre, and the wiring/problems/schedule/run panel on the right
+  edge. Nothing is in normal flow and nothing scrolls.
+
+  **Occlusion is paid for rather than ignored.** A panel over a canvas covers
+  graph, and the honest version of this layout has to answer for that. `fitView` is
+  given per-side padding matching the chrome's own insets, so the graph is fitted
+  into the region nothing covers instead of into the raw viewport — no more nodes
+  centred underneath the action cluster. The panels are translucent with a blur, so
+  what is behind them stays legible. The gaps between them are still canvas: the
+  overlay is `pointer-events: none` except on the panels themselves, so panning and
+  marquee-selection work through it.
+
+  **What is permanent, and what is not.** The add-node dock and the problems are
+  what somebody mid-draw needs, so both are on screen by default. The description
+  paragraph is not: it explains the screen to somebody arriving at it and costs
+  three lines of canvas forever to be read once, so it moved to a tooltip on the
+  title — and is still rendered to screen readers in full, which is the audience a
+  tooltip alone would have failed. The details rail can be put away for the room,
+  and the toggle then carries the problem count and its colour, so the _fact_ of a
+  problem never depends on the panel being open. Running a graph reopens it, since
+  the run's answer is written there.
+
+  The rail's own contents were reordered while it moved. Problems and outstanding
+  work now come first, the wiring after them, the schedule and connector panels
+  last. On a stored graph those last two are tall enough that Problems — the one
+  thing that should never need scrolling to — was below the fold.
+
+  **Small viewports.** The rail starts closed under 1024px and the minimap is
+  hidden there, so the canvas keeps the whole window instead of a floating layout
+  burying it; under 768px the dock drops its labels to icons, which keeps all six
+  kinds reachable without a sideways scroll. Verified in a browser at 1600×1000,
+  1180×820, 820×900 and 560×760: no horizontal overflow, every node clear of the
+  chrome, and the graph on screen at each.
+
+  **Keyboard order was the thing most at risk and is now better than it was.** The
+  chrome is ahead of the canvas in the DOM, so Tab reaches the workflow controls,
+  the actions and the dock before the graph's nodes — rather than after every box
+  and handle on a large canvas. The dock is deliberately ahead of the rail for the
+  same reason: the rail grows a stop for every wire, problem and sink, and the
+  add-node buttons are what somebody is tabbing towards. The rail is not modal and
+  traps nothing, and Escape is left alone, because on this screen it already means
+  "put the half-drawn wire away".
+
+  Nothing about the graph model, the wiring state machine, the edge delete control,
+  the inspectors or the live regions changed.
+
+  Also in here, because it lives in the row this rewrote: **a `filter` node can be
+  added from the canvas.** The kind shipped complete — model, validator, executor,
+  inspector, its own colour — and had no way in except the API, because the row
+  that offers the kinds was five hand-written buttons and there are six kinds. The
+  row now maps `WORKFLOW_NODE_KINDS` through a `Record<WorkflowNodeKind, …>`, so a
+  new kind fails to compile until somebody says how it is offered. The accessible
+  names are generated with it, which is how "Add a if node" appeared and was fixed.
+
+  One incidental fix: the two context values handed to every node and every edge
+  were fresh object literals on each render of the screen, so any state change here
+  re-rendered every box and every wire. They are memoised, which matters more now
+  that opening a panel is a state change on this component.
+
+- 186b969: Undo by action, Reset to the last save, and a canvas that will not lose your work silently
+
+  **Closing the tab on an unsaved graph lost it, with no warning.** There was no
+  `beforeunload` handler anywhere in this package: a stray ⌘W, a middle-click on a
+  link, a refresh out of habit, and an afternoon of wiring was gone. That is data
+  loss rather than a missing nicety, and it is the part of this change that would
+  have shipped on its own.
+
+  There was also no undo of any kind, and the only trace of unsaved work anywhere
+  on screen was the word on the Save button changing from "Saved" to "Save" — thin
+  for something that means "this is only in your browser".
+
+  Four things, and they are one subject.
+
+  **Undo steps back by ACTION, not by change.** The unit is the gesture, not the
+  state update. Dragging a node across the canvas is one action however many
+  hundred position changes React Flow emitted on the way — the drag's own
+  `dragging` flag is what holds the run open, so a slow drag with a pause in the
+  middle is still one step back. Adding a node and auto-wiring it is one action,
+  because it is one gesture that happens to produce two graph changes; undoing them
+  separately would leave a node nobody asked for standing on its own. Typing into a
+  field folds into one action per field: consecutive edits to the same node share
+  an entry only while they touch the same fields, so typing a name and then
+  flipping a switch on the same node a second later stays two steps — otherwise
+  undoing the switch would silently retype the name. Everything else — connect,
+  disconnect, delete, branch, tidy, add — is one entry each, and a delete is never
+  folded into anything, because it is the change people most want back.
+
+  **The stack holds 50 actions and drops the oldest at the limit,** rather than
+  refusing at the top. What that costs is the ability to walk all the way back to
+  the beginning of a long session, which is what Reset is for; the tooltip says
+  "up to the last 50" rather than implying an infinite one.
+
+  **There is no redo, deliberately.** Undo only steps backwards. A redo stack has
+  to be invalidated correctly on every new edit, every save and every graph swap,
+  and a stale one is a control that puts back something that no longer fits the
+  graph. The two things people actually reach for — take back the last mistake, or
+  give up on everything since the last save — are both covered without one.
+  Shift+⌘Z is caught rather than ignored, and says which control does the job
+  instead, because silence reads as a broken shortcut.
+
+  **Reset means the last SAVED version, and says so.** Not "undo until the stack is
+  empty": the baseline moves to each save, so after saving halfway through a
+  session Reset returns to that save, while undoing forty times would walk straight
+  past it to the version the tab was opened on. It is destructive of unsaved work,
+  so it is confirmed exactly as deleting the workflow is, and the confirmation
+  counts what is about to go ("3 actions will be thrown away") and states what it
+  does not touch: no run is stopped, nothing is unpublished, the stored workflow
+  stays as it is.
+
+  **Unsaved work is now visible as a state rather than a word on a button.** An
+  amber dot and "Unsaved" sit directly to the left of Save, as an `<output>`, so it
+  is announced once when work becomes unsaved rather than only found by somebody
+  who goes looking. The dot pulses, and does not under `prefers-reduced-motion`.
+
+  **Leaving with unsaved work is warned about — and only then.** The `beforeunload`
+  listener is registered while the draft is dirty and removed the moment it is not,
+  because a page that always warns is a page whose warning people learn to dismiss
+  without reading. Undoing back to the loaded graph makes the draft genuinely
+  clean, not merely "edited back", so the warning goes away with it.
+
+  **Where undo stops, stated on screen.** Undo touches the drawing and nothing the
+  server has already done — saving, publishing, running and deleting the workflow
+  are not undone here. That sentence is in the tooltip and in the accessible tree
+  next to the controls, not only in a comment, because a boundary somebody has to
+  read the source to learn is not one they will learn.
+
+  **Keyboard and screen reader.** Ctrl/⌘Z undoes, bound on the window so it works
+  without the canvas happening to be focused — and it does not fire while somebody
+  is typing. The canvas has a name field, several config fields and a real
+  contenteditable code editor on it, and in all of them ⌘Z means "undo my typing";
+  the binding declines any input, textarea, select, contenteditable, `role=textbox`
+  or anything inside a dialog or sheet. Every undo and every reset is announced
+  through the canvas's existing live region, naming what it took back — undo
+  routinely reverts something scrolled off screen, and a silent revert of an
+  invisible thing is indistinguishable from a dead button. The Undo button's
+  accessible name carries the same thing ("Undo: adding a sink node").
+
+  Verified in a real headless Chrome as well as in jsdom: a 20-step pointer drag
+  moved a node and one ⌘Z put it back in a single step; ⌘Z inside the inspector's
+  name field did nothing to the graph; the browser's own leave dialog appeared on a
+  navigation away with unsaved work, and cancelling it kept the page and the edits.
+
+  The history lives in a new `workflow/history.tsx` beside the canvas rather than
+  inside it — the canvas's `edit()` now takes a labelled action alongside the
+  change, and that label is what an undo announces.
+
 ## 0.19.0
 
 ### Minor Changes
