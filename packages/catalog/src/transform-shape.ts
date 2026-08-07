@@ -235,8 +235,8 @@ class ModuleScanner {
   }
 
   /** Record that something which can end a value has just been walked past. */
-  private consumedValue(as: string): boolean {
-    this.lastSignificant = as;
+  private consumedValue(ending: string): boolean {
+    this.lastSignificant = ending;
     this.newlineSince = false;
     return true;
   }
