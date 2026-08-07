@@ -9,6 +9,7 @@ import type {
   CatalogRevision,
   CatalogSearchResult,
   CatalogSnapshot,
+  CatalogTrace,
   CatalogTraceList,
   CatalogTransform,
   ConnectionCheck,
@@ -540,6 +541,16 @@ export interface CatalogClient {
   listTraces(query: TraceQuery): Promise<CatalogTraceList>;
 
   /**
+   * One trace, with the event payloads `listTraces` leaves behind.
+   *
+   * The pair is the point. A list page carries every span of every trace on it,
+   * so putting the payloads there means fetching thousands of them to draw
+   * waterfalls that read none — see `CatalogTraceSpan.detail`. This is the call
+   * that has them, and a screen makes it for the one trace somebody opened.
+   */
+  getTrace(id: string): Promise<CatalogTrace>;
+
+  /**
    * Getting data in.
    *
    * On the same client as everything above rather than in a fetch module beside
@@ -889,6 +900,7 @@ export function CatalogProvider({
 
       listEvents: (query) => transport.get(catalogRoutes.events(), { ...query }),
       listTraces: (query) => transport.get(catalogRoutes.traces(), { ...query }),
+      getTrace: (id) => transport.get(catalogRoutes.trace(id)),
 
       pipelineCapabilities: () => transport.get(pipeline.capabilities()),
       listCallableWorkflows: () => transport.get(pipeline.callableWorkflows()),

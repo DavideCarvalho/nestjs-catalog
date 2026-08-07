@@ -337,8 +337,30 @@ export interface CatalogTraceSpan {
    * second answer to a question that already has one.
    */
   principalId?: string;
-  /** The event payload, verbatim — the same bytes the flat trail shows. */
-  detail: Record<string, unknown>;
+  /**
+   * The event payload, verbatim — the same bytes the flat trail shows.
+   *
+   * Optional, and which call you made decides whether it is there:
+   * {@link CatalogTraceStore.getTrace} carries it, {@link
+   * CatalogTraceStore.listTraces} does not.
+   *
+   * The asymmetry is the whole point. A payload is arbitrary JSON of unbounded
+   * width, and a page of traces carries every span of every trace on it — a
+   * real 50-trace page measured 28,022 spans, of which the payloads alone were
+   * 4.3 MB of a 10.4 MB answer, read from the database, parsed, and serialised
+   * again on a screen that re-polls every ten seconds. None of it was drawn:
+   * the list renders a waterfall, which needs when each event happened and
+   * whether it failed, and the payload is read only when somebody expands a
+   * trace — at which point there is exactly one trace to fetch it for.
+   *
+   * So the list is not missing anything it showed before. `failed` and `error`
+   * are still derived from the payload, in the database rather than from these
+   * bytes, and a consumer that needs the payload asks `getTrace` for the one
+   * trace it needs it for. Guard it rather than assuming it: a `??  {}` on a
+   * list span is correct, and dereferencing it is the one thing this shape
+   * makes unsafe.
+   */
+  detail?: Record<string, unknown>;
   occurredAt: string;
   /** Milliseconds from the first event of the trace. Where the bar starts. */
   offsetMs: number;
