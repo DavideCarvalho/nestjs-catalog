@@ -1,3 +1,4 @@
+import { encodeStageRows, renameStagePayload } from '@dudousxd/nestjs-catalog';
 import type { StartedMySqlContainer } from '@testcontainers/mysql';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { type CatalogDatabase, openCatalogDatabase, startMySql } from '../test/mysql-harness';
@@ -176,6 +177,77 @@ describe('batches staged by the previous build', () => {
     const second = await stages.readStage({ runId: 'split', nodeId: 'source', batch: 2 });
 
     expect([...first, ...second]).toEqual([{ id: 1 }, { id: 2 }]);
+  });
+
+  it('hands the batch back undecoded, and takes one back the same way', async () => {
+    // The pair the `rename` node reads through. Against a real column because
+    // the point of it is what MySQL does with the value: `writeStagePayload`
+    // binds an object that never became a row record here, and
+    // `readStagePayload` hands back whatever the driver decoded — so a rename
+    // that rewrote only `shapes` has to survive the round trip through the
+    // engine, not merely through the codec.
+    const rows: Array<Record<string, unknown>> = [
+      { 'Mgmt Cd': 'AF', 'Reg Number': '01-1234' },
+      { 'Mgmt Cd': null, 'Reg Number': '02-9876' },
+    ];
+    await stages.writeStage({ runId: 'payload', nodeId: 'source', batch: 1, rows });
+
+    const stored = await stages.readStagePayload({
+      runId: 'payload',
+      nodeId: 'source',
+      batch: 1,
+    });
+    const renamed = renameStagePayload(stored, {
+      columns: new Map([['Mgmt Cd', 'mgmtCd']]),
+      dropUnnamed: false,
+    });
+    expect(renamed.metadataOnly).toBe(true);
+
+    await stages.writeStagePayload({
+      runId: 'payload',
+      nodeId: 'head',
+      batch: 1,
+      payload: renamed.payload,
+      rows: renamed.rows,
+    });
+
+    // Read back through the ordinary reader, because that is what a sink uses:
+    // the fast path must not produce a batch only the fast path can read.
+    expect(await stages.readStage({ runId: 'payload', nodeId: 'head', batch: 1 })).toEqual([
+      { mgmtCd: 'AF', 'Reg Number': '01-1234' },
+      { mgmtCd: null, 'Reg Number': '02-9876' },
+    ]);
+  });
+
+  it('answers undefined for a payload that was never staged', async () => {
+    // `readStage` can honestly say "no rows"; a payload reader cannot invent an
+    // encoding for a batch that does not exist, and the rename node branches on
+    // the difference to write an empty batch rather than a renamed nothing.
+    expect(
+      await stages.readStagePayload({ runId: 'payload', nodeId: 'source', batch: 99 }),
+    ).toBeUndefined();
+  });
+
+  it('replaces a payload in place when the same batch is re-staged', async () => {
+    // The idempotence `writeStage` promises, through the other door: a retried
+    // rename writes the same batch numbers over the same stage and each one has
+    // to replace itself rather than double the node's output.
+    const first = encodeStageRows([{ a: 1 }]);
+    const second = encodeStageRows([{ a: 2 }, { a: 3 }]);
+    for (const payload of [first, second]) {
+      await stages.writeStagePayload({
+        runId: 'retry',
+        nodeId: 'head',
+        batch: 1,
+        payload,
+        rows: payload.shapeOf.length,
+      });
+    }
+
+    expect(await stages.readStage({ runId: 'retry', nodeId: 'head', batch: 1 })).toEqual([
+      { a: 2 },
+      { a: 3 },
+    ]);
   });
 
   it('an emptied stale batch still reads as no rows', async () => {
