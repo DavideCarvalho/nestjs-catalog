@@ -26,6 +26,7 @@ import {
   namedEnvironment,
 } from './code-context';
 import { EXPECT_SHRINK_LABEL } from './load-expectations';
+import { CatalogStorage } from './media-storage';
 import { PublishService } from './publish.service';
 import { capLines, redactLines, redactSecrets } from './run-logs';
 import {
@@ -169,6 +170,17 @@ export class ConnectorRunnerService {
     @Optional()
     @Inject(CATALOG_PIPELINE_ENVIRONMENT)
     private readonly environmentName?: CatalogEnvironmentNameResolver,
+    /**
+     * The host's media disks, when it mounted any.
+     *
+     * Optional and last for the same reason the line above is: every spec and
+     * every host that constructs this by hand keeps compiling, and absent means
+     * the SDK path — which is what a deployment without media has always done.
+     * Only a connector that names a `disk` reaches for this, and one that does
+     * on a process with no manager is refused rather than quietly read some
+     * other way.
+     */
+    @Optional() private readonly storage?: CatalogStorage,
   ) {}
 
   /**
@@ -705,6 +717,7 @@ export class ConnectorRunnerService {
         secret: resolveSecret(connector),
         state: connector.state ?? {},
         mode: connector.mode === 'incremental' ? 'incremental' : 'full',
+        storage: this.storage?.manager(),
       }),
     );
   }

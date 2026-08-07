@@ -1,7 +1,14 @@
 import type { CatalogConnection, ConnectionCheck } from '@dudousxd/nestjs-catalog';
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
+import { CatalogStorage } from './media-storage';
 import { redactSecrets } from './run-logs';
-import { importOptional, resolveSecretEnv } from './sources';
+import {
+  type StorageManagerLike,
+  importOptional,
+  namedDisk,
+  resolveSecretEnv,
+  unknownDiskDetail,
+} from './sources';
 
 /**
  * Reaching a source to find out whether it can be reached.
@@ -20,6 +27,13 @@ import { importOptional, resolveSecretEnv } from './sources';
 @Injectable()
 export class ConnectionChecker {
   private readonly logger = new Logger(ConnectionChecker.name);
+
+  constructor(
+    // Optional and the only dependency this has, so every spec that constructs
+    // it bare keeps compiling. Absent means no disk can be named here, which is
+    // what {@link probeDisk} then says.
+    @Optional() private readonly storage?: CatalogStorage,
+  ) {}
 
   async check(connection: CatalogConnection): Promise<ConnectionCheck> {
     const started = Date.now();
@@ -70,6 +84,12 @@ export class ConnectionChecker {
     }
 
     if (connection.kind === 's3') {
+      // A named disk is checked first, and instead — a connection that names one
+      // carries no bucket and no credential of its own, so asking about a bucket
+      // would refuse it for the wrong reason.
+      const disk = namedDisk(config);
+      if (disk) return await probeDisk(this.storage?.manager(), disk);
+
       const bucket = text('bucket');
       if (!bucket) throw new Error('This connection has no bucket.');
       return await probeS3(connection, secret);
@@ -163,6 +183,39 @@ async function probeS3(connection: CatalogConnection, secret?: string): Promise<
   return count > 0
     ? `Reached ${bucket}, and there is at least one object under the prefix.`
     : `Reached ${bucket}, but nothing is under the prefix yet.`;
+}
+
+/**
+ * A named media disk, checked the way every other kind is: the cheapest call
+ * that proves it is both there and readable.
+ *
+ * Two refusals rather than one, and the split is the same one the call-node
+ * picker draws between "there are none" and "I cannot ask". A disk that does not
+ * exist is an authoring mistake and the message carries the list of names that
+ * would have worked; no manager at all is a deployment fact and no amount of
+ * retyping the name will fix it. Collapsing them into "could not open the disk"
+ * would send half of everybody to the wrong place.
+ *
+ * The list is `MaxKeys`-equivalent — one page, one object — for the reason
+ * {@link probeS3} gives: a test that can take minutes is a test nobody presses.
+ */
+async function probeDisk(storage: StorageManagerLike | undefined, disk: string): Promise<string> {
+  if (!storage) {
+    throw new Error(
+      `This connection reads the media disk "${disk}", and no storage manager resolved in this process, so nothing here can open it. Mount @dudousxd/nestjs-media on this deployment, or clear the disk and give the connection a bucket and a credential of its own.`,
+    );
+  }
+  const available = storage.diskNames();
+  if (!available.includes(disk)) throw new Error(unknownDiskDetail(disk, available));
+
+  const driver = storage.disk(disk);
+  const result: unknown = await driver.list('', { delimiter: '', limit: 1 });
+  const files: unknown =
+    result && typeof result === 'object' ? Reflect.get(result, 'files') : undefined;
+  const count = Array.isArray(files) ? files.length : 0;
+  return count > 0
+    ? `Reached the disk "${disk}", and there is at least one object on it.`
+    : `Reached the disk "${disk}", but nothing is on it yet.`;
 }
 
 /** Pull a version string out of whatever shape the driver returned. */

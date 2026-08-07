@@ -5,6 +5,7 @@ import { CONNECTION_KINDS, type ConnectableKind } from './connection-form';
 import { FieldGroup, TextAreaField, TextField } from './ui/field';
 import { SelectField } from './ui/select';
 import { Switch } from './ui/switch';
+import { type StorageAvailability, describeStorage } from './workflow/model';
 
 /**
  * Describing where records are read from, in one place.
@@ -120,6 +121,8 @@ export interface SourceDraft {
   format: string;
   records: string;
   bucket: string;
+  /** A named media disk, which stands in for the bucket AND the credential. */
+  disk: string;
   prefix: string;
   suffix: string;
   endpoint: string;
@@ -143,6 +146,7 @@ export function sourceDraftFrom(config: Record<string, unknown> | undefined): So
     format: text('format'),
     records: Array.isArray(records) && records.length > 0 ? JSON.stringify(records, null, 2) : '',
     bucket: text('bucket'),
+    disk: text('disk'),
     prefix: text('prefix'),
     suffix: text('suffix'),
     endpoint: text('endpoint'),
@@ -223,17 +227,29 @@ function fileConfig(draft: SourceDraft): Record<string, unknown> {
   };
 }
 
+/**
+ * Where the objects are, which is one of three answers and never two.
+ *
+ * A connection supplies it, or a disk does, or the fields below do. They are
+ * mutually exclusive on purpose: writing a bucket beside a disk would store two
+ * answers to one question and leave whoever reads it back to guess which won.
+ */
+function s3Address(draft: SourceDraft, viaConnection: boolean): Record<string, unknown> {
+  if (viaConnection) return {};
+  // A disk carries the bucket, the endpoint, the region AND the credential.
+  if (draft.disk) return { disk: draft.disk };
+  return {
+    bucket: draft.bucket,
+    ...(draft.endpoint ? { endpoint: draft.endpoint } : {}),
+    ...(draft.region ? { region: draft.region } : {}),
+    ...(draft.forcePathStyle ? { forcePathStyle: true } : {}),
+  };
+}
+
 /** Bucket and addressing, which a connection can supply, then the per-load narrowing. */
 function s3Config(draft: SourceDraft, viaConnection: boolean): Record<string, unknown> {
   return {
-    ...(viaConnection
-      ? {}
-      : {
-          bucket: draft.bucket,
-          ...(draft.endpoint ? { endpoint: draft.endpoint } : {}),
-          ...(draft.region ? { region: draft.region } : {}),
-          ...(draft.forcePathStyle ? { forcePathStyle: true } : {}),
-        }),
+    ...s3Address(draft, viaConnection),
     ...(draft.prefix ? { prefix: draft.prefix } : {}),
     ...(draft.suffix ? { suffix: draft.suffix } : {}),
     ...(draft.format ? { format: draft.format } : {}),
@@ -294,18 +310,35 @@ export function sourceConfigFrom(
  * is the entire point of this module: the two screens configure the same thing
  * and there is exactly one description of what that thing needs.
  */
+/**
+ * The blank option's value, which cannot be the empty string.
+ *
+ * A select whose option value is `''` is indistinguishable from an unset select
+ * to the underlying primitive, so the "no disk" choice carries a sentinel and is
+ * mapped back to `''` on the way into the draft.
+ */
+const NO_DISK = '__no_disk__';
+
 export function SourceFields({
   kind,
   draft,
   onChange,
   viaConnection,
   disabled,
+  storage,
 }: {
   kind: ConnectorKind;
   draft: SourceDraft;
   onChange: (draft: SourceDraft) => void;
   viaConnection: boolean;
   disabled?: boolean;
+  /**
+   * What this deployment says about naming a media disk.
+   *
+   * Optional, and absent is a third answer rather than "no" — see
+   * {@link describeStorage}, which is what renders it.
+   */
+  storage?: StorageAvailability;
 }) {
   const set = (patch: Partial<SourceDraft>) => onChange({ ...draft, ...patch });
 
@@ -380,9 +413,51 @@ export function SourceFields({
   }
 
   if (kind === 's3') {
+    const disks = describeStorage(storage);
+    const named = draft.disk.trim().length > 0;
     return (
       <div className="space-y-3">
+        {/*
+         * Disks first, and the copy is rendered in every state including the
+         * one where there are none.
+         *
+         * A screen that simply hid this when media was absent would be the
+         * silent fallback this whole thing exists to avoid: nobody misses a
+         * picker they have never seen, so they type a bucket and mint a second
+         * copy of a credential the host already holds, and nothing on the
+         * screen ever told them there was another way. Saying what is lost is
+         * the point — see `describeStorage`.
+         */}
         {!viaConnection && (
+          <div className="space-y-2">
+            {storage?.available && storage.disks.length > 0 ? (
+              <SelectField
+                label="Read through a disk"
+                ariaLabel="Media disk"
+                value={draft.disk || NO_DISK}
+                onValueChange={(value) => set({ disk: value === NO_DISK ? '' : value })}
+                options={[
+                  {
+                    value: NO_DISK,
+                    label: 'Configure the bucket here',
+                    hint: 'This source alone',
+                  },
+                  ...storage.disks.map((name) => ({ value: name, label: name })),
+                ]}
+                disabled={disabled}
+                hint={disks.detail}
+              />
+            ) : (
+              <p
+                className="text-xs text-zinc-500 dark:text-zinc-400"
+                data-testid="source-storage-detail"
+              >
+                {disks.detail}
+              </p>
+            )}
+          </div>
+        )}
+        {!viaConnection && !named && (
           <div className="grid gap-3 sm:grid-cols-2">
             <TextField
               label="Bucket"

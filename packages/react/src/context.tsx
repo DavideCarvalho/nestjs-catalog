@@ -54,6 +54,7 @@ import {
 import type {
   CatalogWorkflow,
   CatalogWorkflowRelease,
+  StorageAvailability,
   WorkflowDurability,
   WorkflowInput,
   WorkflowRun,
@@ -133,6 +134,17 @@ export interface PipelineCapabilities {
    * engine — is the exact promise this project keeps having to remove.
    */
   durable?: WorkflowDurability;
+  /**
+   * Whether a connector here may name a media disk instead of carrying its own
+   * bucket and credential.
+   *
+   * Optional for the same reason `durable` is, and absent is the same third
+   * answer: a server older than this field has not been asked. The console must
+   * not render "no disks" over it — the two look identical to somebody who has
+   * never seen the field, and the first invites them to go and configure a disk
+   * that will never appear.
+   */
+  storage?: StorageAvailability;
 }
 
 /**
