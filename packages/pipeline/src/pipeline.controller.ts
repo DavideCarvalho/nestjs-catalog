@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import {
   CATALOG_PIPELINE_STORE,
   CONNECTOR_KINDS,
+  type CatalogCodeContext,
   type CatalogConnection,
   type CatalogConnector,
   type CatalogPipelineStore,
@@ -16,6 +17,11 @@ import {
   type ReusableNodeBody,
   SubprocessTransformRunner,
   TRANSFORM_LANGUAGES,
+  TRANSFORM_MODES,
+  type TransformLanguage,
+  type TransformMode,
+  type TransformResult,
+  type TransformRunner,
   type WorkflowNode,
   curationActor,
   emitCatalog,
@@ -23,12 +29,15 @@ import {
   isConnectorKind,
   isReusableNodeBody,
   isTransformLanguage,
+  isTransformMode,
   liveWorkflowVersion,
   nodeKindIsReusable,
+  recordModeRefusal,
   reusableNodeBodyOf,
   supportsLoadExpectations,
   supportsReusableNodes,
   supportsTransformRevisions,
+  supportsTransformStreaming,
   supportsWorkflowReleases,
 } from '@dudousxd/nestjs-catalog';
 import type { LoadExpectationInput } from '@dudousxd/nestjs-catalog/client';
@@ -673,6 +682,16 @@ export function createPipelineController(
         language: string;
         code: string;
         description?: string;
+        /**
+         * `string | undefined`, narrowed below, for the reason `language` is:
+         * the value comes off the wire and anything at all can arrive.
+         *
+         * **Absent is not `'batch'` here**, and the difference is what keeps an
+         * older client from silently undoing a deliberate choice: a caller
+         * written before this field existed sends no mode, and the store leaves
+         * the stored one alone rather than resetting it.
+         */
+        mode?: string;
       },
     ) {
       // No per-type check here, and that is not an oversight: a transform names
@@ -686,7 +705,19 @@ export function createPipelineController(
           `"${body.language}" is not a transform language. Accepted: ${TRANSFORM_LANGUAGES.join(', ')}.`,
         );
       }
-      return this.pipeline.saveTransform({ ...body, language: body.language }, principal.id);
+      if (body.mode !== undefined && !isTransformMode(body.mode)) {
+        throw new BadRequestException(
+          `"${body.mode}" is not a transform mode. Accepted: ${TRANSFORM_MODES.join(', ')}.`,
+        );
+      }
+      const mode = body.mode;
+      // Refused here so the author is told while they are still looking at the
+      // code. The runner asks the same question again, because a row can reach
+      // it that never passed through this build's controller — see
+      // `recordModeRefusal`.
+      const refusal = recordModeRefusal({ language: body.language, code: body.code, mode });
+      if (refusal) throw new BadRequestException(refusal);
+      return this.pipeline.saveTransform({ ...body, language: body.language, mode }, principal.id);
     }
 
     @Delete('transforms/:id')
@@ -810,6 +841,8 @@ export function createPipelineController(
         language: string;
         code: string;
         records?: unknown[];
+        /** Which contract to run the sample under. Narrowed below, as `language` is. */
+        mode?: string;
       },
     ) {
       const principal = requirePrincipal(request);
@@ -824,6 +857,17 @@ export function createPipelineController(
         );
       }
       const language = body.language;
+      if (body.mode !== undefined && !isTransformMode(body.mode)) {
+        throw new BadRequestException(
+          `"${body.mode}" is not a transform mode. Accepted: ${TRANSFORM_MODES.join(', ')}.`,
+        );
+      }
+      const mode = body.mode;
+      // The pane must refuse exactly what save refuses, and with the same
+      // sentence. A try that ran code the save would reject is a pane that
+      // teaches the author their transform works.
+      const tryRefusal = recordModeRefusal({ language, code: body.code, mode });
+      if (tryRefusal) throw new BadRequestException(tryRefusal);
 
       // Said out loud, for the same reason `connections/check` says what it did:
       // this route stores nothing — no transform row, no run row, nothing to
@@ -847,16 +891,38 @@ export function createPipelineController(
       // so code deriving a key from the run is meant to see the absence.
       const admitted = allowlistedCodeEnv();
 
+      const options = {
+        timeoutMs: 10_000,
+        context: codeContext({
+          environment: namedEnvironment(this.environmentName),
+          rowCount: records.length,
+          inputs: [],
+          env: admitted.env,
+        }),
+      };
+
       try {
-        const result = await this.transforms.run({ language, code: body.code }, records, {
-          timeoutMs: 10_000,
-          context: codeContext({
-            environment: namedEnvironment(this.environmentName),
-            rowCount: records.length,
-            inputs: [],
-            env: admitted.env,
-          }),
-        });
+        // Run under the contract the transform declares, not under whichever one
+        // the pane finds convenient. A per-record transform tried through `run`
+        // would be handed the whole array as its `record`, read `undefined` off
+        // every property, and show the author a pane full of empty rows for code
+        // that is perfectly correct — which is the same silent mismatch
+        // TRANSFORM_MODES exists to prevent, arriving through the one screen
+        // whose entire value is that it predicts what the load will do.
+        //
+        // Collected into an array here, and only here: a sample is a handful of
+        // records the author pasted, and the pane has to render every row
+        // anyway. Nothing about the streaming path's memory bound is being
+        // spent, because there is nothing to bound.
+        const result =
+          mode === 'record'
+            ? await tryStreamed(
+                this.transforms,
+                { language, code: body.code, mode },
+                records,
+                options,
+              )
+            : await this.transforms.run({ language, code: body.code }, records, options);
         // In front of the transform's own lines, matching where the runners put
         // them: the note is about the conditions the code ran under, and a
         // reader works down from those to what it said.
@@ -1869,4 +1935,40 @@ function restoreWorkflowSecrets(
     if (was?.kind !== node.kind) return node;
     return { ...node, config: restoreRedactedSecrets(node.config, was.config) };
   });
+}
+
+/**
+ * A per-record transform run against a sample, as the whole-batch pane's shape.
+ *
+ * The try pane renders `{rows, logs, elapsedMs}` and has no reason to learn a
+ * second shape for a mode difference the author already declared, so the stream
+ * is drained here and reported the same way. That is safe precisely because a
+ * sample is a sample: the records were pasted into a text box, the pane paints
+ * every row, and there is no dataset to bound. **No other caller may do this** —
+ * see `ConnectorRunnerService` and `WorkflowRunnerService`, which stream, and
+ * whose whole point is that they do not collect.
+ *
+ * Falls back to a buffered `run` when the bound runner cannot stream, so a
+ * deployment that swapped `TransformRunner` for a container still gets a pane
+ * rather than an error about a method it never promised. That fallback would be
+ * wrong for a real load and is right here for the same reason the collection is.
+ */
+async function tryStreamed(
+  runner: TransformRunner,
+  transform: { language: TransformLanguage; code: string; mode: TransformMode },
+  records: unknown[],
+  options: { timeoutMs: number; context: CatalogCodeContext },
+): Promise<TransformResult> {
+  if (!supportsTransformStreaming(runner)) {
+    return runner.run(transform, records, options);
+  }
+  const stream = await runner.runStream(transform, arrayAsStream(records), options);
+  const rows: Array<Record<string, unknown>> = [];
+  for await (const row of stream.rows) rows.push(row);
+  const summary = stream.summary();
+  return { rows, logs: summary.logs, elapsedMs: summary.elapsedMs };
+}
+
+async function* arrayAsStream(records: unknown[]): AsyncGenerator<unknown> {
+  for (const record of records) yield record;
 }

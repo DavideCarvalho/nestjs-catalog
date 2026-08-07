@@ -259,12 +259,18 @@ export type {
   // runs, so this buys completion in the editor and nothing at run time.
   CatalogTransformFunction,
   CatalogTransformInput,
+  // The per-record shape's twin, and type-only for the identical reason. An
+  // author writing a `'record'` transform completes against `{ record, context }`
+  // rather than guessing which of the two objects they are handed.
+  CatalogRecordTransformFunction,
+  CatalogRecordTransformInput,
   CatalogWorkflow,
   CatalogWorkflowCapabilities,
   CatalogWorkflowRelease,
   ConnectorKind,
   ConnectorRun,
   TransformLanguage,
+  TransformMode,
   TransformResult,
   CallableWorkflowRef,
   WorkflowBranchLabel,
@@ -331,6 +337,17 @@ export {
   isConnectorKind,
   isSourceFormat,
   isTransformLanguage,
+  // The editor offers exactly the modes the runner can call, and applies the
+  // default through the same function the store and both runners do. A screen
+  // carrying its own `?? 'batch'` is the second copy that decides a stored
+  // transform means something else.
+  isTransformMode,
+  TRANSFORM_MODES,
+  transformMode,
+  // Whether the two impossible combinations are impossible, asked while the
+  // author is still looking at the code rather than at three in the morning when
+  // a schedule fires.
+  recordModeRefusal,
   SOURCE_FORMATS,
   // The canvas narrows nodes and edges it reads back from HTTP. Without these
   // it either imports them from the package root — dragging NestJS and MikroORM

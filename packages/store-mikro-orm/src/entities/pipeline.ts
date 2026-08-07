@@ -164,6 +164,24 @@ export class TransformRow {
   @Property({ type: 'text' })
   code!: string;
 
+  /**
+   * Whether {@link code} is a function over the batch or over one record.
+   *
+   * **Nullable, and it has to be.** MikroORM does not run a field initialiser
+   * for a column the table does not have yet, so a row hydrated from a database
+   * that predates this column arrives with `undefined` — and `undefined` is
+   * exactly the value the reader must see, because absent means `'batch'` and
+   * every transform stored before this existed is one. A non-null column with a
+   * default would have been the other option and is worse: the backfill would
+   * write `'batch'` into rows nobody chose it for, which is the same answer with
+   * an audit trail claiming somebody decided it.
+   *
+   * See `TRANSFORM_MODES` for the argument, and `transformMode` for the one
+   * place the default is applied.
+   */
+  @Property({ length: 16, nullable: true })
+  mode?: string;
+
   @Property()
   version = 1;
 

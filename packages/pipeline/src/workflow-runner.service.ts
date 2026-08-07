@@ -31,9 +31,11 @@ import {
   readWorkflowCallOutput,
   supportsReusableNodes,
   supportsTransformPins,
+  supportsTransformStreaming,
   supportsWorkflowReleases,
   supportsWorkflowStages,
   supportsWorkflows,
+  transformMode,
   unreachableCallMode,
   unreachableNodeKind,
   unreachablePredicateKind,
@@ -1258,11 +1260,16 @@ export class WorkflowRunnerService {
     const logs: string[] = [];
     const transform = await this.resolveTransform(node);
 
-    // Everything at once, because that is the transform contract: the code is a
-    // function over a batch of records precisely so that it can deduplicate,
-    // aggregate and join, none of which can be done a row at a time. The whole
-    // of a node's input is therefore in this process's heap while it runs —
-    // the same property the single-transform runner has always had.
+    if (transformMode(transform) === 'record' && supportsTransformStreaming(this.transforms)) {
+      return this.streamTransform(node, transform, workflow, input, startedAt, logs);
+    }
+
+    // Everything at once, because that is the batch contract: a `'batch'`
+    // transform is called once with every record precisely so that it can
+    // deduplicate, aggregate and join, none of which can be done a row at a
+    // time. The whole of a node's input is therefore in this process's heap
+    // while it runs — the same property the single-transform runner has for the
+    // same mode, and the property the per-record mode above exists to remove.
     const records = await this.readInputs(input.inputs);
 
     // Resolved here, in the step, rather than anywhere the workflow body could
@@ -1302,6 +1309,123 @@ export class WorkflowRunnerService {
       elapsedMs: Date.now() - startedAt,
       logs: safeLogLines(logs, LOG_LINES_PER_NODE),
     };
+  }
+
+  /**
+   * A per-record transform node: stage in, child, stage out, one batch at a
+   * time.
+   *
+   * ## Why this is the filter node's loop and not the transform node's
+   *
+   * {@link runFilter} already solved this exact problem and its docblock argues
+   * it at length: read one staged batch, do the per-row work, write what came
+   * out, and never let `readInputs` materialise a node's whole input. The only
+   * difference here is that the per-row work happens in another process. So the
+   * shape is deliberately the filter's — the same coalescing into full batches,
+   * the same running batch count, the same {@link clearStaleTail} — rather than
+   * a second answer to where a batch boundary falls.
+   *
+   * The survivors are **coalesced** for the reason the filter gives: a transform
+   * that drops most of what it sees would otherwise write thousands of batches
+   * of a handful of rows, and the stage store holds a row per batch. The carry
+   * is capped at `BATCH_SIZE`, so the heap holds one input batch, one wire
+   * chunk and one output batch — a constant, whatever the load weighs.
+   *
+   * ## What is not the same as the connector path
+   *
+   * A node reads from the stage store and writes back to it, so the round trip
+   * through storage is still there and this does not make a graph as cheap as a
+   * single streamed connector. What it removes is the thing the batch path's own
+   * comment admitted to: the whole of a node's input in this process's heap, at
+   * once, with a copy of the output beside it.
+   *
+   * ## Batch numbering, and a retry
+   *
+   * A running count of the batches actually written, exactly as the filter's is.
+   * That makes it a pure function of `input.inputs` and the transform — both
+   * checkpointed, since the code is resolved through a pin or a version — so a
+   * retried node writes the same numbers over the same stage and each one
+   * replaces itself. A failure part way through leaves batches under this node's
+   * name that the returned ref does not cover; nothing reads them, and the next
+   * attempt overwrites them and sweeps the tail.
+   */
+  private async streamTransform(
+    node: WorkflowTransformNode,
+    transform: CatalogTransform,
+    workflow: CatalogWorkflow,
+    input: WorkflowNodeStepInput,
+    startedAt: number,
+    logs: string[],
+  ): Promise<WorkflowNodeStepOutput> {
+    const store = this.requireStore();
+    const admitted = allowlistedCodeEnv();
+    logs.push(...admitted.notes);
+
+    const stream = await this.transforms.runStream(transform, this.streamInputs(input.inputs), {
+      context: codeContext({
+        runId: input.runId,
+        workflow: { id: workflow.id, name: workflow.name, version: input.workflowVersion },
+        node: { id: node.id, name: node.name },
+        environment: namedEnvironment(this.environmentName),
+        // Known here where the connector's is not: a node's input has already
+        // been staged, so the count is the sum of what the refs say and it is
+        // available before a record is read.
+        rowCount: input.inputs.reduce((total, ref) => total + ref.rowCount, 0),
+        inputs: input.inputs,
+        env: admitted.env,
+      }),
+    });
+
+    let batches = 0;
+    let kept = 0;
+    const carry: Array<Record<string, unknown>> = [];
+    const flush = async (rows: Array<Record<string, unknown>>) => {
+      batches += 1;
+      await store.writeStage({ runId: input.runId, nodeId: node.id, batch: batches, rows });
+    };
+
+    for await (const row of stream.rows) {
+      kept += 1;
+      carry.push(row);
+      if (carry.length >= BATCH_SIZE) await flush(carry.splice(0, BATCH_SIZE));
+    }
+    if (carry.length > 0) await flush(carry.splice(0, carry.length));
+
+    const summary = stream.summary();
+    logs.push(
+      `Transform "${transform.name}" v${transform.version} ran per record over a stream, turning ${summary.recordsIn} records into ${summary.rowsOut} rows in ${summary.elapsedMs}ms. Nothing held the node's whole input.`,
+      ...summary.logs,
+    );
+    await this.clearStaleTail(input.runId, node.id, batches, logs);
+
+    return {
+      nodeId: node.id,
+      output: { runId: input.runId, nodeId: node.id, batches, rowCount: kept },
+      transformVersion: transform.version,
+      rows: kept,
+      rowsIn: summary.recordsIn,
+      elapsedMs: Date.now() - startedAt,
+      logs: safeLogLines(logs, LOG_LINES_PER_NODE),
+    };
+  }
+
+  /**
+   * A node's input as a stream, one staged batch pulled at a time.
+   *
+   * The counterpart to {@link readInputs}, and the reason it is a generator
+   * rather than a method returning an array is the whole of the change: nothing
+   * asks the store for batch `n + 1` until every record of batch `n` has been
+   * handed to the child. That is what carries the back-pressure from the write
+   * side all the way to the read side.
+   */
+  private async *streamInputs(refs: WorkflowStageRef[]): AsyncGenerator<unknown> {
+    const store = this.requireStore();
+    for (const ref of refs) {
+      for (let batch = 1; batch <= ref.batches; batch += 1) {
+        const rows = await store.readStage({ runId: ref.runId, nodeId: ref.nodeId, batch });
+        for (const row of rows) yield row;
+      }
+    }
   }
 
   /**

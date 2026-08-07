@@ -23,6 +23,7 @@ import type {
   SecretContext,
   StoredLoadExpectation,
   TransformLanguage,
+  TransformMode,
   WorkflowEdge,
   WorkflowExecutionMode,
   WorkflowNode,
@@ -47,6 +48,7 @@ import {
   isReusableNodeKind,
   isSealedSecret,
   isTransformLanguage,
+  isTransformMode,
   isWorkflowBranchLabel,
   isWorkflowEdge,
   isWorkflowExecutionMode,
@@ -738,6 +740,7 @@ export class MySqlPipelineStore
     input: Pick<CatalogTransform, 'name' | 'language' | 'code'> & {
       id?: string;
       description?: string;
+      mode?: TransformMode;
     },
     createdBy: string,
   ): Promise<CatalogTransform> {
@@ -751,6 +754,7 @@ export class MySqlPipelineStore
         name: input.name,
         language: input.language,
         code: input.code,
+        mode: input.mode,
         version: 1,
         createdBy,
         createdAt: new Date(),
@@ -763,11 +767,25 @@ export class MySqlPipelineStore
     const superseded = existing
       ? { version: existing.version, code: existing.code, at: existing.updatedAt }
       : undefined;
-    const codeChanged = existing !== null && existing.code !== input.code;
+    // A mode change counts as a code change, and the reason is the whole point
+    // of the field: the mode decides what the same text *means* — called once
+    // with an array, or once per record — so two runs at the same version could
+    // otherwise have computed different rows from byte-identical code. That is
+    // precisely the question `version` exists to answer, and leaving it alone
+    // here would make the number a lie in the one case it most matters.
+    //
+    // An ABSENT `mode` on the input is not a change to `'batch'`. A caller
+    // written before this field existed sends no mode, and reading that as
+    // "make it a batch" would let an old client silently undo a deliberate
+    // choice — the same reading `CatalogPipelineStore.saveTransform` documents.
+    const modeChanged =
+      existing !== null && input.mode !== undefined && existing.mode !== input.mode;
+    const codeChanged = existing !== null && (existing.code !== input.code || modeChanged);
     row.name = input.name;
     row.description = input.description;
     row.language = input.language;
     row.code = input.code;
+    if (input.mode !== undefined) row.mode = input.mode;
     if (codeChanged) row.version += 1;
 
     em.persist(row);
@@ -2548,6 +2566,14 @@ function toTransform(row: TransformRow): CatalogTransform {
     description: row.description,
     language: narrow(row.language, isTransformLanguage, 'Transform language', row.id),
     code: row.code,
+    // Absent stays absent rather than becoming `'batch'` here. The default
+    // belongs to `transformMode` and to nowhere else — a store that resolved it
+    // too would be a second copy of the rule, and the copy that drifts is the
+    // one that changes what a deployment's loads compute.
+    mode:
+      row.mode === undefined
+        ? undefined
+        : narrow(row.mode, isTransformMode, 'Transform mode', row.id),
     version: row.version,
     createdBy: row.createdBy,
     createdAt: row.createdAt.toISOString(),
