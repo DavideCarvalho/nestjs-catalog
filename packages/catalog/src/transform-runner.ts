@@ -280,30 +280,7 @@ export class SubprocessTransformRunner implements TransformRunner {
 
     try {
       if (modulePath) await writeFile(modulePath, transform.code, 'utf8');
-
-      const script = python
-        ? pythonHarness(transform.code)
-        : modulePath
-          ? javascriptModuleHarness(pathToFileURL(modulePath).href)
-          : javascriptHarness(transform.code);
-
-      // `module-typescript` is Node's own stripping — types are erased, never
-      // checked. A transform with a wrong type still runs; the editor's try pane
-      // is what catches it, not the compiler.
-      //
-      // The module shape needs none of it here: the harness itself is plain
-      // JavaScript, and the author's `.mts` file is stripped on import by its
-      // extension. That confines the stripper to the code that asked for it,
-      // rather than running this file's own source through it as well.
-      const args = python
-        ? ['-c', script]
-        : [
-            '--input-type',
-            transform.language === 'typescript' && !modulePath ? 'module-typescript' : 'module',
-            '-e',
-            script,
-          ];
-
+      const args = interpreterArgs(transform, modulePath);
       return await this.execute(interpreter, args, records, context, timeoutMs, shape, started);
     } finally {
       // Unlinked whether the run returned, threw, or was killed on the timeout —
@@ -436,8 +413,7 @@ export class SubprocessTransformRunner implements TransformRunner {
           // annotated. See {@link transformShapeHint}.
           reject(
             new Error(
-              `The transform exited with code ${code}. ${stderr.slice(0, 500)}` +
-                transformShapeHint(shape, stderr),
+              `The transform exited with code ${code}. ${stderr.slice(0, 500)}${transformShapeHint(shape, stderr)}`,
             ),
           );
           return;
@@ -486,6 +462,31 @@ export class SubprocessTransformRunner implements TransformRunner {
     this.pythonPath = null;
     return null;
   }
+}
+
+/**
+ * What the interpreter is invoked with, and which harness it is handed.
+ *
+ * `module-typescript` is Node's own stripping — types are erased, never
+ * checked. A transform with a wrong type still runs; the editor's try pane is
+ * what catches it, not the compiler.
+ *
+ * The module shape needs none of that flag here: the harness itself is plain
+ * JavaScript, and the author's `.mts` file is stripped on import by its
+ * extension. That confines the stripper to the code that asked for it, rather
+ * than running this file's own generated source through it as well.
+ */
+function interpreterArgs(
+  transform: Pick<CatalogTransform, 'language' | 'code'>,
+  modulePath: string | undefined,
+): string[] {
+  if (transform.language === 'python') return ['-c', pythonHarness(transform.code)];
+  const script = modulePath
+    ? javascriptModuleHarness(pathToFileURL(modulePath).href)
+    : javascriptHarness(transform.code);
+  const inputType =
+    transform.language === 'typescript' && !modulePath ? 'module-typescript' : 'module';
+  return ['--input-type', inputType, '-e', script];
 }
 
 /**

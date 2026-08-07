@@ -59,9 +59,10 @@ describe('a bare body is not a module', () => {
   // that follows a keyword, which without the keyword list would open a string
   // literal that never closes and swallow everything after it.
   it('is not confused by an apostrophe inside a regular expression', () => {
-    const code = ["const re = /don't/g;", 'return records.map((r) => ({ n: r.n.replace(re, "") }));'].join(
-      '\n',
-    );
+    const code = [
+      "const re = /don't/g;",
+      'return records.map((r) => ({ n: r.n.replace(re, "") }));',
+    ].join('\n');
     expect(transformDeclaresModule(code)).toBe(false);
   });
 
@@ -77,9 +78,9 @@ describe('a bare body is not a module', () => {
 
 describe('a module is a module', () => {
   it('export default, as a declaration', () => {
-    expect(transformShape('export default function transform({ records }) { return records; }')).toBe(
-      'module',
-    );
+    expect(
+      transformShape('export default function transform({ records }) { return records; }'),
+    ).toBe('module');
   });
 
   it('export default, as an arrow', () => {
@@ -116,15 +117,15 @@ describe('a module is a module', () => {
   });
 
   it('after a comment, which does not move it off the start of a statement', () => {
-    expect(transformDeclaresModule('// what this does\nexport default ({ records }) => records;')).toBe(
-      true,
-    );
+    expect(
+      transformDeclaresModule('// what this does\nexport default ({ records }) => records;'),
+    ).toBe(true);
   });
 
   it('after a statement that ended without a semicolon', () => {
-    expect(transformDeclaresModule('const KEY = "a"\nexport default ({ records }) => records')).toBe(
-      true,
-    );
+    expect(
+      transformDeclaresModule('const KEY = "a"\nexport default ({ records }) => records'),
+    ).toBe(true);
   });
 });
 

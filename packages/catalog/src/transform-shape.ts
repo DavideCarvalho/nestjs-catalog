@@ -133,160 +133,239 @@ function startsRegex(code: string, at: number, lastSignificant: string): boolean
 }
 
 /**
+ * The scan itself, as a cursor over the source.
+ *
+ * A class rather than one long loop because the loop *was* one long loop, and it
+ * scored 126 on a complexity budget of 15 — which in this case the linter was
+ * right about. Every branch below is one lexical thing the scanner has to be
+ * able to walk past without losing its place, and naming them separately is what
+ * makes it possible to read whether the list is complete.
+ *
+ * State is deliberately minimal: where we are, what the last meaningful
+ * character was, whether a newline has happened since, and three depths plus a
+ * stack of open template literals. Nothing here builds a tree, because nothing
+ * here needs to answer any question except one.
+ */
+class ModuleScanner {
+  private i = 0;
+  private lastSignificant = '';
+  private newlineSince = false;
+  private braces = 0;
+  private parens = 0;
+  private brackets = 0;
+  /**
+   * Brace depths at which template literals opened, innermost last. A `}` ends
+   * an interpolation when the depth has come back to the one recorded for it.
+   */
+  private readonly templates: number[] = [];
+
+  constructor(private readonly code: string) {}
+
+  /** Whether a top-level `export` appears anywhere in the source. */
+  findsExport(): boolean {
+    while (this.i < this.code.length) {
+      if (this.step()) return true;
+      this.i += 1;
+    }
+    return false;
+  }
+
+  private step(): boolean {
+    const char = this.code[this.i];
+    if (this.skipTrivia(char)) return false;
+    if (this.skipLiteral(char)) return false;
+    if (this.closesInterpolation(char)) return false;
+    this.adjustDepth(char);
+    if (this.isExportHere(char)) return true;
+    this.lastSignificant = char;
+    this.newlineSince = false;
+    return false;
+  }
+
+  /**
+   * Whitespace and comments.
+   *
+   * A comment leaves {@link lastSignificant} alone on purpose: a comment between
+   * a `;` and an `export` does not move the `export` off the start of a
+   * statement, and a rule that thought it did would fail on the most ordinary
+   * thing anybody writes above a function.
+   */
+  private skipTrivia(char: string): boolean {
+    if (char === '\n') {
+      this.newlineSince = true;
+      return true;
+    }
+    if (char === ' ' || char === '\t' || char === '\r') return true;
+    return this.skipComment(char);
+  }
+
+  private skipComment(char: string): boolean {
+    if (char !== '/') return false;
+    const next = this.code[this.i + 1];
+    if (next === '/') {
+      while (this.i < this.code.length && this.code[this.i] !== '\n') this.i += 1;
+      this.newlineSince = true;
+      return true;
+    }
+    if (next !== '*') return false;
+    const end = this.code.indexOf('*/', this.i + 2);
+    const chunk = end === -1 ? this.code.slice(this.i) : this.code.slice(this.i, end + 2);
+    // A block comment spanning lines ends the line for the newline rule, and an
+    // unterminated one swallows the rest of the file.
+    if (chunk.includes('\n')) this.newlineSince = true;
+    this.i = end === -1 ? this.code.length : end + 1;
+    return true;
+  }
+
+  /** Strings, template literals and regular expressions — walked past whole. */
+  private skipLiteral(char: string): boolean {
+    if (char === '"' || char === "'") {
+      this.skipQuoted(char);
+      return this.consumedValue(char);
+    }
+    if (char === '`') {
+      this.openTemplate();
+      return this.consumedValue('`');
+    }
+    if (char === '/' && startsRegex(this.code, this.i, this.lastSignificant)) {
+      this.skipRegex();
+      return this.consumedValue('/');
+    }
+    return false;
+  }
+
+  /** Record that something which can end a value has just been walked past. */
+  private consumedValue(as: string): boolean {
+    this.lastSignificant = as;
+    this.newlineSince = false;
+    return true;
+  }
+
+  private skipQuoted(quote: string): void {
+    this.i += 1;
+    while (this.i < this.code.length && this.code[this.i] !== quote) {
+      if (this.code[this.i] === '\\') this.i += 1;
+      this.i += 1;
+    }
+  }
+
+  private skipRegex(): void {
+    this.i += 1;
+    let inClass = false;
+    while (this.i < this.code.length) {
+      const char = this.code[this.i];
+      if (char === '\\') this.i += 1;
+      else if (char === '[') inClass = true;
+      else if (char === ']') inClass = false;
+      // A newline ends it either way: an unterminated regex is a syntax error,
+      // and running to the end of the file on one would hide everything after.
+      else if (char === '\n' || (char === '/' && !inClass)) break;
+      this.i += 1;
+    }
+  }
+
+  /**
+   * Walk a template literal to its closing backtick, or to the `${` that hands
+   * control back to the code scanner.
+   */
+  private openTemplate(): void {
+    this.templates.push(this.braces);
+    this.i += 1;
+    while (this.i < this.code.length) {
+      const char = this.code[this.i];
+      if (char === '\\') {
+        this.i += 1;
+      } else if (char === '`') {
+        this.templates.pop();
+        return;
+      } else if (char === '$' && this.code[this.i + 1] === '{') {
+        this.i += 1;
+        return;
+      }
+      this.i += 1;
+    }
+  }
+
+  /**
+   * A `}` that ends an interpolation rather than a block: keep reading the
+   * template literal it was inside.
+   */
+  private closesInterpolation(char: string): boolean {
+    if (char !== '}') return false;
+    if (this.templates.length === 0) return false;
+    if (this.templates[this.templates.length - 1] !== this.braces) return false;
+    this.templates.pop();
+    this.i += 1;
+    this.resumeTemplate();
+    return true;
+  }
+
+  private resumeTemplate(): void {
+    while (this.i < this.code.length) {
+      const char = this.code[this.i];
+      if (char === '\\') {
+        this.i += 1;
+      } else if (char === '`') {
+        this.consumedValue('`');
+        return;
+      } else if (char === '$' && this.code[this.i + 1] === '{') {
+        this.templates.push(this.braces);
+        this.i += 1;
+        this.newlineSince = false;
+        return;
+      }
+      this.i += 1;
+    }
+  }
+
+  private adjustDepth(char: string): void {
+    if (char === '{') this.braces += 1;
+    else if (char === '}') this.braces -= 1;
+    else if (char === '[') this.brackets += 1;
+    else if (char === ']') this.brackets -= 1;
+    else if (char === '(') this.parens += 1;
+    else if (char === ')') this.parens -= 1;
+  }
+
+  /**
+   * The whole question, in one place: the keyword `export`, whole, at the start
+   * of a statement, at the outermost level of the source.
+   */
+  private isExportHere(char: string): boolean {
+    if (char !== 'e') return false;
+    if (this.braces !== 0 || this.parens !== 0 || this.brackets !== 0) return false;
+    if (this.templates.length > 0) return false;
+    if (!this.atStatementStart()) return false;
+    if (!this.code.startsWith('export', this.i)) return false;
+    return !isIdentifierChar(this.code[this.i + 6] ?? '');
+  }
+
+  /**
+   * Start of input, after a `;` or a `}`, or on a new line — the last because
+   * JavaScript does not require the semicolon and plenty of people do not write
+   * one.
+   */
+  private atStatementStart(): boolean {
+    return (
+      this.lastSignificant === '' ||
+      this.lastSignificant === ';' ||
+      this.lastSignificant === '}' ||
+      this.newlineSince
+    );
+  }
+}
+
+/**
  * Does this code declare an ES module — and so ask to be called as a function
  * over one object?
  *
  * See the module docblock for the rule and why it is the rule. Python is not
- * asked this question: {@link pythonHarness} writes the `def` itself, so a
- * Python transform never states a signature and never had the problem this
- * detector exists to solve.
+ * asked this question: its harness writes the `def` itself, so a Python
+ * transform never states a signature and never had the problem this detector
+ * exists to solve.
  */
 export function transformDeclaresModule(code: string): boolean {
-  let lastSignificant = '';
-  let newlineSince = false;
-  let braces = 0;
-  let parens = 0;
-  let brackets = 0;
-  /**
-   * Open template literals, innermost last. A `}` closes the innermost `${` when
-   * this is non-empty and the brace depth has come back to where that `${`
-   * opened it.
-   */
-  const templates: number[] = [];
-
-  for (let i = 0; i < code.length; i += 1) {
-    const char = code[i];
-    const next = code[i + 1];
-
-    if (char === '\n') {
-      newlineSince = true;
-      continue;
-    }
-    if (char === ' ' || char === '\t' || char === '\r') continue;
-
-    // Comments — skipped whole, and they do not disturb statement position: a
-    // comment between `;` and `export` leaves the `export` exactly as much at
-    // the start of a statement as it was.
-    if (char === '/' && next === '/') {
-      while (i < code.length && code[i] !== '\n') i += 1;
-      newlineSince = true;
-      continue;
-    }
-    if (char === '/' && next === '*') {
-      const end = code.indexOf('*/', i + 2);
-      // A block comment containing a newline ends the line for ASI purposes,
-      // and an unterminated one swallows the rest of the file.
-      const chunk = end === -1 ? code.slice(i) : code.slice(i, end + 2);
-      if (chunk.includes('\n')) newlineSince = true;
-      i = end === -1 ? code.length : end + 1;
-      continue;
-    }
-
-    if (char === '"' || char === "'") {
-      i += 1;
-      while (i < code.length && code[i] !== char) {
-        if (code[i] === '\\') i += 1;
-        i += 1;
-      }
-      lastSignificant = char;
-      newlineSince = false;
-      continue;
-    }
-
-    if (char === '`') {
-      templates.push(braces);
-      // Consume until the closing backtick or a `${`, whichever comes first.
-      i += 1;
-      while (i < code.length) {
-        if (code[i] === '\\') {
-          i += 1;
-        } else if (code[i] === '`') {
-          templates.pop();
-          break;
-        } else if (code[i] === '$' && code[i + 1] === '{') {
-          // Back to scanning code, inside the interpolation. The `}` that ends
-          // it is recognised below by the depth recorded on the stack.
-          i += 1;
-          break;
-        }
-        i += 1;
-      }
-      lastSignificant = '`';
-      newlineSince = false;
-      continue;
-    }
-
-    if (char === '/' && startsRegex(code, i, lastSignificant)) {
-      i += 1;
-      let inClass = false;
-      while (i < code.length) {
-        if (code[i] === '\\') i += 1;
-        else if (code[i] === '[') inClass = true;
-        else if (code[i] === ']') inClass = false;
-        else if (code[i] === '/' && !inClass) break;
-        else if (code[i] === '\n') break;
-        i += 1;
-      }
-      lastSignificant = '/';
-      newlineSince = false;
-      continue;
-    }
-
-    if (char === '{') braces += 1;
-    else if (char === '[') brackets += 1;
-    else if (char === '(') parens += 1;
-    else if (char === ']') brackets -= 1;
-    else if (char === ')') parens -= 1;
-    else if (char === '}') {
-      const resumes = templates.length > 0 && templates[templates.length - 1] === braces;
-      if (resumes) {
-        // The interpolation is over: keep reading the template literal it was
-        // inside, from just past this brace.
-        templates.pop();
-        let j = i + 1;
-        let reopened = false;
-        while (j < code.length) {
-          if (code[j] === '\\') {
-            j += 1;
-          } else if (code[j] === '`') {
-            break;
-          } else if (code[j] === '$' && code[j + 1] === '{') {
-            templates.push(braces);
-            j += 1;
-            reopened = true;
-            break;
-          }
-          j += 1;
-        }
-        i = j;
-        if (!reopened) lastSignificant = '`';
-        newlineSince = false;
-        continue;
-      }
-      braces -= 1;
-    }
-
-    if (
-      char === 'e' &&
-      braces === 0 &&
-      parens === 0 &&
-      brackets === 0 &&
-      templates.length === 0 &&
-      (lastSignificant === '' ||
-        lastSignificant === ';' ||
-        lastSignificant === '}' ||
-        newlineSince) &&
-      code.startsWith('export', i) &&
-      !isIdentifierChar(code[i + 6] ?? '')
-    ) {
-      return true;
-    }
-
-    lastSignificant = char;
-    newlineSince = false;
-  }
-
-  return false;
+  return new ModuleScanner(code).findsExport();
 }
 
 /** {@link transformDeclaresModule}, as the shape it names. */
