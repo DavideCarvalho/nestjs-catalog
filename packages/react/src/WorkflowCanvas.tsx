@@ -15,6 +15,7 @@ import {
   type NodeChange,
   NodeToolbar,
   type OnConnectEnd,
+  Panel,
   Position,
   ReactFlow,
   ReactFlowProvider,
@@ -29,6 +30,7 @@ import '@xyflow/react/dist/style.css';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   ArrowRight,
+  ChevronDown,
   CircleAlert,
   CircleDashed,
   Code2,
@@ -40,6 +42,8 @@ import {
   LayoutGrid,
   Link2,
   Loader2,
+  Maximize2,
+  Minimize2,
   PanelRight,
   Play,
   Plug,
@@ -235,6 +239,15 @@ const CHROME = {
   side: 28,
   /** The rail's width plus its gutter, when it is open. */
   rail: 336,
+  /**
+   * The top inset once the workflow card is collapsed to its head.
+   *
+   * The card is the tallest thing on this screen and the only one focus mode
+   * changes the height of, so it is the only inset that moves with the mode.
+   * The dock is still at the bottom and the actions are untouched, so those two
+   * keep their numbers.
+   */
+  topFocused: 76,
 };
 
 /**
@@ -253,10 +266,18 @@ interface FitPadding {
   left: PaddingPx;
 }
 
-/** {@link CHROME} as the padding `fitView` wants. The right edge is the only side that moves. */
-function chromeFitPadding(railOpen: boolean): FitPadding {
+/**
+ * {@link CHROME} as the padding `fitView` wants.
+ *
+ * Two sides move, and only two: the right, because the rail comes and goes, and
+ * the top, because focus mode collapses the card to its head. The whole reason
+ * this function exists is that a fit which ignored either would put a node under
+ * a panel — so a mode that makes the chrome smaller has to say so here, or the
+ * canvas it just bought would go unused.
+ */
+function chromeFitPadding(railOpen: boolean, cardCollapsed: boolean): FitPadding {
   return {
-    top: `${CHROME.top}px`,
+    top: `${cardCollapsed ? CHROME.topFocused : CHROME.top}px`,
     bottom: `${CHROME.bottom}px`,
     left: `${CHROME.side}px`,
     right: `${railOpen ? CHROME.rail : CHROME.side}px`,
@@ -276,8 +297,301 @@ function chromeFitPadding(railOpen: boolean): FitPadding {
  * answer there: it is what hydrates into on a desktop, and a panel that appears
  * after hydration is a worse first paint than one that was always there.
  */
-function railOpenByDefault(): boolean {
+function railOpenByWidth(): boolean {
   return typeof window === 'undefined' ? true : window.innerWidth >= 1024;
+}
+
+/**
+ * Whether this is a pointer that can hover at all.
+ *
+ * The whole shrink-and-expand idea below is built on hover, and hover is not a
+ * thing every pointer has. On a touch screen there is no state between "not
+ * touching" and "touching": the first contact with a pannable minimap IS a pan,
+ * so a map that expanded on touch would turn a navigation gesture into a resize
+ * gesture and move the viewport while doing it. There is no version of
+ * hover-to-expand that works there, so the honest answer is not to shrink at
+ * all — a finger gets the map exactly as it is today.
+ *
+ * `pointer: fine` as well as `hover: hover`, because the pair is what excludes a
+ * TV remote and a Wii-style pointer: those report `hover: hover` with a coarse
+ * pointer, and a 96px target you have to wave at is worse than a 200px one.
+ *
+ * Every failure answers `false` — no window, no `matchMedia` (jsdom does not
+ * implement it), or a throw. `false` means "do not shrink", which is the answer
+ * that takes nothing away, and that is the same rule
+ * {@link focusModeAtMount} follows for the same reason.
+ */
+const HOVER_POINTER_QUERY = '(hover: hover) and (pointer: fine)';
+
+function hoverCapablePointer(): boolean {
+  if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return false;
+  try {
+    return window.matchMedia(HOVER_POINTER_QUERY).matches;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * How much of its size the overview keeps while focus mode has the screen.
+ *
+ * React Flow's minimap is 200×150, and 0.48 of that is 96×72 — whole pixels on
+ * both axes, which a rounder-looking 0.5 would also give but 0.45 would not. A
+ * fractional height puts the mask's bottom edge on a half-pixel and the
+ * viewport box picks up a grey seam that reads as a border it does not have.
+ *
+ * WHAT SURVIVES AT THIS SIZE, which is the only question that matters — a
+ * shrunk minimap that reads as decoration has taken the navigation aid away and
+ * kept the pixels. At 96×72 the map still carries the one thing it is for: WHERE
+ * THE VIEWPORT IS IN THE GRAPH. That is drawn as a hole in a tinted mask, so it
+ * is an area rather than a detail, and area survives scaling — the box keeps its
+ * position and its proportion of the whole, which is the entire "am I looking at
+ * the middle of this graph or the far edge" question. The node dots keep their
+ * kind colours (see {@link miniMapColor}), so a cluster and a lone box on the
+ * other side of the graph are still two different pictures.
+ *
+ * WHAT IS SACRIFICED: reading an individual node's position precisely, and any
+ * hope of telling two adjacent nodes apart. Both are recovered by hovering, and
+ * neither was ever a gesture here — no `onNodeClick` is passed to the minimap,
+ * so a dot has never been a target.
+ *
+ * A single scale rather than a smaller `style={{ width, height }}`, and that is
+ * NOT a shortcut — see {@link FocusMiniMap} for why it is the only version of
+ * this that cannot make a drag jump under the finger.
+ *
+ * SPELLED AS A LITERAL CLASS, and it has to be. This package ships as compiled
+ * JS and the console's stylesheet points Tailwind at `dist/**\/*.js` to find the
+ * classes in it. Tailwind emits only what it can SEE in that text, so a class
+ * built as `scale-[${scale}]` survives compilation as an un-evaluated template
+ * and the rule is never generated — no error, no warning, and a focus mode
+ * whose minimap simply never shrinks. Hence one string, and the arithmetic in
+ * this comment rather than in the code: 200×150 × 0.48 = 96×72.
+ */
+const MINIMAP_FOCUSED_CLASS = 'scale-[0.48]';
+
+/* ---------------------------------------------------------------------------
+ * Focus mode.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The key focus mode is remembered under, and — deliberately — `sessionStorage`.
+ *
+ * ## Why it is remembered at all
+ *
+ * A mode somebody has to re-enter after every reload is a mode nobody uses. The
+ * person this exists for is the one drawing a forty-node graph, and that person
+ * reloads: a deploy lands, a query is retried, a tab is restored. Losing the
+ * layout each time makes the gesture a novelty.
+ *
+ * ## Why it is not `localStorage`
+ *
+ * This mode HIDES things — the workflow picker, the name field, the description.
+ * A preference that hides controls and is restored silently a week later is
+ * somebody opening the console, finding a screen with fewer controls than they
+ * remember, and having no way to connect that to a keypress from last Tuesday.
+ * That is the exact confusion a persisted hiding-mode causes, and it is worse
+ * than re-pressing a key.
+ *
+ * `sessionStorage` is the honest middle: the mode lives exactly as long as the
+ * TAB that chose it. A reload keeps it, because a reload is the same working
+ * session and is usually not even deliberate. A new tab, or tomorrow, starts
+ * with the chrome present. Nobody inherits a hidden control from a decision they
+ * cannot remember making.
+ *
+ * It is per-tab rather than per-workflow on purpose: focus is a statement about
+ * how somebody wants to WORK, not about a particular graph, and re-entering it
+ * on every switch of the picker would make it feel like a property of the
+ * document.
+ */
+const FOCUS_STORAGE_KEY = 'catalog.workflowCanvas.focus';
+
+/**
+ * Whether focus mode was on in this tab.
+ *
+ * Every failure answers `false` — no window (a host rendering this on a server),
+ * no storage (Safari's private mode throws on `sessionStorage` access rather
+ * than returning null), or anything stored that is not exactly `'1'`. The chrome
+ * being present is the state that hides nothing, so it is the only safe answer
+ * to "I could not tell".
+ */
+function focusModeAtMount(): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    return window.sessionStorage.getItem(FOCUS_STORAGE_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether the details rail starts on screen, once focus mode has had its say.
+ *
+ * A mount that restores focus (see {@link focusModeAtMount}) has to start with
+ * the rail away, or a reload puts back the one panel the mode had just taken and
+ * focus arrives half-applied. Measured in a browser before this existed: press
+ * F, reload, and the rail was open again with the toggle still reading "Turn off
+ * focus mode" — a screen making two claims about itself.
+ */
+function railOpenByDefault(): boolean {
+  return !focusModeAtMount() && railOpenByWidth();
+}
+
+/** Remember it, or fail silently — a mode is not worth an exception. */
+function rememberFocusMode(on: boolean): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.sessionStorage.setItem(FOCUS_STORAGE_KEY, on ? '1' : '0');
+  } catch {
+    // A browser that refuses storage still gets the mode, for this render.
+  }
+}
+
+/**
+ * The key that toggles focus mode.
+ *
+ * A bare letter rather than a chord, because this is a drawing surface and the
+ * hand that would reach for a modifier is the hand on the pointer. `f` is the
+ * mnemonic and nothing else on this screen claims it: React Flow binds only
+ * Delete/Backspace and the arrows, and Escape already means "put the half-drawn
+ * wire away" (see `workflow/wiring.tsx`), which is why this is not Escape.
+ *
+ * Discoverable rather than folklore: the toggle renders the letter beside its
+ * icon and its tooltip names it, so the shortcut is learnable from the control
+ * it duplicates instead of from a changelog.
+ */
+const FOCUS_SHORTCUT = 'f';
+
+/**
+ * Whether a keypress belongs to whatever the person is typing into.
+ *
+ * The failure this prevents is specific and would be reported as "the panels
+ * vanish while I name a node": this screen is covered in text fields — the name
+ * field, the inspector's config editor, the transform's code surface — and a
+ * bare-letter shortcut that did not ask would fire on the `f` of "fleet".
+ *
+ * Narrowed with `instanceof` rather than by reading `tagName` off an `EventTarget`,
+ * because a target can be a document or a window and neither has one.
+ * `isContentEditable` covers the code editor, which is a `div`.
+ */
+function typingInto(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  if (target.isContentEditable) return true;
+  return (
+    target instanceof HTMLInputElement ||
+    target instanceof HTMLTextAreaElement ||
+    target instanceof HTMLSelectElement
+  );
+}
+
+/**
+ * Whether the chrome is compacted so the graph gets the screen, and the one
+ * gesture that changes it.
+ *
+ * ## What the mode does, and what it deliberately does not
+ *
+ * ON: the workflow card collapses to its head, the node dock drops its labels
+ * (the form it already takes on a phone — see `AddButton` — rather than a second
+ * compact form invented for this), and the rail goes away.
+ *
+ * OFF-LIMITS: the action cluster. That is not an oversight, it is the reason the
+ * mode is safe. Every signal on this screen that prevents a mistake lives in that
+ * cluster or hangs off it — Save doubles as the unsaved indicator, the refusal
+ * notes appear beneath the button that caused them, the shrink refusal with its
+ * acknowledge control is one of those notes, and the rail toggle carries the
+ * problem count and its colour while the rail is away. It is also the smallest of
+ * the three groups, so hiding it would buy the least canvas for the most risk.
+ * What is left in focus is a graph plus the things that can tell you the graph is
+ * wrong.
+ *
+ * ## Why one gesture rather than three
+ *
+ * Because the ask was "compactar os menus" for "real estate", and real estate is
+ * a property of the whole screen. Three independent collapses is three decisions
+ * and six states to be in; a person who wants the room wants the room. The rail
+ * keeps its own toggle because it had one before this and closing it alone is a
+ * legitimate smaller wish.
+ *
+ * ## Why the rail is passed in rather than owned here
+ *
+ * Because it existed first and is still operable on its own. This hook borrows
+ * it for the duration of the mode and gives it back; it does not become the
+ * rail's owner, which is what taking the `useState` would have meant.
+ */
+function useFocusMode(
+  railOpen: boolean,
+  setRailOpen: (open: boolean) => void,
+): { focused: boolean; toggleFocus: () => void } {
+  const [focused, setFocused] = useState(focusModeAtMount);
+
+  /**
+   * Whether the rail was open before focus took it away.
+   *
+   * A ref rather than state: nothing renders from it, and leaving focus should
+   * put the screen back the way it was found rather than assert a default. A
+   * person who had closed the rail themselves and then used focus would
+   * otherwise get a panel they never asked for on the way out.
+   *
+   * Seeded from the WIDTH rather than from `railOpen`, and the two differ in
+   * exactly one case: a mount that restored focus, where `railOpen` is already
+   * false because focus put it there. Seeding from it would mean leaving focus
+   * after a reload left the rail away too — restoring a state that focus itself
+   * created rather than the one it displaced.
+   */
+  const railBeforeFocus = useRef(railOpenByWidth());
+
+  const toggleFocus = useCallback(() => {
+    const next = !focused;
+    rememberFocusMode(next);
+    if (next) railBeforeFocus.current = railOpen;
+    setRailOpen(next ? false : railBeforeFocus.current);
+    setFocused(next);
+  }, [focused, railOpen, setRailOpen]);
+
+  /**
+   * The keyboard way in and out. See {@link FOCUS_SHORTCUT}.
+   *
+   * On `window` rather than on the canvas container, because the point of the
+   * shortcut is that it works while the hands are on the graph — and React
+   * Flow's pane is not a focusable element, so a container-scoped handler would
+   * only fire after somebody had tabbed to something.
+   *
+   * Every modifier is refused rather than ignored: `Ctrl+F` is find, `Cmd+F` is
+   * find, and a shortcut that swallowed either would be a bug reported as "the
+   * browser's search is broken on this screen".
+   */
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+      if (event.key.toLowerCase() !== FOCUS_SHORTCUT) return;
+      if (typingInto(event.target)) return;
+      event.preventDefault();
+      toggleFocus();
+    }
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [toggleFocus]);
+
+  return { focused, toggleFocus };
+}
+
+/**
+ * Whether the workflow card actually folds — because focus mode REFUSES to fold
+ * it while the graph has no name.
+ *
+ * The one place this mode could become a trap. Save is disabled on an empty name
+ * (see `CanvasActions`), and the field that fills it in is inside the card — so a
+ * focus mode that collapsed the card unconditionally would leave somebody who had
+ * just picked "New workflow" with a dead Save button, a tooltip about a field
+ * they cannot see, and no way to connect the two.
+ *
+ * So the card is chrome that is quiet when it has nothing to report and asserts
+ * itself when it does: it stays open, in focus mode, exactly while the only
+ * control that can unblock Save is the one it holds. {@link FocusToggle} says so
+ * rather than appearing broken, and `WorkflowCard` additionally declines to fold
+ * while the caret is still in the field.
+ */
+function focusCollapsesTheCard(focused: boolean, draftName: string): boolean {
+  return focused && draftName.trim().length > 0;
 }
 
 /**
@@ -1121,10 +1435,20 @@ function CanvasActions({
  */
 function AddNodeBar({
   refreshing,
+  compact,
   onAdd,
   onTidy,
 }: {
   refreshing: boolean;
+  /**
+   * The icons-only form, asked for rather than measured.
+   *
+   * Deliberately the SAME form the dock already takes below `md`, rather than a
+   * second compact layout invented for focus mode: this row has one way of
+   * being small, and two would drift the moment somebody changed one of them.
+   * All focus does is ask for it at any width — see `AddButton`.
+   */
+  compact: boolean;
   onAdd: (kind: WorkflowNodeKind) => void;
   onTidy: () => void;
 }) {
@@ -1136,7 +1460,7 @@ function AddNodeBar({
       )}
     >
       {WORKFLOW_NODE_KINDS.map((kind) => (
-        <AddButton key={kind} kind={kind} onClick={() => onAdd(kind)} />
+        <AddButton key={kind} kind={kind} compact={compact} onClick={() => onAdd(kind)} />
       ))}
 
       <span className={cn('mx-1 h-6 w-px shrink-0 bg-zinc-200 dark:bg-zinc-800')} aria-hidden />
@@ -1150,9 +1474,10 @@ function AddNodeBar({
           className="shrink-0"
         >
           <LayoutGrid size={12} />
-          {/* The word goes when the dock has to fit a phone. The accessible name
-              above is unconditional, so nothing is lost to a screen reader. */}
-          <span className="hidden md:inline">Tidy</span>
+          {/* The word goes when the dock has to fit a phone, and when focus mode
+              asks for the room. The accessible name above is unconditional, so
+              nothing is lost to a screen reader either way. */}
+          <span className={compact ? 'hidden' : 'hidden md:inline'}>Tidy</span>
         </Button>
       </Tooltip>
 
@@ -1211,6 +1536,165 @@ function miniMapColor(data: { kind?: unknown } | undefined): string {
 }
 
 /**
+ * The overview, and the one thing focus mode does to it.
+ *
+ * WHY IT SHRINKS RATHER THAN GOES
+ * -------------------------------
+ * Focus mode's argument everywhere else is that the chrome it hides is chrome
+ * you do not need while drawing. The minimap is the exception: it is a
+ * navigation aid for exactly the big graph that made somebody want the room in
+ * the first place, so taking it away is taking away the thing the mode is FOR.
+ * It shrinks to the size at which it still answers "where am I", and hovering
+ * it brings the rest back. See {@link MINIMAP_FOCUSED_CLASS} for what survives
+ * at that size and what does not.
+ *
+ * WHY A TRANSFORM AND NOT A SMALLER MINIMAP
+ * -----------------------------------------
+ * React Flow sizes the minimap from `style.width`/`style.height` (defaulting to
+ * 200×150) and derives `viewScale` from them — `boundingRect.width /
+ * elementWidth`. Its pan handler then moves the viewport by `rawClientDelta *
+ * viewScale`, reading `viewScale` LIVE from a ref on every mousemove.
+ *
+ * So shrinking the honest way — passing a smaller width and height — would
+ * change the pan gain, and change it on every frame of an animation between the
+ * two sizes. A drag that started while the map was small and expanded mid-
+ * gesture would have the viewport accelerate under the finger, continuously,
+ * for the length of the animation. That is the exact failure worth avoiding.
+ *
+ * Scaling has none of it: `style.width` stays 200 in both states, so `viewScale`
+ * is a constant and the pan gain is IDENTICAL small, large, and every frame in
+ * between. Scale is a compositor property, so the animation never touches
+ * layout, never re-renders React Flow, and never resolves against `height:
+ * auto` — which is the shape of animation that never settled under jsdom and
+ * left the card body mounted forever in a test. There is nothing here for that
+ * to happen to: the element is always mounted, always 200×150 in layout, and
+ * the only thing moving is one compositor property.
+ *
+ * (Tailwind v4 emits `scale-*` as the INDEPENDENT `scale` property rather than
+ * as `transform: scale(...)`, so the computed `transform` here reads `none` and
+ * the size lives in `scale`. It honours `transform-origin` exactly the same
+ * way, and `transition-transform` in v4 expands to `transform, translate,
+ * scale, rotate` — so the transition below does cover it. Both checked in a
+ * browser rather than assumed, because a transition that silently covers
+ * nothing is a snap that looks like a missing animation.)
+ *
+ * The residue is that while shrunk the pan gain is calibrated for the large map
+ * — a drag would move the viewport less than the small drawing suggests. On a
+ * fine pointer that state is unreachable: a drag needs a press, a press needs
+ * the pointer over the element, and the pointer being over the element is what
+ * expands it. Every drag begins on a settled, full-size map. On a touch screen
+ * there is no shrinking at all ({@link hoverCapablePointer}), so it cannot
+ * arise there either. Expand-then-pan, arrived at by geometry rather than by
+ * disabling anything.
+ *
+ * WHY IT CANNOT FLICKER
+ * ---------------------
+ * Both states are anchored at the same bottom-left corner and the transform
+ * origin is that corner, so the small box is a strict sub-rectangle of the
+ * large one. A pointer that enters the small box is therefore still inside the
+ * large box once it expands, and expansion can never move the element out from
+ * under the pointer that caused it. The one geometry that oscillates — expand,
+ * pointer now outside, collapse, repeat — needs the two boxes to disagree about
+ * a region, and containment is what rules that out.
+ *
+ * It also cannot collide with the zoom controls above it, because the expanded
+ * size is the size the minimap already is today: the gap the shrink opens up is
+ * space that was always reserved for this element, so growing back into it
+ * covers nothing that was not already covered.
+ */
+function FocusMiniMap({ focused }: { focused: boolean }) {
+  /*
+   * Read once at mount rather than subscribed to, which is the same call
+   * `railOpenByWidth` makes and for the same reason: a live query would re-shrink
+   * the map under a pointer that is resting on it because a tablet was docked.
+   * The cost of being wrong is one session on the size it booted with.
+   */
+  const [canHover] = useState(hoverCapablePointer);
+  const shrinks = focused && canHover;
+
+  return (
+    /*
+     * React Flow's own `Panel`, so this wrapper IS the panel: it takes the
+     * absolute positioning, the 15px margin, the z-index and — the reason it is
+     * `Panel` rather than a hand-rolled div — the rule that switches
+     * `pointer-events` off while a box-selection is being dragged across the
+     * canvas. The minimap inside is switched to `static` so it stops being the
+     * positioned element and becomes this one's content; without that there
+     * would be two absolutely-positioned boxes fighting over one corner.
+     */
+    <Panel
+      position="bottom-left"
+      /*
+       * THE KEYBOARD PATH, and it exists only while the map is shrunk.
+       *
+       * A minimap that expands on hover cannot be expanded by somebody who has
+       * no pointer, and `focus-within` is only an answer if something in here
+       * can hold a caret — React Flow's minimap is an `svg` with `role="img"`,
+       * which cannot. So the panel itself becomes the focus stop.
+       *
+       * Conditional on `shrinks`, and that is the whole reason this is safe:
+       * outside focus mode the tab order is byte-for-byte the one the previous
+       * round measured and settled — app nav, card, actions, rail toggle, dock,
+       * rail, canvas — because `undefined` puts no stop here at all. Inside
+       * focus mode there is one extra stop, at the end, on the element that
+       * needs it. That is a net gain for a keyboard: the minimap was never
+       * reachable before, in either mode.
+       */
+      tabIndex={shrinks ? 0 : undefined}
+      role={shrinks ? 'group' : undefined}
+      aria-label={
+        shrinks
+          ? 'Graph overview, reduced. Hold focus here, or hover it, to see it full size.'
+          : undefined
+      }
+      className={cn(
+        // An overview is worth least on the screen with least room for it:
+        // below `lg` it would cover a sixth of the canvas to describe the other
+        // five. Moved here from the minimap itself along with the positioning.
+        'hidden lg:block',
+        // The corner both states share. `scale` alone would shrink about the
+        // centre and unpin the map from the corner it is anchored to, which is
+        // also what makes the containment argument above hold.
+        'origin-bottom-left',
+        /*
+         * A tween on a transform, matching the duration and the curve the card
+         * body folds on, so the two halves of one gesture move as one gesture.
+         *
+         * `prefers-reduced-motion` gets the same end state and no transition —
+         * a CSS variant rather than the `useReducedMotion()` hook the motion
+         * components here use, because this animation is CSS and the media
+         * query is the direct expression of it. There is no state to keep in
+         * step and nothing to settle.
+         */
+        'transition-transform duration-200 ease-[cubic-bezier(0.32,0.72,0,1)]',
+        'motion-reduce:transition-none',
+        // `focus` as well as `focus-within`: the stop is on this element, so it
+        // is `focus` that fires today. `focus-within` is here so that a control
+        // added inside later expands the map rather than being drawn at half
+        // size under somebody's caret.
+        shrinks && MINIMAP_FOCUSED_CLASS,
+        shrinks && 'hover:scale-100 focus:scale-100 focus-within:scale-100',
+        // The focus ring goes on the panel, because the panel is the focus stop.
+        shrinks && 'rounded-lg outline-none focus-visible:ring-2 focus-visible:ring-sky-500',
+      )}
+    >
+      <MiniMap
+        pannable
+        zoomable
+        // Positioning now belongs to the panel above, so the minimap stops
+        // claiming a corner and just draws in the box it is given.
+        position="bottom-left"
+        nodeColor={(node) => miniMapColor(node.data)}
+        className={cn(
+          '!static !m-0',
+          '!overflow-hidden !rounded-lg !border !border-zinc-200 !shadow-sm dark:!border-zinc-800',
+        )}
+      />
+    </Panel>
+  );
+}
+
+/**
  * The graph itself, and the two states in which there is no graph to draw.
  *
  * Loading and failure are drawn inside the canvas's own frame rather than in
@@ -1241,6 +1725,7 @@ function GraphSurface({
   wiringRefusal,
   nodeMenu,
   fitPadding,
+  focused,
 }: {
   loading: boolean;
   failed: boolean;
@@ -1275,6 +1760,15 @@ function GraphSurface({
    * puts nodes under the floating panels.
    */
   fitPadding: FitPadding;
+  /**
+   * Whether focus mode has the screen — read here only by the minimap.
+   *
+   * Deliberately the MODE and not `cardCollapsed`. The card refuses to fold
+   * while the graph has no name, because the field that fixes that is inside
+   * it; the overview has no such dependency, so tying it to the refusal would
+   * leave the minimap full size for a reason that has nothing to do with it.
+   */
+  focused: boolean;
 }) {
   /*
    * Memoised because they are context values read by every node and every edge
@@ -1361,19 +1855,7 @@ function GraphSurface({
                   '!bottom-0 lg:!bottom-[9.5rem]',
                 )}
               />
-              <MiniMap
-                pannable
-                zoomable
-                position="bottom-left"
-                nodeColor={(node) => miniMapColor(node.data)}
-                // An overview is worth least on the screen with least room for
-                // it: below `lg` it would cover a sixth of the canvas to
-                // describe the other five.
-                className={cn(
-                  '!hidden lg:!block',
-                  '!overflow-hidden !rounded-lg !border !border-zinc-200 !shadow-sm dark:!border-zinc-800',
-                )}
-              />
+              <FocusMiniMap focused={focused} />
               <PendingWireLine pending={wiring.pending} />
               <WiringHint
                 pending={wiring.pending}
@@ -1928,23 +2410,32 @@ function Canvas({
    */
   const [railOpen, setRailOpen] = useState(railOpenByDefault);
 
+  const { focused, toggleFocus } = useFocusMode(railOpen, setRailOpen);
+  const cardCollapsed = focusCollapsesTheCard(focused, draft.name);
+
   /**
    * The region of the viewport the graph should be fitted into.
    *
-   * See {@link CHROME}. The right edge is the only side that moves, because the
-   * rail is the only panel that comes and goes.
+   * See {@link CHROME}. Two sides move: the right with the rail, the top with
+   * the card's collapse.
    *
    * Declared up here with the state rather than beside its use, because both
    * `fitView` call sites below name it in a dependency array — and a `const` read
    * by a hook that runs earlier in the body is a temporal-dead-zone crash, not a
    * lint warning.
    *
-   * Toggling the rail deliberately does NOT re-fit. That would throw away a
-   * viewport somebody had panned to, in response to an action about a panel; the
-   * new padding applies at the next fit that was going to happen anyway —
-   * opening a graph, or pressing Tidy.
+   * Toggling the rail deliberately does NOT re-fit, and neither does entering
+   * focus. That would throw away a viewport somebody had panned to, in response
+   * to an action about a panel; the new padding applies at the next fit that was
+   * going to happen anyway — opening a graph, or pressing Tidy. Focus is the
+   * stronger case for the same rule: somebody who has just asked for room is
+   * looking at a particular part of the graph, and jumping the viewport is the
+   * one thing that would lose it.
    */
-  const fitPadding = useMemo<FitPadding>(() => chromeFitPadding(railOpen), [railOpen]);
+  const fitPadding = useMemo<FitPadding>(
+    () => chromeFitPadding(railOpen, cardCollapsed),
+    [railOpen, cardCollapsed],
+  );
   /**
    * Whether the "this load is expected to shrink" dialog is open.
    *
@@ -2874,6 +3365,9 @@ function Canvas({
             workflowsPending={workflows.isPending}
             draftName={draft.name}
             canEdit={canEdit}
+            collapsed={cardCollapsed}
+            reducedMotion={reducedMotion}
+            onExpand={toggleFocus}
             onSelect={(value) => {
               loadedRef.current = null;
               setSelected(value);
@@ -2914,6 +3408,17 @@ function Canvas({
               />
               <span className="h-6 w-px shrink-0 bg-zinc-200 dark:bg-zinc-800" aria-hidden />
               <RailToggle open={railOpen} problems={live} onToggle={() => setRailOpen((o) => !o)} />
+              {/*
+               * Last, and therefore the last tab stop in the cluster.
+               *
+               * The previous round settled the order deliberately — app nav,
+               * card, actions, rail toggle, dock, rail, canvas — so the one
+               * control added here goes on the end of the group it belongs to
+               * rather than into the middle of it. Nothing that was reachable
+               * moves. It is also the outermost thing in the row visually, which
+               * is where a control about the whole screen belongs.
+               */}
+              <FocusToggle on={focused} cardCollapsed={cardCollapsed} onToggle={toggleFocus} />
             </div>
 
             {/*
@@ -2962,6 +3467,7 @@ function Canvas({
           <div className="absolute inset-x-0 bottom-3 flex justify-center px-3 sm:bottom-4 sm:px-4">
             <AddNodeBar
               refreshing={workflows.isFetching && !workflows.isPending}
+              compact={focused}
               onAdd={addNode}
               onTidy={tidy}
             />
@@ -3021,6 +3527,7 @@ function Canvas({
       </div>
 
       <GraphSurface
+        focused={focused}
         loading={workflows.isPending}
         failed={workflows.isError}
         error={workflows.error}
@@ -3206,7 +3713,15 @@ function article(word: string): string {
   return /^[aeiou]/i.test(word) ? 'an' : 'a';
 }
 
-function AddButton({ kind, onClick }: { kind: WorkflowNodeKind; onClick: () => void }) {
+function AddButton({
+  kind,
+  compact,
+  onClick,
+}: {
+  kind: WorkflowNodeKind;
+  compact: boolean;
+  onClick: () => void;
+}) {
   const { icon: Icon, label, hint } = ADD_NODE[kind];
   const noun = label.toLowerCase();
   return (
@@ -3226,8 +3741,11 @@ function AddButton({ kind, onClick }: { kind: WorkflowNodeKind; onClick: () => v
         <Icon size={12} />
         {/* Below `md` the dock is icons: six labelled buttons do not fit a phone
             and a dock that scrolls sideways to reach `filter` is a dock that
-            hides it again, which is the failure this row was just fixed for. */}
-        <span className="hidden md:inline">{label}</span>
+            hides it again, which is the failure this row was just fixed for.
+            Focus mode asks for that same form at any width — and the `aria-label`
+            above is what makes that safe, because the button's accessible name
+            never depended on this word being rendered. */}
+        <span className={compact ? 'hidden' : 'hidden md:inline'}>{label}</span>
       </Button>
     </Tooltip>
   );
@@ -3376,6 +3894,88 @@ function problemBadge(
 }
 
 /**
+ * Give the canvas the screen, or give the chrome back.
+ *
+ * ## What this control promises, and what it does not
+ *
+ * It promises room, and it says exactly what it takes to get it — "the card and
+ * the dock labels" — rather than "focus mode", because a mode named after a
+ * feeling is a mode nobody can predict. What it explicitly does not promise is
+ * that the screen goes quiet: the action cluster it sits inside stays whole, so
+ * Save, the refusals and the problem count are all still here after it is
+ * pressed. Somebody reading the tooltip should come away knowing that nothing
+ * which can stop a mistake is about to disappear.
+ *
+ * ## The refusal
+ *
+ * The refusal is the case where the mode is ON and the card stayed open anyway,
+ * because the graph has no name and the field that fixes that is inside it (see
+ * `cardCollapsed`). A control that had been pressed and visibly done nothing
+ * would read as broken, so it says which of the two things it is. The word is in
+ * the accessible name too, not only in the tooltip — a tooltip is a pointer
+ * affordance and this is the one state where the button's behaviour differs
+ * from its label.
+ *
+ * ## The shortcut
+ *
+ * Rendered as a letter beside the icon rather than mentioned only in prose. A
+ * keyboard shortcut nobody can see is a shortcut for whoever read the commit,
+ * and this screen's whole argument is that the hands stay on the canvas.
+ * `aria-hidden` on the glyph because the accessible name already spells it out
+ * as a sentence, and "F" read aloud in the middle of one is noise.
+ */
+function FocusToggle({
+  on,
+  cardCollapsed,
+  onToggle,
+}: {
+  on: boolean;
+  /** Whether the card actually folded. See {@link focusCollapsesTheCard}. */
+  cardCollapsed: boolean;
+  onToggle: () => void;
+}) {
+  const refusing = on && !cardCollapsed;
+  const hint = refusing
+    ? `Focus is on, but the card is staying until this ${WORKFLOW_NAME.singular} has a name — the field that gives it one is in there, and Save is held back without it. Press ${FOCUS_SHORTCUT.toUpperCase()} or this button to turn focus off.`
+    : on
+      ? `Bring back the ${WORKFLOW_NAME.singular} card and the dock's labels. Shortcut: ${FOCUS_SHORTCUT.toUpperCase()}.`
+      : `Collapse the ${WORKFLOW_NAME.singular} card, drop the dock to icons and put the details panel away, so the graph gets the screen. Save, the refusals and the problem count stay exactly where they are. Shortcut: ${FOCUS_SHORTCUT.toUpperCase()}.`;
+
+  const name = refusing
+    ? 'Turn off focus mode (the card is staying: this workflow has no name yet)'
+    : on
+      ? `Turn off focus mode, shortcut ${FOCUS_SHORTCUT.toUpperCase()}`
+      : `Turn on focus mode and give the canvas the room, shortcut ${FOCUS_SHORTCUT.toUpperCase()}`;
+
+  return (
+    <Tooltip content={hint}>
+      <Button
+        variant="ghost"
+        size="sm"
+        onClick={onToggle}
+        aria-pressed={on}
+        aria-label={name}
+        className={cn(
+          'shrink-0',
+          // On, the control is the only thing on screen saying so — the chrome
+          // it collapsed cannot say it is missing. So it carries the state in
+          // its own colour rather than relying on a panel that is gone.
+          on && 'bg-sky-100 text-sky-700 dark:bg-sky-950 dark:text-sky-300',
+        )}
+      >
+        {on ? <Minimize2 size={12} /> : <Maximize2 size={12} />}
+        <span
+          aria-hidden
+          className="rounded border border-current/30 px-1 font-mono text-[10px] leading-4 opacity-70"
+        >
+          {FOCUS_SHORTCUT.toUpperCase()}
+        </span>
+      </Button>
+    </Tooltip>
+  );
+}
+
+/**
  * Which graph this is, and the two fields that name it — top-left, floating.
  *
  * The corner a document's identity lives in, in every tool shaped like this one.
@@ -3384,6 +3984,26 @@ function problemBadge(
  * costs three lines of canvas forever to be read once. It is still reachable
  * from the button beside the title, and still read out in full to a screen
  * reader, which is the one audience a tooltip would have failed.
+ *
+ * ## Collapsed
+ *
+ * The tallest panel on the screen, so the one focus mode is really about: ~400
+ * by ~270 of the canvas, most of it two fields and a paragraph about durability
+ * that nobody reads twice. Collapsed, what is left is the head — and the head
+ * gains something rather than only losing things, because the name that was in
+ * the field has to go somewhere: it moves up beside the title, truncated, so the
+ * card still answers "which graph am I looking at" while it is small.
+ *
+ * What SURVIVES the collapse is the point. The status badges stay, so a graph
+ * that is `adopted`, unpublished or disabled still says so; the commits badge
+ * stays, so which type this writes is still on screen. Those are the two facts
+ * on this card that can stop a mistake, and neither of them is worth the height
+ * that the fields cost.
+ *
+ * The `h1` is in both states, at the same level, so collapsing does not knock a
+ * heading out of the document outline — a screen whose only `h1` comes and goes
+ * with a display preference is a screen that reads differently to a screen
+ * reader depending on a decision made about pixels.
  */
 function WorkflowCard({
   eyebrow,
@@ -3397,6 +4017,9 @@ function WorkflowCard({
   workflowsPending,
   draftName,
   canEdit,
+  collapsed,
+  reducedMotion,
+  onExpand,
   onSelect,
   onRename,
 }: {
@@ -3411,55 +4034,181 @@ function WorkflowCard({
   workflowsPending: boolean;
   draftName: string;
   canEdit: boolean;
+  /** Focus mode, and the graph has a name. See `cardCollapsed`. */
+  collapsed: boolean;
+  reducedMotion: boolean;
+  /** Leaves focus mode entirely, rather than opening this card alone. */
+  onExpand: () => void;
   onSelect: (value: string) => void;
   onRename: (name: string) => void;
 }) {
+  /**
+   * Whether something inside this card currently has the keyboard.
+   *
+   * The card will not fold while it does, and that is a correctness fix rather
+   * than a nicety. The refusal above holds the card open while the graph has no
+   * name — so the very next thing that happens is somebody typing one, and the
+   * condition that was holding the card open stops being true on the FIRST
+   * character. Without this, the field disappears out from under the caret
+   * mid-word and the rest of the name is typed into nothing.
+   *
+   * Tracked by bubbling rather than by handlers on each field: `focusin` and
+   * `focusout` bubble (unlike `focus` and `blur`), which React exposes as
+   * `onFocus`/`onBlur` on any ancestor, so this works for the picker, the name
+   * field and anything added to the card later without threading a prop.
+   *
+   * `relatedTarget` is where the focus WENT. Still inside the card — Tab from
+   * the picker to the name field — is not a departure. `null` is a departure:
+   * it is what a click on something unfocusable produces, and the card folding
+   * then is right.
+   */
+  const [holdsFocus, setHoldsFocus] = useState(false);
+  const folded = collapsed && !holdsFocus;
+
   return (
-    <div className={cn('pointer-events-auto w-[min(24rem,100%)] p-3', FLOATING)}>
+    /*
+     * `layout` rather than a CSS transition, because the box goes from a fixed
+     * 24rem to whatever its head needs and there is no width to transition TO —
+     * `auto` is not an animatable value. Motion measures both states and
+     * interpolates the real numbers, which is the difference between a panel
+     * that folds and one that snaps and then re-renders at the new size.
+     */
+    <motion.div
+      layout={!reducedMotion}
+      transition={reducedMotion ? { duration: 0 } : { type: 'spring', stiffness: 420, damping: 34 }}
+      onFocus={() => setHoldsFocus(true)}
+      onBlur={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget)) setHoldsFocus(false);
+      }}
+      className={cn(
+        'pointer-events-auto p-3',
+        // Collapsed it is allowed to be WIDER than the 24rem it is fixed at
+        // open, and that is not a slip. Wrapping the head onto a second line
+        // costs 23px of height across the full width of the panel; letting it
+        // run to 30rem costs a strip of canvas beside a title, at the top-left
+        // corner where a graph laid out left-to-right has nothing yet. Height is
+        // the expensive axis here, so the trade goes that way.
+        folded ? 'w-auto max-w-[min(30rem,100%)] py-2' : 'w-[min(24rem,100%)]',
+        FLOATING,
+      )}
+    >
       <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
-        <p className={cn('font-mono text-[10px] uppercase tracking-[0.18em]', MUTED)}>{eyebrow}</p>
+        {/* The eyebrow is the screen's section, read once on arrival. It is the
+            first thing to go and the least missed. */}
+        {!folded && (
+          <p className={cn('font-mono text-[10px] uppercase tracking-[0.18em]', MUTED)}>
+            {eyebrow}
+          </p>
+        )}
         <h1 className="text-sm font-semibold tracking-tight">{title}</h1>
+        {/* The name, only while the field that normally holds it is away. Two
+            copies of it on screen at once would be the card saying one thing
+            twice in a panel whose whole problem is height. */}
+        {folded && (
+          <p className={cn('max-w-[12rem] truncate text-xs', MUTED)} title={draftName}>
+            {draftName}
+          </p>
+        )}
         {stored && <WorkflowStatusBadge workflow={stored} />}
         <CommitsBadge produces={produces} />
-        <Tooltip content={intro}>
-          <Button
-            variant="ghost"
-            size="icon"
-            aria-label="What this screen is for"
-            className="ml-auto h-5 w-5"
+        {folded ? (
+          <Tooltip
+            content={`Bring the ${WORKFLOW_NAME.singular} picker, the name field and the checkpointing note back, and leave focus mode. Shortcut: ${FOCUS_SHORTCUT.toUpperCase()}.`}
           >
-            <Info size={11} />
-          </Button>
-        </Tooltip>
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={onExpand}
+              aria-expanded={false}
+              aria-label="Show the workflow card and leave focus mode"
+              className="ml-auto h-5 w-5"
+            >
+              <ChevronDown size={11} />
+            </Button>
+          </Tooltip>
+        ) : (
+          <Tooltip content={intro}>
+            <Button
+              variant="ghost"
+              size="icon"
+              aria-label="What this screen is for"
+              className="ml-auto h-5 w-5"
+            >
+              <Info size={11} />
+            </Button>
+          </Tooltip>
+        )}
       </div>
       {/*
        * The paragraph the tooltip carries, kept in the accessible tree.
        * A tooltip is a pointer affordance first and is announced unevenly; the
        * text is short and there is no reason for a screen-reader user to get a
        * worse version of the screen than a hovering one.
+       *
+       * Rendered in BOTH states, and that is what makes dropping the info button
+       * above defensible: collapsing takes away a pointer affordance for text
+       * that is already here, not the text.
        */}
       <p className="sr-only">{intro}</p>
 
-      <div className="mt-2.5 grid gap-2">
-        <SelectField
-          label={WORKFLOW_NAME.title}
-          ariaLabel={`Which ${WORKFLOW_NAME.singular} to edit`}
-          value={selected}
-          onValueChange={onSelect}
-          options={workflowOptions}
-          disabled={workflowsPending}
-        />
-        <TextField
-          label="Name"
-          value={draftName}
-          onChange={onRename}
-          placeholder="Fleet readiness"
-          disabled={!canEdit}
-        />
-      </div>
+      {/*
+       * `AnimatePresence` rather than a `hidden` class, and the difference is
+       * focus: a collapsed panel left in the DOM is a panel a Tab can still land
+       * in, which is exactly the "stranded focus" a hidden control causes.
+       * Unmounting is the only version of this that keeps the tab ring on
+       * something a person can see.
+       */}
+      <AnimatePresence initial={false}>
+        {!folded && (
+          <motion.div
+            key="body"
+            initial={reducedMotion ? false : { height: 0, opacity: 0 }}
+            animate={{ height: 'auto', opacity: 1 }}
+            exit={reducedMotion ? { opacity: 0 } : { height: 0, opacity: 0 }}
+            /*
+             * A tween, and NOT the spring the rail and the outer box use.
+             *
+             * Two reasons, one aesthetic and one that cost an afternoon. A
+             * spring overshoots, and a height overshooting past zero is a panel
+             * that clips itself against its own border on the way down — the
+             * one place on this screen where bounce reads as a glitch rather
+             * than as life. And a spring on a height resolved from `auto` has
+             * no analytic end: it settles by threshold, on frames. Under jsdom,
+             * which reports no layout, it never settled at all and
+             * `AnimatePresence` therefore never unmounted the body — so focus
+             * mode "worked" in a browser and left the picker and the name field
+             * in the document forever in a test. A tween ends on a clock.
+             */
+            transition={
+              reducedMotion ? { duration: 0 } : { duration: 0.22, ease: [0.32, 0.72, 0, 1] }
+            }
+            // Or the fields spill out of the box on the way down: the height is
+            // being animated from zero and their own height is not.
+            className="overflow-hidden"
+          >
+            <div className="mt-2.5 grid gap-2">
+              <SelectField
+                label={WORKFLOW_NAME.title}
+                ariaLabel={`Which ${WORKFLOW_NAME.singular} to edit`}
+                value={selected}
+                onValueChange={onSelect}
+                options={workflowOptions}
+                disabled={workflowsPending}
+              />
+              <TextField
+                label="Name"
+                value={draftName}
+                onChange={onRename}
+                placeholder="Fleet readiness"
+                disabled={!canEdit}
+              />
+            </div>
 
-      <DurabilityBanner durability={durability} />
-    </div>
+            <DurabilityBanner durability={durability} />
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </motion.div>
   );
 }
 
