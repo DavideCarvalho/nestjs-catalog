@@ -37,6 +37,54 @@ import { Logger } from '@nestjs/common';
  * that; a spool can, and so a single mechanism serves every streamed format.
  */
 
+/**
+ * **The seam, named — for whoever puts a storage driver behind it.**
+ *
+ * Nothing here knows what S3 is. The file-backed fetchers need exactly three
+ * things from wherever bytes live, and they are deliberately small enough to
+ * list:
+ *
+ * 1. **Enumerate a prefix**, yielding a key, a last-modified instant and a size.
+ *    `listUnreadObjects`/`readListingEntry` in `sources.ts` are the only code
+ *    that does this, and `S3Object` is the only shape it produces.
+ * 2. **Open one key as chunks** — `AsyncIterable<Uint8Array>`, which is what
+ *    {@link spool} takes. It is already transport-blind: `objectBodyChunks` in
+ *    `sources.ts` is the whole S3-shaped part, and it is nine lines.
+ * 3. **Read a byte range**, which only parquet wants, and which is satisfied
+ *    today by spooling and seeking the spool.
+ *
+ * Those map onto `@dudousxd/nestjs-media`'s `StorageDriver` almost exactly —
+ * `list()`, `stream()`, `stream(path, range)` — and an adapter should be one
+ * small file rather than a rewrite of this one. **No media dependency is taken
+ * here**; what follows is what reading that interface turned up, recorded so
+ * the adapter's author does not have to find it twice.
+ *
+ * - **`list()` rolls keys up by default.** `ListOptions.delimiter` defaults to
+ *   `'/'`, which puts deeper keys into `folders` instead of `files`. The
+ *   catalog's listing passes *no* delimiter and is therefore recursive, so an
+ *   adapter must ask for `delimiter: ''` or a connector pointed at a prefix of
+ *   dated partitions will quietly see nothing but folder names. Silent, and
+ *   indistinguishable from an empty bucket.
+ * - **`ListEntry.lastModified` is `Date | null`.** The catalog *refuses* an
+ *   entry it cannot place against the watermark rather than skipping it — see
+ *   `readListingEntry` — because a skipped object is one nobody notices is
+ *   missing. An adapter has to keep that refusal, not paper over a null with a
+ *   `stat()` per key: a prefix of ten thousand objects would become ten
+ *   thousand extra round trips per run.
+ * - **`stat()` is not the cheaper path here, and it is worth saying why.** The
+ *   suggestion that the current code fetches a body to learn last-modified is
+ *   not what it does: `ListObjectsV2` returns `Key`, `LastModified` and `Size`
+ *   in the listing itself, so the watermark already costs one paginated list
+ *   and no `GetObject`. `stat()` would be strictly worse *for the fan-out*. It
+ *   is genuinely useful for one thing this does not do yet — see the next point.
+ * - **`capabilities.ranged` is the interesting one.** A driver that can serve a
+ *   byte range could back a parquet read *without a spool at all*: parquet
+ *   needs a length and random access, which is `stat().size` plus
+ *   `stream(path, range)`, and `parquetRecordsFrom` in `source-parquet.ts` is
+ *   already written against that pair rather than against a file handle. The
+ *   text formats would still want the spool, for the back-pressure reason
+ *   below, so `ranged` buys parquet and not CSV.
+ */
 const payloadLogger = new Logger('CatalogSourcePayload');
 
 /**

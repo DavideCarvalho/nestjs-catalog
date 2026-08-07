@@ -267,7 +267,7 @@ export const SOURCE_KINDS: Record<ConnectorKind, SourceKindProfile> = {
   file: {
     label: 'a file',
     required: ['path'],
-    optional: ['format', 'jsonPath', 'delimiter', 'sheet', 'maxBytes'],
+    optional: ['format', 'jsonPath', 'delimiter', 'sheet', 'maxBytes', 'readIdleTimeoutMs'],
     keysRecordsBySourceName: true,
   },
   s3: {
@@ -280,6 +280,7 @@ export const SOURCE_KINDS: Record<ConnectorKind, SourceKindProfile> = {
       'delimiter',
       'sheet',
       'maxBytes',
+      'readIdleTimeoutMs',
       'region',
       'maxObjectsPerRun',
     ],

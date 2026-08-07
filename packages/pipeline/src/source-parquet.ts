@@ -69,36 +69,55 @@ export async function* parquetRecords(
   payload: LocalPayload,
   source: string,
 ): AsyncGenerator<unknown> {
-  const api = await parquetApi();
   const handle = await open(payload.path, 'r');
   try {
-    const file = fileBuffer(handle, payload.byteLength);
-    const metadata = readMetadata(await api.metadata(file), source);
-    refuseUnreadableColumns(metadata.schema, source);
-    const compressors = await resolveCompressors(metadata, source);
-    const columns = topLevelColumns(metadata.schema);
-
-    let rowStart = 0;
-    for (const group of metadata.rowGroups) {
-      const rowEnd = rowStart + group;
-      if (group >= ROW_GROUP_ROWS_TO_NOTE) {
-        parquetLogger.warn(
-          `${source} has a row group of ${group} rows. A row group is the smallest thing a parquet reader can decode, so this read holds that many rows at once however it is consumed. Ask the producer for smaller row groups if this worker is memory-bound.`,
-        );
-      }
-      const rows = await api.readObjects({
-        file,
-        metadata: metadata.raw,
-        rowStart,
-        rowEnd,
-        parsers: PARSERS,
-        ...(compressors ? { compressors } : {}),
-      });
-      for (const row of rows) yield shapeRow(row, columns, source);
-      rowStart = rowEnd;
-    }
+    yield* parquetRecordsFrom(fileBuffer(handle, payload.byteLength), source);
   } finally {
     await handle.close().catch(() => undefined);
+  }
+}
+
+/**
+ * The same read, over anything that can report a length and serve a byte range.
+ *
+ * Split out from {@link parquetRecords} because the spool is a *transport*
+ * decision and not a parquet one. A storage driver that can serve ranges —
+ * `@dudousxd/nestjs-media` declares exactly that as `capabilities.ranged` —
+ * satisfies {@link RandomAccessBytes} with `stat().size` and
+ * `stream(path, range)`, and could then read a parquet object out of a bucket
+ * without ever putting it on this worker's disk. Nothing does that yet and no
+ * dependency is taken for it; the seam is here so that when something does, it
+ * is a caller rather than a rewrite. See `source-payloads.ts` for the rest of
+ * that argument, including why the text formats would still want the spool.
+ */
+export async function* parquetRecordsFrom(
+  file: RandomAccessBytes,
+  source: string,
+): AsyncGenerator<unknown> {
+  const api = await parquetApi();
+  const metadata = readMetadata(await api.metadata(file), source);
+  refuseUnreadableColumns(metadata.schema, source);
+  const compressors = await resolveCompressors(metadata, source);
+  const columns = topLevelColumns(metadata.schema);
+
+  let rowStart = 0;
+  for (const group of metadata.rowGroups) {
+    const rowEnd = rowStart + group;
+    if (group >= ROW_GROUP_ROWS_TO_NOTE) {
+      parquetLogger.warn(
+        `${source} has a row group of ${group} rows. A row group is the smallest thing a parquet reader can decode, so this read holds that many rows at once however it is consumed. Ask the producer for smaller row groups if this worker is memory-bound.`,
+      );
+    }
+    const rows = await api.readObjects({
+      file,
+      metadata: metadata.raw,
+      rowStart,
+      rowEnd,
+      parsers: PARSERS,
+      ...(compressors ? { compressors } : {}),
+    });
+    for (const row of rows) yield shapeRow(row, columns, source);
+    rowStart = rowEnd;
   }
 }
 
@@ -363,7 +382,7 @@ async function resolveCompressors(
 
 /** As much of `hyparquet` as this file calls, checked before it is called. */
 interface ParquetApi {
-  metadata(file: AsyncBuffer): Promise<unknown>;
+  metadata(file: RandomAccessBytes): Promise<unknown>;
   readObjects(options: Record<string, unknown>): Promise<unknown[]>;
 }
 
@@ -382,7 +401,7 @@ async function parquetApi(): Promise<ParquetApi> {
   const readObjects = functionAt(module, 'parquetReadObjects');
 
   return {
-    async metadata(file: AsyncBuffer): Promise<unknown> {
+    async metadata(file: RandomAccessBytes): Promise<unknown> {
       return await metadata(file);
     },
     async readObjects(options: Record<string, unknown>): Promise<unknown[]> {
@@ -414,13 +433,14 @@ function functionAt(module: unknown, name: string): (...args: unknown[]) => Prom
  * that arrived over a socket is spooled to disk before this sees it. See
  * `source-payloads.ts`.
  */
-interface AsyncBuffer {
+export interface RandomAccessBytes {
   byteLength: number;
+  /** Bytes `[start, end)`, or to the end when `end` is omitted. */
   slice(start: number, end?: number): Promise<ArrayBuffer>;
 }
 
 /** An open file handle, seen as the buffer the reader wants. */
-function fileBuffer(handle: FileHandle, byteLength: number): AsyncBuffer {
+function fileBuffer(handle: FileHandle, byteLength: number): RandomAccessBytes {
   return {
     byteLength,
     async slice(start: number, end?: number): Promise<ArrayBuffer> {
