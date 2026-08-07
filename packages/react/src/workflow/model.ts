@@ -47,6 +47,8 @@ export type {
   WorkflowNode,
   WorkflowNodeKind,
   WorkflowPredicateKind,
+  WorkflowRenameNode,
+  WorkflowRenameUnnamed,
   WorkflowRowCountPredicate,
   WorkflowSinkNode,
   WorkflowSkipReason,
@@ -67,6 +69,15 @@ export {
   isWorkflowFilterValue,
   isWorkflowNodeKind,
   isWorkflowPredicateKind,
+  isWorkflowRenameUnnamed,
+  // The rename rules, core's for the reason every rule here is core's: a form
+  // that checked a target name against its own copy of the identifier pattern
+  // would accept a name the server refuses, after Save — and `workflowKnownColumns`
+  // is what lets the inspector say which columns actually reach a node instead of
+  // guessing.
+  renameColumnRefusals,
+  workflowKnownColumns,
+  workflowRenameUnnamed,
   // The two wire formats a call node can be authored in, plus the reader that
   // applies the default. Core's, not a copy, for the reason every rule here is:
   // an inspector offering a mode the runner cannot build a payload for is a
@@ -80,6 +91,7 @@ export {
   unreachableFilterPredicateKind,
   unreachableNodeKind,
   unreachablePredicateKind,
+  unreachableRenameUnnamed,
   // Core's, not a copy, for the reason every other rule here is core's: the
   // inspector has to offer exactly the acknowledgements `validateWorkflow`
   // requires, and a screen that worked out its own list would offer a set the
@@ -92,6 +104,8 @@ export {
   WORKFLOW_FILTER_OPERATORS,
   WORKFLOW_FILTER_PREDICATE_KINDS,
   WORKFLOW_PREDICATE_KINDS,
+  WORKFLOW_RENAME_MAX_COLUMNS,
+  WORKFLOW_RENAME_UNNAMED,
   WORKFLOW_NODE_ID_PATTERN,
   WORKFLOW_NODE_KINDS,
 } from '@dudousxd/nestjs-catalog/client';

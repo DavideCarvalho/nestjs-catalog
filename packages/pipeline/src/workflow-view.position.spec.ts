@@ -45,6 +45,9 @@ const MINIMAL: Record<WorkflowNodeKind, Record<string, unknown>> = {
     kind: 'filter',
     predicate: { kind: 'compare', column: 'status', operator: 'equals', value: 'OPEN' },
   },
+  // And the seventh. Three for three, which is as close to proof as a claim
+  // about the next person ever gets.
+  rename: { kind: 'rename', columns: { 'Mgmt Cd': 'mgmtCd' } },
 };
 
 const KINDS = Object.keys(MINIMAL) as WorkflowNodeKind[];

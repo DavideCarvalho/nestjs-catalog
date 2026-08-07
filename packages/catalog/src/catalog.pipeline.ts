@@ -1043,6 +1043,8 @@ export const WORKFLOW_NODE_KINDS = [
   'if',
   /** Drops the rows that fail a declarative test. See {@link WorkflowFilterNode}. */
   'filter',
+  /** Renames columns, declaratively. See {@link WorkflowRenameNode}. */
+  'rename',
 ] as const;
 
 export type WorkflowNodeKind = (typeof WORKFLOW_NODE_KINDS)[number];
@@ -2392,6 +2394,263 @@ export interface WorkflowFilterNode extends WorkflowNodeBase {
   narrows?: string[];
 }
 
+/* --- rename -------------------------------------------------------------- */
+
+/**
+ * What happens to a column the rename does not name.
+ *
+ * Two words rather than a boolean, because the two are genuinely different
+ * nodes and a boolean called `drop` would read as a modifier on one node. See
+ * {@link WorkflowRenameNode.unnamed} for what each costs.
+ */
+export const WORKFLOW_RENAME_UNNAMED = [
+  /** Passed through untouched. The default, and the metadata-only case. */
+  'keep',
+  /** Removed. The output columns are exactly the map's targets. */
+  'drop',
+] as const;
+
+export type WorkflowRenameUnnamed = (typeof WORKFLOW_RENAME_UNNAMED)[number];
+
+/** Same reason as {@link isConnectorKind}: one list, no second copy to drift. */
+export function isWorkflowRenameUnnamed(value: unknown): value is WorkflowRenameUnnamed {
+  return WORKFLOW_RENAME_UNNAMED.some((each) => each === value);
+}
+
+/**
+ * The exhaustiveness guard for {@link WORKFLOW_RENAME_UNNAMED}.
+ *
+ * {@link unreachableNodeKind}, one level down, and for the identical reason: the
+ * two words decide whether a batch is rewritten or only re-labelled, and a third
+ * one added without a branch would silently pick whichever the last `if` was.
+ */
+export function unreachableRenameUnnamed(value: never, where: string): never {
+  throw new Error(
+    `${where} does not handle the rename disposition ${JSON.stringify(value)}. The list and every decision made per entry are meant to move together.`,
+  );
+}
+
+/**
+ * How many columns one rename may name.
+ *
+ * The same argument {@link WORKFLOW_FILTER_MAX_VALUES} makes: the map travels in
+ * the graph and into the graph fingerprint, and past a few hundred entries the
+ * thing being expressed is a schema mapping that belongs in a stored object
+ * rather than in a node. It is also the bound that keeps
+ * {@link isWorkflowRenameColumns} — which is run on JSON out of a column — from
+ * being a place to hand a service a million-key object.
+ */
+export const WORKFLOW_RENAME_MAX_COLUMNS = 500;
+
+/**
+ * Renames columns, and does nothing else, ever.
+ *
+ * ## Why this is a node kind and not a flag, and why it stays small
+ *
+ * The generic {@link WorkflowTransformNode} continues to exist for everything
+ * else, and **that is what lets this node stay deliberately narrow**. The usual
+ * objection to a declarative shortcut is that it grows — rename, then cast, then
+ * default, then trim, and then it is a small language nobody designed and
+ * everybody has to learn. With a real code node sitting beside it, the answer to
+ * "I need more than renaming" is always *use a transform*, and never *add a
+ * field here*. That is the constraint that keeps this honest, and it is the
+ * reason to refuse the next field rather than a reason to feel bad about
+ * refusing it.
+ *
+ * ## What it buys, measured rather than asserted
+ *
+ * **1. It streams by construction.** A rename is per record. It cannot
+ * aggregate, deduplicate, sort or look at a neighbour, so there is no batch it
+ * has to hold. A transform node cannot make that promise — an author's function
+ * is handed the whole batch and may legitimately reduce over it — which is why
+ * `ConnectorRunnerService` has to log *"Held all N records in memory"* when a
+ * transform is present. This node never contributes that line.
+ *
+ * **2. It needs no child process.** A transform round trip for 103,087 rows
+ * costs ~338 ms, of which the author's `.map` is ~5 ms. The transport — encode,
+ * write, decode, run, encode, read — is the entire bill. A rename does not need
+ * transport, and the same rename in process is ~14 ms.
+ *
+ * **3. On staged data it is metadata-only, and exactly when.** A staged batch is
+ * a shape dictionary (see `catalog.stage-encoding.ts`): `shapes` holds each
+ * distinct key-set once, `shapeOf[i]` indexes it, and `values[i]` is a
+ * positional array parallel to that shape. A positional array does not care what
+ * the key is called, so renaming a key is a rewrite of `shapes` and nothing
+ * else — tens of strings for a hundred thousand rows.
+ *
+ * **That last claim holds for `unnamed: 'keep'` and does not hold for
+ * `unnamed: 'drop'`.** Dropping a column removes a position, so every `values`
+ * row has to be rebuilt and the cost is back to O(rows). Both are worth having
+ * and they are not the same operation, so the node says which one it did:
+ * `renameStagePayload` reports `metadataOnly`, and the run log prints it.
+ *
+ * ## The config
+ *
+ * {@link columns} is a map of **old name → new name**, applied
+ * **simultaneously** rather than in sequence. `{"a": "b", "b": "c"}` maps `a` to
+ * `b` and `b` to `c`; it does not chain `a → b → c`. Sequential application
+ * would make the result depend on the iteration order of a JSON object, which is
+ * not a thing to build a load on.
+ *
+ * A `Record` rather than a list of pairs, and the reason is a refusal it buys
+ * for free: a key cannot appear twice in an object, so *two renames of the same
+ * source column* is unrepresentable. The mirror mistake — two renames **onto**
+ * the same target — is representable and is refused by `validateWorkflow`, which
+ * can see it from the config alone with nothing to run.
+ *
+ * The four remaining edge cases, all decided rather than discovered:
+ *
+ * - **A column the map does not name** — {@link unnamed} decides, and it
+ *   defaults to `keep`.
+ * - **A named column that is not in a given record** — nothing happens to that
+ *   record. This is not an error, because a batch legitimately holds rows with
+ *   different key-sets; that is the entire reason the stage encoding is a shape
+ *   *dictionary* and not one column list. A source column that turns out to be
+ *   in **no** row of the whole run is reported loudly in the run log, because it
+ *   is almost always a typo in a header and the symptom otherwise is a column of
+ *   NULLs and a green run.
+ * - **A rename onto a name the record already holds** — refused, at run time,
+ *   naming both columns. There are two columns and one name, and every rule for
+ *   picking a winner is arbitrary. It is detected per *shape* rather than per
+ *   row, so it fails on the first batch rather than at row ninety thousand.
+ *   Under `unnamed: 'drop'` there is no collision to have: a column the map does
+ *   not name does not exist in the output, so it cannot occupy anything.
+ * - **`a → a`** — allowed. Under `keep` it is a no-op; under `drop` it is how a
+ *   column is *selected*, which is a real use.
+ *
+ * ## What the target names have to be
+ *
+ * {@link WORKFLOW_FILTER_COLUMN_PATTERN}, checked at authoring time. Two
+ * separate reasons, and both are about a failure that reports success:
+ *
+ * - `property-names.ts` refuses a *published property* whose name cannot become
+ *   a column, and its docblock is the record of what happens when a name and the
+ *   key in the record disagree: the load looks every field up as `row[name]`, so
+ *   the column takes NULL in every row and the run is green. Thirteen types went
+ *   in that way. A rename is the tool that makes the record's key match the
+ *   property, so a rename that produces a name no property can carry is the
+ *   trap re-armed one node upstream.
+ * - The filter node's columns follow the same pattern precisely so a predicate
+ *   could one day be pushed into a `WHERE`. A rename whose target cannot be
+ *   named by a filter would author a graph today that could never be pushed down
+ *   tomorrow.
+ *
+ * The *source* names are deliberately unconstrained. `Mgmt Cd`, `VEH Type Name`
+ * and `Reg Number` are exactly what real drops are keyed by, and being able to
+ * name them is the entire point of the node.
+ */
+export interface WorkflowRenameNode extends WorkflowNodeBase {
+  kind: 'rename';
+  /**
+   * Old name → new name, applied simultaneously. Never empty; at most
+   * {@link WORKFLOW_RENAME_MAX_COLUMNS} entries; every target matches
+   * {@link WORKFLOW_FILTER_COLUMN_PATTERN} and no two share one.
+   *
+   * Empty is refused rather than treated as a no-op, for the reason an empty
+   * filter group is: under `keep` it is a node that draws as configured and does
+   * nothing, and under `drop` it deletes every column of every row and commits
+   * the result. Two silent opposites reached by deleting the last row of a form.
+   */
+  columns: Record<string, string>;
+  /**
+   * What happens to the columns this node does not name. Absent means `keep`.
+   *
+   * Absent is `keep` rather than being required, because `keep` is the node this
+   * one is called after: a rename that also deleted everything it did not
+   * mention would be a projection wearing the word "rename", and somebody would
+   * find that out by looking at a committed snapshot.
+   *
+   * `drop` is here because the shape it replaces is real —
+   * `records.map((r) => ({ mgmtCd: r["Mgmt Cd"] }))` is a rename *and* a
+   * projection, and it is what a drop of Air Force fleet data forces today. It
+   * costs the metadata-only property (see the docblock above), and the run says
+   * so rather than leaving the difference to be guessed at.
+   */
+  unnamed?: WorkflowRenameUnnamed;
+}
+
+/** {@link WorkflowRenameNode.unnamed}, resolved. One reader of the default. */
+export function workflowRenameUnnamed(node: WorkflowRenameNode): WorkflowRenameUnnamed {
+  return node.unnamed ?? 'keep';
+}
+
+/**
+ * Every reason a rename map cannot be stored, as sentences, or empty.
+ *
+ * One function, called by {@link validateWorkflow}, by the HTTP boundary and by
+ * the canvas, for the reason `validateWorkflow` itself is shared: a screen that
+ * checked a target name against its own copy of the pattern is a screen that
+ * eventually accepts something the server refuses, halfway through a save.
+ *
+ * All of them rather than the first, exactly as
+ * {@link refuseUnpublishablePropertyNames} argues: a map of forty columns typed
+ * in one sitting is usually wrong about several in the same way.
+ */
+export function renameColumnRefusals(columns: Record<string, string>): string[] {
+  const refusals: string[] = [];
+  const entries = Object.entries(columns);
+  if (entries.length === 0) {
+    refusals.push(
+      'It renames nothing. An empty map is refused rather than stored: with unnamed columns kept it is a node that draws as configured and does nothing, and with them dropped it deletes every column of every row.',
+    );
+    return refusals;
+  }
+  if (entries.length > WORKFLOW_RENAME_MAX_COLUMNS) {
+    refusals.push(
+      `It names ${entries.length} columns, and at most ${WORKFLOW_RENAME_MAX_COLUMNS} may be renamed in one node. Past that the thing being expressed is a schema mapping rather than a rename.`,
+    );
+  }
+
+  const targets = new Map<string, string[]>();
+  for (const [from, to] of entries) {
+    if (from.length === 0) {
+      refusals.push('One entry renames a column with no name, so there is nothing for it to find.');
+      continue;
+    }
+    if (typeof to !== 'string' || !WORKFLOW_FILTER_COLUMN_PATTERN.test(to)) {
+      refusals.push(
+        `${JSON.stringify(from)} is renamed to ${JSON.stringify(to)}, which is not a name a column can have: letters, digits and underscore, starting with a letter or an underscore. A load looks every field up as \`row[name]\`, so a column this service cannot name downstream is one that loads NULL into every row and reports success.`,
+      );
+      continue;
+    }
+    targets.set(to, [...(targets.get(to) ?? []), from]);
+  }
+
+  for (const [to, sources] of targets) {
+    if (sources.length < 2) continue;
+    refusals.push(
+      `${sources.map((from) => JSON.stringify(from)).join(' and ')} are both renamed to ${JSON.stringify(to)}. Two columns cannot share one name, and picking a winner would be a rule about which of somebody's data survives.`,
+    );
+  }
+
+  return refusals;
+}
+
+/**
+ * Whether a stored rename map is one this build can run.
+ *
+ * Refused rather than repaired, the stance {@link isWorkflowFilterPredicate}
+ * takes about a predicate and for the same reason one step further along: a
+ * rename read back with one entry silently dropped is a graph that commits a
+ * column of NULLs under a name nobody can now explain.
+ *
+ * `Object.entries` rather than a `for…in`, so an inherited key cannot enter the
+ * map, and the values are checked one by one rather than trusted from the type.
+ */
+export function isWorkflowRenameColumns(value: unknown): value is Record<string, string> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const entries = Object.entries(value);
+  if (entries.every(([, to]) => typeof to === 'string')) {
+    const columns: Record<string, string> = {};
+    for (const [from, to] of entries) {
+      if (typeof to !== 'string') return false;
+      columns[from] = to;
+    }
+    return renameColumnRefusals(columns).length === 0;
+  }
+  return false;
+}
+
 /**
  * A discriminated union, so narrowing a node is `node.kind === "sink"` and
  * never a type assertion. This is why the kind list is not simply a string on
@@ -2404,7 +2663,8 @@ export type WorkflowNode =
   | WorkflowSinkNode
   | WorkflowCallNode
   | WorkflowIfNode
-  | WorkflowFilterNode;
+  | WorkflowFilterNode
+  | WorkflowRenameNode;
 
 /* --- reusable nodes ------------------------------------------------------ */
 
@@ -2464,6 +2724,11 @@ export function isReusableNodeKind(value: unknown): value is ReusableNodeKind {
  *   may not have, and a filter is worse: {@link WorkflowFilterNode.narrows} is
  *   an acknowledgement about *this* graph's sinks, so a shared one would carry
  *   somebody else's acknowledgement into a graph they never saw.
+ * - `rename` — the same argument as `if` and `filter`, and the sharpest version
+ *   of it: a rename map names the source's own spelling of its columns, so it is
+ *   *about* one drop of one file. `Mgmt Cd → mgmtCd` saved under a name and
+ *   dropped into a graph reading a different system renames nothing at all, and
+ *   the symptom is a column of NULLs rather than a failure.
  */
 export const NODE_KIND_IS_REUSABLE = {
   source: true,
@@ -2472,6 +2737,7 @@ export const NODE_KIND_IS_REUSABLE = {
   call: false,
   if: false,
   filter: false,
+  rename: false,
 } as const satisfies Record<WorkflowNodeKind, boolean> & Record<ReusableNodeKind, true>;
 
 /** Whether this kind can be saved as a reusable node. Reads {@link NODE_KIND_IS_REUSABLE}. */
@@ -3506,6 +3772,29 @@ export const WORKFLOW_ISSUE_CODES = [
   'filter-narrows-unacknowledged',
   'filter-narrows-nothing',
   /**
+   * A rename whose map cannot be stored: empty, too big, or naming a target that
+   * is not a column name or that two source columns share. Every one of those is
+   * detectable from the node alone, which is the point of the node — see
+   * {@link renameColumnRefusals} for the sentences.
+   */
+  'rename-invalid',
+  /**
+   * A node naming a column that nothing upstream can produce.
+   *
+   * The one thing a declarative rename buys the *validator*, and it is the whole
+   * reason the node is data rather than code. A rename with
+   * `unnamed: 'drop'` has an output column set that is known exactly from its
+   * config — its targets, and nothing else, whatever it was handed. So a filter
+   * or a second rename downstream of one, naming a column outside that set, is
+   * provably wrong at the moment the graph is saved instead of at the moment the
+   * load comes out empty.
+   *
+   * Reported only where the set is *closed*. See {@link workflowKnownColumns}
+   * for exactly how far that reaches and for what it deliberately does not
+   * claim.
+   */
+  'column-not-produced',
+  /**
    * A version pin that is not a version — `0`, `2.5`, `"3"`, `-1`.
    *
    * One code for both pins, because they are one mistake: a threshold that
@@ -3598,6 +3887,9 @@ export function validateWorkflow(graph: WorkflowGraph): WorkflowValidationIssue[
   }
 
   checkReachability(nodes, roots, sinks, incoming, outgoing, issues);
+  // After the cycle check has returned, so the walk it does cannot meet a loop
+  // on a graph this function has already accepted as acyclic.
+  checkColumnsProduced({ nodes, edges }, issues);
 
   return issues;
 }
@@ -3989,7 +4281,29 @@ function nodeIsUnconfigured(node: WorkflowNode): WorkflowValidationIssue | undef
   if (node.kind === 'call') return callIsUnnamed(node);
   if (node.kind === 'if') return ifIsUnconfigured(node);
   if (node.kind === 'filter') return filterIsUnconfigured(node);
+  if (node.kind === 'rename') return renameIsUnconfigured(node);
   return undefined;
+}
+
+/**
+ * A rename whose map this service will not store.
+ *
+ * The refusals come from {@link renameColumnRefusals} rather than being restated
+ * here, so the canvas, the HTTP boundary and this validator say the same
+ * sentence about the same map. Every one of them is a *silent* failure if it
+ * were let through: an empty map is a node that does nothing or a node that
+ * deletes every column, a target that is not a column name loads NULL into every
+ * row and reports success, and two columns renamed onto one name means one of
+ * them is gone and nothing says which.
+ */
+function renameIsUnconfigured(node: WorkflowRenameNode): WorkflowValidationIssue | undefined {
+  const refusals = renameColumnRefusals(node.columns ?? {});
+  if (refusals.length === 0) return undefined;
+  return {
+    code: 'rename-invalid',
+    nodeIds: [node.id],
+    message: `Rename "${node.name}" (${node.id}) cannot be stored as it is. ${refusals.join(' ')}`,
+  };
 }
 
 /**
@@ -4669,6 +4983,7 @@ function canonicalNode(node: WorkflowNode): string {
       [...(node.narrows ?? [])].sort(),
     ]);
   }
+  if (node.kind === 'rename') return canonicalRename(node);
   if (node.kind === 'sink') {
     return JSON.stringify([
       node.id,
@@ -4679,6 +4994,29 @@ function canonicalNode(node: WorkflowNode): string {
     ]);
   }
   return unreachableNodeKind(node, 'workflowGraphHash');
+}
+
+/**
+ * A rename, canonicalised.
+ *
+ * Sorted by source column, so a canvas that rewrites the object in a different
+ * order is not an edit — the rule `sortedEntries` applies to a source's config,
+ * and it is safe here for a reason specific to this node: the map is applied
+ * *simultaneously*, so its order changes nothing about the result.
+ *
+ * `unnamed` is appended only when it is `drop`, exactly as `edge.branch` is
+ * appended only when there is a label. Every rename that keeps its unnamed
+ * columns — whether it says so or says nothing — hashes to one string, so
+ * normalising the field on a canvas cannot renumber a graph. It is in there at
+ * all because it decides which columns reach the sink.
+ */
+function canonicalRename(node: WorkflowRenameNode): string {
+  return JSON.stringify([
+    node.id,
+    node.kind,
+    sortedEntries(node.columns),
+    ...(workflowRenameUnnamed(node) === 'drop' ? ['drop'] : []),
+  ]);
 }
 
 /**
@@ -4783,6 +5121,215 @@ function canonicalFilterPredicate(predicate: WorkflowFilterPredicate): string {
   return unreachableFilterPredicateKind(predicate, 'workflowGraphHash');
 }
 
+/* --- what the graph knows about columns ---------------------------------- */
+
+/**
+ * Every column a filter predicate names, once each, in the order they appear.
+ *
+ * Its own function rather than a walk inlined into the validator, because two
+ * things want it — the refusal below and anything on a screen that wants to say
+ * which columns a node depends on — and a second copy of a tree walk is a second
+ * copy that forgets the `oneOf` branch.
+ */
+export function workflowFilterColumns(predicate: WorkflowFilterPredicate): string[] {
+  const found: string[] = [];
+  const visit = (each: WorkflowFilterPredicate): void => {
+    if (each.kind === 'all' || each.kind === 'any') {
+      for (const child of each.children) visit(child);
+      return;
+    }
+    if (!found.includes(each.column)) found.push(each.column);
+  };
+  visit(predicate);
+  return found;
+}
+
+/**
+ * The columns that can reach this node, when the graph knows — and `undefined`
+ * when it does not.
+ *
+ * ## What this is for
+ *
+ * It is the one thing a declarative rename buys that a transform cannot, and it
+ * is worth being precise about how far it reaches rather than overselling it.
+ *
+ * With a JS transform, the catalog cannot know what columns come out — the
+ * answer is inside a function body — which is why the property-name rule in
+ * `property-names.ts` fires at publish time and why a mismatch between a
+ * property and a record key is discovered as a column of NULLs. A rename is
+ * **data**, so for one arrangement the answer is exact:
+ *
+ * > A rename with `unnamed: 'drop'` produces its targets and **nothing else**,
+ * > whatever it was handed.
+ *
+ * That set is *closed* — an upper bound that holds regardless of what is
+ * upstream — and it survives every node that does not touch columns. So a filter
+ * or a second rename downstream of one can be told, at authoring time, that it
+ * names a column which cannot be there.
+ *
+ * ## What it deliberately does not claim
+ *
+ * - **It is an upper bound, not the output.** A target only appears in a row
+ *   whose input actually held the source column. So a column *inside* the set
+ *   may still be absent, and nothing here says otherwise.
+ * - **A `keep` rename tells you nothing on its own.** Its output is its input
+ *   with some keys re-labelled, and its input is unknown unless something
+ *   upstream closed it. So `undefined` propagates, and that is the honest
+ *   answer rather than an empty set.
+ * - **A source, a transform and a call are always unknown.** A source's shape is
+ *   discovered against the live system rather than declared in the graph; a
+ *   transform is a function body; a call is a workflow this graph does not own.
+ * - **It says nothing about a sink's declared properties.** That is the check
+ *   worth wanting — "this sink writes a property no upstream node produces" —
+ *   and it is *not* available here: a {@link WorkflowSinkNode} carries a
+ *   `targetType` and nothing else, so the property list would have to be
+ *   threaded into a validator that is pure and dependency-free on purpose. What
+ *   is built instead is the run log, which prints the columns a rename produced.
+ *
+ * Cycles answer `undefined` rather than looping. `validateWorkflow` refuses a
+ * cyclic graph before it gets here, but the canvas calls this while a graph is
+ * being drawn and is entitled to a wrong-but-terminating answer.
+ */
+export function workflowKnownColumns(
+  graph: WorkflowGraph,
+  nodeId: string,
+): ReadonlySet<string> | undefined {
+  const nodes = graph.nodes ?? [];
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+  const { incoming } = buildAdjacency(nodes, graph.edges ?? []);
+  const answered = new Map<string, ReadonlySet<string> | undefined>();
+  const open = new Set<string>();
+
+  const outOf = (id: string): ReadonlySet<string> | undefined => {
+    if (answered.has(id)) return answered.get(id);
+    // A loop. Answered as unknown and remembered, so the walk terminates and so
+    // that a second question about the same node does not re-enter it.
+    if (open.has(id)) return undefined;
+    const node = byId.get(id);
+    if (!node) return undefined;
+    open.add(id);
+    const produced = producedColumns(node, () => intoNode(id));
+    open.delete(id);
+    answered.set(id, produced);
+    return produced;
+  };
+
+  const intoNode = (id: string): ReadonlySet<string> | undefined => {
+    const feeds = incoming.get(id) ?? [];
+    if (feeds.length === 0) return undefined;
+    const union = new Set<string>();
+    for (const from of feeds) {
+      const upstream = outOf(from);
+      // One unknown input makes the whole position unknown: the rows arrive
+      // concatenated, so a column any one of them carries is a column this node
+      // can see.
+      if (upstream === undefined) return undefined;
+      for (const column of upstream) union.add(column);
+    }
+    return union;
+  };
+
+  return intoNode(nodeId);
+}
+
+/**
+ * What one node passes on, given what reaches it.
+ *
+ * The upstream set is a thunk rather than a value because the one case that
+ * makes this function worth having does not need it: a rename that drops its
+ * unnamed columns answers from its own config, so the walk stops there rather
+ * than climbing to a source it would learn nothing from.
+ *
+ * Ends in {@link unreachableNodeKind}, so a node kind added without an answer
+ * here is a compile error rather than a silent `undefined` — which would be the
+ * *safe* wrong answer and would therefore never be noticed.
+ */
+function producedColumns(
+  node: WorkflowNode,
+  upstream: () => ReadonlySet<string> | undefined,
+): ReadonlySet<string> | undefined {
+  if (node.kind === 'rename') {
+    if (workflowRenameUnnamed(node) === 'drop') return new Set(Object.values(node.columns ?? {}));
+    const known = upstream();
+    if (known === undefined) return undefined;
+    const renamed = new Set<string>();
+    for (const column of known) renamed.add(node.columns?.[column] ?? column);
+    return renamed;
+  }
+  // Neither of these touches a column: a filter decides which *rows* survive and
+  // an `if` decides which *nodes* run. Both hand on exactly the shape they were
+  // given, which is what makes a closed set survive one.
+  if (node.kind === 'filter' || node.kind === 'if') return upstream();
+  // A source's shape is discovered against the live system, a transform's is
+  // inside a function body, a call's belongs to a workflow this graph does not
+  // own, and nothing reads a sink's output. See {@link workflowKnownColumns}.
+  if (
+    node.kind === 'source' ||
+    node.kind === 'transform' ||
+    node.kind === 'call' ||
+    node.kind === 'sink'
+  ) {
+    return undefined;
+  }
+  return unreachableNodeKind(node, 'workflowKnownColumns');
+}
+
+/**
+ * That no node names a column the graph can prove is not there.
+ *
+ * Only where {@link workflowKnownColumns} answers, which is only downstream of a
+ * rename that drops what it does not name. Everywhere else this is silent, and
+ * that silence is correct rather than a gap being tolerated: refusing a column
+ * the graph merely has no opinion about would make every filter downstream of a
+ * transform unsaveable.
+ *
+ * A refusal rather than a warning, because both failures are silent and total.
+ * A filter on a column that cannot exist matches no row — a comparison against
+ * an absent column is false under the three-valued logic
+ * {@link workflowFilterMatches} implements, *including the inverses* — so the
+ * load comes out empty and every node reports success. A rename of a column that
+ * cannot exist renames nothing, so the target is absent, and a sink writing it
+ * commits NULL into every row. That is the exact shape `property-names.ts` was
+ * written about, one node upstream of where it can be caught.
+ */
+function checkColumnsProduced(graph: WorkflowGraph, issues: WorkflowValidationIssue[]): void {
+  for (const node of graph.nodes ?? []) {
+    // Narrowed off the union rather than tested with a property check, so a kind
+    // that starts naming columns without being answered for here is a type error
+    // at `missingColumnMessage` and not a check that silently passes.
+    if (node.kind !== 'filter' && node.kind !== 'rename') continue;
+    const named =
+      node.kind === 'filter'
+        ? workflowFilterColumns(node.predicate)
+        : Object.keys(node.columns ?? {});
+    if (named.length === 0) continue;
+    const known = workflowKnownColumns(graph, node.id);
+    if (known === undefined) continue;
+    const missing = named.filter((column) => column.length > 0 && !known.has(column));
+    if (missing.length === 0) continue;
+    issues.push({
+      code: 'column-not-produced',
+      nodeIds: [node.id],
+      message: missingColumnMessage(node, missing, known),
+    });
+  }
+}
+
+/** The sentence {@link checkColumnsProduced} says, per kind. */
+function missingColumnMessage(
+  node: WorkflowFilterNode | WorkflowRenameNode,
+  missing: readonly string[],
+  known: ReadonlySet<string>,
+): string {
+  const quoted = (names: Iterable<string>) =>
+    [...names].map((column) => JSON.stringify(column)).join(', ');
+  const consequence =
+    node.kind === 'filter'
+      ? 'A test on a column that is not there matches no row — not even a "does not equal" test — so this load would come out empty and every node would report success.'
+      : 'A rename of a column that is not there does nothing, so the column it was meant to produce is absent and a sink writing it commits NULL into every row.';
+  return `${node.kind === 'filter' ? 'Filter' : 'Rename'} "${node.name}" (${node.id}) names ${quoted(missing)}, and nothing upstream produces ${missing.length === 1 ? 'that column' : 'those columns'}. A rename above this node drops every column it does not name, so what reaches here is exactly ${quoted(known)}. ${consequence}`;
+}
+
 function sortedEntries(config: Record<string, unknown>): Array<[string, unknown]> {
   return Object.keys(config)
     .sort()
@@ -4836,12 +5383,29 @@ export function isWorkflowNode(value: unknown): value is WorkflowNode {
       ? isWorkflowFilterPredicate(Reflect.get(value, 'predicate'))
       : false;
   }
+  if (kind === 'rename') return isRenameNodeShape(value);
   if (kind === 'source') {
     const sourceKind = Reflect.get(value, 'sourceKind');
     const config = Reflect.get(value, 'config');
     return isConnectorKind(sourceKind) && typeof config === 'object' && config !== null;
   }
   return isWorkflowNodeKindUnhandled(kind);
+}
+
+/**
+ * Everything a `rename` node carries.
+ *
+ * `unnamed` absent is accepted and always will be — it is what every rename
+ * written before the field existed carries, and it means `keep`. A value that is
+ * present and unrecognised is refused rather than defaulted, for the reason an
+ * unrecognised `edge.branch` is: reading it back as `keep` would turn a
+ * projection into a pass-through silently, and the sink would commit every
+ * column the author meant to remove.
+ */
+function isRenameNodeShape(value: object): boolean {
+  const unnamed = Reflect.get(value, 'unnamed');
+  if (unnamed !== undefined && !isWorkflowRenameUnnamed(unnamed)) return false;
+  return isWorkflowRenameColumns(Reflect.get(value, 'columns'));
 }
 
 /**
@@ -5307,6 +5871,33 @@ export interface CatalogStageStore {
    * as long as something might still resume onto them.
    */
   dropStages(runId: string): Promise<number>;
+  /**
+   * The batch exactly as it is stored, without decoding it into rows.
+   *
+   * Optional, and the only thing that reads it is the `rename` node. See
+   * {@link renameStagePayload}: a staged batch names its columns once, in
+   * `shapes`, and carries the data in positional arrays — so renaming a column
+   * is a rewrite of tens of strings rather than a rebuild of a hundred thousand
+   * objects. `readStage` cannot express that, because decoding to
+   * `Record<string, unknown>` *is* the rebuild.
+   *
+   * Optional rather than required so that a store written against the shipped
+   * interface keeps working: {@link supportsStagePayloads} is what asks, and a
+   * store that answers no gets the row path, which produces the same rows more
+   * slowly. It is deliberately `unknown` — the encoding is
+   * `catalog.stage-encoding.ts`'s business and a store's job is to hand back
+   * what it was given.
+   */
+  readStagePayload?(ref: { runId: string; nodeId: string; batch: number }): Promise<unknown>;
+  /** The other half. Idempotent per `(runId, nodeId, batch)`, exactly like {@link writeStage}. */
+  writeStagePayload?(input: {
+    runId: string;
+    nodeId: string;
+    batch: number;
+    payload: unknown;
+    /** How many rows the payload holds. The store does not decode it to count. */
+    rows: number;
+  }): Promise<{ written: number }>;
 }
 
 /**
@@ -5453,6 +6044,32 @@ export function supportsWorkflowStages(
   store: CatalogPipelineStore,
 ): store is CatalogPipelineStore & CatalogStageStore {
   return typeof store.writeStage === 'function' && typeof store.readStage === 'function';
+}
+
+/**
+ * Whether this store will hand a staged batch over without decoding it.
+ *
+ * Both methods, never one: a rename that could read the payload and not write
+ * one back would have to decode its own output to store it, which is the rebuild
+ * the pair exists to avoid. The methods rather than a flag, the same argument
+ * {@link supportsWorkflows} makes.
+ *
+ * A store that answers no is not broken and nothing degrades except speed — the
+ * rename node falls back to `readStage`/`writeStage` and produces identical
+ * rows. Which path ran is said in the run log, because "this rename was
+ * metadata-only" is a claim, and a claim that could quietly stop being true is
+ * worse than no claim.
+ */
+export function supportsStagePayloads(
+  store: CatalogPipelineStore,
+): store is CatalogPipelineStore &
+  CatalogStageStore &
+  Required<Pick<CatalogStageStore, 'readStagePayload' | 'writeStagePayload'>> {
+  return (
+    supportsWorkflowStages(store) &&
+    typeof store.readStagePayload === 'function' &&
+    typeof store.writeStagePayload === 'function'
+  );
 }
 
 /**

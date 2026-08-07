@@ -334,6 +334,148 @@ export function decodeStageRows(stored: unknown): Array<Record<string, unknown>>
   }
 }
 
+/* --- renaming a staged batch --------------------------------------------- */
+
+/**
+ * A rename, reduced to what the encoding needs to know.
+ *
+ * A `Map` rather than the node's `Record`, because this runs once per shape and
+ * a `Map` lookup is what the loop below wants; and separate from
+ * `WorkflowRenameNode` so this file keeps knowing nothing about graphs.
+ */
+export interface StageRenamePlan {
+  /** Old name → new name, applied simultaneously. */
+  readonly columns: ReadonlyMap<string, string>;
+  /** Whether a column the plan does not name survives. See the node's docblock. */
+  readonly dropUnnamed: boolean;
+}
+
+/** What {@link renameStagePayload} did, in enough detail for a run to report it. */
+export interface StageRenameResult {
+  /** Ready to store, in the same column the batch came out of. */
+  readonly payload: ColumnarStageBatch;
+  readonly rows: number;
+  /**
+   * Whether **no value moved** — the batch came back columnar and only its
+   * `shapes` were rewritten.
+   *
+   * The claim the rename node is built on, reported rather than assumed: it is
+   * true for a pure rename over a columnar batch and false the moment unnamed
+   * columns are dropped, because dropping one removes a position from every
+   * `values` row. A run that says which one happened is a run whose cost can be
+   * explained afterwards.
+   */
+  readonly metadataOnly: boolean;
+  /** How many entries of `shapes` came out different from what went in. */
+  readonly shapesRewritten: number;
+  /** The plan's source columns that were present in at least one shape. */
+  readonly matched: ReadonlySet<string>;
+}
+
+/**
+ * Rename the columns of one staged batch.
+ *
+ * ## The metadata-only path, which is the whole point
+ *
+ * A columnar batch names its columns once per distinct key-set, in `shapes`, and
+ * carries the data in `values` as arrays that are *positional* — `values[i][3]`
+ * is whatever `shapes[shapeOf[i]][3]` is called. A positional array does not
+ * care what the key is called. So a pure rename rewrites `shapes` and hands back
+ * the **same `shapeOf` and the same `values` arrays, by reference**: a hundred
+ * thousand rows cost as many string comparisons as there are distinct key-sets,
+ * which for a real load is one or two.
+ *
+ * `dropUnnamed` breaks that and is allowed to. Removing a column removes a
+ * position, so every `values` row has to be rebuilt, and the result says so
+ * through {@link StageRenameResult.metadataOnly} rather than leaving the
+ * difference to be inferred from a stopwatch.
+ *
+ * ## Collisions
+ *
+ * A rename onto a name the shape already holds **throws**, naming both columns.
+ * The alternative is a shape with one name twice, which decodes to whichever
+ * value was written last — one of the author's two columns silently gone, with
+ * a green run. It is detected per shape rather than per row, so it fails on the
+ * first batch rather than at row ninety thousand.
+ *
+ * Under `dropUnnamed` there is nothing to collide with: a column the plan does
+ * not name is not in the output, so it cannot be occupying a name.
+ *
+ * ## A row-oriented batch
+ *
+ * Re-encoded first and then renamed by the one code path above, rather than
+ * given a second implementation that walks objects. Two implementations of "what
+ * does this rename mean" is how the fallback path ends up disagreeing with the
+ * fast one about a collision. The re-encode costs a pass and is reported as
+ * `metadataOnly: false`, which is the truth about the bytes.
+ */
+export function renameStagePayload(stored: unknown, plan: StageRenamePlan): StageRenameResult {
+  const payload = classifyStagePayload(stored);
+  const wasColumnar = payload.encoding === 'columnar/v1';
+  const batch = wasColumnar ? payload.batch : encodeStageRows(payload.rows.filter(isRowRecord));
+
+  const matched = new Set<string>();
+  const shapes: string[][] = [];
+  const keeps: number[][] = [];
+  let shapesRewritten = 0;
+
+  for (const shape of batch.shapes) {
+    const names: string[] = [];
+    const kept: number[] = [];
+    // Where each output name came from, so a collision can name both sides.
+    const placed = new Map<string, string>();
+    for (const [at, name] of shape.entries()) {
+      const to = plan.columns.get(name);
+      if (to !== undefined) matched.add(name);
+      if (to === undefined && plan.dropUnnamed) continue;
+      const out = to ?? name;
+      const already = placed.get(out);
+      if (already !== undefined) {
+        throw new Error(
+          `Renaming ${JSON.stringify(name)} to ${JSON.stringify(out)} would collide with ${JSON.stringify(already)}, which is already called that in the same rows. Two columns cannot share one name — one of them would silently win and the run would report success. Rename the other one too, or drop the columns this node does not name.`,
+        );
+      }
+      placed.set(out, name);
+      names.push(out);
+      kept.push(at);
+    }
+    shapes.push(names);
+    keeps.push(kept);
+    if (!sameKeys(names, shape)) shapesRewritten += 1;
+  }
+
+  // The pure-rename case: every position survived in place, so `values` is
+  // handed straight back. This is the line the node's whole argument rests on.
+  const metadataOnly = wasColumnar && !plan.dropUnnamed;
+  const values = metadataOnly
+    ? batch.values
+    : batch.shapeOf.map((at, index) => pick(batch.values[index] ?? [], keeps[at] ?? []));
+
+  return {
+    payload: {
+      enc: STAGE_ENCODING,
+      v: STAGE_ENCODING_VERSION,
+      shapes,
+      shapeOf: batch.shapeOf,
+      values,
+    },
+    rows: batch.shapeOf.length,
+    metadataOnly,
+    shapesRewritten,
+    matched,
+  };
+}
+
+/** The named positions of one row, in order. */
+function pick(cells: readonly unknown[], at: readonly number[]): unknown[] {
+  const out: unknown[] = new Array(at.length);
+  for (let index = 0; index < at.length; index += 1) {
+    const from = at[index];
+    out[index] = from === undefined ? null : cells[from];
+  }
+  return out;
+}
+
 function fromColumnar(batch: ColumnarStageBatch): Array<Record<string, unknown>> {
   const rows: Array<Record<string, unknown>> = [];
   for (const [index, at] of batch.shapeOf.entries()) {

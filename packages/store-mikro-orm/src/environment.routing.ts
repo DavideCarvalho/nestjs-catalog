@@ -79,6 +79,7 @@ import {
   supportsLoadExpectations,
   supportsReusableNodes,
   supportsSavedQueryRevisions,
+  supportsStagePayloads,
   supportsTransformPins,
   supportsTransformRevisions,
   supportsWorkflowReleases,
@@ -664,6 +665,31 @@ export class RoutingPipelineStore implements CatalogPipelineStore {
     return requireStages(this.inner).readStage(ref);
   }
 
+  /**
+   * Forwarded like everything else, and it throws rather than falling back.
+   *
+   * The fallback that suggests itself — decode through `readStage`, re-encode
+   * here — would make {@link supportsStagePayloads} answer yes for a store that
+   * cannot, and a caller would then report a batch as untouched while this proxy
+   * had rebuilt every row of it. A claim about cost that quietly stops being
+   * true is worse than the extra branch, so the honest answer is a refusal
+   * naming the environment. This matches `requireStages` one method up, which
+   * has always thrown for the same reason.
+   */
+  readStagePayload(ref: { runId: string; nodeId: string; batch: number }): Promise<unknown> {
+    return requireStagePayloads(this.inner).readStagePayload(ref);
+  }
+
+  writeStagePayload(input: {
+    runId: string;
+    nodeId: string;
+    batch: number;
+    payload: unknown;
+    rows: number;
+  }): Promise<{ written: number }> {
+    return requireStagePayloads(this.inner).writeStagePayload(input);
+  }
+
   dropStages(runId: string): Promise<number> {
     return requireStages(this.inner).dropStages(runId);
   }
@@ -781,6 +807,19 @@ function requireStages(store: CatalogPipelineStore): CatalogPipelineStore & Cata
   if (!supportsWorkflowStages(store)) {
     throw new BadRequestException(
       "This environment's pipeline store cannot stage rows between workflow nodes.",
+    );
+  }
+  return store;
+}
+
+function requireStagePayloads(
+  store: CatalogPipelineStore,
+): CatalogPipelineStore &
+  CatalogStageStore &
+  Required<Pick<CatalogStageStore, 'readStagePayload' | 'writeStagePayload'>> {
+  if (!supportsStagePayloads(store)) {
+    throw new BadRequestException(
+      "This environment's pipeline store cannot hand a staged batch over without decoding it. Nothing is wrong with the graph — the store this environment routes to is older than the node that asked.",
     );
   }
   return store;
