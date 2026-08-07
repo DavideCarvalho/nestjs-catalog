@@ -22,8 +22,14 @@ was dropping rows with no ledger at all.
 
 **Not which rows come out.** The same lines are skipped for the same reason: a
 line with no content in any cell would shape into a record whose every column is
-the empty string, and the rows out of a CSV are meant to be the rows somebody
-exported. Every existing graph loads exactly what it loaded before.
+`null`, and the rows out of a CSV are meant to be the rows somebody exported.
+Every existing graph loads exactly what it loaded before.
+
+The counter runs on the raw cells, one line *before* `emptyAsNull` maps a blank
+cell to `null`. That order is deliberate and is the thing to preserve on any
+future edit: it asks whether the **line** had any content, which is a question
+about the file, and by the time the mapping is done a row of empty cells and a
+row of real nulls are indistinguishable.
 
 What is new is that the count comes back with them:
 
@@ -73,7 +79,23 @@ skipped — it changes which line the header is read from, silently. The behavio
 is unchanged, but it is now said out loud, which is the only way anybody would
 find it.
 
-`minor` rather than `patch`: no export was removed and no signature a consumer
-calls changed shape, but `FetchResult` and `RecordStream` both gained a field,
-and a custom `SourceFetcher` in a consumer's tree can now say something it could
-not say before.
+## One shape change worth naming
+
+`fetchFile` now always returns a `FetchResult` rather than sometimes a bare
+array, because it has somewhere to put the count. Both are inside
+`SourceFetcher`'s declared return type and every caller reads it through
+`toRecordStream` or `toBufferedFetchResult`, so nothing in the repository had to
+change — but a consumer calling `fetchFile` directly and indexing the result as
+an array would notice. Returning an array when there were no blank lines and an
+object when there were would have been worse: a shape that varies with the
+contents of the file is a shape every caller has to test.
+
+A workbook read carries no notes and is asserted to carry none. `.xlsx` has no
+blank *line* to skip — a row of empty cells is a row of `null`s the reader hands
+over like any other — so `blankRows: 0` there is the truth rather than a
+placeholder.
+
+`minor` rather than `patch`: no export was removed, but `FetchResult` and
+`RecordStream` both gained a field, `fetchFile`'s return shape narrowed, and a
+custom `SourceFetcher` in a consumer's tree can now say something it could not
+say before.

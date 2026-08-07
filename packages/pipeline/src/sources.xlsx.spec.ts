@@ -116,12 +116,14 @@ describe('reading a workbook', () => {
       ],
     });
 
-    const result = await fetchFile({
-      connector: connector({ path }),
-      state: {},
-      mode: 'full',
-    });
-    expect(Array.isArray(result) ? undefined : result.notes).toBeUndefined();
+    // On the whole result rather than on `result.notes`: `notes` is declared on
+    // `FetchResult` and not on `StreamedFetchResult`, so reaching for the field
+    // would need a narrowing that says more about the union than about this
+    // fetch. Asserting the object entire says the stronger thing anyway — the
+    // key is absent, not merely undefined.
+    await expect(
+      fetchFile({ connector: connector({ path }), state: {}, mode: 'full' }),
+    ).resolves.toEqual({ records: [{ name: 'widget', count: 3 }] });
   });
 
   it('takes the format from the extension, with no format configured', async () => {
