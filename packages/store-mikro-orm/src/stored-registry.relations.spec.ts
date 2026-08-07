@@ -19,7 +19,7 @@ import type { MikroORM } from '@mikro-orm/core';
  * So these tests are about a link arriving, surviving a re-publish, and being
  * drawn once.
  */
-import type { EntityManager } from '@mikro-orm/mysql';
+import type { EntityManager } from '@mikro-orm/sql';
 import { describe, expect, it, vi } from 'vitest';
 import { SnapshotRow } from './entities/governance';
 import {

@@ -1,4 +1,5 @@
 import type { Provider } from '@nestjs/common';
+import type { CatalogSqlDialect } from './dialect';
 
 /**
  * Kept in its own file, not beside the module that consumes it.
@@ -188,4 +189,47 @@ export interface CatalogStoreModuleOptions {
    * successfully.
    */
   contextName?: string;
+  /**
+   * Which SQL engine this store's warehouse writes for. Default `'mysql'`.
+   *
+   * Only the *warehouse* store reads this, because only the warehouse store
+   * writes SQL by hand — the pipeline, workspace and trace stores go through
+   * MikroORM's entity API and are portable already. See `dialect.ts` for what
+   * genuinely differs between the two and, more usefully, for the longer list of
+   * things that turned out not to.
+   *
+   * ## What a Postgres deployment has to know that a MySQL one does not
+   *
+   * Two behavioural differences survive the seam, because closing either would
+   * mean this package lying about its engine:
+   *
+   * - **Column names are case-sensitive.** Postgres identifiers are quoted here,
+   *   so `assetId` and `AssetID` are two columns; MySQL folds them into one and
+   *   refuses the type. A model published happily against Postgres can therefore
+   *   be *refused* by MySQL, which is the direction people do not expect. It
+   *   matters at migration time and nowhere else.
+   * - **Search stays case-insensitive**, and that one is a repair rather than a
+   *   difference: the dialect uses `ILIKE` so a Postgres catalog's search box
+   *   returns the same rows a MySQL one does.
+   *
+   * The environment model is unchanged: **one database per environment**, not
+   * one schema. Postgres could do the latter and deliberately does not — see
+   * `catalog.environment.ts` for the argument, which turns on isolation staying
+   * physical rather than becoming session state on a pooled connection.
+   */
+  dialect?: CatalogSqlDialect['name'];
+  /**
+   * The `EntityManager` class `@mikro-orm/nestjs` registered for the *default*
+   * connection, when it is not `@mikro-orm/mysql`'s.
+   *
+   * Needed only by a Postgres host that sets no `contextName`:
+   * `@mikro-orm/postgresql` exports its own `EntityManager` subclass, so the
+   * token this package aliases by default is a different class and Nest cannot
+   * resolve it. Passing a `contextName` avoids the question entirely and is the
+   * better answer for a host that has a database of its own. See
+   * `catalogConnectionProviders`.
+   */
+  entityManagerToken?: unknown;
+  /** The matching `MikroORM` class, for the same reason. */
+  mikroOrmToken?: unknown;
 }

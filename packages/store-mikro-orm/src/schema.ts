@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { MetadataStorage, MikroORM } from '@mikro-orm/core';
 import { Logger } from '@nestjs/common';
+import { type CatalogSqlDialect, dialectForPlatform } from './dialect';
 import { PrincipalRow, SnapshotRow } from './entities/governance';
 import { ObjectTypeRow, PropertyRow } from './entities/model';
 import {
@@ -152,31 +153,33 @@ function tableNameOf(entity: (typeof OWNED)[number]): string {
  * — an unsafe update would read those as orphans and drop every published
  * type's data.
  */
-export async function ensureCatalogSchema(orm: MikroORM): Promise<void> {
+export async function ensureCatalogSchema(
+  orm: MikroORM,
+  /**
+   * Which engine's DDL the three statements below are written in.
+   *
+   * Derived from the ORM's own platform rather than passed in by every caller,
+   * because the ORM already knows and a second opinion is a second thing that
+   * can be wrong — a host that named the wrong one here would create the marker
+   * table with MySQL quoting against a Postgres connection and fail at boot with
+   * a syntax error rather than with a sentence. Overridable for a test that
+   * wants to pin one.
+   */
+  dialect: CatalogSqlDialect = dialectForPlatform(orm),
+): Promise<void> {
   const logger = new Logger('CatalogSchema');
   const fingerprint = fingerprintOf(orm);
   const connection = orm.em.getConnection();
 
-  await connection.execute(
-    `CREATE TABLE IF NOT EXISTS \`${MARKER_TABLE}\` (
-       \`id\` VARCHAR(32) NOT NULL PRIMARY KEY,
-       \`fingerprint\` VARCHAR(64) NOT NULL,
-       \`applied_at\` DATETIME NOT NULL
-     )`,
-  );
+  await connection.execute(dialect.markerTableCreate(MARKER_TABLE));
 
   const rows = await connection.execute<Array<{ fingerprint: string }>>(
-    `SELECT fingerprint FROM \`${MARKER_TABLE}\` WHERE id = 'catalog'`,
+    `SELECT fingerprint FROM ${dialect.ident(MARKER_TABLE)} WHERE id = 'catalog'`,
   );
   if (rows[0]?.fingerprint === fingerprint) return;
 
   await orm.schema.update({ safe: true });
-  await connection.execute(
-    `INSERT INTO \`${MARKER_TABLE}\` (id, fingerprint, applied_at)
-     VALUES ('catalog', ?, NOW())
-     ON DUPLICATE KEY UPDATE fingerprint = VALUES(fingerprint), applied_at = VALUES(applied_at)`,
-    [fingerprint],
-  );
+  await connection.execute(dialect.markerUpsert(MARKER_TABLE), [fingerprint]);
   logger.log(
     `Schema applied for ${catalogManagedTables().join(', ')} (${fingerprint.slice(0, 12)})`,
   );

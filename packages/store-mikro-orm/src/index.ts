@@ -88,7 +88,19 @@ export {
   toPhysicalName,
   UnsafeIdentifierError,
 } from './identifiers';
-export { MySqlWarehouseStore } from './mysql-warehouse.store';
+export {
+  MikroOrmWarehouseStore,
+  MySqlWarehouseStore,
+  PostgresWarehouseStore,
+} from './warehouse.store';
+export {
+  CATALOG_SQL_DIALECTS,
+  type CatalogSqlDialect,
+  coerceScalar,
+  dialectForPlatform,
+  MYSQL_DIALECT,
+  POSTGRES_DIALECT,
+} from './dialect';
 export {
   dropView,
   refreshView,

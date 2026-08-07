@@ -60,7 +60,7 @@ import {
   workflowGraphHash,
   workflowRowY,
 } from '@dudousxd/nestjs-catalog';
-import type { EntityManager } from '@mikro-orm/mysql';
+import type { EntityManager } from '@mikro-orm/sql';
 import {
   BadRequestException,
   Inject,

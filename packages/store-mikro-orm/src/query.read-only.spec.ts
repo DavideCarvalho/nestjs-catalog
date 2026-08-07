@@ -1,5 +1,5 @@
 import 'reflect-metadata';
-import type { EntityManager } from '@mikro-orm/mysql';
+import type { EntityManager } from '@mikro-orm/sql';
 import { describe, expect, it, vi } from 'vitest';
 import { runReadOnlyQuery } from './query';
 

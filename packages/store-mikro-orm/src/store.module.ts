@@ -14,10 +14,10 @@ import {
   catalogConnectionProviders,
 } from './context';
 import { MikroOrmCatalogDirectory } from './directory.service';
-import { MySqlWarehouseStore } from './mysql-warehouse.store';
 import { CATALOG_STORE_OPTIONS, type CatalogStoreModuleOptions } from './options';
 import { MySqlPipelineStore } from './pipeline.store';
 import { StoredCatalogRegistry } from './stored-registry.service';
+import { MySqlWarehouseStore, PostgresWarehouseStore } from './warehouse.store';
 import { MySqlWorkspaceStore } from './workspace.store';
 
 /**
@@ -34,7 +34,11 @@ export class CatalogMikroOrmStoreModule {
         // First, so everything below resolves its EntityManager from the
         // connection the host named rather than from whichever one happens to
         // be the default in this process.
-        ...catalogConnectionProviders(options.contextName),
+        ...catalogConnectionProviders(
+          options.contextName,
+          options.entityManagerToken,
+          options.mikroOrmToken,
+        ),
         { provide: CATALOG_STORE_OPTIONS, useValue: options },
         // Before the store that injects it. Only when the host supplied one:
         // absent, `MySqlPipelineStore` falls back to the vault that refuses to
@@ -42,12 +46,24 @@ export class CatalogMikroOrmStoreModule {
         // vault should meet.
         ...(options.secretVault ? [options.secretVault] : []),
         StoredCatalogRegistry,
+        // Both classes are provided, and only one of them is bound to
+        // `CATALOG_STORE`. Providing the pair costs nothing — neither does any
+        // work until something injects it — and it keeps `MySqlWarehouseStore`
+        // injectable by name in a host that already reaches for it, which is the
+        // only reason the class still exists under that name at all.
         MySqlWarehouseStore,
+        PostgresWarehouseStore,
         MySqlWorkspaceStore,
         MySqlPipelineStore,
         { provide: CATALOG_PIPELINE_STORE, useExisting: MySqlPipelineStore },
         { provide: CatalogRegistry, useExisting: StoredCatalogRegistry },
-        { provide: CATALOG_STORE, useExisting: MySqlWarehouseStore },
+        // Which engine's SQL the warehouse emits. The default is MySQL, so a
+        // deployment that says nothing gets exactly what it had.
+        {
+          provide: CATALOG_STORE,
+          useExisting:
+            options.dialect === 'postgres' ? PostgresWarehouseStore : MySqlWarehouseStore,
+        },
         { provide: CATALOG_WORKSPACE_STORE, useExisting: MySqlWorkspaceStore },
         // Only when asked for. A deployment that routes the diagnostics channel
         // into its own tracing and wants nothing in a table simply leaves this
@@ -76,6 +92,7 @@ export class CatalogMikroOrmStoreModule {
         CATALOG_STORE_MIKRO_ORM,
         StoredCatalogRegistry,
         MySqlWarehouseStore,
+        PostgresWarehouseStore,
         MySqlWorkspaceStore,
         MySqlPipelineStore,
         CatalogRegistry,

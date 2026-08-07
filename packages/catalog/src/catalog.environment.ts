@@ -84,15 +84,43 @@ const ENVIRONMENT_ID_PATTERN = /^[a-z][a-z0-9_]{0,23}$/;
  * module refuses it as a tenant: "default" is the value that means "no
  * namespace at all", so an environment called `default` would derive the bare
  * keyspace and quietly share a results queue with every other engine on the
- * Redis. The rest are MySQL's own schemas, which an environment must never be
- * pointed at.
+ * Redis.
+ *
+ * The rest are databases the *engine* owns, and an environment must never be
+ * pointed at one — an environment id becomes a database name, so `mysql` or
+ * `postgres` here means this package running `CREATE TABLE catalog_object_type`
+ * inside the server's own maintenance database.
+ *
+ * **Both engines' lists, on both engines, deliberately.** The alternative is a
+ * refusal that depends on which driver happens to be mounted, and that is the
+ * shape that bites during a migration: an environment named `postgres` is
+ * perfectly legal on MySQL today and becomes a live incident on the day somebody
+ * moves the deployment, at which point renaming an environment means renaming
+ * its database, its MikroORM context and its Redis keyspace. Refusing the union
+ * costs a deployment nothing — nobody wants an environment called
+ * `information_schema` — and keeps the answer the same everywhere.
+ *
+ * `template0` and `template1` are Postgres's own, and are the two most likely to
+ * be typed by accident by somebody who has just read a `createdb` man page.
  */
 const RESERVED_ENVIRONMENT_IDS: readonly string[] = [
   'default',
+  // MySQL's.
   'information_schema',
   'mysql',
   'performance_schema',
   'sys',
+  // PostgreSQL's. `postgres` is the maintenance database every cluster ships
+  // with and the one a client connects to when it has nowhere else to go.
+  'postgres',
+  'template0',
+  'template1',
+  // Not a database but a schema, and reserved because a Postgres deployment
+  // that ever did put environments in schemas would collide with the default
+  // one — see the note on `databaseName` for why this package does not.
+  'public',
+  'pg_catalog',
+  'pg_toast',
 ];
 
 export function isEnvironmentId(value: unknown): value is CatalogEnvironmentId {
@@ -138,6 +166,58 @@ export interface CatalogEnvironment {
    * `obj_<type>`) and carry no environment in them, so two environments in one
    * database would collide on every table. Separate databases make the
    * collision impossible and make MySQL's own `GRANT` the enforcement point.
+   *
+   * ## PostgreSQL keeps this exactly, and there the choice is a real one
+   *
+   * The sentence above leans on MySQL not distinguishing the two words. Postgres
+   * does distinguish them, and in a way that looks like an invitation: one
+   * connection reaches many schemas, which MySQL cannot do, so each environment
+   * could be a schema in one database behind one connection pool. That is
+   * cheaper — one pool instead of N — and it is refused.
+   *
+   * **The property that has to survive is the one this file is built around:
+   * there is no ambient default, and a cross-environment read is impossible
+   * because the database makes it so rather than because the application was
+   * careful.** Schema-per-environment cannot keep it, by either of the two
+   * routes available.
+   *
+   * *Route one, `search_path`.* Isolation then rests on a session variable on a
+   * pooled connection — and that is not a hypothetical hazard here, it is one
+   * this codebase has already measured and written up. `runReadOnlyQuery` in the
+   * MikroORM store deliberately passes its statement timeout as a per-statement
+   * hint rather than `SET SESSION`, because the session form was observed riding
+   * the pooled connection into an unrelated request: "after one query-console
+   * request, a *different* `em.fork()` read `@@SESSION.MAX_EXECUTION_TIME` back
+   * as the value set here". A leaked `MAX_EXECUTION_TIME` is a slow query. A
+   * leaked `search_path` is dev's request answered out of production's schema,
+   * returning entirely plausible rows, which is the failure
+   * {@link resolveEnvironment} exists to make impossible.
+   *
+   * *Route two, qualify every identifier.* Then isolation is a prefix that has to
+   * be present on every statement — which is the same class of thing as a
+   * `WHERE` clause, and this interface's own docblock says why that is refused:
+   * "there is no field here that a `WHERE` clause could be built out of, because
+   * a filter is precisely the sort of isolation that fails silently the one time
+   * somebody forgets it". A forgotten schema qualifier is a forgotten filter.
+   *
+   * And `GRANT` cannot rescue either route, which is the argument that actually
+   * settles it. One connection pool is one role; if that role can reach both
+   * schemas — which is what "one connection reaches many schemas" *means* — then
+   * `GRANT` is enforcing nothing between them. Making it the enforcement point
+   * again requires a role per environment, a role per environment requires a
+   * connection per environment, and at that point the shared pool that motivated
+   * the whole idea is gone and separate databases cost nothing extra.
+   *
+   * **What it costs:** N connection pools on Postgres, the same as on MySQL, and
+   * no cross-environment SQL join. The second is a feature — data never moves
+   * between environments — and the first is the price of the guarantee.
+   *
+   * **What an operator has to know:** nothing new. The deployment story is the
+   * same on both engines, which is the main thing this choice buys: one
+   * `catalogDatabaseNameFor`, one `ensureDatabase`, one shape of `GRANT`, and no
+   * per-engine paragraph in a runbook. The genuine Postgres/MySQL differences
+   * live in the store's `dialect.ts` and are about column case and search, not
+   * about isolation.
    */
   databaseName: string;
   /**

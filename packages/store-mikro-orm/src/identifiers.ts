@@ -29,7 +29,7 @@ export { UnsafeIdentifierError } from '@dudousxd/nestjs-catalog';
  *
  * Both used to be private to this package and `physicalColumn` was private
  * *twice* — one copy in `query.ts` deciding the view's columns, one in
- * `mysql-warehouse.store.ts` deciding the table's. They are the same function
+ * `warehouse.store.ts` deciding the table's. They are the same function
  * for the same reason the refusal is: the publish-time check in the pipeline
  * package now asks whether a name cleans to an identifier, so it has to be
  * asking about the cleaning this adapter will actually perform, and a copy is a

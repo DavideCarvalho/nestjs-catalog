@@ -11,7 +11,7 @@ import type {
   SavedQuery,
 } from '@dudousxd/nestjs-catalog';
 import { CATALOG_REVISION_LIMIT } from '@dudousxd/nestjs-catalog';
-import type { EntityManager } from '@mikro-orm/mysql';
+import type { EntityManager } from '@mikro-orm/sql';
 import { Inject, Injectable } from '@nestjs/common';
 import { CATALOG_STORE_ENTITY_MANAGER } from './context';
 import {

@@ -9,7 +9,7 @@ import {
   type SavedQuery,
   emitCatalog,
 } from '@dudousxd/nestjs-catalog';
-import { EntityManager } from '@mikro-orm/mysql';
+import { EntityManager } from '@mikro-orm/sql';
 import { Test } from '@nestjs/testing';
 import { describe, expect, it } from 'vitest';
 import { CatalogAuditRecorder, MySqlCatalogTraceStore } from './audit-recorder.service';

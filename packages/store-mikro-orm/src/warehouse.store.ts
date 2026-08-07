@@ -23,9 +23,15 @@ import type {
   ScalarType,
   SnapshotRef,
 } from '@dudousxd/nestjs-catalog';
-import type { EntityManager } from '@mikro-orm/mysql';
+// From `@mikro-orm/sql`, which is where `@mikro-orm/mysql` and
+// `@mikro-orm/postgresql` both re-export it from — the *same* `SqlEntityManager`
+// class, not two structurally similar ones. This import used to name the MySQL
+// package, and that single line was the whole of what bound this file to one
+// engine at the type level.
+import type { EntityManager } from '@mikro-orm/sql';
 import { BadRequestException, Inject, Injectable, Logger } from '@nestjs/common';
 import { CATALOG_STORE_ENTITY_MANAGER } from './context';
+import { type CatalogSqlDialect, MYSQL_DIALECT, POSTGRES_DIALECT } from './dialect';
 import { SnapshotRow } from './entities/governance';
 import { ObjectTypeRow, PropertyRow } from './entities/model';
 import {
@@ -35,7 +41,6 @@ import {
   ROW_COLUMN,
   SNAPSHOT_BATCH_INDEX,
   SNAPSHOT_COLUMN,
-  ident,
   outputAlias,
   physicalColumn,
   tableFor,
@@ -43,8 +48,17 @@ import {
 import { refreshView, relationsFor, runReadOnlyQuery, streamReadOnlyQuery } from './query';
 
 /**
- * MySQL as a warehouse: one physical table per object type, append-only,
- * partitioned by snapshot.
+ * A SQL warehouse: one physical table per object type, append-only, partitioned
+ * by snapshot.
+ *
+ * **One class, two engines.** Everything below is written against
+ * {@link CatalogSqlDialect} rather than against MySQL, and the two shipped
+ * dialects are values rather than subclasses — see `dialect.ts` for what is
+ * genuinely different between them and, more usefully, for the much longer list
+ * of things that turned out not to be. A second store forked from this one would
+ * be two implementations that disagree the moment either is edited, and the
+ * shared contract in `test/catalog-store-contract.ts` is what keeps this one
+ * honest about both.
  *
  * Snapshots are emulated, not native, and that is the honest label. MySQL keeps
  * no history of its own, so history here is a column — every load writes rows
@@ -81,10 +95,10 @@ const CARRIED_FROM_NOTHING = 'none';
 const CARRY_FORWARD_STALE_LABEL = '_carryForwardStale';
 
 @Injectable()
-export class MySqlWarehouseStore
+export class MikroOrmWarehouseStore
   implements CatalogMergeStore, CatalogQueryStore, CatalogFilteringReadStore
 {
-  private readonly logger = new Logger(MySqlWarehouseStore.name);
+  private readonly logger = new Logger(this.constructor.name);
 
   /**
    * All nine, because all nine become one conjunct in the `WHERE` this store
@@ -152,7 +166,22 @@ export class MySqlWarehouseStore
     // not this catalog's.
     @Inject(CATALOG_STORE_ENTITY_MANAGER)
     private readonly em: EntityManager,
+    /**
+     * Which engine's SQL this store emits.
+     *
+     * Defaulted to MySQL rather than required, so every existing wiring — a
+     * host's `new MySqlWarehouseStore(em)`, the module's provider list, the
+     * environment bundle — keeps working and keeps meaning what it meant. A
+     * Postgres deployment names {@link PostgresWarehouseStore}, which is this
+     * class with the other value bound.
+     */
+    protected readonly dialect: CatalogSqlDialect = MYSQL_DIALECT,
   ) {}
+
+  /** Quote an identifier the way this store's engine does. */
+  private ident(value: string): string {
+    return this.dialect.ident(value);
+  }
 
   /**
    * Bring the physical table in line with the type definition.
@@ -182,31 +211,35 @@ export class MySqlWarehouseStore
     // a mapping the publisher has never seen, is the part that costs an
     // afternoon.
     //
-    // `foldsColumnCase` because MySQL does: `assetId` and `AssetID` are one
-    // column here, and the DDL would be refused for a collision the property
-    // names do not look like they have.
+    // `foldsColumnCase` from the dialect, because the two engines genuinely
+    // differ: MySQL folds, so `assetId` and `AssetID` are one column and this
+    // refuses; Postgres quotes, so they are two columns and this must not. The
+    // consequence is an asymmetry an operator has to know about — a model
+    // Postgres accepts can be refused by MySQL — and it is stated where the flag
+    // is declared rather than smoothed over here.
     assertNoColumnCollisions(type, physicalColumn, {
-      foldsColumnCase: true,
-      store: 'MySQL',
+      foldsColumnCase: this.dialect.foldsColumnCase,
+      store: this.dialect.name,
     });
 
     const existing = await this.existingColumns(table);
 
     if (existing.size === 0) {
-      const columns = type.properties.map(
-        (p) => `${ident(physicalColumn(p.name))} ${sqlType(p.type)} NULL`,
-      );
-      await connection.execute(
-        `CREATE TABLE IF NOT EXISTS ${ident(table)} (
-           ${ident(ROW_COLUMN)} BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-           ${ident(SNAPSHOT_COLUMN)} VARCHAR(128) NOT NULL,
-           ${ident(PRINCIPAL_COLUMN)} VARCHAR(128) NOT NULL,
-           ${ident(LOADED_AT_COLUMN)} DATETIME NOT NULL,
-           ${ident(BATCH_COLUMN)} INT NOT NULL DEFAULT 0,
-           ${columns.join(',\n           ')},
-           KEY ${ident(SNAPSHOT_BATCH_INDEX)} (${ident(SNAPSHOT_COLUMN)}, ${ident(BATCH_COLUMN)})
-         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
-      );
+      for (const statement of this.dialect.createObjectTable({
+        table,
+        columns: type.properties.map((p) => [
+          this.ident(physicalColumn(p.name)),
+          `${this.dialect.columnType(p.type)} NULL`,
+        ]),
+        rowColumn: ROW_COLUMN,
+        snapshotColumn: SNAPSHOT_COLUMN,
+        principalColumn: PRINCIPAL_COLUMN,
+        loadedAtColumn: LOADED_AT_COLUMN,
+        batchColumn: BATCH_COLUMN,
+        index: SNAPSHOT_BATCH_INDEX,
+      })) {
+        await connection.execute(statement);
+      }
       this.logger.log(`Created ${table} with ${type.properties.length} columns`);
       emitCatalog('schema.changed', {
         typeName: type.name,
@@ -223,10 +256,8 @@ export class MySqlWarehouseStore
     // since — and the failure lands at write time, on a table that looks fine.
     const RESERVED: Array<[string, string]> = [[BATCH_COLUMN, 'INT NOT NULL DEFAULT 0']];
     for (const [column, definition] of RESERVED) {
-      if (existing.has(column.toLowerCase())) continue;
-      await connection.execute(
-        `ALTER TABLE ${ident(table)} ADD COLUMN ${ident(column)} ${definition}`,
-      );
+      if (existing.has(this.foldName(column))) continue;
+      await connection.execute(this.dialect.addColumn(table, column, definition));
       this.logger.log(`Added reserved column ${column} to ${table}`);
     }
 
@@ -236,13 +267,15 @@ export class MySqlWarehouseStore
     await this.ensureSnapshotBatchIndex(type.name, table);
 
     const missing = type.properties.filter(
-      (p) => !existing.has(physicalColumn(p.name).toLowerCase()),
+      (p) => !existing.has(this.foldName(physicalColumn(p.name))),
     );
     for (const property of missing) {
       await connection.execute(
-        `ALTER TABLE ${ident(table)} ADD COLUMN ${ident(
+        this.dialect.addColumn(
+          table,
           physicalColumn(property.name),
-        )} ${sqlType(property.type)} NULL`,
+          `${this.dialect.columnType(property.type)} NULL`,
+        ),
       );
     }
     if (missing.length > 0) {
@@ -389,7 +422,7 @@ export class MySqlWarehouseStore
     const placeholders = rows.map((row) => {
       values.push(options.snapshotId, options.principalId, now, batch);
       for (const property of properties) {
-        values.push(coerce(row[property.name], property.type));
+        values.push(this.dialect.coerce(row[property.name], property.type));
       }
       return `(${columns.map(() => '?').join(',')})`;
     });
@@ -407,7 +440,7 @@ export class MySqlWarehouseStore
     await em
       .getConnection()
       .execute(
-        `DELETE FROM ${ident(table)} WHERE ${ident(SNAPSHOT_COLUMN)} = ? AND ${ident(BATCH_COLUMN)} = ?`,
+        `DELETE FROM ${this.ident(table)} WHERE ${this.ident(SNAPSHOT_COLUMN)} = ? AND ${this.ident(BATCH_COLUMN)} = ?`,
         [options.snapshotId, batch],
       );
     // Skipped only because MySQL has no syntax for inserting no tuples. Nothing
@@ -416,7 +449,7 @@ export class MySqlWarehouseStore
       await em
         .getConnection()
         .execute(
-          `INSERT INTO ${ident(table)} (${columns.map(ident).join(',')}) VALUES ${placeholders.join(',')}`,
+          `INSERT INTO ${this.ident(table)} (${columns.map((column) => this.ident(column)).join(',')}) VALUES ${placeholders.join(',')}`,
           values,
         );
     }
@@ -547,7 +580,7 @@ export class MySqlWarehouseStore
     // idempotent rather than additive, and it also clears a stale merge left by
     // a batch that arrived after the last one.
     await connection.execute(
-      `DELETE FROM ${ident(table)} WHERE ${ident(SNAPSHOT_COLUMN)} = ? AND ${ident(BATCH_COLUMN)} = ?`,
+      `DELETE FROM ${this.ident(table)} WHERE ${this.ident(SNAPSHOT_COLUMN)} = ? AND ${this.ident(BATCH_COLUMN)} = ?`,
       [snapshotId, CARRY_FORWARD_BATCH],
     );
 
@@ -559,8 +592,8 @@ export class MySqlWarehouseStore
         BATCH_COLUMN,
         ...type.properties.map((p) => physicalColumn(p.name)),
       ];
-      const previousAlias = ident('prev');
-      const incomingAlias = ident('incoming');
+      const previousAlias = this.ident('prev');
+      const incomingAlias = this.ident('incoming');
 
       // `_principal_id` and `_loaded_at` come across untouched rather than
       // being restamped with this run. A carried row is not a new load of that
@@ -570,10 +603,10 @@ export class MySqlWarehouseStore
       // snapshot row, and that is a different question.
       const selected = [
         '?',
-        `${previousAlias}.${ident(PRINCIPAL_COLUMN)}`,
-        `${previousAlias}.${ident(LOADED_AT_COLUMN)}`,
+        `${previousAlias}.${this.ident(PRINCIPAL_COLUMN)}`,
+        `${previousAlias}.${this.ident(LOADED_AT_COLUMN)}`,
         '?',
-        ...type.properties.map((p) => `${previousAlias}.${ident(physicalColumn(p.name))}`),
+        ...type.properties.map((p) => `${previousAlias}.${this.ident(physicalColumn(p.name))}`),
       ];
 
       // A LEFT JOIN anti-join rather than `NOT EXISTS`, and not for taste:
@@ -596,19 +629,22 @@ export class MySqlWarehouseStore
       // NULL-keyed row would match nothing, be carried forward on every run,
       // and duplicate itself for as long as the connector kept running.
       const join = keyColumns
-        .map((column) => `${incomingAlias}.${ident(column)} = ${previousAlias}.${ident(column)}`)
+        .map(
+          (column) =>
+            `${incomingAlias}.${this.ident(column)} = ${previousAlias}.${this.ident(column)}`,
+        )
         .join(' AND ');
 
       await connection.execute(
-        `INSERT INTO ${ident(table)} (${columns.map(ident).join(',')})
+        `INSERT INTO ${this.ident(table)} (${columns.map((column) => this.ident(column)).join(',')})
          SELECT ${selected.join(',')}
-           FROM ${ident(table)} AS ${previousAlias}
-           LEFT JOIN ${ident(table)} AS ${incomingAlias}
-             ON ${incomingAlias}.${ident(SNAPSHOT_COLUMN)} = ?
-            AND ${incomingAlias}.${ident(BATCH_COLUMN)} <> ?
+           FROM ${this.ident(table)} AS ${previousAlias}
+           LEFT JOIN ${this.ident(table)} AS ${incomingAlias}
+             ON ${incomingAlias}.${this.ident(SNAPSHOT_COLUMN)} = ?
+            AND ${incomingAlias}.${this.ident(BATCH_COLUMN)} <> ?
             AND ${join}
-          WHERE ${previousAlias}.${ident(SNAPSHOT_COLUMN)} = ?
-            AND ${incomingAlias}.${ident(ROW_COLUMN)} IS NULL`,
+          WHERE ${previousAlias}.${this.ident(SNAPSHOT_COLUMN)} = ?
+            AND ${incomingAlias}.${this.ident(ROW_COLUMN)} IS NULL`,
         [snapshotId, CARRY_FORWARD_BATCH, snapshotId, CARRY_FORWARD_BATCH, previous.snapshotId],
       );
     }
@@ -623,8 +659,8 @@ export class MySqlWarehouseStore
     const [{ total, carried }] = await connection.execute<
       Array<{ total: number; carried: number | null }>
     >(
-      `SELECT COUNT(*) AS total, SUM(${ident(BATCH_COLUMN)} = ?) AS carried
-         FROM ${ident(table)} WHERE ${ident(SNAPSHOT_COLUMN)} = ?`,
+      `SELECT COUNT(*) AS total, ${this.dialect.countCarried(this.ident(BATCH_COLUMN))} AS carried
+         FROM ${this.ident(table)} WHERE ${this.ident(SNAPSHOT_COLUMN)} = ?`,
       [CARRY_FORWARD_BATCH, snapshotId],
     );
     const rowCount = Number(total ?? 0);
@@ -771,7 +807,7 @@ export class MySqlWarehouseStore
     await em.flush();
 
     // The view is what queries select from, so it moves with the commit.
-    await refreshView(em, type, snapshotId);
+    await refreshView(em, type, snapshotId, this.dialect);
 
     emitCatalog('snapshot.committed', {
       typeName: type.name,
@@ -794,9 +830,10 @@ export class MySqlWarehouseStore
     }
     await em
       .getConnection()
-      .execute(`DELETE FROM ${ident(tableFor(type.name))} WHERE ${ident(SNAPSHOT_COLUMN)} = ?`, [
-        snapshotId,
-      ]);
+      .execute(
+        `DELETE FROM ${this.ident(tableFor(type.name))} WHERE ${this.ident(SNAPSHOT_COLUMN)} = ?`,
+        [snapshotId],
+      );
     await em.nativeDelete(SnapshotRow, { id: `${type.name}:${snapshotId}` });
     emitCatalog('snapshot.dropped', { typeName: type.name, snapshotId });
   }
@@ -916,16 +953,16 @@ export class MySqlWarehouseStore
     if (selected.length === 0) return { rows: [], total: 0, snapshot };
 
     const params: unknown[] = [snapshotId];
-    let where = `${ident(SNAPSHOT_COLUMN)} = ?`;
+    let where = `${this.ident(SNAPSHOT_COLUMN)} = ?`;
 
-    const search = searchPredicate(selected, query.search);
+    const search = searchPredicate(selected, query.search, this.dialect);
     if (search) {
       where += ` AND ${search.sql}`;
       params.push(...search.values);
     }
 
     for (const filter of query.filters ?? []) {
-      const { sql, values } = filterPredicate(selected, filter);
+      const { sql, values } = filterPredicate(selected, filter, this.dialect);
       where += ` AND ${sql}`;
       params.push(...values);
     }
@@ -933,14 +970,14 @@ export class MySqlWarehouseStore
     const [{ total }] = await em
       .getConnection()
       .execute<Array<{ total: number }>>(
-        `SELECT COUNT(*) AS total FROM ${ident(table)} WHERE ${where}`,
+        `SELECT COUNT(*) AS total FROM ${this.ident(table)} WHERE ${where}`,
         params,
       );
 
     const sortProperty = selected.find((p) => p.name === query.sort);
     const orderBy = sortProperty
-      ? `${ident(physicalColumn(sortProperty.name))} ${query.dir === 'desc' ? 'DESC' : 'ASC'}`
-      : `${ident(ROW_COLUMN)} ASC`;
+      ? `${this.ident(physicalColumn(sortProperty.name))} ${query.dir === 'desc' ? 'DESC' : 'ASC'}`
+      : `${this.ident(ROW_COLUMN)} ASC`;
 
     const size = Math.max(1, query.size ?? 25);
     const offset = (Math.max(1, query.page ?? 1) - 1) * size;
@@ -956,9 +993,9 @@ export class MySqlWarehouseStore
     // nothing outside this method sees the difference.
     const rows = await em.getConnection().execute<Array<Record<string, unknown>>>(
       `SELECT ${selected
-        .map((p) => `${ident(physicalColumn(p.name))} AS ${ident(outputAlias(p.name))}`)
+        .map((p) => `${this.ident(physicalColumn(p.name))} AS ${this.ident(outputAlias(p.name))}`)
         .join(',')}
-         FROM ${ident(table)} WHERE ${where} ORDER BY ${orderBy} LIMIT ? OFFSET ?`,
+         FROM ${this.ident(table)} WHERE ${where} ORDER BY ${orderBy} LIMIT ? OFFSET ?`,
       [...params, size, offset],
     );
 
@@ -970,7 +1007,7 @@ export class MySqlWarehouseStore
   }
 
   async runQuery(request: CatalogQueryRequest): Promise<CatalogQueryResult> {
-    return runReadOnlyQuery(this.em.fork(), request);
+    return runReadOnlyQuery(this.em.fork(), request, this.dialect);
   }
 
   /**
@@ -981,7 +1018,7 @@ export class MySqlWarehouseStore
    * generator in return.
    */
   streamQuery(request: CatalogQueryStreamRequest): AsyncIterable<Record<string, unknown>> {
-    return streamReadOnlyQuery(this.em, request);
+    return streamReadOnlyQuery(this.em, request, this.dialect);
   }
 
   async queryRelations(): Promise<CatalogQueryRelation[]> {
@@ -1033,12 +1070,12 @@ export class MySqlWarehouseStore
     keys: CatalogPropertyDef[],
     sides: Array<[snapshotId: string, described: string]>,
   ): Promise<void> {
-    const nullTest = keyColumns.map((column) => `${ident(column)} IS NULL`).join(' OR ');
+    const nullTest = keyColumns.map((column) => `${this.ident(column)} IS NULL`).join(' OR ');
 
     for (const [snapshotId, described] of sides) {
       const [{ unkeyed }] = await this.em.getConnection().execute<Array<{ unkeyed: number }>>(
-        `SELECT COUNT(*) AS unkeyed FROM ${ident(table)}
-            WHERE ${ident(SNAPSHOT_COLUMN)} = ? AND (${nullTest})`,
+        `SELECT COUNT(*) AS unkeyed FROM ${this.ident(table)}
+            WHERE ${this.ident(SNAPSHOT_COLUMN)} = ? AND (${nullTest})`,
         [snapshotId],
       );
       const count = Number(unkeyed ?? 0);
@@ -1124,10 +1161,10 @@ export class MySqlWarehouseStore
     if (snapshotIds.length === 0) return new Map();
 
     const rows = await em.getConnection().execute<Array<{ snapshot: string; total: number }>>(
-      `SELECT ${ident(SNAPSHOT_COLUMN)} AS snapshot, COUNT(*) AS total
-           FROM ${ident(table)}
-          WHERE ${ident(SNAPSHOT_COLUMN)} IN (${snapshotIds.map(() => '?').join(',')})
-          GROUP BY ${ident(SNAPSHOT_COLUMN)}`,
+      `SELECT ${this.ident(SNAPSHOT_COLUMN)} AS snapshot, COUNT(*) AS total
+           FROM ${this.ident(table)}
+          WHERE ${this.ident(SNAPSHOT_COLUMN)} IN (${snapshotIds.map(() => '?').join(',')})
+          GROUP BY ${this.ident(SNAPSHOT_COLUMN)}`,
       [...snapshotIds],
     );
 
@@ -1141,22 +1178,37 @@ export class MySqlWarehouseStore
     return (await this.countBySnapshot(em, table, [snapshotId])).get(snapshotId) ?? 0;
   }
 
+  /**
+   * A column name as this engine compares it.
+   *
+   * Lower-cased on MySQL, which folds; left exactly as written on Postgres,
+   * which does not. Getting this wrong in the Postgres direction is not a
+   * cosmetic slip: folding both sides would match a wanted `AssetId` against an
+   * existing `assetid`, conclude the column is already there, and skip creating
+   * it — and the load then fails on `column "AssetId" does not exist`, against a
+   * table that looks complete.
+   */
+  private foldName(value: string): string {
+    return this.dialect.foldsColumnCase ? value.toLowerCase() : value;
+  }
+
   private async existingColumns(table: string): Promise<Set<string>> {
-    const rows = await this.em.getConnection().execute<Array<{ COLUMN_NAME: string }>>(
-      `SELECT COLUMN_NAME FROM information_schema.COLUMNS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?`,
-      [table],
-    );
-    return new Set(rows.map((r) => String(r.COLUMN_NAME).toLowerCase()));
+    const { sql, nameKey } = this.dialect.existingColumnsQuery();
+    const rows = await this.em
+      .getConnection()
+      .execute<Array<Record<string, unknown>>>(sql, [table]);
+    return new Set(rows.map((row) => this.foldName(String(row[nameKey]))));
   }
 
   private async existingIndexes(table: string): Promise<Set<string>> {
-    const rows = await this.em.getConnection().execute<Array<{ INDEX_NAME: string }>>(
-      `SELECT DISTINCT INDEX_NAME FROM information_schema.STATISTICS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?`,
-      [table],
-    );
-    return new Set(rows.map((row) => String(row.INDEX_NAME).toLowerCase()));
+    const { sql, nameKey } = this.dialect.existingIndexesQuery();
+    const rows = await this.em
+      .getConnection()
+      .execute<Array<Record<string, unknown>>>(sql, [table]);
+    // Index names are always compared case-insensitively, unlike columns: this
+    // package chooses them itself (`ix_snapshot_batch`), they are never a
+    // publisher's, and both engines create them lower-case.
+    return new Set(rows.map((row) => String(row[nameKey]).toLowerCase()));
   }
 
   /**
@@ -1225,7 +1277,10 @@ export class MySqlWarehouseStore
     const indexes = await this.existingIndexes(table);
     if (indexes.has(SNAPSHOT_BATCH_INDEX.toLowerCase())) return;
 
-    const statement = `ALTER TABLE ${ident(table)} ADD INDEX ${ident(SNAPSHOT_BATCH_INDEX)} (${ident(SNAPSHOT_COLUMN)}, ${ident(BATCH_COLUMN)})`;
+    const statement = this.dialect.addIndex(table, SNAPSHOT_BATCH_INDEX, [
+      SNAPSHOT_COLUMN,
+      BATCH_COLUMN,
+    ]);
     try {
       await this.em.getConnection().execute(statement);
     } catch (error) {
@@ -1309,13 +1364,19 @@ function primaryKeyProperties(type: CatalogObjectTypeDef): CatalogPropertyDef[] 
 function searchPredicate(
   selected: CatalogPropertyDef[],
   term: string | undefined,
+  dialect: CatalogSqlDialect,
 ): { sql: string; values: unknown[] } | undefined {
   const trimmed = term?.trim();
   if (!trimmed) return undefined;
   const searchable = selected.filter((p) => p.type === 'string' && !p.classification);
   if (searchable.length === 0) return undefined;
   return {
-    sql: `(${searchable.map((p) => `${ident(physicalColumn(p.name))} LIKE ?`).join(' OR ')})`,
+    // `dialect.likeOperator`, because "does a search box match case" is not a
+    // detail of SQL syntax — it is what the screen returns. MySQL's default
+    // collation is case-insensitive and Postgres's `LIKE` is not, so the same
+    // catalog on the two engines would answer differently for the same term
+    // unless one of them says `ILIKE`. See the flag's own docblock.
+    sql: `(${searchable.map((p) => `${dialect.ident(physicalColumn(p.name))} ${dialect.likeOperator} ?`).join(' OR ')})`,
     values: searchable.map(() => `%${trimmed}%`),
   };
 }
@@ -1338,6 +1399,7 @@ function searchPredicate(
 function filterPredicate(
   selected: CatalogPropertyDef[],
   filter: CatalogResolvedFilter,
+  dialect: CatalogSqlDialect,
 ): { sql: string; values: unknown[] } {
   const property = selected.find((p) => p.name === filter.property.name);
   if (!property) {
@@ -1345,7 +1407,7 @@ function filterPredicate(
       `${filter.property.name} is not among the columns this read returns, so it cannot be filtered on.`,
     );
   }
-  return predicateFor(ident(physicalColumn(property.name)), filter);
+  return predicateFor(dialect.ident(physicalColumn(property.name)), filter, dialect);
 }
 
 /**
@@ -1371,6 +1433,7 @@ function filterPredicate(
 function predicateFor(
   column: string,
   filter: CatalogResolvedFilter,
+  dialect: CatalogSqlDialect,
 ): { sql: string; values: unknown[] } {
   switch (filter.op) {
     case 'eq':
@@ -1378,7 +1441,13 @@ function predicateFor(
     case 'ne':
       return { sql: `(${column} <> ? OR ${column} IS NULL)`, values: [filter.value] };
     case 'contains':
-      return { sql: `${column} LIKE ?`, values: [`%${String(filter.value)}%`] };
+      // The same reasoning as the search box above: `contains` means the same
+      // thing to a user on both engines, so the operator differs to keep the
+      // meaning identical rather than the syntax identical.
+      return {
+        sql: `${column} ${dialect.likeOperator} ?`,
+        values: [`%${String(filter.value)}%`],
+      };
     case 'gt':
       return { sql: `${column} > ?`, values: [filter.value] };
     case 'gte':
@@ -1403,47 +1472,14 @@ function unknownOperator(operator: never): never {
   throw new BadRequestException(`This store cannot filter with ${String(operator)}.`);
 }
 
-/**
- * Deliberately wide types.
- *
- * A warehouse is fed by publishers that will widen a column one day without
- * telling anyone, and a load that fails on a value one character too long is a
- * worse outcome than a column that is roomier than it needs to be.
- */
-function sqlType(type: ScalarType): string {
-  switch (type) {
-    case 'number':
-      return 'DOUBLE';
-    case 'boolean':
-      return 'TINYINT(1)';
-    case 'date':
-      return 'DATETIME';
-    case 'uuid':
-      return 'CHAR(36)';
-    case 'json':
-      return 'JSON';
-    default:
-      return 'TEXT';
-  }
-}
-
-function coerce(value: unknown, type: ScalarType): unknown {
-  if (value === undefined || value === null || value === '') return null;
-  if (type === 'date') {
-    const parsed = new Date(String(value));
-    return Number.isNaN(parsed.getTime()) ? null : parsed;
-  }
-  if (type === 'boolean') return value ? 1 : 0;
-  if (type === 'number') {
-    const n = Number(value);
-    return Number.isFinite(n) ? n : null;
-  }
-  if (type === 'json') return JSON.stringify(value);
-  return String(value);
-}
+// `sqlType` and `coerce` used to live here. Both are now per-dialect and sit in
+// `dialect.ts` beside the reason each mapping is what it is — the two engines
+// disagree on the boolean in both directions (`TINYINT(1)` takes 1/0, `BOOLEAN`
+// refuses them) and on very little else.
 
 /**
- * MySQL hands back TINYINT for booleans and strings for DOUBLE; undo that.
+ * An engine hands back TINYINT or a real boolean, and strings for wide numbers;
+ * undo that.
  *
  * In under the alias `read` selected, out under the property's own name. Those
  * are the same string for almost every property and are not for one whose name
@@ -1500,4 +1536,44 @@ function toRef(row: SnapshotRow, rowCount: number): SnapshotRef {
     principalId: row.principalId,
     labels: row.labels,
   };
+}
+
+/**
+ * The store on MySQL.
+ *
+ * A named subclass rather than a factory call, because this is the class every
+ * existing host, module and test constructs by name, and Nest resolves a
+ * provider by its class identity. It has no body: the whole of "this is the
+ * MySQL store" is the dialect value it binds, which is the point of the seam.
+ */
+@Injectable()
+export class MySqlWarehouseStore extends MikroOrmWarehouseStore {
+  constructor(@Inject(CATALOG_STORE_ENTITY_MANAGER) em: EntityManager) {
+    super(em, MYSQL_DIALECT);
+  }
+}
+
+/**
+ * The store on PostgreSQL.
+ *
+ * Same class, other dialect, and nothing else — which is the claim the shared
+ * contract in `test/catalog-store-contract.ts` checks rather than takes on
+ * trust: both of these run the same suite, and a case that passes for one and
+ * not the other is a real disagreement rather than a gap in somebody's
+ * imagination.
+ *
+ * Its capabilities are inherited unchanged, and each of the four is still true
+ * of what this class issues on Postgres. `atomicCutover` is the one worth
+ * pausing on, because it is obtained differently: MySQL gets it from
+ * `CREATE OR REPLACE VIEW` taking an exclusive metadata lock, and Postgres
+ * cannot use that statement at all (it refuses to insert a column into an
+ * existing view's column list), so it drops and recreates inside a transaction
+ * — which Postgres honours for DDL, so a concurrent `SELECT` still sees one
+ * definition or the other and never a missing name.
+ */
+@Injectable()
+export class PostgresWarehouseStore extends MikroOrmWarehouseStore {
+  constructor(@Inject(CATALOG_STORE_ENTITY_MANAGER) em: EntityManager) {
+    super(em, POSTGRES_DIALECT);
+  }
 }

@@ -1,10 +1,10 @@
 import type { CatalogObjectTypeDef, CatalogPropertyDef } from '@dudousxd/nestjs-catalog';
-import type { EntityManager } from '@mikro-orm/mysql';
+import type { EntityManager } from '@mikro-orm/sql';
 import { BadRequestException } from '@nestjs/common';
 import { describe, expect, it } from 'vitest';
 import { SnapshotRow } from './entities/governance';
 import { ObjectTypeRow } from './entities/model';
-import { MySqlWarehouseStore } from './mysql-warehouse.store';
+import { MySqlWarehouseStore } from './warehouse.store';
 
 /**
  * A load that produced no rows, and what the store does about it.

@@ -24,14 +24,15 @@
 import type { CatalogEnvironment, CatalogEnvironmentId } from '@dudousxd/nestjs-catalog';
 import { UnknownEnvironmentError } from '@dudousxd/nestjs-catalog';
 import type { MikroORM } from '@mikro-orm/core';
-import type { EntityManager } from '@mikro-orm/mysql';
+import type { EntityManager } from '@mikro-orm/sql';
 import { Logger } from '@nestjs/common';
 import { MySqlCatalogTraceStore } from './audit-recorder.service';
+import { type CatalogSqlDialect, dialectForPlatform } from './dialect';
 import type { PromotionTarget } from './environment.promotion';
-import { MySqlWarehouseStore } from './mysql-warehouse.store';
 import { MySqlPipelineStore } from './pipeline.store';
 import { ensureCatalogSchema } from './schema';
 import { StoredCatalogRegistry } from './stored-registry.service';
+import { MikroOrmWarehouseStore } from './warehouse.store';
 import { MySqlWorkspaceStore } from './workspace.store';
 
 /**
@@ -45,7 +46,7 @@ import { MySqlWorkspaceStore } from './workspace.store';
  */
 export class CatalogEnvironmentBundle implements PromotionTarget {
   readonly registry: StoredCatalogRegistry;
-  readonly store: MySqlWarehouseStore;
+  readonly store: MikroOrmWarehouseStore;
   readonly pipeline: MySqlPipelineStore;
   readonly workspace: MySqlWorkspaceStore;
   readonly traces: MySqlCatalogTraceStore;
@@ -54,6 +55,7 @@ export class CatalogEnvironmentBundle implements PromotionTarget {
     readonly environment: CatalogEnvironment,
     readonly orm: MikroORM,
     readonly em: EntityManager,
+    dialect: CatalogSqlDialect,
   ) {
     // `autoSchema: false` because `prepare()` below runs `ensureCatalogSchema`
     // itself, in a place where the environment it is about to touch is named in
@@ -62,7 +64,13 @@ export class CatalogEnvironmentBundle implements PromotionTarget {
     // construct — which it does not, so the schema would silently never be
     // applied and the first read would fail on a missing table.
     this.registry = new StoredCatalogRegistry(em, orm, { autoSchema: false });
-    this.store = new MySqlWarehouseStore(em);
+    // The base class with the environment's own dialect, rather than one of the
+    // two named subclasses. There is no injector here to pick a provider, and
+    // the dialect is derived from the connection this environment actually
+    // opened — so an environment cannot be served DDL for the wrong engine, and
+    // two environments on two engines is expressible rather than merely not
+    // forbidden.
+    this.store = new MikroOrmWarehouseStore(em, dialect);
     this.pipeline = new MySqlPipelineStore(em);
     this.workspace = new MySqlWorkspaceStore(em);
     this.traces = new MySqlCatalogTraceStore(em);
@@ -85,16 +93,26 @@ export class CatalogEnvironmentBundle implements PromotionTarget {
     const em = orm.em;
     if (!isSqlEntityManager(em)) {
       throw new Error(
-        `The ORM for environment "${environment.id}" did not produce a SQL EntityManager. This store is MySQL-only, and continuing would mean discovering that on the first query rather than at boot.`,
+        `The ORM for environment "${environment.id}" did not produce a SQL EntityManager. This store speaks SQL (MySQL or PostgreSQL), and continuing would mean discovering that on the first query rather than at boot.`,
       );
     }
 
+    // Asked of the connection rather than configured beside it. An environment
+    // is a database, the ORM opened it, and the ORM is therefore the only thing
+    // that cannot be wrong about which engine is on the other end.
+    const dialect = dialectForPlatform(orm);
+
+    // Still a database and still one per environment, on both engines. Postgres
+    // could put each environment in a schema on one connection and deliberately
+    // does not — see the note on `CatalogEnvironment.databaseName` for the
+    // argument, which is that isolation has to stay physical rather than become
+    // session state on a pooled connection.
     await orm.schema.ensureDatabase();
-    const bundle = new CatalogEnvironmentBundle(environment, orm, em);
-    await ensureCatalogSchema(orm);
+    const bundle = new CatalogEnvironmentBundle(environment, orm, em, dialect);
+    await ensureCatalogSchema(orm, dialect);
     await bundle.registry.reload();
     logger.log(
-      `Environment "${environment.id}" ready on database ${environment.databaseName} (${bundle.registry.getSnapshot().stats.types} object types).`,
+      `Environment "${environment.id}" ready on ${dialect.name} database ${environment.databaseName} (${bundle.registry.getSnapshot().stats.types} object types).`,
     );
     return bundle;
   }

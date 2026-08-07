@@ -13,7 +13,7 @@ import type { MikroORM } from '@mikro-orm/core';
  * dating a type by one reports freshness that does not exist, which is worse
  * than reporting nothing.
  */
-import type { EntityManager } from '@mikro-orm/mysql';
+import type { EntityManager } from '@mikro-orm/sql';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { SnapshotRow } from './entities/governance';
 import { ObjectTypeRow } from './entities/model';

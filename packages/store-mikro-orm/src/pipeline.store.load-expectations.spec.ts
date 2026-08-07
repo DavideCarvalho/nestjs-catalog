@@ -1,5 +1,5 @@
 import type { StoredLoadExpectation } from '@dudousxd/nestjs-catalog';
-import type { EntityManager } from '@mikro-orm/mysql';
+import type { EntityManager } from '@mikro-orm/sql';
 import { BadRequestException } from '@nestjs/common';
 import { describe, expect, it } from 'vitest';
 import { LoadExpectationRow } from './entities/pipeline';
