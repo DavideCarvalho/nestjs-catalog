@@ -100,11 +100,75 @@ shell, a multi-tenant console — the supported change is to bind your own `Tran
 container, gVisor, a WASM runtime) rather than to tighten a scope. It is an interface precisely so
 that swap is a provider change.
 
+## Per-record transforms, and why the mode is declared
+
+A transform is called once with the whole batch by default, and that is what aggregating,
+deduplicating, sorting and joining need. It is also what stops a graph streaming: the runner has to
+buffer the source before it can make the call. And that is not an edge case — a column rename is
+mandatory for every DPAS file this ingests, because real headers contain spaces (`Mgmt Cd`,
+`Asset Id`) and both `WORKFLOW_FILTER_COLUMN_PATTERN` and `property-names.ts` refuse them.
+
+So a transform declares which contract it is written against.
+
+```js
+// mode: 'record' — called once per record, over a stream
+export default function transform({ record, context }) {
+  return { mgmtCd: record['Mgmt Cd'] };
+}
+```
+
+Return one object for one row, an array to turn one record into several, `[]` or `null` to drop it.
+Map, filter and flatMap under one rule.
+
+The runner feeds the source into the child as NDJSON and pulls rows back as they are produced, so
+source, transform and sink all run at once and nothing anywhere holds the dataset. Over the real
+102,520-row `af_fleet.csv` (`packages/catalog/bench/transform-stream.mjs`): 938 ms and 636 MB
+buffered against 485 ms and 154 MB streamed. At three times the data the buffered arm does not get
+slower — it **fails**, because a 44 MB JSON result exceeds `MAX_OUTPUT_BYTES`; the streamed arm holds
+159 MB, and 231 MB at 1.2 million records.
+
+**The mode is declared and never inferred.** Destructuring is not reliably introspectable and a
+parameter name is the author's to choose, and both wrong guesses commit silently: guess towards
+per-record and an aggregation returns one partial answer per record; guess towards batch and a
+per-record function reads `undefined` off every property. Absent means `'batch'`, which is every
+transform stored before the field existed.
+
+Two combinations are refused by name, at save and again at run:
+
+- **it must be a module.** A bare body has `records` in scope by the harness's own construction, so
+  there is no honest way to hand it one record under a name it never wrote;
+- **it cannot be Python yet.** That harness writes `def transform(records, context):` itself, so a
+  Python transform never states a signature and there is no second `def` for the per-record shape.
+  Whole-batch Python is unaffected.
+
+### What a per-record transform may retain
+
+| | |
+|---|---|
+| other records | **no** — there is no array in scope; the call shape enforces it |
+| an end-of-stream emit | **no** — there is no finish hook, so an accumulated aggregate has nowhere to go. The node's row count comes out zero, which is loud rather than silently wrong |
+| anything past the node | **no** — the child is spawned for one node run and killed at the end of it |
+| module-scope state within one run | **yes** — a memo table or a compiled regex. No harness can prevent it without forbidding modules, so it is written down rather than pretended otherwise |
+
+### What the timeout means for a stream
+
+Total wall clock for a batch, **a stall for a stream**, and the difference is deliberate. A streamed
+transform's elapsed time would include waiting on its source — which the batch path finished before
+it spawned anything — so a total bound would fail loads that work today for reasons that have nothing
+to do with the transform. What is bounded instead is the child owing an answer and nobody hearing
+one: a hang is caught, a slow source is not, and a slow sink back-pressuring the chain is not. The
+outer bound is still the durable step and `abandoned-runs.ts`.
+
+A failure names where it happened — `failed on record 618` — where a batch call could only report
+that the transform threw. A killed child cannot say where it got to, so a stall reports the window it
+stopped in rather than picking a record inside it. Rows already produced sit in an **uncommitted**
+snapshot and **no watermark moves**: the commit is above this path and is never reached.
+
 ## What code is told: `context`
 
-A transform is a function over a batch, and the batch is not the whole of what it needs. So the code
-gets a second parameter — `context` in JavaScript, TypeScript and Python alike — carrying the run,
-the graph, how much arrived, and the environment variables this deployment admits.
+Records are not the whole of what code needs. So it also gets `context` — in JavaScript, TypeScript
+and Python alike, and in both modes — carrying the run, the graph, how much arrived, and the
+environment variables this deployment admits.
 
 ```js
 // javascript / typescript
@@ -125,7 +189,7 @@ token = context["env"]["VENDOR_TOKEN"]
 | `workflow` / `node` | `{id, name, version}` and `{id, name}`, in a graph. Absent for a connector's single transform |
 | `connectorId` | the connector, when the code runs as a connector's transform rather than in a graph |
 | `environment` | what the host calls this copy of the world, when it declared one — see `environmentName` |
-| `rowCount` | how many records reached this code |
+| `rowCount` | how many records reached this code. **`0` on a streamed connector**, which does not know the total until the read has finished — a guess would be worse than a number that cannot be mistaken for a measurement |
 | `inputs` | per inbound edge, in edge order: `{runId, nodeId, batches, rowCount}` — handles, never rows |
 | `env` | the environment variables the credential allow-list admits, **and only those** |
 
@@ -262,10 +326,13 @@ a batch. Two exceptions, both deliberate:
 - **Postgres.** Plain `pg` buffers the result set inside the driver; streaming needs an explicit
   portal, which lives in `pg-cursor`/`pg-query-stream` — a dependency this package does not require.
   Narrow a large Postgres connector with `watermarkColumn` or a `LIMIT`.
-- **Any connector with a transform.** A transform is a function over a batch — that is the contract,
-  and it is what lets one deduplicate, aggregate or join — so it is given the whole read in one call
-  and the whole read is therefore in memory. Chunking the calls would silently change what an
-  aggregating transform computes. The run log says when this is what happened.
+- **A connector whose transform is `mode: 'batch'`.** A batch transform is called once with every
+  record — that is the contract, and it is what lets one deduplicate, aggregate or join — so it is
+  given the whole read in one call and the whole read is therefore in memory. Chunking the calls
+  would silently change what an aggregating transform computes. The run log says when this is what
+  happened, and names the way out.
+
+  A transform whose mode is `'record'` has no such contract, so it **streams**: see below.
 
 **`scheduler` is per process.** Starting a run from a process that "should not" would still be
 correct — the run id is derived from the cron fire time and `engine.start` is idempotent, so a

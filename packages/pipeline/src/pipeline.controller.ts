@@ -857,17 +857,11 @@ export function createPipelineController(
         );
       }
       const language = body.language;
-      if (body.mode !== undefined && !isTransformMode(body.mode)) {
-        throw new BadRequestException(
-          `"${body.mode}" is not a transform mode. Accepted: ${TRANSFORM_MODES.join(', ')}.`,
-        );
-      }
-      const mode = body.mode;
       // The pane must refuse exactly what save refuses, and with the same
-      // sentence. A try that ran code the save would reject is a pane that
+      // sentences. A try that ran code the save would reject is a pane that
       // teaches the author their transform works.
-      const tryRefusal = recordModeRefusal({ language, code: body.code, mode });
-      if (tryRefusal) throw new BadRequestException(tryRefusal);
+      const mode = narrowTransformMode(body.mode);
+      refuseUnrunnable({ language, code: body.code, mode });
 
       // Said out loud, for the same reason `connections/check` says what it did:
       // this route stores nothing — no transform row, no run row, nothing to
@@ -1935,6 +1929,33 @@ function restoreWorkflowSecrets(
     if (was?.kind !== node.kind) return node;
     return { ...node, config: restoreRedactedSecrets(node.config, was.config) };
   });
+}
+
+/**
+ * The mode off the wire, narrowed, with absence left absent.
+ *
+ * Absent is **not** `'batch'`: a caller written before the field existed sends
+ * no mode, and the store reads that as no instruction rather than as a reset.
+ * One function for both routes so the two cannot narrow it differently.
+ */
+function narrowTransformMode(value: string | undefined): TransformMode | undefined {
+  if (value === undefined) return undefined;
+  if (!isTransformMode(value)) {
+    throw new BadRequestException(
+      `"${value}" is not a transform mode. Accepted: ${TRANSFORM_MODES.join(', ')}.`,
+    );
+  }
+  return value;
+}
+
+/** {@link recordModeRefusal}, as a refusal. Both routes ask it, identically. */
+function refuseUnrunnable(transform: {
+  language: TransformLanguage;
+  code: string;
+  mode: TransformMode | undefined;
+}): void {
+  const refusal = recordModeRefusal(transform);
+  if (refusal) throw new BadRequestException(refusal);
 }
 
 /**
