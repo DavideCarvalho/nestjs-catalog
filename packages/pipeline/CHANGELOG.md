@@ -1,5 +1,41 @@
 # @dudousxd/nestjs-catalog-pipeline
 
+## 0.18.0
+
+### Minor Changes
+
+- 382b71d: A `rename` node kind: declarative column renaming, with no author code.
+
+  The generic `transform` continues to exist for everything else, and that is
+  what lets this node stay narrow. The answer to "I need more than renaming" is
+  always _use a transform_, never _add a field here_.
+
+  **The config** is a map of old name → new name, applied simultaneously, plus
+  `unnamed: 'keep' | 'drop'` for the columns it does not mention (absent means
+  `keep`). A target that is not a column name, and two columns renamed onto one
+  name, are refused when the graph is saved. A rename onto a name the rows
+  already hold fails the node naming both columns; under `drop` there is nothing
+  to collide with.
+
+  **Why it is a kind rather than a transform.** A rename is per record, so it
+  streams by construction and never holds a batch. It needs no child process. And
+  on staged data it is metadata-only: a staged batch names its columns once, in
+  `shapes`, and keeps the values in positional arrays, so renaming a column
+  rewrites a handful of strings and moves no data at all. Dropping a column
+  removes a position and does cost a pass over the rows — the run log says which
+  one happened.
+
+  **Authoring-time schema.** A rename with `unnamed: 'drop'` has an output column
+  set known exactly from its config, so `workflowKnownColumns` can answer for
+  anything downstream of one. A filter or a second rename naming a column that
+  cannot be there is now refused when the graph is saved rather than discovered
+  when the load comes out empty.
+
+  `CatalogStageStore` gains two optional members, `readStagePayload` and
+  `writeStagePayload`, probed by `supportsStagePayloads`. A store without them
+  keeps working: the rename falls back to the row path and produces identical
+  rows through the same rename function.
+
 ## 0.17.0
 
 ### Minor Changes
@@ -1379,9 +1415,9 @@ equals?}` or `{kind: 'rowCount', atLeast}` — where it used to carry `envVar` a
   Every scheduled connector in a deployment was silently inert. The worker said so
   at boot, once, and contradicted itself on the next line:
 
-                ERROR [ConnectorScheduler] No connector will run on a schedule:
-                      parser.parseExpression is not a function.
-                LOG   [ConnectorScheduler] Watching connector schedules every 30000ms.
+                  ERROR [ConnectorScheduler] No connector will run on a schedule:
+                        parser.parseExpression is not a function.
+                  LOG   [ConnectorScheduler] Watching connector schedules every 30000ms.
 
   `cron-parser` v4 exported `parseExpression`; v5 replaced it with
   `CronExpressionParser.parse`. The durable core read only the v4 shape, so
