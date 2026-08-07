@@ -141,6 +141,27 @@ separate durable step, resumable and checkpointed on its own. A connector has on
 no boundary to cross. So a graph is *bounded* end to end without being as *cheap* as a single
 streamed connector, and those are different claims.
 
+`packages/pipeline/bench/source-stage.mjs` measures the whole graph — the shipped
+`WorkflowRunnerService`, a stage store that writes files so the staged rows are not in the heap
+being measured, and a counting sink. Over flip's real 102,519-record `af_fleet.csv`:
+
+| | peak RSS | median wall clock |
+|---|---|---|
+| the source buffered its read | 435 MB | 527 ms |
+| the source stages as it reads | 172 MB | 484 ms |
+
+At three times the data (307,557 records) the buffered arm goes to **769 MB** and 1,758 ms while the
+streamed arm holds **171 MB** — the same number it held at one third the size, which is the property
+worth having. Both arms produce identical counts: 102,519 records, 206 staged batches, 89,458 rows
+with a non-null `Mgmt Cd`, 568 blank lines skipped.
+
+**What it does not change is the durable checkpoint.** A node is the unit of resumption: its output
+is checkpointed when the step returns, so a crash part way through a source re-runs the whole read on
+the next attempt, exactly as it did when the read was buffered. What incremental staging changes is
+that a failed attempt leaves *more* batches behind — which is harmless because batch numbers are
+positions rather than a running count, so the retry writes over them, and `clearStaleTail` empties
+whatever a longer earlier attempt left past the end.
+
 **The mode is declared and never inferred.** Destructuring is not reliably introspectable and a
 parameter name is the author's to choose, and both wrong guesses commit silently: guess towards
 per-record and an aggregation returns one partial answer per record; guess towards batch and a
