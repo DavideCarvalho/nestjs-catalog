@@ -9,6 +9,7 @@ import {
   type CatalogReusableNode,
   type CatalogReusableNodeStore,
   type CatalogWorkflow,
+  type CatalogWorkflowRelease,
   REUSABLE_NODE_KINDS,
   RequireHuman,
   RequireScopes,
@@ -22,11 +23,13 @@ import {
   isConnectorKind,
   isReusableNodeBody,
   isTransformLanguage,
+  liveWorkflowVersion,
   nodeKindIsReusable,
   reusableNodeBodyOf,
   supportsLoadExpectations,
   supportsReusableNodes,
   supportsTransformRevisions,
+  supportsWorkflowReleases,
 } from '@dudousxd/nestjs-catalog';
 import type { LoadExpectationInput } from '@dudousxd/nestjs-catalog/client';
 import {
@@ -156,6 +159,25 @@ export function createPipelineController(
         );
       }
       return this.pipeline;
+    }
+
+    /**
+     * The store, narrowed to one that can hold a release and be pointed at one.
+     *
+     * The same shape as {@link requireReusableNodes} above and for the same
+     * reason: the members are optional so a store written before releases
+     * existed still compiles, which makes "this deployment cannot hold releases"
+     * a sentence somebody can read rather than a `TypeError` on a route they
+     * pressed.
+     */
+    private requireReleases() {
+      const store = this.pipeline;
+      if (!supportsWorkflowReleases(store)) {
+        throw new BadRequestException(
+          'The pipeline store configured here cannot hold workflow releases, so there is no version to freeze and nothing to point a schedule at. Graphs on this deployment run whatever their latest save holds.',
+        );
+      }
+      return store;
     }
 
     /** What this deployment can actually execute, and whether a run survives a crash. */
@@ -1250,10 +1272,18 @@ export function createPipelineController(
     async runWorkflow(
       @Req() request: { principal?: CatalogPrincipal },
       @Param('id') id: string,
-      @Body() body?: { snapshotId?: string; expectShrink?: string },
+      @Body() body?: { snapshotId?: string; expectShrink?: string; version?: number },
     ) {
       const principal = requirePrincipal(request);
-      const workflow = await this.workflows.requireWorkflow(id);
+      const head = await this.workflows.requireWorkflow(id);
+      // Resolved *before* the grant check, which is the whole reason this route
+      // does the resolution rather than leaving it to the launcher. The check
+      // below is over the types a graph commits, and the graph that runs may not
+      // be the head: a live pointer at v3 whose sink writes a different type
+      // than v9's would otherwise be authorised against v9 and executed as v3.
+      const version = readRunVersion(body, head);
+      const workflow =
+        version === head.version ? head : await this.workflows.requireWorkflowAt(id, version);
       // The case save time cannot see: a graph written last month by a
       // principal that could commit this type, run today by one that cannot.
       assertMayWriteTypes(
@@ -1264,6 +1294,11 @@ export function createPipelineController(
       const run = await this.launcher.run({
         workflowId: id,
         principalId: principal.id,
+        // Explicit, never left to be re-derived. The launcher would compute the
+        // same number, and computing it twice is how the version that was
+        // authorised and the version that ran come to differ by one save landing
+        // between the two reads.
+        version,
         // Almost always absent — the console posts an empty body. Present when
         // somebody is re-driving a load they already own the identity of.
         snapshotId: body?.snapshotId,
@@ -1275,6 +1310,119 @@ export function createPipelineController(
         ...(body && 'expectShrink' in body ? { expectShrink: body.expectShrink } : {}),
       });
       return toRunView(workflow, run);
+    }
+
+    /**
+     * Freeze this graph as it stands, so something can be pointed at it.
+     *
+     * ## Why releasing and going live are two routes and not one
+     *
+     * Because they are two decisions and the interesting deployments make them
+     * at different times. Releasing says "this shape is worth keeping"; going
+     * live says "this shape is what runs". A single route would mean the only
+     * way to keep a version is to deploy it, which is the coupling this whole
+     * change exists to break — and it would make releasing a candidate for
+     * review impossible without shipping it first.
+     *
+     * It also keeps the blast radius of each route legible. **This one cannot
+     * change what any load does.** It writes one immutable row; nothing reads it
+     * until somebody presses the other route.
+     *
+     * Authorised like publishing rather than like reading, even though it
+     * changes nothing that runs: a release is what a live pointer may name, so
+     * minting one is a step on the path to a load, and the graph's own sinks are
+     * re-checked here for the reason `publish` re-checks them.
+     */
+    @Post('workflows/:id/releases')
+    @RequireScopes('catalog:write')
+    async releaseWorkflow(
+      @Req() request: { principal?: CatalogPrincipal },
+      @Param('id') id: string,
+      @Body() body?: { notes?: string },
+    ) {
+      const principal = requirePrincipal(request);
+      const store = this.requireReleases();
+      const workflow = await this.workflows.requireWorkflow(id);
+      assertMayWriteTypes(
+        principal,
+        committedTypes(workflow.nodes),
+        `releasing workflow "${workflow.name}"`,
+      );
+      return redactRelease(
+        await store.releaseWorkflow(id, principal.id, {
+          ...(typeof body?.notes === 'string' ? { notes: body.notes } : {}),
+        }),
+      );
+    }
+    /**
+     * Every released version of this graph, newest first.
+     *
+     * Redacted node by node exactly as `GET workflows` is, and that is not
+     * belt-and-braces: a release archives the graph as it was *stored*, which
+     * means it holds whatever sealed credential the source node held, and a list
+     * route that skipped the redaction would hand back through the history what
+     * the read of the live graph is careful not to hand back directly.
+     */
+    @Get('workflows/:id/releases')
+    @RequireScopes('catalog:read')
+    async workflowReleases(@Param('id') id: string) {
+      const store = this.requireReleases();
+      return (await store.listWorkflowReleases(id)).map(redactRelease);
+    }
+    /**
+     * Choose which released version this graph runs. **This is the deploy.**
+     *
+     * `PUT` because it sets a pointer to a value rather than appending anything,
+     * and the same call is promotion, rollback and un-pinning — the last of
+     * those by sending `null`, which is a decision somebody has to make
+     * explicitly rather than an empty body meaning something.
+     *
+     * An absent `version` key is refused rather than read as `null`, for the
+     * reason `PUT workflows/:id/schedule` refuses an empty write: the difference
+     * between "run v6" and "go back to running whatever the canvas holds" is the
+     * difference this whole feature is about, and a body that omitted the field
+     * would resolve it by accident.
+     *
+     * Authorised like publishing and running, and this is the route where that
+     * matters most — it is the one that decides what a cron executes, and the
+     * grant is checked against the sinks of **the version being deployed**, not
+     * of the head. A caller may not go live on a graph committing a type they
+     * could not commit to themselves.
+     */
+    @Put('workflows/:id/live')
+    @RequireScopes('catalog:write')
+    async setLiveVersion(
+      @Req() request: { principal?: CatalogPrincipal },
+      @Param('id') id: string,
+      @Body() body?: { version?: number | null },
+    ) {
+      const principal = requirePrincipal(request);
+      const store = this.requireReleases();
+      const head = await this.workflows.requireWorkflow(id);
+      const version = readLiveVersion(body, head);
+
+      // The graph that would run, checked before it is made to run. Reading it
+      // also proves the release exists in a way that produces a graph rather
+      // than merely a row — the store refuses an unreleased version too, and
+      // this is the check that would catch a release whose nodes this build
+      // cannot narrow.
+      const deployed =
+        version === undefined ? head : await this.workflows.requireWorkflowAt(id, version);
+      assertMayWriteTypes(
+        principal,
+        committedTypes(deployed.nodes),
+        version === undefined
+          ? `clearing the live version of workflow "${head.name}"`
+          : `setting workflow "${head.name}" live at v${version}`,
+      );
+
+      const saved = await store.setLiveWorkflowVersion(id, version, principal.id);
+      if (version === undefined) {
+        this.logger.warn(
+          `"${saved.name}" now follows its latest save again, so editing it is once more the same thing as deploying it.`,
+        );
+      }
+      return saved;
     }
 
     /**
@@ -1564,6 +1712,80 @@ function reachesConnection(
  * read side of that decision, and leaving it out would hand back in plaintext
  * what the write side had refused to store in plaintext.
  */
+/**
+ * Which version `POST workflows/:id/run` should execute.
+ *
+ * Absent is the ordinary answer and means "whatever this graph is set to run":
+ * the live version if one is set, the latest save otherwise. `liveWorkflowVersion`
+ * is what decides, so this route and the scheduler cannot come to different
+ * conclusions about which graph is deployed.
+ *
+ * Present is refused unless it is a whole number of at least one, and the
+ * refusal is worth the four lines: the value arrives from a form, `"6"` is what
+ * an unparsed field sends, and a string here would match no stored version and
+ * be discovered by a load that stops rather than by the person who typed it.
+ */
+function readRunVersion(body: { version?: unknown } | undefined, head: CatalogWorkflow): number {
+  const found = body?.version;
+  if (found === undefined || found === null) return liveWorkflowVersion(head);
+  if (typeof found !== 'number' || !Number.isInteger(found) || found < 1) {
+    throw new BadRequestException(
+      `"${head.name}" was asked to run version ${JSON.stringify(found)}, and a version is a whole number of at least 1. Leave it out to run whatever this graph is set to run.`,
+    );
+  }
+  return found;
+}
+
+/**
+ * Which version `PUT workflows/:id/live` should deploy — or none.
+ *
+ * `null` is a real answer here and `undefined` is not, which is the opposite of
+ * every other optional field on this controller. Sending `null` means "stop
+ * pinning this graph and go back to running its latest save", which is a
+ * decision with consequences somebody should have to state; omitting the key
+ * means the caller sent a body with no instruction in it, and reading that as
+ * the un-pin would perform the most dangerous of the three operations by
+ * default. So the omission is refused and the `null` is honoured.
+ */
+function readLiveVersion(
+  body: { version?: unknown } | undefined,
+  head: CatalogWorkflow,
+): number | undefined {
+  if (!body || !('version' in body)) {
+    throw new BadRequestException(
+      `Nothing to set for "${head.name}": send "version" with the released version to run, or null to go back to running its latest save. An absent field would have to be read as one of those, and reading it as the second would un-pin a live pipeline because somebody sent an empty body.`,
+    );
+  }
+  const found = body.version;
+  if (found === null) return undefined;
+  if (typeof found !== 'number' || !Number.isInteger(found) || found < 1) {
+    throw new BadRequestException(
+      `"${head.name}" cannot be set live at ${JSON.stringify(found)}: a version is a whole number of at least 1, or null to follow the latest save.`,
+    );
+  }
+  return found;
+}
+
+/**
+ * One release, as a screen may see it.
+ *
+ * The same node-by-node redaction `redactWorkflow` performs, and needed for a
+ * sharper reason than symmetry: a release archives the graph **as stored**, so
+ * it holds whatever sealed credential the source node held at the time. Without
+ * this, the history route would hand back in plaintext what the read of the live
+ * graph goes to some trouble not to.
+ */
+function redactRelease(release: CatalogWorkflowRelease): CatalogWorkflowRelease {
+  return {
+    ...release,
+    nodes: release.nodes.map((node) =>
+      node.kind === 'source' || node.kind === 'call'
+        ? { ...node, config: redactConfigSecrets(node.config) }
+        : node,
+    ),
+  };
+}
+
 function redactWorkflow(workflow: CatalogWorkflow): CatalogWorkflow {
   return {
     ...workflow,

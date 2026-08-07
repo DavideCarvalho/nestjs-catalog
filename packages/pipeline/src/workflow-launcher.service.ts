@@ -1,4 +1,5 @@
 import type { CallableWorkflowRef, CatalogWorkflow, ConnectorRun } from '@dudousxd/nestjs-catalog';
+import { liveWorkflowVersion } from '@dudousxd/nestjs-catalog';
 import { WorkflowEngine } from '@dudousxd/nestjs-durable';
 import type { AnnouncedWorkflow } from '@dudousxd/nestjs-durable-core';
 import { BadRequestException, Inject, Injectable, Logger, Optional } from '@nestjs/common';
@@ -339,8 +340,30 @@ export class WorkflowLauncher {
      * with no author attached to a snapshot.
      */
     expectShrink?: string;
+    /**
+     * Which version to run, when the caller means a particular one.
+     *
+     * Absent is the ordinary case and means "whatever this graph is set to run"
+     * — the live version if one is set, its latest save otherwise. Present is
+     * the escape hatch the maintainer asked for by name: a new version can be
+     * released and tried without becoming what the cron executes, by naming it
+     * here rather than by pointing the graph at it.
+     *
+     * Note which way round that is. Naming a version does **not** deploy it, and
+     * nothing about this call moves `liveVersion`. Running is running; deploying
+     * is `setLiveWorkflowVersion`, and keeping them apart is the whole point.
+     */
+    version?: number;
   }): Promise<ConnectorRun> {
-    const workflow = await this.runner.requireWorkflow(input.workflowId);
+    const head = await this.runner.requireWorkflow(input.workflowId);
+    // Resolved once, here, so the durable payload, the inline path and the row
+    // this answers with cannot disagree about which graph ran. `head` is only
+    // used for its identity from this line down.
+    const version = input.version ?? liveWorkflowVersion(head);
+    const workflow =
+      version === head.version
+        ? head
+        : await this.runner.requireWorkflowAt(input.workflowId, version);
     const connectorId = input.connectorId ?? (await this.runner.attributionFor(workflow));
     const snapshotId = input.snapshotId ?? newSnapshotId('wf');
     const durability = this.durability();

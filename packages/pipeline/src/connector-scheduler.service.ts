@@ -3,6 +3,7 @@ import {
   type CatalogConnector,
   type CatalogPipelineStore,
   type CatalogWorkflow,
+  liveWorkflowVersion,
   supportsWorkflows,
 } from '@dudousxd/nestjs-catalog';
 import { WorkflowEngine } from '@dudousxd/nestjs-durable';
@@ -75,6 +76,30 @@ export const CATALOG_SCHEDULER_ENABLED = Symbol('CATALOG_SCHEDULER_ENABLED');
  * withdraw. A scheduler that registered schedules at boot would be a second copy
  * of a database column, and the two would disagree the first time somebody
  * edited one.
+ *
+ * ## Which version a window runs, and why it is not the one on the row
+ *
+ * `liveWorkflowVersion(workflow)`, never `workflow.version`. The distinction is
+ * the point of this paragraph and it is worth stating as the hazard it removes:
+ * the graph row holds one shape, the latest, and `version` is bumped by every
+ * edit that changes behaviour — **including the autosave of a canvas somebody is
+ * still dragging boxes around on**. So before this, saving a `ready` graph
+ * changed what the next tick of a five-minute cron executed. There was no
+ * publish step in between, because `saveWorkflow` keeps a ready graph ready; the
+ * only gate was `ready` versus `draft`, and an edit does not cross it. Editing
+ * was deploying, silently, on a schedule.
+ *
+ * A graph with a live version set no longer moves underneath its own cron:
+ * `liveVersion` names a release, the release holds the graph, and the run is
+ * planned and executed against that. Editing bumps a counter nobody here reads.
+ * Deploying is `setLiveWorkflowVersion`, which is a route a person presses.
+ *
+ * A graph with **no** live version behaves exactly as it always has — it follows
+ * its latest save. That is deliberate and it is the reason nothing was
+ * backfilled: every scheduled pipeline on every existing deployment keeps doing
+ * precisely what it does today until somebody deliberately releases and deploys
+ * one. An upgrade that quietly pinned them all would be a deploy of every
+ * pipeline at once, performed by a migration.
  *
  * ## What it costs a host that is not loading anything
  *
@@ -371,7 +396,16 @@ export class ConnectorScheduler implements OnApplicationBootstrap, OnApplication
       workflow: CATALOG_WORKFLOW_RUN,
       input: {
         workflowId: workflow.id,
-        workflowVersion: workflow.version,
+        // **The version this graph is set to run, not the version it currently
+        // holds.** This one line is the whole of what stops a save being a
+        // deploy: `workflow.version` is bumped by every edit that changes the
+        // graph, including the autosave of a canvas somebody is mid-drag on, so
+        // reading it here meant the next window executed whatever the editor had
+        // got to. `liveWorkflowVersion` answers with the released version when
+        // one is set and with the head when none is — so a graph nobody has
+        // released behaves exactly as it does today, and a graph somebody has
+        // released stops moving underneath its own cron.
+        workflowVersion: liveWorkflowVersion(workflow),
         workflowName: workflow.name,
         connectorId: connector.id,
         principalId: SCHEDULER_PRINCIPAL,
@@ -463,7 +497,10 @@ export class ConnectorScheduler implements OnApplicationBootstrap, OnApplication
   private announce(scheduled: CatalogWorkflow[]): void {
     const fingerprint = scheduled
       .map(
-        (workflow) => `${workflow.id}@${workflow.schedule}@${workflow.status}@${workflow.enabled}`,
+        (workflow) =>
+          `${workflow.id}@${workflow.schedule}@${workflow.status}@${workflow.enabled}@${
+            workflow.liveVersion ?? 'latest'
+          }`,
       )
       .sort()
       .join('|');
@@ -481,7 +518,23 @@ export class ConnectorScheduler implements OnApplicationBootstrap, OnApplication
     this.logger.log(
       `Scheduling ${runnable.length} of ${scheduled.length} workflow(s) carrying a cron: ${
         runnable.length > 0
-          ? runnable.map((workflow) => `${workflow.name} (${workflow.schedule})`).join(', ')
+          ? runnable
+              .map(
+                (workflow) =>
+                  // The version is on this line because it is the answer to the
+                  // question this log exists to settle — "did my edit take?" —
+                  // and once a graph can be pinned, "it is scheduled" and "the
+                  // thing I just saved is scheduled" stop being the same claim.
+                  // `latest save` rather than a bare number for an unpinned
+                  // graph, because that is the fact worth reading: this one does
+                  // still move when somebody edits it.
+                  `${workflow.name} (${workflow.schedule}, running ${
+                    workflow.liveVersion === undefined
+                      ? `its latest save, v${workflow.version}`
+                      : `v${workflow.liveVersion}`
+                  })`,
+              )
+              .join(', ')
           : 'none of them are ready and enabled'
       }.`,
     );
@@ -600,7 +653,17 @@ function isRunnable(workflow: CatalogWorkflow): boolean {
  * how many times a tick asks the store, not how many times a window runs.
  */
 function settlementOf(workflow: CatalogWorkflow, fireMs: number): string {
-  return `${fireMs}|${workflow.schedule ?? ''}|${workflow.version}|${workflow.updatedAt}`;
+  // `liveVersion` is in here explicitly rather than left to ride on `updatedAt`,
+  // even though `setLiveWorkflowVersion` writes the row and therefore bumps it.
+  // What this string has to expire on is "everything a decision about this
+  // window turns on", and the live version is now the *first* of those — leaning
+  // on a timestamp to carry it would mean a deploy took effect only because of a
+  // column nobody deploying is thinking about, and the day that write becomes a
+  // `nativeUpdate` the settlement would silently outlive the rollback it was
+  // meant to expire on.
+  return `${fireMs}|${workflow.schedule ?? ''}|${workflow.version}|${
+    workflow.liveVersion ?? 'latest'
+  }|${workflow.updatedAt}`;
 }
 
 function positiveInt(raw: string | undefined, fallback: number): number {

@@ -10,6 +10,8 @@ import type {
   CatalogStageStore,
   CatalogTransform,
   CatalogWorkflow,
+  CatalogWorkflowRelease,
+  CatalogWorkflowReleaseStore,
   CatalogWorkflowStore,
   ConnectionCheck,
   ConnectorKind,
@@ -73,6 +75,7 @@ import {
   LoadExpectationRow,
   ReusableNodeRow,
   TransformRow,
+  WorkflowReleaseRow,
   WorkflowRow,
   WorkflowStageRow,
 } from './entities/pipeline';
@@ -85,7 +88,11 @@ import { pruneRevisions, readRevisions, recordRevision } from './workspace.store
 
 @Injectable()
 export class MySqlPipelineStore
-  implements CatalogPipelineStore, CatalogWorkflowStore, CatalogStageStore
+  implements
+    CatalogPipelineStore,
+    CatalogWorkflowStore,
+    CatalogWorkflowReleaseStore,
+    CatalogStageStore
 {
   private readonly logger = new Logger(MySqlPipelineStore.name);
 
@@ -367,24 +374,47 @@ export class MySqlPipelineStore
     return sealed;
   }
 
-  /** One graph, with every config-carrying node's config opened. */
-  private async withOpenGraph(workflow: CatalogWorkflow): Promise<CatalogWorkflow> {
+  /**
+   * Every config-carrying node's config, opened, keyed on the graph it belongs to.
+   *
+   * Split out of {@link withOpenGraph} so that a **released** graph takes the
+   * identical path. A release archives the nodes exactly as the row held them,
+   * which is to say sealed, and a second opening routine written beside this one
+   * is how the archive would eventually come back plaintext or come back
+   * unreadable. The context is the *workflow* id rather than the release id, and
+   * it has to be: that is what the node was sealed under, and a provider scoping
+   * its key by context would fail to open a graph filed under a name that did
+   * not exist when it was written.
+   *
+   * Returns the same array when nothing was sealed, so a deployment that never
+   * turned encryption on allocates nothing per read.
+   */
+  private async openNodeConfigs(
+    nodes: WorkflowNode[],
+    workflowId: string,
+  ): Promise<WorkflowNode[]> {
     let opened = false;
-    const nodes: WorkflowNode[] = [];
-    for (const node of workflow.nodes) {
+    const out: WorkflowNode[] = [];
+    for (const node of nodes) {
       if (!carriesConfig(node)) {
-        nodes.push(node);
+        out.push(node);
         continue;
       }
-      const config = await this.openCredentials(node.config, 'workflow', workflow.id);
+      const config = await this.openCredentials(node.config, 'workflow', workflowId);
       if (config === node.config) {
-        nodes.push(node);
+        out.push(node);
         continue;
       }
       opened = true;
-      nodes.push({ ...node, config });
+      out.push({ ...node, config });
     }
-    return opened ? { ...workflow, nodes } : workflow;
+    return opened ? out : nodes;
+  }
+
+  /** One graph, with every config-carrying node's config opened. */
+  private async withOpenGraph(workflow: CatalogWorkflow): Promise<CatalogWorkflow> {
+    const nodes = await this.openNodeConfigs(workflow.nodes, workflow.id);
+    return nodes === workflow.nodes ? workflow : { ...workflow, nodes };
   }
 
   /** Sequentially, for the reason {@link withOpenConfigs} gives. */
@@ -1533,6 +1563,240 @@ export class MySqlPipelineStore
     return toWorkflow(row);
   }
 
+  /**
+   * Freeze this graph as it stands, under the version it stands at.
+   *
+   * ## The one thing that writes to `catalog_workflow_release`
+   *
+   * Not `saveWorkflow` — that is the autosave this feature exists to stop being
+   * a deploy, and `CatalogWorkflow.version`'s docblock is right that archiving
+   * per save would fill the table with a canvas somebody is still dragging boxes
+   * around on. Not `publishWorkflow` either, and that one is worth stating
+   * because it is the tempting place: publishing is idempotent and
+   * `applyPromotion` calls it, so a release minted there would appear in an
+   * environment as a side effect of somebody promoting configuration into it.
+   * A release is a thing a person does on purpose, so it has one route and this
+   * is what that route calls.
+   *
+   * ## Idempotent per version, and what that protects
+   *
+   * The primary key is `{workflowId}:{version}`, so a second release of one
+   * version cannot land beside the first. It is checked here as well as enforced
+   * there, because the honest answer to "release this thing that is released" is
+   * the release — an error would make a double-click a failure, which is the
+   * argument `publishWorkflow` already makes about being idempotent. What the
+   * check adds over letting the insert collide is that it does **not** rewrite
+   * `releasedBy`, `releasedAt` or `notes`: the graph has not changed, so the
+   * record of who shipped it must not be quietly reassigned to whoever pressed
+   * the button second.
+   *
+   * ## Sealed, not opened
+   *
+   * `row.nodes` is copied verbatim. That is the whole of it, and it is
+   * deliberate: `getWorkflow` opens sealed credentials on the way out, so
+   * releasing an *opened* graph would write plaintext credentials into a second
+   * table that no `withOpenGraph` ever re-seals. The archive holds ciphertext and
+   * `getWorkflowAt` opens it through exactly the path a workflow read takes.
+   */
+  async releaseWorkflow(
+    id: string,
+    releasedBy: string,
+    options?: { notes?: string },
+  ): Promise<CatalogWorkflowRelease> {
+    const em = this.em.fork();
+    const row = await em.findOne(WorkflowRow, { id });
+    if (!row) {
+      throw new NotFoundException(`Workflow ${id} does not exist, so there is nothing to release.`);
+    }
+    if (narrowStatus(row.status, row.id) !== 'ready') {
+      throw new BadRequestException(
+        `"${row.name}" is a draft, so it cannot be released. A release is what a schedule can be pointed at, and only a graph somebody has declared finished may be — publish it first, which is the step that validates it and says what is wrong if it is not.`,
+      );
+    }
+
+    const key = workflowReleaseKey(id, row.version);
+    const existing = await em.findOne(WorkflowReleaseRow, { id: key });
+    // Answered with what is there, and deliberately not updated. See the note
+    // above: re-attributing an existing release would erase who shipped it.
+    if (existing) return this.withOpenRelease(toWorkflowRelease(existing));
+
+    const release = em.create(WorkflowReleaseRow, {
+      id: key,
+      workflowId: id,
+      version: row.version,
+      graphHash: row.graphHash,
+      // Verbatim off the row, sealed. See the note on this method.
+      nodes: row.nodes,
+      edges: row.edges,
+      targetType: row.targetType,
+      notes: options?.notes?.trim() ? options.notes.trim() : undefined,
+      releasedBy,
+      releasedAt: new Date(),
+    });
+    em.persist(release);
+    await em.flush();
+
+    this.logger.log(
+      `${releasedBy} released "${row.name}" (${row.id}) at v${row.version}. ${
+        row.liveVersion === undefined || row.liveVersion === null
+          ? 'Nothing points at it yet — this graph still runs whatever its latest save holds until somebody sets a live version.'
+          : `The live version is still v${row.liveVersion}; releasing does not deploy.`
+      }`,
+    );
+    return this.withOpenRelease(toWorkflowRelease(release));
+  }
+
+  /**
+   * Newest first, which is the order a picker wants and the order rollback is
+   * read in: the thing above the live one is what you came back from.
+   */
+  async listWorkflowReleases(id: string): Promise<CatalogWorkflowRelease[]> {
+    const em = this.em.fork();
+    const rows = await em.find(
+      WorkflowReleaseRow,
+      { workflowId: id },
+      { orderBy: { version: 'desc' } },
+    );
+    const releases: CatalogWorkflowRelease[] = [];
+    // Sequentially, for the reason `withOpenConfigs` gives about a hundred
+    // ciphertexts and a KMS request rate.
+    for (const row of rows) releases.push(await this.withOpenRelease(toWorkflowRelease(row)));
+    return releases;
+  }
+
+  /**
+   * The graph as released at a version, on the row's present identity.
+   *
+   * Two reads rather than one, because the answer is genuinely made of two
+   * things. The **graph** — nodes, edges, `targetType`, `graphHash` and the
+   * version itself — comes from the release and is what was frozen. The
+   * **operational** fields — name, status, schedule, enabled, the live pointer —
+   * come from the row as it is now, because none of them were released: a cron
+   * somebody changed this morning governs the version that is live, not the cron
+   * that happened to be on the row the day it was frozen.
+   *
+   * `undefined` when either read comes back empty, and callers must not read
+   * that as "use the latest". A version with no release is the state
+   * `setLiveWorkflowVersion` refuses to create, so reaching it means a release
+   * predating this table or a row somebody edited by hand — and running the
+   * current graph instead is exactly the substitution a live pointer is written
+   * down to prevent.
+   */
+  async getWorkflowAt(id: string, version: number): Promise<CatalogWorkflow | undefined> {
+    const em = this.em.fork();
+    const row = await em.findOne(WorkflowRow, { id });
+    if (!row) return undefined;
+    const release = await em.findOne(WorkflowReleaseRow, { id: workflowReleaseKey(id, version) });
+    if (!release) return undefined;
+
+    const released = toWorkflowRelease(release);
+    return this.withOpenGraph({
+      ...toWorkflow(row),
+      version: released.version,
+      graphHash: released.graphHash,
+      targetType: released.targetType,
+      nodes: released.nodes,
+      edges: released.edges,
+    });
+  }
+
+  /**
+   * Point the graph at a released version, or take the pointer off.
+   *
+   * **This is the deploy.** Everything else in this class edits; this is the one
+   * call that changes what the next cron window executes, which is why it names
+   * its actor, logs in full sentences and is the only workflow method that
+   * refuses on the strength of a row in another table.
+   *
+   * Rollback is this call with a smaller number and needs nothing else — the
+   * older graph is still in `catalog_workflow_release`, so repointing is
+   * sufficient rather than merely suggestive.
+   *
+   * ## What it refuses, and what it deliberately does not
+   *
+   * A version with no release behind it is refused, naming what there is. The
+   * alternative is a pointer that stores fine and stops the pipeline at its next
+   * window, discovered by a load failing rather than by the person who typed it.
+   *
+   * Clearing it is **allowed**. It restores the state every graph in every
+   * deployment is in — following the head — so refusing would strand anything
+   * that had ever gone live, and it is logged as the hazard it re-introduces
+   * rather than as a routine write.
+   *
+   * ## The connector's row is deliberately not touched
+   *
+   * `saveWorkflowSchedule` writes through to `ConnectorRow`, and this does not.
+   * The connector's `updatedAt` is what `ConnectorScheduler` compares a cron
+   * window against to decide whether a window predates the last thing that
+   * happened to the pipeline — bumping it here would silently swallow the
+   * current window, so a rollback performed to fix a bad load would skip the
+   * catch-up run that was the point of doing it. The scheduler notices this
+   * change through the workflow's own settlement fingerprint, which carries the
+   * live version for exactly this reason.
+   */
+  async setLiveWorkflowVersion(
+    id: string,
+    version: number | undefined,
+    changedBy: string,
+  ): Promise<CatalogWorkflow> {
+    const em = this.em.fork();
+    const row = await em.findOne(WorkflowRow, { id });
+    if (!row) {
+      throw new NotFoundException(
+        `Workflow ${id} does not exist, so it cannot be given a version.`,
+      );
+    }
+
+    const was = row.liveVersion ?? undefined;
+    if (version === undefined) {
+      row.liveVersion = undefined;
+      em.persist(row);
+      await em.flush();
+      this.logger.warn(
+        `${changedBy} cleared the live version of "${row.name}" (${row.id})${
+          was === undefined ? '' : `, which was v${was}`
+        }. It now runs whatever its latest save holds, so from here an edit to this graph changes what the next scheduled window executes.`,
+      );
+      return toWorkflow(row);
+    }
+
+    const release = await em.findOne(WorkflowReleaseRow, { id: workflowReleaseKey(id, version) });
+    if (!release) {
+      const available = await em.find(
+        WorkflowReleaseRow,
+        { workflowId: id },
+        { orderBy: { version: 'desc' } },
+      );
+      throw new BadRequestException(
+        `"${row.name}" has no release at v${version}, so nothing could run if it were pointed there. ${
+          available.length === 0
+            ? 'It has no releases at all yet — release it first, which freezes the graph as it currently stands.'
+            : `Released versions are ${available.map((candidate) => `v${candidate.version}`).join(', ')}.`
+        }`,
+      );
+    }
+
+    row.liveVersion = version;
+    em.persist(row);
+    await em.flush();
+    this.logger.log(
+      `${changedBy} set the live version of "${row.name}" (${row.id}) to v${version}${
+        was === undefined
+          ? ', which was following its latest save until now'
+          : was === version
+            ? ' (unchanged)'
+            : `, rolling ${version < was ? 'back' : 'forward'} from v${was}`
+      }. Its latest save is v${row.version}.`,
+    );
+    return toWorkflow(row);
+  }
+
+  /** Open a released graph's sealed credentials, through the workflow's own path. */
+  private async withOpenRelease(release: CatalogWorkflowRelease): Promise<CatalogWorkflowRelease> {
+    const nodes = await this.openNodeConfigs(release.nodes, release.workflowId);
+    return nodes === release.nodes ? release : { ...release, nodes };
+  }
+
   async connectorsUsingWorkflow(id: string): Promise<CatalogConnector[]> {
     const em = this.em.fork();
     const rows = await em.find(ConnectorRow, { workflowId: id }, { orderBy: { name: 'asc' } });
@@ -1562,14 +1826,26 @@ export class MySqlPipelineStore
    * is the real cost of this operation and it is why it is a delete rather than
    * something softer — an operator who wants the history keeps the graph and
    * unpublishes it.
+   *
+   * **The releases go with it**, and that is the opposite of the call
+   * `deleteTransform` makes about revisions. A transform's revisions survive it
+   * deliberately, because runs that executed that code are still in the history
+   * and the code should outlive somebody tidying up the editor. Here the history
+   * does *not* survive — it is dropped two lines down with the connector — so
+   * keeping the releases would leave rows that nothing can reach and nothing can
+   * name. The rule is the same in both places: an archive outlives its subject
+   * exactly as long as something can still cite it.
    */
   async deleteWorkflow(id: string): Promise<boolean> {
     const em = this.em.fork();
     const deleted = (await em.nativeDelete(WorkflowRow, { id })) > 0;
     if (deleted) {
       const dropped = await em.nativeDelete(ConnectorRow, { workflowId: id });
-      if (dropped > 0) {
-        this.logger.log(`Deleted workflow ${id} and the ${dropped} connector(s) that ran it.`);
+      const releases = await em.nativeDelete(WorkflowReleaseRow, { workflowId: id });
+      if (dropped > 0 || releases > 0) {
+        this.logger.log(
+          `Deleted workflow ${id}, the ${dropped} connector(s) that ran it and ${releases} release(s) of it.`,
+        );
       }
     }
     return deleted;
@@ -2657,6 +2933,48 @@ function stageKey(runId: string, nodeId: string, batch: number): string {
   return `${runId}#${nodeId}#${batch}`;
 }
 
+/**
+ * `{workflowId}:{version}` — the release's primary key, derived not random.
+ *
+ * The same construction and the same reason as `revisionKey` next door: keying
+ * on the pair makes "one release per version" a property the database enforces,
+ * so a race between two people pressing release cannot produce two rows claiming
+ * to be the same version of the same graph. The separator is `:` and a workflow
+ * id is a UUID, so the pair cannot be ambiguous.
+ */
+function workflowReleaseKey(workflowId: string, version: number): string {
+  return `${workflowId}:${version}`;
+}
+
+/**
+ * A stored release, narrowed.
+ *
+ * Every node and edge goes through `narrowGraphPart` exactly as a workflow's do.
+ * A release is *older* than the row beside it by construction, so it is the more
+ * likely of the two to hold a shape this build does not recognise — and the
+ * answer has to be the same loud refusal, because a release that quietly dropped
+ * an unreadable node would hand a run nine steps of a ten-step graph and report
+ * a plausible row count.
+ */
+function toWorkflowRelease(row: WorkflowReleaseRow): CatalogWorkflowRelease {
+  return {
+    id: row.id,
+    workflowId: row.workflowId,
+    version: row.version,
+    graphHash: row.graphHash,
+    nodes: row.nodes.map((node, index) =>
+      narrowGraphPart(node, isWorkflowNode, 'node', index, row.workflowId),
+    ),
+    edges: row.edges.map((edge, index) =>
+      narrowGraphPart(edge, isWorkflowEdge, 'edge', index, row.workflowId),
+    ),
+    targetType: row.targetType,
+    notes: row.notes,
+    releasedBy: row.releasedBy,
+    releasedAt: row.releasedAt.toISOString(),
+  };
+}
+
 function toWorkflow(row: WorkflowRow): CatalogWorkflow {
   return {
     id: row.id,
@@ -2671,6 +2989,14 @@ function toWorkflow(row: WorkflowRow): CatalogWorkflow {
     status: narrowStatus(row.status, row.id),
     version: row.version,
     graphHash: row.graphHash,
+    // Spread rather than assigned, so a graph that follows its head carries no
+    // key at all. `{ liveVersion: undefined }` and `{}` are the same object to
+    // every reader in TypeScript and different ones to `JSON.stringify`, and it
+    // is the serialised form that crosses to a canvas and into a durable step's
+    // checkpoint — where an explicit `undefined` is not a thing JSON has.
+    ...(row.liveVersion === undefined || row.liveVersion === null
+      ? {}
+      : { liveVersion: row.liveVersion }),
     targetType: row.targetType,
     schedule: row.schedule,
     enabled: row.enabled,

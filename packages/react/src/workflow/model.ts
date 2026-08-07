@@ -24,6 +24,7 @@ export type {
   CallableWorkflowDisagreement,
   CallableWorkflowRef,
   CatalogWorkflow,
+  CatalogWorkflowRelease,
   WorkflowBranchLabel,
   WorkflowEdge,
   WorkflowCallNode,

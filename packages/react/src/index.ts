@@ -374,6 +374,11 @@ export {
   type ReusableNodeInput,
   type ReusableNodeUsage,
   type SavedNodeAsReusable,
+  // What `releaseWorkflow` may be told about the version it is freezing. The
+  // release itself is `CatalogWorkflowRelease`, re-exported from the catalog
+  // package, because a release is a thing the server owns rather than a shape
+  // only a console has an opinion about.
+  type WorkflowReleaseInput,
   type WorkflowRunOptions,
   type WorkflowScheduleInput,
   useCatalogClient,
