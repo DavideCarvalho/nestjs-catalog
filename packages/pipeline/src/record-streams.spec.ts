@@ -213,7 +213,7 @@ describe('the reader pulls rather than being pushed', () => {
     expect(asked).toEqual([0, 1]);
     await iterator.next();
     expect(asked).toEqual([0, 1, 2]);
-    await iterator.return?.();
+    await iterator.return?.(undefined);
   });
 });
 

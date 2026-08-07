@@ -239,7 +239,9 @@ function dayIso(days: number): string {
  */
 function shapeRow(row: unknown, columns: readonly string[], source: string): unknown {
   if (!row || typeof row !== 'object') {
-    throw new Error(`${source} produced a row that is not an object, so it cannot become a record.`);
+    throw new Error(
+      `${source} produced a row that is not an object, so it cannot become a record.`,
+    );
   }
   const record: Record<string, unknown> = {};
   for (const column of columns) {
@@ -309,7 +311,9 @@ function parquetValue(value: unknown, column: string, source: string): unknown {
     return nested;
   }
 
-  throw new Error(`"${column}" in ${source} came back as ${kind}, which cannot be stored as a value.`);
+  throw new Error(
+    `"${column}" in ${source} came back as ${kind}, which cannot be stored as a value.`,
+  );
 }
 
 const BINARY_ADVICE =
@@ -466,7 +470,8 @@ async function parquetApi(): Promise<ParquetApi> {
 }
 
 function functionAt(module: unknown, name: string): (...args: unknown[]) => Promise<unknown> {
-  const value: unknown = module && typeof module === 'object' ? Reflect.get(module, name) : undefined;
+  const value: unknown =
+    module && typeof module === 'object' ? Reflect.get(module, name) : undefined;
   if (typeof value !== 'function') {
     throw new Error(
       `This deployment's "hyparquet" has no ${name}(), so a parquet connector cannot read anything. Install a 1.x release of the package.`,
@@ -572,7 +577,9 @@ function countAt(group: unknown, key: string, source: string): number {
   const value: unknown = group && typeof group === 'object' ? Reflect.get(group, key) : undefined;
   if (typeof value === 'bigint') {
     if (value > BigInt(Number.MAX_SAFE_INTEGER)) {
-      throw new Error(`${source} declares a row group of ${value} rows, which is not a readable file.`);
+      throw new Error(
+        `${source} declares a row group of ${value} rows, which is not a readable file.`,
+      );
     }
     return Number(value);
   }
@@ -581,11 +588,14 @@ function countAt(group: unknown, key: string, source: string): number {
 }
 
 function collectCodecs(group: unknown, into: Set<string>): void {
-  const columns: unknown = group && typeof group === 'object' ? Reflect.get(group, 'columns') : undefined;
+  const columns: unknown =
+    group && typeof group === 'object' ? Reflect.get(group, 'columns') : undefined;
   if (!Array.isArray(columns)) return;
   for (const column of columns) {
-    const meta: unknown = column && typeof column === 'object' ? Reflect.get(column, 'meta_data') : undefined;
-    const codec: unknown = meta && typeof meta === 'object' ? Reflect.get(meta, 'codec') : undefined;
+    const meta: unknown =
+      column && typeof column === 'object' ? Reflect.get(column, 'meta_data') : undefined;
+    const codec: unknown =
+      meta && typeof meta === 'object' ? Reflect.get(meta, 'codec') : undefined;
     if (typeof codec === 'string') into.add(codec);
   }
 }
@@ -607,30 +617,43 @@ function readSchema(elements: readonly unknown[]): SchemaNode[] {
 
   for (let index = 1; index < elements.length; index += 1) {
     const element = elements[index];
-    const name: unknown = element && typeof element === 'object' ? Reflect.get(element, 'name') : undefined;
-    path.push(typeof name === 'string' ? name : `column ${index}`);
+    path.push(nameOf(element) ?? `column ${index}`);
     nodes.push(readSchemaNode(element, [...path]));
 
-    const children: unknown =
-      element && typeof element === 'object' ? Reflect.get(element, 'num_children') : undefined;
-    if (typeof children === 'number' && children > 0) {
+    const children = childCount(element);
+    if (children > 0) {
       remaining.push(children);
       continue;
     }
-
-    // A leaf closes itself and every group whose last child it was.
-    path.pop();
-    while (remaining.length > 0) {
-      const left = (remaining.pop() ?? 1) - 1;
-      if (left > 0) {
-        remaining.push(left);
-        break;
-      }
-      path.pop();
-    }
+    closeGroups(path, remaining);
   }
 
   return nodes;
+}
+
+/** A leaf closes itself, and every group whose last child it was. */
+function closeGroups(path: string[], remaining: number[]): void {
+  path.pop();
+  while (remaining.length > 0) {
+    const left = (remaining.pop() ?? 1) - 1;
+    if (left > 0) {
+      remaining.push(left);
+      return;
+    }
+    path.pop();
+  }
+}
+
+function nameOf(element: unknown): string | undefined {
+  const name: unknown =
+    element && typeof element === 'object' ? Reflect.get(element, 'name') : undefined;
+  return typeof name === 'string' ? name : undefined;
+}
+
+function childCount(element: unknown): number {
+  const children: unknown =
+    element && typeof element === 'object' ? Reflect.get(element, 'num_children') : undefined;
+  return typeof children === 'number' && children > 0 ? children : 0;
 }
 
 const TEXT_CONVERTED: ReadonlySet<string> = new Set(['UTF8', 'ENUM', 'JSON', 'DECIMAL', 'BSON']);
@@ -663,7 +686,9 @@ function readSchemaNode(element: unknown, path: string[]): SchemaNode {
   const convertedType = typeof converted === 'string' ? converted : undefined;
   const logicalValue = at('logical_type');
   const logicalName =
-    logicalValue && typeof logicalValue === 'object' ? Reflect.get(logicalValue, 'type') : undefined;
+    logicalValue && typeof logicalValue === 'object'
+      ? Reflect.get(logicalValue, 'type')
+      : undefined;
   const logicalType = typeof logicalName === 'string' ? logicalName : undefined;
 
   const type = at('type');
@@ -697,8 +722,11 @@ function decimalWidth(
   scale: unknown,
 ): { precision?: number; scale?: number } {
   const fromLogical = logical && typeof logical === 'object' ? logical : undefined;
-  const p = integerOf(fromLogical ? Reflect.get(fromLogical, 'precision') : undefined) ?? integerOf(precision);
-  const s = integerOf(fromLogical ? Reflect.get(fromLogical, 'scale') : undefined) ?? integerOf(scale);
+  const p =
+    integerOf(fromLogical ? Reflect.get(fromLogical, 'precision') : undefined) ??
+    integerOf(precision);
+  const s =
+    integerOf(fromLogical ? Reflect.get(fromLogical, 'scale') : undefined) ?? integerOf(scale);
   return { ...(p === undefined ? {} : { precision: p }), ...(s === undefined ? {} : { scale: s }) };
 }
 

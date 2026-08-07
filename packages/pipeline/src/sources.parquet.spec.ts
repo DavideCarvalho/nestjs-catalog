@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { gzipSync } from 'node:zlib';
 import type { CatalogConnector } from '@dudousxd/nestjs-catalog';
+import type { ColumnSource } from 'hyparquet-writer';
 import { parquetWriteFile } from 'hyparquet-writer';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { parquetRecords, unreadableParquetColumns } from './source-parquet';
@@ -40,7 +41,7 @@ afterAll(() => {
 /** A parquet file, from columns and optionally an explicit schema. */
 function write(
   name: string,
-  columnData: Array<Record<string, unknown>>,
+  columnData: ColumnSource[],
   options: Record<string, unknown> = {},
 ): string {
   const path = join(directory, name);
@@ -95,9 +96,7 @@ describe('reading a parquet file', () => {
    * an absence.
    */
   it('gives null for an absent value and keeps an empty string as one', async () => {
-    const path = write('nulls.parquet', [
-      { name: 'a', data: ['x', null, ''], type: 'STRING' },
-    ]);
+    const path = write('nulls.parquet', [{ name: 'a', data: ['x', null, ''], type: 'STRING' }]);
 
     expect(await readFile(path)).toEqual([{ a: 'x' }, { a: null }, { a: '' }]);
   });
@@ -292,7 +291,9 @@ describe('columns refused before a single row is read', () => {
           logical_type: { type: 'DECIMAL', precision: 38, scale: 9 },
         },
       ]),
-    ).toEqual([expect.stringMatching(/"amount" is a DECIMAL\(38,9\), which is read through a double/)]);
+    ).toEqual([
+      expect.stringMatching(/"amount" is a DECIMAL\(38,9\), which is read through a double/),
+    ]);
   });
 
   it('reads a DECIMAL narrow enough to be exact', () => {
@@ -416,11 +417,7 @@ describe('row groups are the unit of reading', () => {
    * asked for by then is what says which happened.
    */
   it('has not read the last group when it hands over the first record', async () => {
-    const path = write(
-      'lazy.parquet',
-      [{ name: 'n', data, type: 'INT32' }],
-      { rowGroupSize: 50 },
-    );
+    const path = write('lazy.parquet', [{ name: 'n', data, type: 'INT32' }], { rowGroupSize: 50 });
 
     const stream = parquetRecords(
       { path, byteLength: statSync(path).size, release: async () => undefined },
@@ -441,9 +438,7 @@ describe('row groups are the unit of reading', () => {
 
 describe('through the file connector', () => {
   it('takes the format from a .parquet extension', async () => {
-    const path = write('by-extension.parquet', [
-      { name: 'a', data: ['x'], type: 'STRING' },
-    ]);
+    const path = write('by-extension.parquet', [{ name: 'a', data: ['x'], type: 'STRING' }]);
 
     const result = await toBufferedFetchResult(
       await fetchFile({ connector: connector({ path }), state: {}, mode: 'full' }),
@@ -525,13 +520,7 @@ describe.skipIf(!existsSync(REAL_CSV))('the 21 LRS af_fleet drop, as parquet', (
     const first = fromCsv.records[0];
     if (!first || typeof first !== 'object') throw new Error('expected records');
     const columns = Object.keys(first);
-    expect(columns).toEqual([
-      'Mgmt Cd',
-      'VEH Type Name',
-      'Asset NSN',
-      'Reg Number',
-      'VEH Cat',
-    ]);
+    expect(columns).toEqual(['Mgmt Cd', 'VEH Type Name', 'Asset NSN', 'Reg Number', 'VEH Cat']);
 
     const path = write(
       'af_fleet.parquet',
@@ -554,9 +543,7 @@ describe.skipIf(!existsSync(REAL_CSV))('the 21 LRS af_fleet drop, as parquet', (
     // gives — so a graph filtering on `isNotNull` sees 89,458 either way.
     const present = fromParquet.filter(
       (record) =>
-        record !== null &&
-        typeof record === 'object' &&
-        Reflect.get(record, 'Mgmt Cd') !== null,
+        record !== null && typeof record === 'object' && Reflect.get(record, 'Mgmt Cd') !== null,
     );
     expect(present).toHaveLength(89_458);
   }, 120_000);

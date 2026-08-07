@@ -268,7 +268,11 @@ function declaredLength(response: Response): number | undefined {
   return Number.isInteger(parsed) && parsed >= 0 ? parsed : undefined;
 }
 
-function refuseOversize(size: number | undefined, label: string, maxBytes: number | undefined): void {
+function refuseOversize(
+  size: number | undefined,
+  label: string,
+  maxBytes: number | undefined,
+): void {
   if (maxBytes === undefined || size === undefined || size <= maxBytes) return;
   throw new Error(
     `${label} is ${size} bytes, over the ${maxBytes}-byte limit this connector sets with "maxBytes". Raise it, or narrow what the connector reads.`,

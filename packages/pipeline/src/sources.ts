@@ -16,6 +16,7 @@ import {
   decodeChunks,
   ndjsonRecords,
 } from './record-streams';
+import { admitsSecretEnv, credentialUnavailable, secretEnvAllowlist } from './secret-env-allowlist';
 import { parquetRecords } from './source-parquet';
 import {
   type LocalPayload,
@@ -24,7 +25,6 @@ import {
   payloadChunks,
   spool,
 } from './source-payloads';
-import { admitsSecretEnv, credentialUnavailable, secretEnvAllowlist } from './secret-env-allowlist';
 
 export { importOptional };
 
@@ -266,11 +266,7 @@ export async function toBufferedFetchResult(
     // discovery sample as it is of the whole read — and it is the discovery that
     // most wants to hear it, because that is where somebody is still deciding
     // what the file is.
-    return {
-      records,
-      ...(value.state === undefined ? {} : { state: value.state }),
-      ...(value.notes === undefined ? {} : { notes: value.notes }),
-    };
+    return withSettled(records, value.state, value.notes);
   }
 
   const records: unknown[] = [];
@@ -283,12 +279,26 @@ export async function toBufferedFetchResult(
     if (limit !== undefined && records.length >= limit) return { records };
     records.push(record);
   }
-  const state = value.state?.();
-  const notes = value.notes?.() ?? [];
+  return withSettled(records, value.state?.(), value.notes?.());
+}
+
+/**
+ * A finished read, with the two optional fields present only when they say
+ * something.
+ *
+ * One place rather than two literals: `state` and `notes` are both absent-means-
+ * nothing, and an object that carried `notes: []` would read as "the parse had
+ * nothing to report" where the truth is "the parse reported nothing".
+ */
+function withSettled(
+  records: unknown[],
+  state: Record<string, unknown> | undefined,
+  notes: string[] | undefined,
+): FetchResult {
   return {
     records,
     ...(state === undefined ? {} : { state }),
-    ...(notes.length === 0 ? {} : { notes }),
+    ...(notes === undefined || notes.length === 0 ? {} : { notes }),
   };
 }
 
@@ -1646,30 +1656,9 @@ async function* readObjectRecords(input: {
       const format = resolveFormat(object.key, config);
       const body = await client.send(new s3.GetObjectCommand({ Bucket: bucket, Key: object.key }));
 
-      if (FORMAT_READING[format] === 'stream') {
-        yield* streamObject(body, uri, format, config, ledger);
-      } else {
-        const bytes = await readObjectBytes(body, uri);
-        // Was `!text.trim()` on the decoded body. Asked of the bytes instead so
-        // the skip still happens for a whitespace-only object — which matters,
-        // because the alternative is handing `""` to `JSON.parse` and failing a
-        // whole run on an empty part file that this has always skipped.
-        if (isBlank(bytes)) {
-          completed.push(object);
-          continue;
-        }
-        const parsed = await parseRecords(bytes, object.key, config);
-        if (parsed.blankRows > 0) {
-          ledger.blankRows += parsed.blankRows;
-          ledger.sources += 1;
-          if (ledger.firstSource === undefined) ledger.firstSource = uri;
-        }
-        // Yielded one at a time rather than spread into a `push`, because a
-        // spread becomes one argument per row and a CSV drop with a few hundred
-        // thousand of them overflows the call stack — a failure that only shows
-        // up on the large files this connector exists to read.
-        for (const record of parsed.records) yield record;
-      }
+      yield* FORMAT_READING[format] === 'stream'
+        ? streamObject(body, uri, format, config, ledger)
+        : wholeObject(body, uri, config, ledger);
 
       completed.push(object);
     }
@@ -1678,6 +1667,37 @@ async function* readObjectRecords(input: {
     // when a run is the only thing happening.
     client.destroy?.();
   }
+}
+
+/**
+ * One object's rows, from a body read whole.
+ *
+ * The formats {@link FORMAT_READING} calls `whole` still go this way, and this
+ * still holds one object at a time rather than the prefix — which is the part
+ * that changed. The records are yielded one at a time rather than spread into a
+ * `push`, because a spread becomes one argument per row and a drop with a few
+ * hundred thousand of them overflows the call stack.
+ */
+async function* wholeObject(
+  body: unknown,
+  label: string,
+  config: Record<string, unknown>,
+  ledger: BlankRowLedger,
+): AsyncGenerator<unknown> {
+  const bytes = await readObjectBytes(body, label);
+  // Was `!text.trim()` on the decoded body. Asked of the bytes instead so the
+  // skip still happens for a whitespace-only object — which matters, because
+  // the alternative is handing `""` to `JSON.parse` and failing a whole run on
+  // an empty part file that this has always skipped.
+  if (isBlank(bytes)) return;
+
+  const parsed = await parseRecords(bytes, label, config);
+  if (parsed.blankRows > 0) {
+    ledger.blankRows += parsed.blankRows;
+    ledger.sources += 1;
+    if (ledger.firstSource === undefined) ledger.firstSource = label;
+  }
+  for (const record of parsed.records) yield record;
 }
 
 /**

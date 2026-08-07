@@ -67,13 +67,17 @@ const FULL: Pick<FetchContext, 'state' | 'mode'> = { state: {}, mode: 'full' };
 describe('a file connector hands rows over', () => {
   it('reports itself as streamed, which is what the runner logs about', async () => {
     const path = file('rows.csv', 'a,b\n1,2\n3,4\n');
-    const stream = toRecordStream(await fetchFile({ connector: connector('file', { path }), ...FULL }));
+    const stream = toRecordStream(
+      await fetchFile({ connector: connector('file', { path }), ...FULL }),
+    );
     expect(stream.streamed).toBe(true);
   });
 
   it('leaves json whole, because a document has no row boundary', async () => {
     const path = file('rows.json', '[{"a":1},{"a":2}]');
-    const stream = toRecordStream(await fetchFile({ connector: connector('file', { path }), ...FULL }));
+    const stream = toRecordStream(
+      await fetchFile({ connector: connector('file', { path }), ...FULL }),
+    );
     expect(stream.streamed).toBe(false);
   });
 
@@ -107,7 +111,9 @@ describe('a file connector hands rows over', () => {
    */
   it('reports nothing before the stream is drained, and the truth after', async () => {
     const path = file('timing.csv', 'a\n1\n\n2\n');
-    const stream = toRecordStream(await fetchFile({ connector: connector('file', { path }), ...FULL }));
+    const stream = toRecordStream(
+      await fetchFile({ connector: connector('file', { path }), ...FULL }),
+    );
 
     expect(stream.notes()).toEqual([]);
     const records: unknown[] = [];
