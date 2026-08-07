@@ -192,6 +192,12 @@ importers:
       cron-parser:
         specifier: ^5.7.0
         version: 5.7.0
+      hyparquet:
+        specifier: 1.28.1
+        version: 1.28.1
+      hyparquet-writer:
+        specifier: 0.16.5
+        version: 0.16.5
       typescript:
         specifier: 5.9.3
         version: 5.9.3
@@ -3143,6 +3149,15 @@ packages:
   human-id@4.2.0:
     resolution: {integrity: sha512-K3GbkIWqyvvlpfhBPlbEvD97TtqBpAYA4kt+cn2lD2x2HuohzZCibcA2nOlnJT6exqvJLggoB5nv2dNf192nEA==}
     hasBin: true
+
+  hyparquet-writer@0.16.5:
+    resolution: {integrity: sha512-+f9/aOOiZrQU9MCinU79npYvyo62C4UOkbtk2+c8ViyPGBt4ihLpT+ZhEw8oBLroTbkJVO22y4ftcY/R9AYaQg==}
+
+  hyparquet@1.27.1:
+    resolution: {integrity: sha512-kvMGVKlB/xa9UHxWLJkySJYGC436nPeBWC9Fzo/BZtMEzFUjmzD1KuLz67EOpA3Ci6V7yF/yTG7QRSDSx5EDSg==}
+
+  hyparquet@1.28.1:
+    resolution: {integrity: sha512-04PlyhYZpNDVaOjJNX4SP00beWf9Y9vXEOEQXSMFqVQNzxGxTmsJOQgBjar8VzLpT6E2kxNiWKL539e1dHcOVA==}
 
   iconv-lite@0.6.3:
     resolution: {integrity: sha512-4fCk79wshMdzMp2rH06qWrJE4iolqLhCUH+OiuIgU++RB0+94NlDL81atO7GX55uUKueo0txHNtvEyI6D7WdMw==}
@@ -7426,6 +7441,14 @@ snapshots:
       - supports-color
 
   human-id@4.2.0: {}
+
+  hyparquet-writer@0.16.5:
+    dependencies:
+      hyparquet: 1.27.1
+
+  hyparquet@1.27.1: {}
+
+  hyparquet@1.28.1: {}
 
   iconv-lite@0.6.3:
     dependencies:
