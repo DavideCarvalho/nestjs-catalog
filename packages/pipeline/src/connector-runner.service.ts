@@ -432,7 +432,7 @@ export class ConnectorRunnerService {
       // After the writes, because with a streamed source the count is not known
       // until the last row has gone past. The line reads the same and sits in
       // the same place in the log as it always did.
-      logs.push(`Fetched ${counts.seen} records from ${connector.kind}.`);
+      logs.push(`Fetched ${counts.seen} records from ${connector.kind}.`, ...source.notes);
       return { fetched: counts.seen, written: counts.written };
     }
 
@@ -445,7 +445,7 @@ export class ConnectorRunnerService {
     into.noteTransformVersion(transform.version);
 
     const records = await collect(source.records);
-    logs.push(`Fetched ${records.length} records from ${connector.kind}.`);
+    logs.push(`Fetched ${records.length} records from ${connector.kind}.`, ...source.notes);
     // Only when the source could have streamed and was not allowed to. An
     // operator looking at a connector that exhausted its heap should be able to
     // read why off the run, rather than working it out from the fact that the

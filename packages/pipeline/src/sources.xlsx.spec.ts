@@ -70,10 +70,25 @@ function isConnector(value: unknown): value is CatalogConnector {
   return typeof value === 'object' && value !== null;
 }
 
+/**
+ * The records out of a file fetch, whichever of its shapes it used.
+ *
+ * It used to assert the bare-array shape. `fetchFile` now always returns a
+ * {@link FetchResult}, because it has somewhere to put the blank-line count a
+ * CSV parse reports — a shape that varied with whether the file happened to
+ * have blank lines in it would be worse than either. Both are inside
+ * `SourceFetcher`'s declared return type and every caller in the repository
+ * reads it through `toRecordStream` or `toBufferedFetchResult`, so this helper
+ * was pinning an implementation detail rather than a contract. A workbook read
+ * carries no notes, which the case below asserts rather than assumes.
+ */
 async function read(config: Record<string, unknown>): Promise<unknown[]> {
   const result = await fetchFile({ connector: connector(config), state: {}, mode: 'full' });
-  if (!Array.isArray(result)) throw new Error('the file fetcher returned a shape it never returns');
-  return result;
+  if (Array.isArray(result)) return result;
+  if (!Array.isArray(result.records)) {
+    throw new Error('the file fetcher returned a shape it never returns');
+  }
+  return result.records;
 }
 
 describe('reading a workbook', () => {
@@ -86,6 +101,29 @@ describe('reading a workbook', () => {
     });
 
     await expect(read({ path })).resolves.toEqual([{ name: 'widget', count: 3 }]);
+  });
+
+  // A workbook has no blank *line* to skip — a row of empty cells is a row of
+  // `null`s the reader hands over like any other — so it has nothing to report
+  // and must stay silent. The CSV parser's ledger reaches the run through the
+  // same `FetchResult.notes` this fetch now returns, and a workbook read that
+  // started saying something there would be a note on a file with no defect.
+  it('says nothing about skipped rows, because a workbook skips none', async () => {
+    const path = writeWorkbook('quiet.xlsx', {
+      Sheet1: [
+        ['name', 'count'],
+        ['widget', 3],
+      ],
+    });
+
+    // On the whole result rather than on `result.notes`: `notes` is declared on
+    // `FetchResult` and not on `StreamedFetchResult`, so reaching for the field
+    // would need a narrowing that says more about the union than about this
+    // fetch. Asserting the object entire says the stronger thing anyway — the
+    // key is absent, not merely undefined.
+    await expect(
+      fetchFile({ connector: connector({ path }), state: {}, mode: 'full' }),
+    ).resolves.toEqual({ records: [{ name: 'widget', count: 3 }] });
   });
 
   it('takes the format from the extension, with no format configured', async () => {
