@@ -307,6 +307,47 @@ describe('grouping the audit trail into traces', () => {
   });
 
   /**
+   * The list leaves the payloads in the database; `getTrace` brings them.
+   *
+   * Held against a real engine rather than a unit test because the two halves
+   * are computed in different languages: on the detail path `failed` and
+   * `error` come from the payload in TypeScript, on the list path from
+   * `JSON_EXTRACT` in MySQL. They can only be shown to agree by running both.
+   *
+   * The failure this guards is a quiet one. A list that graded a span
+   * differently from the detail view would paint a card green and then explain
+   * a failure when somebody opened it, and nothing would look broken until the
+   * one load anybody cared about was the one that got it wrong.
+   */
+  it('lists a trace without its payloads and still grades it identically', async () => {
+    const page = await store.listTraces({ outcome: 'failed', limit: 1 });
+    const listed = page.traces[0];
+    const detailed = await store.getTrace(listed.id);
+    if (!detailed) throw new Error(`getTrace lost ${listed.id}`);
+
+    // The whole story, in the same order. The list drops a column, never a step.
+    expect(listed.spans.map((span) => span.id)).toEqual(detailed.spans.map((span) => span.id));
+
+    // The one difference, in both directions — an assertion each way, so this
+    // fails if the list starts carrying payloads again as well as if the
+    // detail view stops.
+    expect(listed.spans.every((span) => span.detail === undefined)).toBe(true);
+    expect(detailed.spans.every((span) => span.detail !== undefined)).toBe(true);
+
+    // And the grading is the same, which is what the column was being read for.
+    expect(listed.spans.map((span) => span.failed)).toEqual(
+      detailed.spans.map((span) => span.failed),
+    );
+    expect(listed.spans.map((span) => span.error)).toEqual(
+      detailed.spans.map((span) => span.error),
+    );
+    expect(listed.error).toBe(detailed.error);
+    // Not vacuous: this page is the failed one, so there is a message to agree
+    // about and `toEqual` above is comparing something.
+    expect(typeof listed.error).toBe('string');
+  });
+
+  /**
    * The performance claim, as a fact about the plan.
    *
    * Before the rewrite every filter was written against a CTE that spooled the

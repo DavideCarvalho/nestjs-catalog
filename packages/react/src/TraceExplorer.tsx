@@ -49,6 +49,16 @@ const PANEL = 'bg-white dark:bg-zinc-900';
  */
 export interface CatalogTraceSource {
   listTraces(query: TraceQuery): Promise<CatalogTraceList>;
+  /**
+   * One trace, with the payloads the list leaves in the database.
+   *
+   * Optional for the same reason the whole source is discovered rather than
+   * declared: a host that has not updated its client still gets a working
+   * screen. Without it the steps render from what the list carried, which is
+   * every step, its timing and its error — everything except the one payload
+   * line per step that `summarise` writes.
+   */
+  getTrace?(id: string): Promise<CatalogTrace>;
 }
 
 /**
@@ -73,9 +83,19 @@ export function useTraceSource(explicit?: CatalogTraceSource): CatalogTraceSourc
     const candidate = Reflect.get(client, 'listTraces');
     if (typeof candidate !== 'function') return undefined;
 
+    const one = Reflect.get(client, 'getTrace');
+
     return {
       listTraces: (query: TraceQuery) =>
         Promise.resolve(candidate.call(client, query)).then(toTraceList),
+      // Discovered separately from `listTraces`, because the two arrived in
+      // different versions: a host pinned to a client that has the list and not
+      // this one is a supported state, and the steps still render without it.
+      ...(typeof one === 'function'
+        ? {
+            getTrace: (id: string) => Promise.resolve(one.call(client, id)).then(toTrace),
+          }
+        : {}),
     };
   }, [client, explicit]);
 }
@@ -122,6 +142,21 @@ function isTrace(value: unknown): value is CatalogTrace {
     typeof Reflect.get(value, 'id') === 'string' &&
     Array.isArray(Reflect.get(value, 'spans'))
   );
+}
+
+/**
+ * One trace, validated the same way the list's are.
+ *
+ * Same reason as {@link toTraceList}: it came back through a method nobody
+ * type-checked, and the steps pane is where somebody is reading a payload
+ * closely enough that a silently malformed one would mislead rather than
+ * merely look wrong.
+ */
+function toTrace(value: unknown): CatalogTrace {
+  if (!isTrace(value)) {
+    throw new Error('The trace endpoint answered with something that is not a trace.');
+  }
+  return value;
 }
 
 function numberOr(value: unknown, fallback: number): number {
@@ -369,6 +404,7 @@ export function TraceExplorer({ source }: { source?: CatalogTraceSource } = {}) 
             <TraceCard
               key={trace.id}
               trace={trace}
+              source={traces}
               expanded={open === trace.id}
               onToggle={() => setOpen(open === trace.id ? null : trace.id)}
             />
@@ -387,12 +423,66 @@ export function TraceExplorer({ source }: { source?: CatalogTraceSource } = {}) 
   );
 }
 
+/**
+ * The steps of one expanded trace.
+ *
+ * Rendered only while the card is open, which is the whole optimisation: a
+ * screen showing fifty collapsed cards makes none of these requests, and the
+ * list it drew them from never carried the payloads to begin with.
+ *
+ * The list's spans are the steps — every one of them, in order, with its timing
+ * and its error. What they do not carry is the event payload, which is the one
+ * line per step {@link summarise} writes and the reason a page of traces would
+ * otherwise be megabytes of JSON nobody looked at. So opening a card fetches
+ * the trace that has them.
+ *
+ * Those spans are drawn immediately and replaced when the fetch lands, rather
+ * than a spinner standing in for them. Every step, its order and its error are
+ * already known; blanking a pane that can already answer "which step failed" to
+ * wait for one line of payload would be slower exactly where it matters. If the
+ * fetch fails, or the host's client predates `getTrace`, that is simply where it
+ * stays — one line per step poorer, and still the whole story.
+ */
+function TraceSteps({ trace, source }: { trace: CatalogTrace; source: CatalogTraceSource }) {
+  const fetchOne = source.getTrace;
+  const { data, isFetching } = useQuery({
+    queryKey: ['catalog', 'trace', trace.id],
+    queryFn: () => {
+      if (!fetchOne) throw new Error('This client cannot fetch a single trace.');
+      return fetchOne(trace.id);
+    },
+    enabled: typeof fetchOne === 'function',
+    // The payloads of a finished load do not change. A running one keeps
+    // gaining steps, and the list underneath is already re-polling, so this
+    // follows it rather than holding a stale pane open beside a fresh card.
+    staleTime: OUTCOMES[trace.outcome].settled ? Number.POSITIVE_INFINITY : 10_000,
+  });
+
+  const spans: CatalogTraceSpan[] = data?.spans ?? trace.spans;
+
+  return (
+    <div className="mt-2 space-y-1 border-t border-zinc-100 pt-2 dark:border-zinc-800">
+      {spans.map((span) => (
+        <Step key={span.id} span={span} coarse={trace.coarse} />
+      ))}
+      {isFetching && data === undefined && (
+        <p className={cn('flex items-center gap-1.5 font-mono text-[10px]', MUTED)}>
+          <LoaderCircle size={11} className="animate-spin" />
+          loading payloads
+        </p>
+      )}
+    </div>
+  );
+}
+
 function TraceCard({
   trace,
+  source,
   expanded,
   onToggle,
 }: {
   trace: CatalogTrace;
+  source: CatalogTraceSource;
   expanded: boolean;
   onToggle: () => void;
 }) {
@@ -488,13 +578,7 @@ function TraceCard({
         {expanded ? 'Hide steps' : `${trace.spans.length} steps`}
       </button>
 
-      {expanded && (
-        <div className="mt-2 space-y-1 border-t border-zinc-100 pt-2 dark:border-zinc-800">
-          {trace.spans.map((span) => (
-            <Step key={span.id} span={span} coarse={trace.coarse} />
-          ))}
-        </div>
-      )}
+      {expanded && <TraceSteps trace={trace} source={source} />}
     </div>
   );
 }
