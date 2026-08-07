@@ -61,6 +61,16 @@ export interface FetchContext {
   state: Record<string, unknown>;
   /** Whether the caller wants everything or only what changed. */
   mode: 'full' | 'incremental';
+  /**
+   * The host's `@dudousxd/nestjs-media` storage manager, when it mounted one.
+   *
+   * Optional, and absent is the ordinary case rather than a fault: a deployment
+   * without media reads S3 through the SDK exactly as it always has. Only a
+   * connector that *names a disk* needs this, and one that names a disk on a
+   * process without a manager is refused rather than quietly read some other
+   * way — see {@link noStorageDetail}.
+   */
+  storage?: StorageManagerLike;
 }
 
 /**
@@ -550,9 +560,12 @@ async function* streamPayload(
  * instead would have promised never to read objects four through ten again, and
  * they would be gone.
  */
-export const fetchS3: SourceFetcher = async ({ connector, secret, state, mode }) => {
+export const fetchS3: SourceFetcher = async ({ connector, secret, state, mode, storage }) => {
+  const disk = namedDisk(connector.config);
   const bucket = String(connector.config.bucket ?? '').trim();
-  if (!bucket) throw new Error('This connector has no bucket configured.');
+  if (!disk && !bucket) {
+    throw new Error('This connector has no bucket configured.');
+  }
 
   const prefix = String(connector.config.prefix ?? '');
   const suffix = String(connector.config.suffix ?? '');
@@ -570,15 +583,14 @@ export const fetchS3: SourceFetcher = async ({ connector, secret, state, mode })
       : [],
   );
 
-  const s3 = await importOptional<S3Module>('@aws-sdk/client-s3', 'S3');
-  const client = createS3Client(s3, connector, secret);
+  // The one place the transport is decided, and the only thing downstream of
+  // here that knows which it was is the URI in a log line.
+  const store = await openObjectStore({ disk, storage, connector, secret, bucket });
 
   let consumed: S3Object[];
   try {
     const candidates = await listUnreadObjects({
-      client,
-      s3,
-      bucket,
+      store,
       prefix,
       suffix,
       previousWatermark,
@@ -595,14 +607,14 @@ export const fetchS3: SourceFetcher = async ({ connector, secret, state, mode })
     // The listing is the only part that still runs before the fetcher returns,
     // so it is the only part whose failure can be caught here. Everything after
     // it is the generator's, including tearing the client down.
-    client.destroy?.();
+    store.close();
     throw error;
   }
 
   // Nothing new. Returning no state leaves the previous watermark exactly
   // where it was, which is what "nothing happened" should mean.
   if (consumed.length === 0) {
-    client.destroy?.();
+    store.close();
     return [];
   }
 
@@ -614,9 +626,7 @@ export const fetchS3: SourceFetcher = async ({ connector, secret, state, mode })
 
   return {
     records: readObjectRecords({
-      client,
-      s3,
-      bucket,
+      store,
       objects: consumed,
       config: connector.config,
       completed,
@@ -630,7 +640,7 @@ export const fetchS3: SourceFetcher = async ({ connector, secret, state, mode })
       completed.length === 0
         ? undefined
         : nextObjectState(completed, previousWatermark, previousKeys),
-    notes: () => blankRowNotes(ledger, `s3://${bucket}/${prefix}`),
+    notes: () => blankRowNotes(ledger, store.uri(prefix)),
   };
 };
 
@@ -1495,6 +1505,100 @@ interface S3Module {
 
 type S3ClientLike = InstanceType<S3Module['S3Client']>;
 
+/**
+ * What this file needs from a `@dudousxd/nestjs-media` `StorageManager`, and
+ * nothing else.
+ *
+ * Written out rather than imported, for the reason {@link S3Module} is: a
+ * top-level import from a package a deployment may not have installed is a
+ * compile error for everyone who does not use it. The difference is that the
+ * media package is never imported here *at all*, not even at run time — see
+ * `media-storage.ts`, which resolves the manager from the injector by a globally
+ * registered symbol. This interface is the whole of the coupling.
+ */
+export interface StorageManagerLike {
+  disk(name?: string): StorageDriverLike;
+  /** The configured disk names, so a bad one can be refused with the real list. */
+  diskNames(): string[];
+}
+
+/** What this file needs from one disk: list a prefix, and read an object. */
+export interface StorageDriverLike {
+  list(
+    prefix: string,
+    options?: { delimiter?: string; cursor?: string; limit?: number },
+  ): Promise<unknown>;
+  stream(path: string): Promise<unknown>;
+}
+
+/**
+ * Whether a value is a usable `StorageManager`, asked of the injector's answer.
+ *
+ * Feature-detected rather than trusted, the same way the run reconciler checks
+ * what is actually bound under the `WorkflowEngine` token: the value arrives
+ * from a symbol any package may bind, and a `disk()` that does not exist should
+ * be a refusal here rather than a `TypeError` four frames into a run.
+ */
+export function isStorageManager(value: unknown): value is StorageManagerLike {
+  if (!value || typeof value !== 'object') return false;
+  return (
+    typeof Reflect.get(value, 'disk') === 'function' &&
+    typeof Reflect.get(value, 'diskNames') === 'function'
+  );
+}
+
+/**
+ * The disk a connector named, or nothing if it named none.
+ *
+ * Trimmed and required to be a string, because `disk: 123` in a config blob is
+ * an authoring mistake rather than a disk called "123".
+ */
+export function namedDisk(config: Record<string, unknown>): string | undefined {
+  const value = config.disk;
+  if (typeof value !== 'string') return undefined;
+  const name = value.trim();
+  return name.length > 0 ? name : undefined;
+}
+
+/**
+ * What to say when a connector names a disk and this process has no media.
+ *
+ * One sentence, and it names both halves of the fix, because the two causes are
+ * genuinely different: the host may not mount `@dudousxd/nestjs-media` at all,
+ * or it may mount it somewhere this injector cannot see. Silently falling back
+ * to the direct-SDK path would be worse than refusing — the connector names no
+ * bucket and no credentials when it names a disk, so the fallback would not read
+ * the objects the author meant, it would read nothing and call the run a
+ * success.
+ */
+export function noStorageDetail(disk: string): string {
+  return `This connector reads the media disk "${disk}", and no storage manager resolved in this process, so nothing here can open it. Mount @dudousxd/nestjs-media on this deployment, or clear the disk and give the connector a bucket and a credential of its own.`;
+}
+
+/** What to say when the media is there and the disk is not. */
+export function unknownDiskDetail(disk: string, available: readonly string[]): string {
+  return available.length === 0
+    ? `This connector reads the media disk "${disk}", and the storage manager here has no disks configured at all.`
+    : `This connector reads the media disk "${disk}", which is not one this deployment configured. The disks it has are: ${available.join(', ')}.`;
+}
+
+/**
+ * The disk a connector named, resolved — or a refusal that says which half failed.
+ *
+ * The two failures are kept apart on purpose, and it is the same distinction the
+ * call-node picker draws between "there are none" and "I cannot ask". "No
+ * storage manager here" sends somebody to the deployment; "no disk by that name"
+ * sends them to the connector, with the list of names that would have worked.
+ * Collapsing them into "could not open the disk" would send everybody to the
+ * wrong place half the time.
+ */
+export function resolveDisk(storage: StorageManagerLike | undefined, disk: string): StorageDriverLike {
+  if (!storage) throw new Error(noStorageDetail(disk));
+  const available = storage.diskNames();
+  if (!available.includes(disk)) throw new Error(unknownDiskDetail(disk, available));
+  return storage.disk(disk);
+}
+
 interface S3Object {
   key: string;
   /** ISO-8601, so a string comparison agrees with a comparison of instants. */
@@ -1555,6 +1659,228 @@ function createS3Client(
 }
 
 /**
+ * Reading a prefix of objects, with the transport left out.
+ *
+ * The seam exists to stop there being two S3 readers. Everything that makes the
+ * S3 source *what it is* — the watermark and its tie set, the oldest-first sort
+ * `maxObjectsPerRun` cuts against, the per-object format resolution, the blank-row
+ * ledger, the spool-or-whole dispatch, the `completed` list that decides what the
+ * run may promise never to read again — is written once, against this, and does
+ * not know whether the bytes came from `@aws-sdk/client-s3` or from a
+ * `@dudousxd/nestjs-media` disk. What the two transports differ in is four
+ * methods long, and the interface makes any divergence a compile error rather
+ * than a thing that has to be noticed in review.
+ *
+ * `list` is an async iterable rather than an array because pagination belongs to
+ * the transport: the SDK has continuation tokens, a media disk has a cursor, and
+ * the caller filters as objects arrive rather than accumulating a bucket listing
+ * it is about to throw most of away.
+ */
+interface ObjectStore {
+  /** Every object under the prefix, paginated internally, in no particular order. */
+  list(prefix: string): AsyncIterable<S3Object>;
+  /** One object's bytes, read whole — for the formats that have no row boundary. */
+  bytes(key: string, label: string): Promise<Uint8Array>;
+  /** One object's bytes, as the chunks they arrive in. */
+  chunks(key: string, label: string): AsyncIterable<Uint8Array>;
+  /** How this object should be named in a log line or a note. */
+  uri(key: string): string;
+  /** Release whatever the transport holds open. Called once, in a `finally`. */
+  close(): void;
+}
+
+/**
+ * The transport a connector asked for, opened.
+ *
+ * A named disk wins, and when one is named the SDK is never loaded — which is
+ * the point of the whole exercise for a deployment that has media and would
+ * rather not also install an AWS SDK to read its own bucket.
+ */
+async function openObjectStore(input: {
+  disk: string | undefined;
+  storage: StorageManagerLike | undefined;
+  connector: CatalogConnector;
+  secret: string | undefined;
+  bucket: string;
+}): Promise<ObjectStore> {
+  const { disk, storage, connector, secret, bucket } = input;
+  if (disk) return diskObjectStore(resolveDisk(storage, disk), disk);
+
+  const s3 = await importOptional<S3Module>('@aws-sdk/client-s3', 'S3');
+  return sdkObjectStore(s3, createS3Client(s3, connector, secret), bucket);
+}
+
+/**
+ * The object store as `@aws-sdk/client-s3` sees it.
+ *
+ * Every call here is the one the fetcher made before the seam existed, moved
+ * rather than rewritten: same `ListObjectsV2` pagination, same `GetObject`, same
+ * `transformToByteArray` for a whole read and same async-iteration for a streamed
+ * one, same `destroy()` to stop the SDK's keep-alive sockets holding the process
+ * open. A deployment without media resolves this and cannot tell the difference.
+ */
+function sdkObjectStore(s3: S3Module, client: S3ClientLike, bucket: string): ObjectStore {
+  return {
+    async *list(prefix: string): AsyncGenerator<S3Object> {
+      let token: string | undefined;
+      do {
+        const page = readListing(
+          await client.send(
+            new s3.ListObjectsV2Command({
+              Bucket: bucket,
+              ...(prefix ? { Prefix: prefix } : {}),
+              ...(token ? { ContinuationToken: token } : {}),
+            }),
+          ),
+        );
+        for (const object of page.objects) yield object;
+        token = page.nextToken;
+      } while (token);
+    },
+    async bytes(key: string, label: string): Promise<Uint8Array> {
+      const body = await client.send(new s3.GetObjectCommand({ Bucket: bucket, Key: key }));
+      return await readObjectBytes(body, label);
+    },
+    async *chunks(key: string, label: string): AsyncGenerator<Uint8Array> {
+      const body = await client.send(new s3.GetObjectCommand({ Bucket: bucket, Key: key }));
+      yield* objectBodyChunks(body, label);
+    },
+    uri: (key: string): string => `s3://${bucket}/${key}`,
+    close: (): void => {
+      client.destroy?.();
+    },
+  };
+}
+
+/**
+ * The same object store, through a named `@dudousxd/nestjs-media` disk.
+ *
+ * The point of this path is not that it is faster — it is not, it issues the
+ * same calls — but that it is configured **once, by the host**. A connector that
+ * names `disk: "drops"` inherits the bucket, the endpoint, the path-style flag
+ * and above all the credentials the application already set up for that disk, so
+ * the catalog stops asking for a second copy of them under a name of its own.
+ *
+ * `delimiter: ''` is not a detail. A media disk lists with `/` by default, which
+ * rolls nested keys up into folder prefixes and would silently hide every object
+ * below the first level — a prefix of `year=2026/month=07/part-0.csv` would list
+ * as one folder and no files, and the run would read nothing and report success.
+ * The empty delimiter is the flat listing this source has always done, and it is
+ * the same idiom media's own console uses to sweep a folder recursively.
+ *
+ * `entry.key` is fed straight back to `stream()`, which is the contract media's
+ * console relies on too. Note the one place that bites: a disk configured with a
+ * `keyPrefix` returns keys that already carry it, and the driver prepends it
+ * again on the read. Point a catalog connector at a disk without a `keyPrefix`,
+ * or set the connector's `prefix` to the part below it.
+ */
+function diskObjectStore(driver: StorageDriverLike, disk: string): ObjectStore {
+  const read = async (key: string, label: string): Promise<AsyncIterable<Uint8Array>> =>
+    chunksOf(asAsyncIterable(await driver.stream(key), label), label);
+
+  return {
+    async *list(prefix: string): AsyncGenerator<S3Object> {
+      let cursor: string | undefined;
+      do {
+        const page: unknown = await driver.list(prefix, {
+          delimiter: '',
+          ...(cursor ? { cursor } : {}),
+        });
+        const result = readDiskListing(page, disk);
+        for (const object of result.objects) yield object;
+        cursor = result.cursor;
+      } while (cursor);
+    },
+    async bytes(key: string, label: string): Promise<Uint8Array> {
+      return await collect(await read(key, label));
+    },
+    async *chunks(key: string, label: string): AsyncGenerator<Uint8Array> {
+      yield* await read(key, label);
+    },
+    uri: (key: string): string => `disk://${disk}/${key}`,
+    // A disk belongs to the host, which opened it and will close it. Tearing
+    // down a shared driver at the end of one connector run would take out every
+    // other reader of the same disk.
+    close: (): void => undefined,
+  };
+}
+
+/** Every chunk of a body, joined — the whole-read path over a transport that only streams. */
+async function collect(chunks: AsyncIterable<Uint8Array>): Promise<Uint8Array> {
+  const parts: Uint8Array[] = [];
+  let total = 0;
+  for await (const chunk of chunks) {
+    parts.push(chunk);
+    total += chunk.byteLength;
+  }
+  const joined = new Uint8Array(total);
+  let offset = 0;
+  for (const part of parts) {
+    joined.set(part, offset);
+    offset += part.byteLength;
+  }
+  return joined;
+}
+
+/** A driver's `stream()` return, narrowed to the one thing this reads it as. */
+function asAsyncIterable(value: unknown, label: string): AsyncIterable<unknown> {
+  if (!isAsyncIterable(value)) {
+    throw new Error(
+      `${label} came back without a readable body. A media disk's stream() must return a Node Readable.`,
+    );
+  }
+  return value;
+}
+
+/**
+ * One page of a media disk's listing, in the shape the rest of this file reads.
+ *
+ * Narrowed rather than trusted, for the same reason {@link readListing} is: this
+ * is a third-party driver's return value, and the invariant that matters —
+ * an object with no last-modified date cannot be placed against the watermark —
+ * has to hold whichever transport produced it. Refused rather than skipped,
+ * because a skipped object is one nobody notices is missing.
+ */
+function readDiskListing(
+  value: unknown,
+  disk: string,
+): { objects: S3Object[]; cursor?: string } {
+  if (!value || typeof value !== 'object') {
+    throw new Error(`Disk "${disk}" answered a listing that was not a result object.`);
+  }
+  const files: unknown = Reflect.get(value, 'files');
+  const cursor: unknown = Reflect.get(value, 'cursor');
+  const objects: S3Object[] = [];
+
+  if (Array.isArray(files)) {
+    for (const entry of files) {
+      if (!entry || typeof entry !== 'object') continue;
+      const key: unknown = Reflect.get(entry, 'key');
+      const modified: unknown = Reflect.get(entry, 'lastModified');
+      const size: unknown = Reflect.get(entry, 'sizeBytes');
+      if (typeof key !== 'string') continue;
+      if (key.endsWith('/')) continue;
+      if (!(modified instanceof Date)) {
+        throw new Error(
+          `The listing entry for "${key}" on disk "${disk}" has no lastModified, so this run cannot tell whether it is new. Refusing rather than skipping it, because a skipped object is one nobody notices is missing.`,
+        );
+      }
+      objects.push({
+        key,
+        lastModified: modified.toISOString(),
+        // Absent size means "read it and find out" rather than "it is empty".
+        size: typeof size === 'number' ? size : 1,
+      });
+    }
+  }
+
+  return {
+    objects,
+    cursor: typeof cursor === 'string' && cursor.length > 0 ? cursor : undefined,
+  };
+}
+
+/**
  * Every object under the prefix this run has not already read.
  *
  * Every run lists the whole prefix, because S3 has no "modified since" filter —
@@ -1568,33 +1894,18 @@ function createS3Client(
  * against and that belongs next to the slice.
  */
 async function listUnreadObjects(input: {
-  client: S3ClientLike;
-  s3: S3Module;
-  bucket: string;
+  store: ObjectStore;
   prefix: string;
   suffix: string;
   previousWatermark: string | undefined;
   previousKeys: Set<string>;
 }): Promise<S3Object[]> {
-  const { client, s3, bucket, prefix, suffix, previousWatermark, previousKeys } = input;
+  const { store, prefix, suffix, previousWatermark, previousKeys } = input;
   const candidates: S3Object[] = [];
-  let token: string | undefined;
 
-  do {
-    const page = readListing(
-      await client.send(
-        new s3.ListObjectsV2Command({
-          Bucket: bucket,
-          ...(prefix ? { Prefix: prefix } : {}),
-          ...(token ? { ContinuationToken: token } : {}),
-        }),
-      ),
-    );
-    for (const object of page.objects) {
-      if (isUnread(object, suffix, previousWatermark, previousKeys)) candidates.push(object);
-    }
-    token = page.nextToken;
-  } while (token);
+  for await (const object of store.list(prefix)) {
+    if (isUnread(object, suffix, previousWatermark, previousKeys)) candidates.push(object);
+  }
 
   return candidates;
 }
@@ -1647,35 +1958,33 @@ function byOldestThenKey(a: S3Object, b: S3Object): number {
  * calls `return` and unwinds this.
  */
 async function* readObjectRecords(input: {
-  client: S3ClientLike;
-  s3: S3Module;
-  bucket: string;
+  store: ObjectStore;
   objects: readonly S3Object[];
   config: Record<string, unknown>;
   completed: S3Object[];
   ledger: BlankRowLedger;
 }): AsyncGenerator<unknown> {
-  const { client, s3, bucket, objects, config, completed, ledger } = input;
+  const { store, objects, config, completed, ledger } = input;
 
   try {
     for (const object of objects) {
-      const uri = `s3://${bucket}/${object.key}`;
+      const uri = store.uri(object.key);
       // The same format logic a file connector uses, per object: the extension
       // decides unless the connector overrides it, which is what a prefix full
       // of `part-00000` files needs.
       const format = resolveFormat(object.key, config);
-      const body = await client.send(new s3.GetObjectCommand({ Bucket: bucket, Key: object.key }));
 
       yield* FORMAT_READING[format] === 'stream'
-        ? streamObject(body, uri, format, config, ledger)
-        : wholeObject(body, uri, config, ledger);
+        ? streamObject(store, object.key, uri, format, config, ledger)
+        : wholeObject(store, object.key, uri, config, ledger);
 
       completed.push(object);
     }
   } finally {
     // The SDK keeps sockets alive for reuse, which keeps the process alive too
-    // when a run is the only thing happening.
-    client.destroy?.();
+    // when a run is the only thing happening. A media disk is the host's and is
+    // left open — see {@link diskObjectStore}.
+    store.close();
   }
 }
 
@@ -1689,12 +1998,13 @@ async function* readObjectRecords(input: {
  * hundred thousand of them overflows the call stack.
  */
 async function* wholeObject(
-  body: unknown,
+  store: ObjectStore,
+  key: string,
   label: string,
   config: Record<string, unknown>,
   ledger: BlankRowLedger,
 ): AsyncGenerator<unknown> {
-  const bytes = await readObjectBytes(body, label);
+  const bytes = await store.bytes(key, label);
   // Was `!text.trim()` on the decoded body. Asked of the bytes instead so the
   // skip still happens for a whitespace-only object — which matters, because
   // the alternative is handing `""` to `JSON.parse` and failing a whole run on
@@ -1720,15 +2030,26 @@ async function* wholeObject(
  * first means the socket's lifetime is the object's size over the network, and
  * the slow half reads from a local file that is not going anywhere. See
  * `source-payloads.ts`, which carries the rest of that argument.
+ *
+ * **A media disk composes with that rather than replacing it.** A driver's
+ * `stream()` hands back a `Readable`, which is an async iterable of chunks and
+ * therefore exactly what {@link spool} already takes — so the disk transport
+ * feeds the same spool, and the ECONNRESET fix covers it unchanged. It has to:
+ * the media S3 driver is the same `GetObject` over the same socket, so reading
+ * it lazily would reproduce the identical stall. The one transport where
+ * spooling is arguably wasted is a local disk, which copies a file that was
+ * already local — and paying one local copy to keep a single code path is a
+ * better trade than a second reader that has to be kept in step by hand.
  */
 async function* streamObject(
-  body: unknown,
+  store: ObjectStore,
+  key: string,
   label: string,
   format: SourceFormat,
   config: Record<string, unknown>,
   ledger: BlankRowLedger,
 ): AsyncGenerator<unknown> {
-  const payload = await spool(objectBodyChunks(body, label), label, payloadLimits(config));
+  const payload = await spool(store.chunks(key, label), label, payloadLimits(config));
   try {
     yield* streamedRecords(payload, format, label, config, ledger);
   } finally {
