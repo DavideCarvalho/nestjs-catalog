@@ -26,29 +26,40 @@ export default function transform({ record, context }) {
 
 Return one object, an array of them (fan-out), or `null` (drop). The runner feeds
 the source into a child process as NDJSON and pulls rows back as they are
-produced, so the source, the child and the sink all run at once and nothing
-anywhere holds the dataset.
+produced, so the source, the child and the sink all run at once.
+
+**Which path that makes end-to-end bounded, exactly.** A **connector** streams the
+whole way: `source.records` goes into the child and the child's rows go into
+`appendBatches`, so back-pressure reaches the file descriptor and nothing
+anywhere holds the dataset. A **workflow graph** does not, and this change does
+not claim to make it so — its source node still stages its whole output before
+any downstream node reads a row, by the design `runSource` documents and which is
+left untouched here. What a graph gains is that its *transform node* no longer
+holds the whole of its input in the heap on top of that: it reads one staged
+batch, maps it, and writes what came out. Making the source node stage
+incrementally is the next change, and `runSource` names the line.
 
 **Measured through the shipped runner**, end to end from the unopened file, over
-the real 102,520-record `af_fleet.csv` — `packages/catalog/bench/transform-stream.mjs`:
+the real 102,519-record `af_fleet.csv` — `packages/catalog/bench/transform-stream.mjs`:
 
 | | wall clock | peak RSS |
 |---|---|---|
-| whole batch | 938 ms | 636 MB |
-| per record | 485 ms | 154 MB |
-| in-process floor | 281 ms | 118 MB |
+| whole batch | 586 ms | 503 MB |
+| per record | 383 ms | 153 MB |
+| in-process floor | 207 ms | 114 MB |
 
 Scale is where it stops being a percentage. Reading the same file three times —
-307,560 records — the **whole-batch arm fails outright**: its single JSON result
+307,557 records — the **whole-batch arm fails outright**: its single JSON result
 is 44 MB against a 32 MB `MAX_OUTPUT_BYTES`, so the child is killed and the load
-cannot be done at all. The streamed arm holds **159 MB** for the same data, and
-**231 MB at 1,230,240 records** — twelve times the fixture, for one and a half
-times the memory, where the batch path stops at roughly 230,000 rows of this
+cannot be done at all. The streamed arm holds **152 MB** for the same data, and
+**217 MB at 1,230,228 records** — twelve times the fixture, for one and a half
+times the memory, where the batch path stops at roughly 235,000 rows of this
 shape.
 
-**The row counts are identical across every arm at every size** — 102,520
-records, 102,520 rows, 89,459 with a non-null `Mgmt Cd` — and they are stated
-here because a faster transform that loses a row is a failure, and chunk
+**The row counts are identical across every arm at every size** — 102,519
+records, 102,519 rows, 89,458 with a non-null `Mgmt Cd`, matching what
+`test-system/full-pipeline.system-spec.ts` expects of this drop — and they are
+stated here because a faster transform that loses a row is a failure, and chunk
 boundaries are exactly where that hides. They agree at 1×, 3× and 12×, which is
 what makes it a claim about the framing rather than about one lucky size.
 

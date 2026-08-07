@@ -121,11 +121,20 @@ Return one object for one row, an array to turn one record into several, `[]` or
 Map, filter and flatMap under one rule.
 
 The runner feeds the source into the child as NDJSON and pulls rows back as they are produced, so
-source, transform and sink all run at once and nothing anywhere holds the dataset. Over the real
-102,520-row `af_fleet.csv` (`packages/catalog/bench/transform-stream.mjs`): 938 ms and 636 MB
-buffered against 485 ms and 154 MB streamed. At three times the data the buffered arm does not get
-slower — it **fails**, because a 44 MB JSON result exceeds `MAX_OUTPUT_BYTES`; the streamed arm holds
-159 MB, and 231 MB at 1.2 million records.
+source, transform and sink all run at once. Over the real 102,519-row `af_fleet.csv`
+(`packages/catalog/bench/transform-stream.mjs`): 586 ms and 503 MB buffered against 383 ms and
+153 MB streamed. At three times the data the buffered arm does not get slower — it **fails**,
+because a 44 MB JSON result exceeds `MAX_OUTPUT_BYTES`; the streamed arm holds 152 MB, and 217 MB at
+1.2 million records.
+
+**Which path is bounded end to end, and which is not.** A **connector** streams the whole way:
+`source.records` goes into the child and the child's rows go into `appendBatches`, so back-pressure
+reaches the file descriptor. A **workflow graph** does not — its source node stages its whole output
+before any downstream node reads a row of it, which is deliberate and documented on `runSource`.
+What a graph gains from this mode is that its *transform node* no longer holds the whole of its
+input in the heap on top of that: it reads one staged batch, maps it, and writes what came out, the
+way the filter node already did. Staging a source incrementally is a separate change, and
+`runSource` marks the line.
 
 **The mode is declared and never inferred.** Destructuring is not reliably introspectable and a
 parameter name is the author's to choose, and both wrong guesses commit silently: guess towards

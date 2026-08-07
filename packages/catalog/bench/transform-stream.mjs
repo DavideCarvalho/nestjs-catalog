@@ -42,9 +42,18 @@
  * AF_FLEET=/path/to/af_fleet.csv node packages/catalog/bench/transform-stream.mjs
  * ```
  *
+ * **Point `AF_FLEET` at a real CSV, not at a copy pulled out of an object store's
+ * on-disk layout.** MinIO writes a 32-byte bitrot checksum at the head of every
+ * 1 MiB block of a part file, so a `part.1` carved out by hand has binary spliced
+ * into the middle of a data row every megabyte — and when one of those checksums
+ * happens to contain a `0x0A`, it splits a row and the record count comes out one
+ * high. That is not hypothetical; it is how this bench was first run, and it cost
+ * an afternoon of wondering whether a chunk boundary had eaten a row. The counts
+ * printed below are the check: they must match what the drop is known to hold.
+ *
  * `REPEAT=n` reads the fixture n times per run, back to back, which is what
  * turns "the stream holds less" into "the stream holds a constant". Raising it
- * is also how the whole-batch arm's hard ceiling shows up: past about 230,000
+ * is also how the whole-batch arm's hard ceiling shows up: past about 235,000
  * rows of this shape its single JSON result exceeds `MAX_OUTPUT_BYTES` and the
  * run **fails** — which is not a slow load, it is a load that cannot be done at
  * all. The streamed arm has no such ceiling, because what it bounds is one
