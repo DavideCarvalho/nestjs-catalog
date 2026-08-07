@@ -3,7 +3,6 @@ import { mkdtemp, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
-import { Logger } from '@nestjs/common';
 
 /**
  * Where a file-backed connector's bytes come from, and what keeps that read
@@ -82,10 +81,9 @@ import { Logger } from '@nestjs/common';
  *   needs a length and random access, which is `stat().size` plus
  *   `stream(path, range)`, and `parquetRecordsFrom` in `source-parquet.ts` is
  *   already written against that pair rather than against a file handle. The
- *   text formats would still want the spool, for the back-pressure reason
- *   below, so `ranged` buys parquet and not CSV.
+ *   text formats would still want the spool, for the back-pressure reason in
+ *   the header above, so `ranged` buys parquet and not CSV.
  */
-const payloadLogger = new Logger('CatalogSourcePayload');
 
 /**
  * How long a remote read may produce nothing before it is abandoned.
@@ -351,15 +349,4 @@ async function* watched(
     // that owns the transport hangs up separately.
     void Promise.resolve(iterator.return?.()).catch(() => undefined);
   }
-}
-
-/**
- * Say once that a payload was spooled, and how big it was.
- *
- * On the logger rather than the run's own log lines, because it is a fact about
- * this pod's disk rather than about the data — an operator chasing a full
- * volume needs it, and somebody reading a run does not.
- */
-export function noteSpool(label: string, payload: LocalPayload): void {
-  payloadLogger.debug(`Spooled ${label} to ${payload.path} (${payload.byteLength} bytes).`);
 }
