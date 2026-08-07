@@ -3,10 +3,21 @@ import {
   type CatalogWorkflow,
   type ConnectorKind,
   type ConnectorRun,
+  WORKFLOW_BRANCH_LABELS,
+  WORKFLOW_FILTER_MAX_DEPTH,
+  WORKFLOW_FILTER_MAX_VALUES,
+  WORKFLOW_PREDICATE_KINDS,
+  type WorkflowBranchLabel,
   type WorkflowEdge,
+  type WorkflowFilterPredicate,
+  type WorkflowIfPredicate,
   type WorkflowNode,
+  type WorkflowSkipReason,
   isConnectorKind,
+  isWorkflowBranchLabel,
+  isWorkflowFilterPredicate,
   isWorkflowNodeKind,
+  unreachableNodeKind,
   workflowRunOrder,
 } from '@dudousxd/nestjs-catalog';
 import { BadRequestException } from '@nestjs/common';
@@ -51,6 +62,35 @@ export interface CanvasWorkflowRunNode {
   nodeId: string;
   status: 'pending' | 'running' | 'succeeded' | 'failed' | 'skipped';
   rows?: number;
+  /**
+   * What a filter node was *given*, against `rows` above, which is what it let
+   * through. Absent on every other kind, and absent on filters that ran before
+   * this was recorded — see `WorkflowNodeOutcome.rowsIn` on why absent and zero
+   * must not be folded together.
+   *
+   * The panel subtracts to show what was dropped. It is carried out to the
+   * screen for the reason the whole node exists: a filter whose effect is
+   * invisible is how data goes missing without anybody noticing.
+   */
+  rowsIn?: number;
+  /**
+   * Which branch an `if` node took. The panel's answer to "why did nothing load
+   * into X", and the only place a screen can read the decision from — it is a
+   * fact about this run, not about the graph.
+   */
+  branch?: WorkflowBranchLabel;
+  /**
+   * Why a `skipped` node did not run, when the reason is a branch rather than a
+   * failure upstream.
+   *
+   * Carried all the way out to the screen rather than collapsed into `status`,
+   * because a **sink** with `status: 'skipped'` and this set committed nothing
+   * *and that is correct*: whatever snapshot was live stays live. The same node
+   * with `status: 'succeeded'` and `rows: 0` did commit — an empty incremental
+   * merge — and the same node with `skipped` and no reason is part of a run that
+   * fell over. Three different things a panel has to be able to tell apart.
+   */
+  skippedBecause?: WorkflowSkipReason;
   error?: string;
 }
 
@@ -104,7 +144,7 @@ export function toGraph(input: CanvasWorkflowInput): {
     // The order of this array is preserved exactly as it arrived: a node with
     // several inbound edges receives its inputs in this order, so sorting them
     // here would silently change what a merge produces.
-    return { from, to };
+    return { from, to, branch: readBranch(raw, from, to) };
   });
 
   return { nodes, edges };
@@ -162,6 +202,20 @@ function toNode(raw: unknown): WorkflowNode {
   if (kind === 'call') {
     return toCallNode(raw, { id, name, config, position });
   }
+
+  if (kind === 'if') {
+    return toIfNode(raw, { id, name, position });
+  }
+
+  if (kind === 'filter') {
+    return toFilterNode(raw, { id, name, position });
+  }
+
+  // Everything below is a source. Written as a refusal rather than as a fallthrough
+  // so that a kind added to the list without a branch above is a type error here
+  // — `kind` narrows to `never` only while every kind is accounted for — instead
+  // of a node of the new kind quietly arriving as a source with no `sourceKind`.
+  if (kind !== 'source') return unreachableNodeKind(kind, 'toGraph');
 
   const declared = readUnknown(raw, 'sourceKind');
 
@@ -222,6 +276,185 @@ function toCallNode(
 }
 
 /**
+ * A gate, refused at the boundary if it has nothing to decide on.
+ *
+ * Checked here rather than left to `validateWorkflow`, which a draft is stored
+ * without running, for exactly the reason {@link toCallNode} gives about a
+ * missing version: a gate saved with no variable would have to pick a branch
+ * anyway on the day somebody publishes it, and whichever it picked would be a
+ * decision the graph appears to make and nobody authored — with half the graph
+ * silently not running as the only symptom.
+ */
+function toIfNode(
+  raw: unknown,
+  base: { id: string; name: string; position?: { x: number; y: number } },
+): WorkflowNode {
+  return { ...base, kind: 'if', predicate: toPredicate(readUnknown(raw, 'predicate'), base) };
+}
+
+/**
+ * The test a gate arrived carrying, narrowed one kind at a time.
+ *
+ * The kind is read first and refused if it is not one of the two, rather than
+ * being guessed from which fields are present. Guessing is what the flat shape
+ * would have forced — "it has an `envVar`, so it must be an env test" — and it
+ * answers a payload carrying both fields, or neither, by picking one. A gate
+ * that runs the test its author did not choose is the failure this whole node is
+ * arranged against, so the ambiguity is refused at the boundary instead.
+ */
+function toPredicate(raw: unknown, base: { id: string; name: string }): WorkflowIfPredicate {
+  const kind = readUnknown(raw, 'kind');
+  if (kind === 'rowCount') {
+    return toRowCountPredicate(raw, base);
+  }
+  if (kind === 'env') {
+    return toEnvPredicate(raw, base);
+  }
+  throw new BadRequestException(
+    `If node "${base.name}" (${base.id}) carries a predicate of kind ${JSON.stringify(
+      kind,
+    )}, and a gate can test one of ${WORKFLOW_PREDICATE_KINDS.map((one) => `"${one}"`).join(
+      ' or ',
+    )}. Without one there is nothing for it to decide on, and a gate that decides anyway sends half the graph down a path nobody chose.`,
+  );
+}
+
+/** Refused at the boundary for the reason {@link toCallNode} gives: a draft is stored unvalidated. */
+function toEnvPredicate(raw: unknown, base: { id: string; name: string }): WorkflowIfPredicate {
+  const envVar = readString(raw, 'envVar');
+  if (!envVar) {
+    throw new BadRequestException(
+      `If node "${base.name}" (${base.id}) names no environment variable, so there would be nothing for it to decide on. It reads the name of a variable on the machine that runs the load — never a value, and never a credential.`,
+    );
+  }
+  const equals = readUnknown(raw, 'equals');
+  if (equals !== undefined && equals !== null && typeof equals !== 'string') {
+    throw new BadRequestException(
+      `If node "${base.name}" (${base.id}) compares ${envVar} against something that is not a string. An environment variable is text; a comparison against anything else could never match, and a branch that can never be taken is a subtree that silently never runs.`,
+    );
+  }
+  // Read as `unknown` rather than through `readString`, because that helper
+  // folds an empty string into "absent" — and here the two are different tests.
+  // `equals: ''` asks "is it set but blank"; no `equals` at all asks "is it set
+  // to anything". `null` is folded in with absent because that is what a JSON
+  // round trip of an unset optional field produces.
+  return {
+    kind: 'env',
+    envVar,
+    equals: typeof equals === 'string' ? equals : undefined,
+  };
+}
+
+/**
+ * A row-count test, refused unless the threshold is a whole number of at least
+ * one.
+ *
+ * The same refusal `validateWorkflow` makes, made here as well because a draft
+ * is stored without validating and a threshold arriving as the *string* `"5"` —
+ * which is what an unparsed form field is — would compare false against every
+ * count and strand the `then` branch on every run. Zero is refused for the
+ * reason given on {@link WorkflowRowCountPredicate.atLeast}: it can only ever
+ * answer one way.
+ */
+function toRowCountPredicate(
+  raw: unknown,
+  base: { id: string; name: string },
+): WorkflowIfPredicate {
+  const atLeast = readUnknown(raw, 'atLeast');
+  if (typeof atLeast !== 'number' || !Number.isInteger(atLeast) || atLeast < 1) {
+    throw new BadRequestException(
+      `If node "${base.name}" (${base.id}) branches on a row count of ${JSON.stringify(
+        atLeast,
+      )}, and a threshold has to be a whole number of at least 1. "At least 1" is the "did anything arrive at all" test; anything else here compares false against every count, which is a branch that silently never runs.`,
+    );
+  }
+  return { kind: 'rowCount', atLeast };
+}
+
+/**
+ * A filter, refused at the boundary if its test or its acknowledgement is
+ * unreadable.
+ *
+ * Checked here for the reason {@link toCallNode} gives — a draft is stored
+ * without validating — and the stakes are the highest of the three. A gate
+ * saved with no test picks a branch nobody authored; a filter saved with a test
+ * this build cannot evaluate would throw inside a durable step halfway through a
+ * load, and one saved with a *silently repaired* test decides which rows a
+ * published type contains. So the whole predicate goes through the same guard
+ * the database read uses, and anything it will not accept is refused with the
+ * rules spelled out rather than patched into something runnable.
+ *
+ * `narrows` is read here rather than left to `validateWorkflow` for a sharper
+ * version of the same argument: it is the acknowledgement that a published
+ * snapshot is about to become a subset, and a value that arrived as a bare
+ * string — which is what a form field that forgot to wrap itself sends — must
+ * not be dropped, because dropping it turns an acknowledged graph into one that
+ * never was, and the refusal that follows would name a field somebody did fill
+ * in.
+ */
+function toFilterNode(
+  raw: unknown,
+  base: { id: string; name: string; position?: { x: number; y: number } },
+): WorkflowNode {
+  const narrows = readUnknown(raw, 'narrows');
+  if (
+    narrows !== undefined &&
+    narrows !== null &&
+    (!Array.isArray(narrows) || !narrows.every((type) => typeof type === 'string'))
+  ) {
+    throw new BadRequestException(
+      `Filter node "${base.name}" (${base.id}) says it narrows ${JSON.stringify(narrows)}, and that has to be a list of object type names. It is the record that this filter is allowed to shrink what those types publish, so a value nothing can read is refused rather than treated as no acknowledgement at all.`,
+    );
+  }
+
+  return {
+    ...base,
+    kind: 'filter',
+    predicate: toFilterPredicate(readUnknown(raw, 'predicate'), base),
+    // Trimmed and deduplicated, because the validator compares this against the
+    // set of types the graph says are narrowed and `[" Mvr", "Mvr"]` would fail
+    // that comparison over whitespace. Absent stays absent: an empty list and no
+    // list mean the same thing here, and storing `[]` would be a second spelling.
+    narrows: Array.isArray(narrows) ? readNarrowedTypes(narrows) : undefined,
+  };
+}
+
+/** The acknowledged types, trimmed, deduplicated, and `undefined` when there are none. */
+function readNarrowedTypes(narrows: readonly string[]): string[] | undefined {
+  const types: string[] = [];
+  for (const raw of narrows) {
+    const type = raw.trim();
+    if (type.length > 0 && !types.includes(type)) types.push(type);
+  }
+  return types.length === 0 ? undefined : types;
+}
+
+/**
+ * The test a filter arrived carrying, checked whole.
+ *
+ * One guard rather than a walk written a second time here. `isWorkflowFilterPredicate`
+ * is the same function the store narrows with and the same one the canvas runs,
+ * and a boundary that reimplemented the rules would be a fourth opinion about
+ * what an empty `all` means — which is the difference between a filter that
+ * keeps everything and one that keeps nothing.
+ *
+ * The message lists the rules rather than pointing at the offending node of the
+ * tree, and that is a deliberate limit: the guard answers yes or no, and making
+ * it answer *where* would mean it returned a diagnostic instead of narrowing a
+ * type. The console builds the predicate through a form that cannot produce most
+ * of these, so the reader of this message is somebody posting JSON.
+ */
+function toFilterPredicate(
+  raw: unknown,
+  base: { id: string; name: string },
+): WorkflowFilterPredicate {
+  if (isWorkflowFilterPredicate(raw)) return raw;
+  throw new BadRequestException(
+    `Filter node "${base.name}" (${base.id}) carries a test this service cannot run. A filter tests bare column names — letters, digits and underscore, starting with a letter or underscore — against plain strings, finite numbers or booleans, combined with "all" and "any". A group must hold at least one condition, a list at least one value and at most ${WORKFLOW_FILTER_MAX_VALUES}, and the tree may nest at most ${WORKFLOW_FILTER_MAX_DEPTH} deep. Nothing is repaired here: an "all" with no conditions keeps every row and an "any" with none drops every row, so a test that cannot be read is refused rather than guessed at.`,
+  );
+}
+
+/**
  * A run, node by node.
  *
  * The node list comes from the graph's own run order rather than from the keys
@@ -245,6 +478,9 @@ export function toRunView(workflow: CatalogWorkflow, run: ConnectorRun): CanvasW
       nodeId: entry.node.id,
       status: outcome.status,
       rows: outcome.rows,
+      rowsIn: outcome.rowsIn,
+      branch: outcome.branch,
+      skippedBecause: outcome.skippedBecause,
       error: outcome.error,
     };
   });
@@ -287,6 +523,27 @@ function readRecord(value: unknown, key: string): Record<string, unknown> {
     record[entry] = Reflect.get(found, entry);
   }
   return record;
+}
+
+/**
+ * The branch a wire is on, refusing anything that is neither label nor absent.
+ *
+ * Absent is normal — it is what every wire that does not leave an `if` is, and
+ * what every wire drawn before branches existed is. What is *not* tolerated is
+ * an unrecognised string: dropping it would silently turn a labelled wire into a
+ * plain one, which either makes a subtree run when a branch said it should not
+ * or makes it stop running with nothing anywhere to point at. Both are the
+ * failure this whole feature has to avoid, so a typo is a 400 at the boundary.
+ */
+function readBranch(value: unknown, from: string, to: string): WorkflowBranchLabel | undefined {
+  const found = readUnknown(value, 'branch');
+  if (found === undefined || found === null) return undefined;
+  if (!isWorkflowBranchLabel(found)) {
+    throw new BadRequestException(
+      `The wire from "${from}" to "${to}" is labelled ${JSON.stringify(found)}, which is not a branch. A branch is ${WORKFLOW_BRANCH_LABELS.map((label) => `"${label}"`).join(' or ')}; anything else names a side of the decision that nothing takes.`,
+    );
+  }
+  return found;
 }
 
 function readMode(value: unknown): 'full' | 'incremental' | undefined {

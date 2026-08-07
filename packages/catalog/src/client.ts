@@ -261,17 +261,36 @@ export type {
   TransformLanguage,
   TransformResult,
   CallableWorkflowRef,
+  WorkflowBranchLabel,
   WorkflowCallEnvelope,
   WorkflowCallNode,
   WorkflowCallOutput,
   WorkflowEdge,
   WorkflowExecutionMode,
+  WorkflowFilterAll,
+  WorkflowFilterAny,
+  WorkflowFilterComparison,
+  WorkflowFilterGroup,
+  WorkflowFilterNode,
+  WorkflowFilterOneOf,
+  WorkflowFilterOperator,
+  WorkflowFilterPredicate,
+  WorkflowFilterPredicateKind,
+  WorkflowFilterPresence,
+  WorkflowFilterValue,
   WorkflowGraph,
+  WorkflowEnvPredicate,
+  WorkflowIfNode,
+  WorkflowIfPredicate,
   WorkflowIssueCode,
   WorkflowNode,
   WorkflowNodeKind,
   WorkflowNodeOutcome,
+  WorkflowPredicateKind,
+  WorkflowRowCountPredicate,
+  WorkflowRunOrderEntry,
   WorkflowSinkNode,
+  WorkflowSkipReason,
   WorkflowSourceNode,
   WorkflowStageRef,
   WorkflowTransformNode,
@@ -343,6 +362,51 @@ export {
   WORKFLOW_ISSUE_CODES,
   WORKFLOW_NODE_ID_PATTERN,
   WORKFLOW_NODE_KINDS,
+  // The branch vocabulary, for the same reason as the kinds beside it: a canvas
+  // that has to draw a then and an else must read the two labels from here, or
+  // it keeps a copy and the copy is what eventually spells one of them wrong —
+  // which is a subtree that silently never runs.
+  WORKFLOW_BRANCH_LABELS,
+  // The predicate vocabulary, same argument one level down: an inspector that
+  // offers "environment variable" or "row count" has to offer exactly the kinds
+  // the validator and the runner know, and the exhaustiveness helper is what
+  // makes a form missing one a build failure rather than a gate somebody can
+  // save with nothing to decide on.
+  WORKFLOW_PREDICATE_KINDS,
+  // The filter language, same argument again and for higher stakes: an
+  // inspector that offers an operator the runner cannot evaluate is a graph
+  // somebody saves and a step that throws mid-load, and one that quietly omits
+  // an operator is a filter nobody can express. The bounds travel with them
+  // because the form has to refuse a too-deep tree or a too-long list *before*
+  // the server does, and a second copy of the numbers is what drifts.
+  WORKFLOW_FILTER_COLUMN_PATTERN,
+  WORKFLOW_FILTER_MAX_DEPTH,
+  WORKFLOW_FILTER_MAX_VALUES,
+  WORKFLOW_FILTER_OPERATORS,
+  WORKFLOW_FILTER_PREDICATE_KINDS,
+  WORKFLOW_SKIP_REASONS,
+  isWorkflowBranchLabel,
+  isWorkflowFilterOperator,
+  isWorkflowFilterPredicate,
+  isWorkflowFilterPredicateKind,
+  isWorkflowFilterValue,
+  isWorkflowIfPredicate,
+  isWorkflowPredicateKind,
+  isWorkflowSkipReason,
+  // The row test itself, so the inspector can describe — and a host can preview
+  // — exactly what a load will keep, from the function that decides it.
+  workflowFilterMatches,
+  // Which published types a filter stands in front of. The console has to offer
+  // the same acknowledgements the validator requires, and a canvas computing its
+  // own answer would offer a set the server then refuses.
+  workflowNarrowedTypes,
+  // Exported so a screen can answer "would this node have run" from a recorded
+  // run exactly the way the runner decided it, rather than approximating.
+  workflowNodeRuns,
+  unreachableFilterOperator,
+  unreachableFilterPredicateKind,
+  unreachableNodeKind,
+  unreachablePredicateKind,
   // The draft/ready pair, for the same reason as the list above: a canvas that
   // cannot see it restates it, and the copy is what drifts. Without this the
   // editor could not tell a graph it is allowed to store from one the server

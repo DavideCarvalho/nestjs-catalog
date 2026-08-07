@@ -24,12 +24,30 @@ export type {
   CallableWorkflowDisagreement,
   CallableWorkflowRef,
   CatalogWorkflow,
+  WorkflowBranchLabel,
   WorkflowEdge,
   WorkflowCallNode,
+  WorkflowEnvPredicate,
+  WorkflowFilterAll,
+  WorkflowFilterAny,
+  WorkflowFilterComparison,
+  WorkflowFilterGroup,
+  WorkflowFilterNode,
+  WorkflowFilterOneOf,
+  WorkflowFilterOperator,
+  WorkflowFilterPredicate,
+  WorkflowFilterPredicateKind,
+  WorkflowFilterPresence,
+  WorkflowFilterValue,
   WorkflowGraph,
+  WorkflowIfNode,
+  WorkflowIfPredicate,
   WorkflowNode,
   WorkflowNodeKind,
+  WorkflowPredicateKind,
+  WorkflowRowCountPredicate,
   WorkflowSinkNode,
+  WorkflowSkipReason,
   WorkflowSourceNode,
   WorkflowTransformNode,
 } from '@dudousxd/nestjs-catalog/client';
@@ -40,12 +58,39 @@ export {
   // same list, and two copies of that rule is a picker that eventually offers
   // something the rest of the system will not accept.
   callableWorkflowBlock,
+  isWorkflowBranchLabel,
+  isWorkflowFilterOperator,
+  isWorkflowFilterPredicate,
+  isWorkflowFilterPredicateKind,
+  isWorkflowFilterValue,
   isWorkflowNodeKind,
+  isWorkflowPredicateKind,
+  unreachableFilterOperator,
+  unreachableFilterPredicateKind,
+  unreachableNodeKind,
+  unreachablePredicateKind,
+  // Core's, not a copy, for the reason every other rule here is core's: the
+  // inspector has to offer exactly the acknowledgements `validateWorkflow`
+  // requires, and a screen that worked out its own list would offer a set the
+  // server then refuses — with the person having ticked a box to be told no.
+  workflowNarrowedTypes,
+  WORKFLOW_BRANCH_LABELS,
+  WORKFLOW_FILTER_COLUMN_PATTERN,
+  WORKFLOW_FILTER_MAX_DEPTH,
+  WORKFLOW_FILTER_MAX_VALUES,
+  WORKFLOW_FILTER_OPERATORS,
+  WORKFLOW_FILTER_PREDICATE_KINDS,
+  WORKFLOW_PREDICATE_KINDS,
   WORKFLOW_NODE_ID_PATTERN,
   WORKFLOW_NODE_KINDS,
 } from '@dudousxd/nestjs-catalog/client';
 
-import { WORKFLOW_NODE_ID_PATTERN, type WorkflowNode } from '@dudousxd/nestjs-catalog/client';
+import {
+  WORKFLOW_NODE_ID_PATTERN,
+  type WorkflowBranchLabel,
+  type WorkflowNode,
+  type WorkflowSkipReason,
+} from '@dudousxd/nestjs-catalog/client';
 
 /**
  * What a caller may set.
@@ -168,7 +213,32 @@ export interface WorkflowRunNode {
    * nowhere else to read it from.
    */
   replayed?: boolean;
+  /** Which branch an `if` node took on this run. See {@link WorkflowIfNode}. */
+  branch?: WorkflowBranchLabel;
+  /**
+   * Why a `skipped` node did not run, when a branch is the reason rather than a
+   * failure above it.
+   *
+   * The distinction a run panel exists to draw for a **sink**: skipped by a
+   * branch means it committed nothing *and was right not to*, so the snapshot
+   * that was live before the run is still live. Skipped with no reason means the
+   * run fell over before reaching it. Rendering the two identically would answer
+   * "why is there no fresh data in X" with the same shrug for a healthy run and
+   * a broken one.
+   */
+  skippedBecause?: WorkflowSkipReason;
   rows?: number;
+  /**
+   * What a filter node was handed, where {@link rows} is what it passed on.
+   *
+   * The pair is the whole reporting contract of a filter, and both halves have
+   * to reach the screen or the node's effect is invisible — which is how rows go
+   * missing quietly. Absent on every other kind, and absent on filters that ran
+   * before the server recorded it; a panel must therefore check for its presence
+   * rather than subtract from a defaulted zero, or every historical node would
+   * claim to have dropped everything it produced.
+   */
+  rowsIn?: number;
   error?: string;
   startedAt?: string;
   finishedAt?: string;

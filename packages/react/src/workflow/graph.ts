@@ -8,13 +8,24 @@ import {
 import type { Edge, Node } from '@xyflow/react';
 import { MarkerType } from '@xyflow/react';
 import {
+  type WorkflowBranchLabel,
   type WorkflowCallNode,
   type WorkflowEdge,
+  type WorkflowFilterNode,
+  type WorkflowFilterOperator,
+  type WorkflowFilterPredicate,
+  type WorkflowFilterValue,
+  type WorkflowIfNode,
+  type WorkflowIfPredicate,
   type WorkflowNode,
   type WorkflowNodeKind,
   type WorkflowRunNode,
   type WorkflowSourceNode,
   nodeName,
+  unreachableFilterOperator,
+  unreachableFilterPredicateKind,
+  unreachableNodeKind,
+  unreachablePredicateKind,
 } from './model';
 import { type WorkflowProblem, edgeId } from './validate';
 
@@ -97,7 +108,158 @@ function subtitleFor(node: WorkflowNode, describe: NodeDescriptions): string {
     return type.length > 0 ? `commits ${type}` : 'no object type chosen';
   }
   if (node.kind === 'call') return callSubtitle(node);
-  return describe.transformName(node.transformId) ?? 'no transform chosen';
+  if (node.kind === 'if') return ifSubtitle(node);
+  if (node.kind === 'filter') return filterSubtitle(node);
+  if (node.kind === 'transform') {
+    return describe.transformName(node.transformId) ?? 'no transform chosen';
+  }
+  return unreachableNodeKind(node, 'subtitleFor');
+}
+
+/**
+ * How much a node's face will spend on a predicate before summarising it.
+ *
+ * A node is 224px wide and the subtitle is one truncated line, so a long
+ * predicate spelled out in full is an ellipsis and nothing else. Past this many
+ * leaves the face says how many conditions there are instead, which at least
+ * tells a reader there is something to open.
+ */
+const FILTER_FACE_LEAVES = 2;
+
+/**
+ * The test, on the face of the node — the reason this kind exists rather than a
+ * transform that returns a subset.
+ *
+ * "Keep the open orders" readable off the canvas is reason one of three on
+ * `WorkflowFilterNode`, so the subtitle is the feature and not decoration. It
+ * shows the *values* as well as the columns, which is a difference from
+ * `ifSubtitle` and a deliberate one: an if node stores the name of an
+ * environment variable and never its contents, because that is where a
+ * credential would be, while a filter's value is a business constant somebody
+ * typed into the graph and is already visible to anyone who can see the node.
+ *
+ * The predicate is read into a variable that admits `undefined` before it is
+ * narrowed, for the reason `ifSubtitle` gives: this draws whatever a server
+ * sent, and a canvas that throws while rendering a node is a screen nobody can
+ * use to fix that node.
+ */
+function filterSubtitle(node: WorkflowFilterNode): string {
+  const predicate: WorkflowFilterPredicate | undefined = node.predicate;
+  if (!predicate) return 'nothing to test';
+  const leaves = countFilterLeaves(predicate);
+  if (leaves > FILTER_FACE_LEAVES) return `keeps rows matching ${leaves} conditions`;
+  return `keeps ${describeFilterPredicate(predicate)}`;
+}
+
+/** How many comparisons a predicate is made of, groups not counted. */
+function countFilterLeaves(predicate: WorkflowFilterPredicate): number {
+  if (predicate.kind === 'all' || predicate.kind === 'any') {
+    let total = 0;
+    for (const child of predicate.children) total += countFilterLeaves(child);
+    return total;
+  }
+  return 1;
+}
+
+/**
+ * A predicate as a sentence.
+ *
+ * Shared by the node's face and by the inspector's summary, so the two cannot
+ * describe one filter differently — which on a screen whose whole job is making
+ * a drop visible would be worse than describing it badly.
+ *
+ * Groups are parenthesised whenever they are nested, and never at the top, so
+ * the common single-group predicate reads as a list rather than as a formula.
+ */
+export function describeFilterPredicate(
+  predicate: WorkflowFilterPredicate,
+  nested = false,
+): string {
+  if (predicate.kind === 'all' || predicate.kind === 'any') {
+    const joined = predicate.children
+      .map((child) => describeFilterPredicate(child, true))
+      .join(predicate.kind === 'all' ? ' and ' : ' or ');
+    return nested && predicate.children.length > 1 ? `(${joined})` : joined;
+  }
+  if (predicate.kind === 'present') {
+    return `${predicate.column} ${predicate.operator === 'isNull' ? 'is empty' : 'has a value'}`;
+  }
+  if (predicate.kind === 'oneOf') {
+    const values = predicate.values.map((value) => showFilterValue(value)).join(', ');
+    return `${predicate.column} ${predicate.operator === 'in' ? 'is one of' : 'is none of'} ${values}`;
+  }
+  if (predicate.kind === 'compare') {
+    return `${predicate.column} ${FILTER_OPERATOR_WORDS[predicate.operator]} ${showFilterValue(predicate.value)}`;
+  }
+  return unreachableFilterPredicateKind(predicate, 'describeFilterPredicate');
+}
+
+/**
+ * Each operator as the words a reader of the canvas would use.
+ *
+ * A `Record` keyed by the operator union, so an operator added to core without a
+ * phrase here is a build failure rather than a node whose subtitle silently says
+ * `undefined` — the same reason `BRANCH_STYLE` above is a record.
+ *
+ * Symbols rather than words for the four orderings, because `>` is unambiguous
+ * in every locale a column name is written in and "greater than" is three words
+ * of a line that has to fit in 224 pixels.
+ */
+const FILTER_OPERATOR_WORDS: Record<WorkflowFilterOperator, string> = {
+  equals: '=',
+  notEquals: '≠',
+  greaterThan: '>',
+  greaterThanOrEqual: '≥',
+  lessThan: '<',
+  lessThanOrEqual: '≤',
+  contains: 'contains',
+  notContains: 'does not contain',
+  startsWith: 'starts with',
+  notStartsWith: 'does not start with',
+};
+
+/**
+ * One value, quoted only when it is text.
+ *
+ * `status = "OPEN"` and `qty = 10` are different tests, and the quotes are the
+ * only thing on the face that says which — three-valued logic aside, a string
+ * `"10"` never equals a number `10` here, and that is exactly the mistake the
+ * run log has to report as an incomparable value.
+ */
+function showFilterValue(value: WorkflowFilterValue): string {
+  return typeof value === 'string' ? `"${value}"` : String(value);
+}
+
+/**
+ * The test, on the face of the node.
+ *
+ * Written as the condition rather than as the variable alone, because the whole
+ * question somebody reads a branch to answer is "which way does this go here",
+ * and `CLICKHOUSE_URL` on its own does not say whether it is being tested for
+ * presence or for a value. The name is shown; a value never is — the node stores
+ * the name of a variable and this screen has no more than that.
+ *
+ * The predicate is read into a variable that admits `undefined` before it is
+ * narrowed, even though the type says it is always there. This runs on whatever
+ * a server sent, and a canvas that throws while drawing a node is a screen
+ * nobody can use to fix the node — a subtitle saying the gate has no test is.
+ */
+function ifSubtitle(node: WorkflowIfNode): string {
+  const predicate: WorkflowIfPredicate | undefined = node.predicate;
+  if (!predicate) return 'nothing to decide on';
+  if (predicate.kind === 'env') {
+    const name = typeof predicate.envVar === 'string' ? predicate.envVar.trim() : '';
+    if (name.length === 0) return 'no variable chosen';
+    return predicate.equals === undefined
+      ? `if ${name} is set`
+      : `if ${name} = ${predicate.equals}`;
+  }
+  if (predicate.kind === 'rowCount') {
+    return predicate.atLeast === 1
+      ? 'if any rows arrived'
+      : `if ${predicate.atLeast} rows or more arrived`;
+  }
+  return unreachablePredicateKind(predicate, 'ifSubtitle');
 }
 
 /** What a source reads from: its kind, and the connection or mode that narrows it. */
@@ -141,9 +303,48 @@ function ariaLabelFor(
   const parts = [`${node.kind} node, ${data.label}, ${data.subtitle}`];
   parts.push(incoming.length === 0 ? 'nothing feeds it' : `fed by ${incoming.join(', ')}`);
   parts.push(outgoing.length === 0 ? 'feeds nothing' : `feeds ${outgoing.join(', ')}`);
-  if (data.run) parts.push(`last run ${data.run.status}`);
+  // The branch and the reason for a skip are in here as well as in the tooltip,
+  // because on a canvas this string is the only thing a screen reader gets — and
+  // "skipped" alone cannot distinguish a node a branch stood down from a node a
+  // failure stranded, which is the one distinction this feature adds.
+  if (data.run) {
+    const branch = data.run.branch ? `, took the ${data.run.branch} branch` : '';
+    const because =
+      data.run.skippedBecause === 'branch-not-taken'
+        ? ', because it is on the branch that was not taken, so it committed nothing'
+        : '';
+    // The drop is in the spoken label as well as the tooltip, because a tooltip
+    // is a hover and this is the sentence a screen reader user gets instead of
+    // the whole canvas. A filter that dropped nine tenths of a load and said so
+    // only on hover would be invisible to exactly the reader who cannot check.
+    const dropped = describeDrop(data.run);
+    parts.push(`last run ${data.run.status}${branch}${because}${dropped ? `, ${dropped}` : ''}`);
+  }
   for (const problem of data.problems) parts.push(problem.message);
   return parts.join('. ');
+}
+
+/**
+ * What a filter did to a run, as a phrase — or nothing, for every other node.
+ *
+ * Keyed off `rowsIn` being **present** rather than off the node's kind, which is
+ * the only check that stays right in both directions: a filter that ran before
+ * the server recorded an input count has no drop to report and must not claim
+ * one, and no other kind sets the field at all. Subtracting from a defaulted
+ * zero would make every historical node read as having dropped its whole output.
+ *
+ * Exported so the node badge and the aria label say the same sentence.
+ */
+export function describeDrop(run: WorkflowRunNode): string | undefined {
+  const given = run.rowsIn;
+  if (typeof given !== 'number' || typeof run.rows !== 'number') return undefined;
+  const dropped = given - run.rows;
+  if (dropped <= 0) return `${given} rows in, none dropped`;
+  // The percentage is what makes the number readable: "7,541,187 dropped" needs
+  // arithmetic before anybody can tell a working filter from a broken predicate,
+  // and "98.7%" does not.
+  const share = given === 0 ? 0 : Math.round((dropped / given) * 1000) / 10;
+  return `${given} rows in, ${run.rows} out — ${dropped} dropped (${share}%)`;
 }
 
 export function toFlowNodes(
@@ -199,8 +400,30 @@ export function defaultLabel(kind: WorkflowNodeKind): string {
   if (kind === 'source') return 'Source';
   if (kind === 'sink') return 'Sink';
   if (kind === 'call') return 'Call';
-  return 'Transform';
+  if (kind === 'if') return 'If';
+  if (kind === 'filter') return 'Filter';
+  if (kind === 'transform') return 'Transform';
+  return unreachableNodeKind(kind, 'defaultLabel');
 }
+
+/**
+ * How a branch is drawn: a word on the wire, and a colour that means it.
+ *
+ * A **label**, not only a colour, and that is the accessibility half rather than
+ * a stylistic one — two lines leaving one box differing by hue alone are one
+ * line as far as a colour-blind reader is concerned, and this particular
+ * distinction decides which half of a pipeline runs. Emerald for the branch
+ * taken when the test passes and zinc for the other reads as "the positive one
+ * and the fallback", which is what a then and an else are.
+ *
+ * Kept as a `Record` keyed by the label union so a third branch label added to
+ * core without a line here is a type error rather than an unlabelled grey wire.
+ */
+const BRANCH_STYLE: Record<WorkflowBranchLabel, { stroke: string; text: string }> = {
+  else: { stroke: '#a1a1aa', text: '#71717a' },
+  // biome-ignore lint/suspicious/noThenProperty: the rule guards against an object being mistaken for a thenable by `await`; the key here is one of core's two branch labels and this record is only ever indexed by one of them, never awaited nor returned from anything async. Keying it by the label union is what makes a third label a compile error rather than an unlabelled grey wire, which is the whole reason it is a record and not a function.
+  then: { stroke: '#10b981', text: '#059669' },
+};
 
 /**
  * The stored edges, as React Flow draws them.
@@ -219,37 +442,72 @@ export function toFlowEdges(
   flowing: ReadonlySet<string> = new Set(),
 ): WorkflowFlowEdge[] {
   const labelOf = new Map(nodes.map((node) => [node.id, nodeName(node)]));
-  return edges.map((edge) => {
-    const from = labelOf.get(edge.from) ?? edge.from;
-    const to = labelOf.get(edge.to) ?? edge.to;
-    const id = edgeId(edge);
-    const broken = brokenEdgeIds.has(id);
-    return {
-      id,
-      source: edge.from,
-      target: edge.to,
-      // This package's own edge rather than the built-in `smoothstep`, because
-      // clicking a connection has to offer to remove it. See `workflow/edges.tsx`.
-      type: 'workflowEdge',
-      // The names, not the ids: they become the accessible name of the delete
-      // button, which has to say which connection it removes in the words that
-      // are on the canvas.
-      data: { fromLabel: from, toLabel: to },
-      // Marching ants while the node feeding this edge is actually running. The
-      // one thing a canvas can say about a run that a list of statuses cannot:
-      // where the work currently is.
-      animated: flowing.has(id),
-      // An arrowhead, because "the output of this feeds that" is directional and
-      // a plain line says only that two nodes are related.
-      markerEnd: { type: MarkerType.ArrowClosed, width: 14, height: 14 },
-      ariaLabel: `the output of ${from} feeds ${to}${broken ? ', part of a loop' : ''}`,
-      // An inline stroke rather than a class, because the stroke lands on an
-      // SVG `<path>` React Flow owns: a Tailwind class on the edge wrapper does
-      // not reach it, and inventing a stylesheet rule would mean this package
-      // ships CSS for the first time just to colour one line.
-      style: broken ? { stroke: '#ef4444', strokeWidth: 2 } : undefined,
-    };
-  });
+  return edges.map((edge) =>
+    toFlowEdge(edge, {
+      from: labelOf.get(edge.from) ?? edge.from,
+      to: labelOf.get(edge.to) ?? edge.to,
+      broken: brokenEdgeIds.has(edgeId(edge)),
+      flowing: flowing.has(edgeId(edge)),
+    }),
+  );
+}
+
+/**
+ * One wire, drawn.
+ *
+ * Split out of the `map` above so the styling decisions — arrowhead, branch
+ * colour, the red a loop wears — sit in one function that is about a wire,
+ * rather than in a closure that is also about resolving names.
+ */
+function toFlowEdge(
+  edge: WorkflowEdge,
+  context: { from: string; to: string; broken: boolean; flowing: boolean },
+): WorkflowFlowEdge {
+  const branch = edge.branch === undefined ? undefined : BRANCH_STYLE[edge.branch];
+  return {
+    id: edgeId(edge),
+    source: edge.from,
+    target: edge.to,
+    // This package's own edge rather than the built-in `smoothstep`, because
+    // clicking a connection has to offer to remove it. See `workflow/edges.tsx`.
+    type: 'workflowEdge',
+    // The names, not the ids: they become the accessible name of the delete
+    // button, which has to say which connection it removes in the words that
+    // are on the canvas.
+    data: { fromLabel: context.from, toLabel: context.to },
+    // Marching ants while the node feeding this edge is actually running. The
+    // one thing a canvas can say about a run that a list of statuses cannot:
+    // where the work currently is.
+    animated: context.flowing,
+    // An arrowhead, because "the output of this feeds that" is directional and
+    // a plain line says only that two nodes are related.
+    markerEnd: { type: MarkerType.ArrowClosed, width: 14, height: 14 },
+    label: edge.branch,
+    labelStyle: branch ? { fill: branch.text, fontSize: 10, fontWeight: 600 } : undefined,
+    // The word sits on the wire, so it takes the canvas behind it rather than a
+    // filled plate that would blank out whatever the wire crosses.
+    labelBgStyle: branch ? { fill: 'transparent' } : undefined,
+    ariaLabel: `the output of ${context.from} feeds ${context.to}${
+      edge.branch ? `, on the ${edge.branch} branch` : ''
+    }${context.broken ? ', part of a loop' : ''}`,
+    // An inline stroke rather than a class, because the stroke lands on an
+    // SVG `<path>` React Flow owns: a Tailwind class on the edge wrapper does
+    // not reach it, and inventing a stylesheet rule would mean this package
+    // ships CSS for the first time just to colour one line.
+    //
+    // Broken wins over branch: a wire in a loop is a graph that will not run at
+    // all, which is a bigger fact than which side of a decision it is on.
+    style: edgeStroke(context, branch),
+  };
+}
+
+/** Red for a loop, the branch's colour for a branch, React Flow's default otherwise. */
+function edgeStroke(
+  context: { broken: boolean },
+  branch: { stroke: string } | undefined,
+): { stroke: string; strokeWidth: number } | undefined {
+  if (context.broken) return { stroke: '#ef4444', strokeWidth: 2 };
+  return branch ? { stroke: branch.stroke, strokeWidth: 2 } : undefined;
 }
 
 /** Who feeds each node, by node id. Every node gets an entry, most of them empty. */

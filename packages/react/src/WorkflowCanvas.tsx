@@ -34,6 +34,7 @@ import {
   Code2,
   Database,
   ExternalLink,
+  GitBranch,
   LayoutGrid,
   Link2,
   Loader2,
@@ -76,9 +77,10 @@ import {
 import { Button } from './ui/button';
 import { type ComboOption, ComboboxField } from './ui/combobox';
 import { ConfirmDialog } from './ui/dialog';
-import { TextAreaField, TextField } from './ui/field';
+import { FieldGroup, TextAreaField, TextField } from './ui/field';
 import { Select, SelectField, type SelectOption } from './ui/select';
 import { Sheet } from './ui/sheet';
+import { Switch } from './ui/switch';
 import { Tooltip, TooltipProvider } from './ui/tooltip';
 import { WorkflowEdgeProvider, workflowEdgeTypes } from './workflow/edges';
 import {
@@ -88,6 +90,7 @@ import {
   type WorkflowFlowEdge,
   type WorkflowFlowNode,
   defaultLabel,
+  describeFilterPredicate,
   flowingEdgeIds,
   layout,
   layoutIfUnarranged,
@@ -106,21 +109,46 @@ import {
   type CallableWorkflowBlock,
   type CallableWorkflowRef,
   type CatalogWorkflow,
+  WORKFLOW_BRANCH_LABELS,
+  WORKFLOW_FILTER_MAX_DEPTH,
+  WORKFLOW_FILTER_MAX_VALUES,
+  WORKFLOW_FILTER_OPERATORS,
   WORKFLOW_NODE_KINDS,
+  type WorkflowBranchLabel,
   type WorkflowCallNode,
   type WorkflowEdge,
+  type WorkflowEnvPredicate,
+  type WorkflowFilterNode,
+  type WorkflowFilterOperator,
+  type WorkflowFilterPredicate,
+  type WorkflowFilterPredicateKind,
+  type WorkflowFilterValue,
+  type WorkflowGraph,
+  type WorkflowIfNode,
+  type WorkflowIfPredicate,
   type WorkflowNode,
   type WorkflowNodeKind,
+  type WorkflowPredicateKind,
+  type WorkflowRowCountPredicate,
   type WorkflowRun,
   type WorkflowSinkNode,
   type WorkflowSourceNode,
   type WorkflowTransformNode,
   callableWorkflowBlock,
   describeDurability,
+  isWorkflowBranchLabel,
+  isWorkflowFilterOperator,
+  isWorkflowFilterPredicateKind,
   isWorkflowNodeKind,
+  isWorkflowPredicateKind,
   newLocalId,
   nodeName,
   producedTypes,
+  unreachableFilterOperator,
+  unreachableFilterPredicateKind,
+  unreachableNodeKind,
+  unreachablePredicateKind,
+  workflowNarrowedTypes,
 } from './workflow/model';
 import { WORKFLOW_NAME } from './workflow/name';
 import { WorkflowNodeProvider, workflowNodeTypes } from './workflow/nodes';
@@ -346,7 +374,78 @@ function newNodeOfKind(
     // version 1 in whatever deployment this graph is promoted into.
     return { id, name, kind: 'call', callName: '', callVersion: '', config: {}, position };
   }
-  return { id, name, kind: 'sink', targetType: '', position };
+  if (kind === 'if') {
+    // No variable, so the graph is invalid until somebody names one. There is
+    // nothing to guess: which variable tells this deployment apart from another
+    // is the entire content of the node, and a default would be a decision the
+    // graph appears to make and nobody authored.
+    //
+    // The *kind* of test does get a default, and it is the deployment one,
+    // because a predicate has to be one of them and an empty variable name is a
+    // gate that visibly refuses to publish. A row-count gate with its default
+    // threshold would publish happily while testing something nobody chose.
+    return { id, name, kind: 'if', predicate: { kind: 'env', envVar: '' }, position };
+  }
+  if (kind === 'filter') {
+    // One empty comparison rather than an empty `all`, and rather than nothing.
+    //
+    // Nothing is not available: the model has no "no predicate yet" state, on
+    // purpose, because a filter whose test is absent has to be given one by
+    // somebody and every default is a rule about rows nobody wrote. An empty
+    // `all` *is* representable and is refused by the validator, which is exactly
+    // why it is not the starting point — a group with no conditions keeps every
+    // row, so a filter that started that way would draw as a working node that
+    // does nothing.
+    //
+    // So it starts as one comparison with no column, which the validator refuses
+    // by name: the node says "needs a column" on the canvas from the moment it
+    // is dropped. The operator defaults to `equals` because it is the only one
+    // that is a guess about *form* rather than about data — every other choice
+    // implies something about the column's type before a column is chosen.
+    return {
+      id,
+      name,
+      kind: 'filter',
+      predicate: { kind: 'compare', column: '', operator: 'equals', value: '' },
+      position,
+    };
+  }
+  if (kind === 'sink') {
+    return { id, name, kind: 'sink', targetType: '', position };
+  }
+  return unreachableNodeKind(kind, 'newNodeOfKind');
+}
+
+/**
+ * A wire, with its branch already decided when it leaves an `if`.
+ *
+ * Assigned here rather than left blank for somebody to fill in, because a blank
+ * one is refused by `validateWorkflow` and the refusal would fire on the very
+ * first wire out of a node somebody just created — the premature-error problem
+ * `partitionProblems` exists to describe, arrived at from a different direction.
+ *
+ * The first wire out of a gate is the `then`, the second is the `else`, and
+ * after that it is `then` again. That ordering is not arbitrary: those are the
+ * two somebody is drawing when they draw a gate, in that order, and a third wire
+ * is fan-out on a side they then choose in the inspector. Every one of them is
+ * editable there, so this is a default and never a decision.
+ */
+function newEdge(nodes: WorkflowNode[], edges: WorkflowEdge[], from: string, to: string) {
+  const source = nodes.find((node) => node.id === from);
+  if (source?.kind !== 'if') return { from, to };
+  const taken = edges.filter((edge) => edge.from === from).map((edge) => edge.branch);
+  const free = WORKFLOW_BRANCH_LABELS.find((label) => !taken.includes(label));
+  return { from, to, branch: free ?? 'then' };
+}
+
+/** The same graph with one wire moved onto the other side of its gate. */
+function edgeOnBranch(
+  edges: WorkflowEdge[],
+  moving: WorkflowEdge,
+  branch: WorkflowBranchLabel,
+): WorkflowEdge[] {
+  const id = edgeId(moving);
+  return edges.map((edge) => (edgeId(edge) === id ? { ...edge, branch } : edge));
 }
 
 /**
@@ -614,6 +713,11 @@ const TODO_FOR: Partial<Record<WorkflowProblemCode, string>> = {
   'missing-transform': 'choose a transform that still exists',
   'source-has-input': 'unwire whatever feeds it — a source reads, it is not fed',
   'sink-has-output': 'unwire what it feeds — nothing runs after a sink',
+  'if-not-named': 'name the environment variable it decides on',
+  'if-threshold-invalid': 'give it a whole number of rows, 1 or more, to branch on',
+  'if-needs-one-input': 'leave it one input — a gate carries one stream through',
+  'branch-not-labelled': 'say whether that wire is the "then" or the "else"',
+  'branch-on-plain-edge': 'remove the branch label — only an if node branches',
 };
 
 function todoFor(problem: WorkflowProblem): string {
@@ -835,6 +939,12 @@ function AddNodeBar({
         hint="Hands this step to a durable workflow that already exists, by name and pinned version. It runs as a child of this load, with its own retries."
         onClick={() => onAdd('call')}
       />
+      <AddButton
+        icon={GitBranch}
+        label="If"
+        hint="Sends the rows down one of two branches, depending on an environment variable where the load runs. The other branch is skipped — a sink on it commits nothing and leaves what is published alone."
+        onClick={() => onAdd('if')}
+      />
       <Tooltip content="Lay the nodes out left to right by dependency, with every sink in the last column.">
         <button
           type="button"
@@ -892,6 +1002,15 @@ function miniMapColor(data: { kind?: unknown } | undefined): string {
   // The same amber the node itself draws (see `KIND_STYLE`), so the overview
   // and the canvas agree about which boxes are somebody else's workflow.
   if (kind === 'call') return '#f59e0b';
+  // Fuchsia-500, the gate's own accent, and deliberately not the violet a
+  // transform gets: the overview is where somebody looks to find the branch in
+  // a graph too big to read, so it is the one place the two must not blur.
+  if (kind === 'if') return '#d946ef';
+  // Rose-500, the filter's own accent (see `KIND_STYLE`), and specifically not
+  // the fuchsia beside it: the overview is where somebody looks for "where do
+  // rows disappear in this graph", and a gate and a filter are the two boxes
+  // that answer that question in completely different ways.
+  if (kind === 'filter') return '#f43f5e';
   return '#8b5cf6';
 }
 
@@ -1838,6 +1957,28 @@ function Canvas({
     [edit, markStarted],
   );
 
+  /**
+   * Put a wire on the other side of its gate.
+   *
+   * Announced, like every other wiring change on this screen, because the only
+   * visible effect is a word on a line the reader may not be looking at — and
+   * moving a wire from `then` to `else` is one of the largest changes anybody
+   * can make here: it inverts which half of the pipeline runs.
+   */
+  const setBranch = useCallback(
+    (edge: WorkflowEdge, branch: WorkflowBranchLabel) => {
+      edit((current) => ({ ...current, edges: edgeOnBranch(current.edges, edge, branch) }));
+      markStarted(edge.from, edge.to);
+      setAnnouncement(
+        `${nodeLabelIn(draft.nodes, edge.to)} is now on the "${branch}" branch of ${nodeLabelIn(
+          draft.nodes,
+          edge.from,
+        )}.`,
+      );
+    },
+    [draft.nodes, edit, markStarted],
+  );
+
   const connect = useCallback(
     (from: string, to: string) => {
       const verdict = canConnect(draft.nodes, draft.edges, from, to);
@@ -1848,7 +1989,10 @@ function Canvas({
       // Appended rather than inserted anywhere else: a node with several inbound
       // edges receives its inputs in the order the edges appear in this array,
       // and that order is part of what the graph produces.
-      edit((current) => ({ ...current, edges: [...current.edges, { from, to }] }));
+      edit((current) => ({
+        ...current,
+        edges: [...current.edges, newEdge(current.nodes, current.edges, from, to)],
+      }));
       markStarted(from, to);
       setAnnouncement(
         `${nodeLabelIn(draft.nodes, from)} now feeds ${nodeLabelIn(draft.nodes, to)}.`,
@@ -2082,7 +2226,7 @@ function Canvas({
       edit((current) => ({
         ...current,
         nodes: [...current.nodes, node],
-        edges: [...current.edges, { from: fromId, to: node.id }],
+        edges: [...current.edges, newEdge(current.nodes, current.edges, fromId, node.id)],
       }));
       setUnstarted((current) => new Set([...current, node.id]));
       menu.close();
@@ -2476,6 +2620,7 @@ function Canvas({
         onConnect={connect}
         onConnectToNew={connectToNew}
         onDisconnect={disconnect}
+        onBranch={setBranch}
         onCreateTransform={(nodeId) => createTransform.mutate(nodeId)}
         creatingTransform={createTransform.isPending}
         createTransformError={createTransform.error}
@@ -3013,6 +3158,7 @@ function WiringList({
   describeRemoval,
   canEdit,
   onDisconnect,
+  onBranch,
   children,
 }: {
   title: string;
@@ -3021,6 +3167,12 @@ function WiringList({
   describeRemoval: (name: string) => string;
   canEdit: boolean;
   onDisconnect: (edge: WorkflowEdge) => void;
+  /**
+   * Move a wire onto the other side of its gate. Supplied only for the outgoing
+   * list of an `if` node; absent everywhere else, which is what keeps a branch
+   * control off the wires that have no branch to be on.
+   */
+  onBranch?: (edge: WorkflowEdge, branch: WorkflowBranchLabel) => void;
   children?: ReactNode;
 }) {
   return (
@@ -3033,6 +3185,29 @@ function WiringList({
           {edges.map((edge) => (
             <li key={edgeId(edge)} className="flex items-center gap-1.5 text-[11px]">
               <span className="truncate">{otherEnd(edge)}</span>
+              {onBranch && (
+                // Beside the wire it belongs to rather than as two lists headed
+                // "Then" and "Else", because the branch is a property of the
+                // wire: splitting the list would mean a wire changing sides has
+                // to move between two controls, and the order the wires were
+                // drawn in — which is what the canvas draws — would be lost.
+                <div className="ml-auto w-28 shrink-0">
+                  <Select
+                    ariaLabel={`Which branch feeds ${otherEnd(edge)}`}
+                    value={edge.branch ?? ''}
+                    onValueChange={(branch) => {
+                      if (!isWorkflowBranchLabel(branch)) return;
+                      onBranch(edge, branch);
+                    }}
+                    options={WORKFLOW_BRANCH_LABELS.map((label) => ({
+                      value: label,
+                      label,
+                    }))}
+                    placeholder="branch?"
+                    disabled={!canEdit}
+                  />
+                </div>
+              )}
               {canEdit && (
                 <Tooltip content="Remove this connection.">
                   <button
@@ -3769,6 +3944,889 @@ function readTime(observedAt: string | undefined): string {
   const at = new Date(observedAt);
   return Number.isNaN(at.getTime()) ? observedAt : at.toLocaleTimeString();
 }
+/**
+ * What this gate decides on, and what the decision costs.
+ *
+ * ## The kind of test comes first, and switching it replaces the test
+ *
+ * A gate tests one thing — a variable where the load runs, or how many rows
+ * reached it — and the model says so with a union rather than with two sets of
+ * optional fields. The form is built the same way round: pick the kind, then
+ * fill in the fields that kind has. Switching the picker hands back a whole new
+ * predicate rather than merging the old one's fields into it, which does discard
+ * a variable name somebody typed — deliberately, because the alternative is a
+ * node quietly carrying the leftovers of a test it is no longer making, and the
+ * next reader cannot tell which of the two it will actually do.
+ *
+ * ## No picker for the variable, for a different reason than the call node's
+ *
+ * A call node has no picker because nothing can enumerate the workflows. This
+ * one has no picker because the list would be *wrong*: the variables that matter
+ * are the ones this deployment has and the other one does not, so a list built
+ * from what the console's own process can see would offer exactly the wrong set
+ * — the ones present everywhere — and quietly omit the one somebody is looking
+ * for. Text, and the graph is refused until it is filled in.
+ *
+ * ## What is said out loud here and nowhere else
+ *
+ * That the value never leaves the machine, because somebody typing
+ * `CLICKHOUSE_URL` into a form is entitled to know whether they have just put a
+ * password on a screen. That the test runs where the *load* runs rather than
+ * here, because a variable set in the console's pod and not in the worker's is
+ * the way this goes wrong. And that the branch is decided once and recorded, so
+ * a resumed run cannot change its mind — which is the sentence that makes the
+ * run panel's "took the then branch" trustworthy.
+ */
+function IfInspector({
+  node,
+  canEdit,
+  onChange,
+}: {
+  node: WorkflowIfNode;
+  canEdit: boolean;
+  onChange: (node: WorkflowNode) => void;
+}) {
+  const setPredicate = (predicate: WorkflowIfPredicate) => onChange({ ...node, predicate });
+
+  return (
+    <div className="space-y-3">
+      <SelectField
+        label="Decide on"
+        ariaLabel="What this gate branches on"
+        value={node.predicate.kind}
+        onValueChange={(kind) => {
+          // Narrowed rather than trusted, because `onValueChange` hands back a
+          // string and the model wants one of two. An unrecognised one is
+          // dropped: a gate is never left holding a test nothing can evaluate.
+          if (!isWorkflowPredicateKind(kind)) return;
+          setPredicate(freshPredicate(kind));
+        }}
+        options={[
+          { value: 'env', label: 'An environment variable', hint: 'where the load runs' },
+          {
+            value: 'rowCount',
+            label: 'How many rows reached it',
+            hint: 'off the run’s own record',
+          },
+        ]}
+        disabled={!canEdit}
+        hint="A variable tells one deployment apart from another. A row count tells a load that found data apart from one that found none — which is how a sink is kept from committing an empty snapshot over what is live."
+      />
+      <PredicateFields predicate={node.predicate} canEdit={canEdit} onChange={setPredicate} />
+      <p className={cn('text-[11px] leading-relaxed', MUTED)}>
+        The wires out of this node are labelled <strong>then</strong> and <strong>else</strong>,
+        under “Feeds” below. To invert the test, swap which one is which — there is no “not”,
+        because two ways to say one thing is two places to look when a load goes the way you did not
+        expect.
+      </p>
+      <p className={cn('text-[11px] leading-relaxed', MUTED)}>
+        Everything reachable only through the branch that is not taken is <em>skipped</em>, never
+        failed. A sink on that side commits nothing, so whatever it publishes stays exactly as it
+        was — that is the point, and the run panel says so rather than leaving a blank.
+      </p>
+      <p className={cn('text-[11px] leading-relaxed', MUTED)}>
+        The branch is decided once, at the moment this node runs, and recorded on the run. A load
+        that is resumed after a crash reads the decision back instead of asking again, so it cannot
+        take one branch on the way in and the other on the way back.
+      </p>
+    </div>
+  );
+}
+
+/**
+ * The test a freshly picked kind starts as.
+ *
+ * An env test starts blank, so the graph refuses to publish until somebody names
+ * a variable — there is nothing to guess. A row-count test starts at 1, which is
+ * not a guess but the *only* threshold that means "did anything arrive at all",
+ * which is the case the predicate was built for; a bigger number is a claim
+ * about a particular pipeline and is typed.
+ */
+function freshPredicate(kind: WorkflowPredicateKind): WorkflowIfPredicate {
+  if (kind === 'env') return { kind: 'env', envVar: '' };
+  if (kind === 'rowCount') return { kind: 'rowCount', atLeast: 1 };
+  return unreachablePredicateKind(kind, 'freshPredicate');
+}
+
+/**
+ * The fields one kind of test has, and none of the fields the other has.
+ *
+ * Split per kind and ending in a refusal, so a predicate kind added to the model
+ * without a form here stops the build naming this file — the same rule
+ * `KindInspector` follows for node kinds, and for the same reason: the failure
+ * it prevents is a node somebody can select, that shows nothing to configure,
+ * and that runs anyway.
+ */
+function PredicateFields({
+  predicate,
+  canEdit,
+  onChange,
+}: {
+  predicate: WorkflowIfPredicate;
+  canEdit: boolean;
+  onChange: (predicate: WorkflowIfPredicate) => void;
+}) {
+  if (predicate.kind === 'env') {
+    return <EnvPredicateFields predicate={predicate} canEdit={canEdit} onChange={onChange} />;
+  }
+  if (predicate.kind === 'rowCount') {
+    return <RowCountPredicateFields predicate={predicate} canEdit={canEdit} onChange={onChange} />;
+  }
+  return unreachablePredicateKind(predicate, 'PredicateFields');
+}
+
+function EnvPredicateFields({
+  predicate,
+  canEdit,
+  onChange,
+}: {
+  predicate: WorkflowEnvPredicate;
+  canEdit: boolean;
+  onChange: (predicate: WorkflowIfPredicate) => void;
+}) {
+  // Whether to compare against a value at all is a *mode*, not an empty text
+  // box: `equals: ''` is a real test ("set, but blank") and `equals: undefined`
+  // is a different one ("set to anything"), and a single field could not express
+  // both — clearing the box would silently switch which question is being asked.
+  const comparing = predicate.equals !== undefined;
+
+  return (
+    <>
+      <TextField
+        label="Environment variable"
+        value={predicate.envVar}
+        onChange={(envVar) => onChange({ ...predicate, envVar })}
+        placeholder="CLICKHOUSE_URL"
+        disabled={!canEdit}
+        hint="The name of a variable on the machine that runs the load — not on this one. Only its name is stored, and only “set” or “not set” is ever written to the run log, so naming one that holds a credential is safe."
+      />
+      <SelectField
+        label="Test"
+        ariaLabel="What this gate tests the variable for"
+        value={comparing ? 'equals' : 'set'}
+        onValueChange={(mode) =>
+          onChange(
+            mode === 'equals' ? { ...predicate, equals: '' } : { ...predicate, equals: undefined },
+          )
+        }
+        options={[
+          { value: 'set', label: 'Is set to anything' },
+          { value: 'equals', label: 'Equals a particular value' },
+        ]}
+        disabled={!canEdit}
+        hint="“Is set” is the deployment test: a deployment that has a ClickHouse has its URL and one that does not has nothing. Compare against a value when the variable exists everywhere and only its contents differ."
+      />
+      {comparing && (
+        <TextField
+          label="Equals"
+          value={predicate.equals ?? ''}
+          onChange={(equals) => onChange({ ...predicate, equals })}
+          placeholder="local"
+          disabled={!canEdit}
+          hint="Compared exactly, with no trimming. An empty value here means “set, but blank”, which is a different test from “is set to anything”."
+        />
+      )}
+    </>
+  );
+}
+
+/**
+ * One threshold, and the sentence that says what it is for.
+ *
+ * A text box with a numeric keypad rather than `type="number"`, which is the
+ * rule `ObjectExplorer` already writes down: that control drops what it cannot
+ * parse and answers a scroll wheel, so a number somebody typed can change while
+ * they are reading the form. Non-digits are stripped here instead, and an empty
+ * box is stored as 0 — which the validator refuses by name, so a half-filled
+ * gate says so on the canvas rather than publishing a test that always passes.
+ */
+function RowCountPredicateFields({
+  predicate,
+  canEdit,
+  onChange,
+}: {
+  predicate: WorkflowRowCountPredicate;
+  canEdit: boolean;
+  onChange: (predicate: WorkflowIfPredicate) => void;
+}) {
+  const digits = Number.isInteger(predicate.atLeast) && predicate.atLeast > 0;
+
+  return (
+    <>
+      <TextField
+        label="At least this many rows"
+        value={digits ? String(predicate.atLeast) : ''}
+        onChange={(typed) => {
+          const cleaned = typed.replace(/[^0-9]/g, '');
+          onChange({
+            ...predicate,
+            atLeast: cleaned.length === 0 ? 0 : Number.parseInt(cleaned, 10),
+          });
+        }}
+        inputMode="numeric"
+        placeholder="1"
+        disabled={!canEdit}
+        hint="1 is “did anything arrive at all”. A larger number is for a load whose export is never legitimately small — under it, treat the upstream as broken rather than as data."
+      />
+      <p className={cn('text-[11px] leading-relaxed', MUTED)}>
+        The count is the one on the single wire feeding this node, taken from what that node
+        recorded — nothing is re-counted, and nothing is read out of the staged rows.
+      </p>
+    </>
+  );
+}
+
+/**
+ * Building a filter's predicate, and acknowledging what it shrinks.
+ *
+ * Two halves, and the second one is the reason this inspector is not just a form
+ * over a tree. The predicate editor is the ordinary part: a recursive tree of
+ * conditions with "and"/"or" groups, built from the vocabulary core exports so a
+ * form that offered an operator the runner cannot evaluate is a build failure
+ * rather than a graph somebody saves and a step that throws mid-load.
+ *
+ * The acknowledgement is the part that matters. If this filter is the only thing
+ * feeding a sink that *replaces* what a type publishes, then whatever it drops
+ * disappears from that type — silently, because the run succeeds. The graph
+ * cannot tell that apart from filtering to derive something new (see
+ * `WorkflowFilterNode.narrows`: they are structurally identical graphs), so the
+ * screen asks, per type, and the server refuses the graph until it is answered.
+ * The switches below are that question, and they are shown *only* when the
+ * question is live — offering them on a filter that narrows nothing would train
+ * people to flip them.
+ */
+function FilterInspector({
+  node,
+  graph,
+  canEdit,
+  onChange,
+}: {
+  node: WorkflowFilterNode;
+  graph: WorkflowGraph;
+  canEdit: boolean;
+  onChange: (node: WorkflowNode) => void;
+}) {
+  // Core's answer, not this file's. A canvas that worked out its own set would
+  // offer acknowledgements the server then refuses, which is a person ticking a
+  // box to be told no.
+  const narrowable = workflowNarrowedTypes(graph, node.id);
+  const acknowledged = node.narrows ?? [];
+
+  const setPredicate = (predicate: WorkflowFilterPredicate) => onChange({ ...node, predicate });
+  const setNarrows = (type: string, on: boolean) => {
+    const next = on ? [...acknowledged, type] : acknowledged.filter((named) => named !== type);
+    // Stored as absent rather than as `[]`, so "acknowledged nothing" has one
+    // spelling. The boundary normalises the same way.
+    onChange({ ...node, narrows: next.length === 0 ? undefined : next });
+  };
+
+  return (
+    <div className="space-y-3">
+      <FilterPredicateEditor
+        predicate={node.predicate}
+        depth={0}
+        canEdit={canEdit}
+        onChange={setPredicate}
+        onRemove={undefined}
+      />
+
+      {/* The whole predicate as one sentence, from the same function that
+          writes the node's own subtitle — so a tree deep enough that the face
+          gives up and says "5 conditions" can still be read back in full here,
+          and the two can never describe one filter differently. */}
+      <p className={cn('font-mono text-[10px] leading-relaxed', MUTED)}>
+        keeps {describeFilterPredicate(node.predicate)}
+      </p>
+
+      <p className={cn('text-[11px] leading-relaxed', MUTED)}>
+        Rows that match are passed on; the rest are dropped here. The run records{' '}
+        <strong>how many went in and how many came out</strong>, so the panel can say what this node
+        removed — a filter whose effect is invisible is how data goes missing quietly.
+      </p>
+      <p className={cn('text-[11px] leading-relaxed', MUTED)}>
+        A column with no value never matches, not even a “does not equal” test — that is what a
+        database would answer, and it is what keeps this test meaning the same thing if it is ever
+        pushed into the source query. Use <em>is empty</em> to find those rows. A value the test
+        cannot compare against — text where the test names a number — does not match either, and the
+        run says how many of those there were.
+      </p>
+
+      {narrowable.length > 0 && (
+        <FieldGroup
+          title="What this shrinks"
+          hint={
+            <>
+              This filter is the only thing feeding{' '}
+              {narrowable.length === 1 ? 'a sink that replaces' : 'sinks that replace'} what{' '}
+              {narrowable.length === 1 ? 'a type publishes' : 'these types publish'}. So everything
+              it drops disappears from {narrowable.length === 1 ? 'that type' : 'those types'} the
+              next time this graph runs, and the run reports success while doing it. Say so here if
+              that is what you mean. If you meant to build something new out of a subset, point the
+              sink at a different object type; if you meant to add rows rather than replace them,
+              set the sink to incremental.
+            </>
+          }
+        >
+          {narrowable.map((type) => (
+            <Switch
+              key={type}
+              checked={acknowledged.includes(type)}
+              onCheckedChange={(on) => setNarrows(type, on)}
+              disabled={!canEdit}
+              label={`Replace what ${type} publishes with the rows that pass`}
+              hint={`The published snapshot of ${type} will hold only what this filter keeps. The type's row-count bound still applies and can still refuse the commit.`}
+            />
+          ))}
+        </FieldGroup>
+      )}
+
+      {/* Shown whenever something is acknowledged that the graph no longer
+          backs up — which is what happens when somebody rewires around a filter
+          and leaves the switch on. The validator refuses it; this says why
+          before they hit save. */}
+      {acknowledged.some((type) => !narrowable.includes(type)) && (
+        <p className="text-[11px] leading-relaxed text-amber-600 dark:text-amber-400">
+          This filter says it narrows{' '}
+          {acknowledged
+            .filter((type) => !narrowable.includes(type))
+            .map((type) => `“${type}”`)
+            .join(', ')}
+          , and it no longer does — rows now reach that sink another way, or it merges rather than
+          replaces. Turn it off: an acknowledgement nothing reads is worse than none, because the
+          next reader believes it.
+        </p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * One node of the predicate tree: a group, or a single condition.
+ *
+ * Recursive rather than flattened, because the model is a tree and a flat list
+ * of conditions with a single and/or toggle cannot express "A and (B or C)" —
+ * which is the second thing anybody wants after "A and B".
+ *
+ * `onRemove` is absent exactly at the root, which is what makes the root
+ * unremovable without a separate flag: a predicate is required, so there is
+ * always at least one condition and the button that would delete the last one
+ * does not exist.
+ */
+function FilterPredicateEditor({
+  predicate,
+  depth,
+  canEdit,
+  onChange,
+  onRemove,
+}: {
+  predicate: WorkflowFilterPredicate;
+  depth: number;
+  canEdit: boolean;
+  onChange: (predicate: WorkflowFilterPredicate) => void;
+  onRemove: (() => void) | undefined;
+}) {
+  if (predicate.kind === 'all' || predicate.kind === 'any') {
+    return (
+      <FilterGroupEditor
+        predicate={predicate}
+        depth={depth}
+        canEdit={canEdit}
+        onChange={onChange}
+        onRemove={onRemove}
+      />
+    );
+  }
+  return (
+    <FilterConditionEditor
+      predicate={predicate}
+      depth={depth}
+      canEdit={canEdit}
+      onChange={onChange}
+      onRemove={onRemove}
+    />
+  );
+}
+
+/** The word between a group's conditions, and the two ways to add another one. */
+function FilterGroupEditor({
+  predicate,
+  depth,
+  canEdit,
+  onChange,
+  onRemove,
+}: {
+  predicate: { kind: 'all' | 'any'; children: WorkflowFilterPredicate[] };
+  depth: number;
+  canEdit: boolean;
+  onChange: (predicate: WorkflowFilterPredicate) => void;
+  onRemove: (() => void) | undefined;
+}) {
+  const replaceChild = (index: number, child: WorkflowFilterPredicate) =>
+    onChange({
+      ...predicate,
+      children: predicate.children.map((existing, at) => (at === index ? child : existing)),
+    });
+  // Removing the last child would leave an empty group, which keeps every row
+  // (`all`) or drops every row (`any`) and is refused by the validator. Rather
+  // than let somebody build one and then be told, removing the second-to-last
+  // child collapses the group into the one that is left.
+  const removeChild = (index: number) => {
+    const left = predicate.children.filter((_, at) => at !== index);
+    onChange(left.length === 1 ? left[0] : { ...predicate, children: left });
+  };
+
+  return (
+    <div className={cn('space-y-2 rounded-md border px-2 py-2', RULE)}>
+      <div className="flex items-center gap-2">
+        <div className="min-w-0 flex-1">
+          <SelectField
+            label="Match"
+            ariaLabel="Whether every condition in this group has to match, or any one of them"
+            value={predicate.kind}
+            onValueChange={(kind) => {
+              if (kind !== 'all' && kind !== 'any') return;
+              onChange({ ...predicate, kind });
+            }}
+            options={[
+              { value: 'all', label: 'Every condition', hint: 'and' },
+              { value: 'any', label: 'Any one condition', hint: 'or' },
+            ]}
+            disabled={!canEdit}
+          />
+        </div>
+        {onRemove && canEdit && (
+          <Button variant="ghost" size="sm" onClick={onRemove} className="mt-4 shrink-0">
+            Remove group
+          </Button>
+        )}
+      </div>
+
+      {predicate.children.map((child, index) => (
+        <FilterPredicateEditor
+          // Positional keys, because a condition has no id and nothing in this
+          // tree is reordered — the only edits are replace-in-place, append and
+          // remove, and a removal re-renders the whole subtree from the model
+          // anyway. There is no draft state below this point to be preserved.
+          // biome-ignore lint/suspicious/noArrayIndexKey: see above
+          key={index}
+          predicate={child}
+          depth={depth + 1}
+          canEdit={canEdit}
+          onChange={(next) => replaceChild(index, next)}
+          onRemove={() => removeChild(index)}
+        />
+      ))}
+
+      {canEdit && (
+        <div className="flex gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() =>
+              onChange({ ...predicate, children: [...predicate.children, freshFilterCondition()] })
+            }
+          >
+            Add condition
+          </Button>
+          {/* Offered only while there is room, rather than offered and then
+              refused: the depth bound is core's, and a button that builds a
+              tree the server will not store is worse than one that is not
+              there. */}
+          {depth + 1 < WORKFLOW_FILTER_MAX_DEPTH && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() =>
+                onChange({
+                  ...predicate,
+                  children: [
+                    ...predicate.children,
+                    { kind: 'any', children: [freshFilterCondition()] },
+                  ],
+                })
+              }
+            >
+              Add group
+            </Button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** One condition: a column, a test, and whatever that test compares against. */
+function FilterConditionEditor({
+  predicate,
+  depth,
+  canEdit,
+  onChange,
+  onRemove,
+}: {
+  predicate: Exclude<WorkflowFilterPredicate, { kind: 'all' } | { kind: 'any' }>;
+  depth: number;
+  canEdit: boolean;
+  onChange: (predicate: WorkflowFilterPredicate) => void;
+  onRemove: (() => void) | undefined;
+}) {
+  return (
+    <div className={cn('space-y-2 rounded-md border px-2 py-2', RULE)}>
+      <TextField
+        label="Column"
+        value={predicate.column}
+        onChange={(column) => onChange({ ...predicate, column })}
+        placeholder="status"
+        disabled={!canEdit}
+        hint="The bare name as the rows carry it — letters, digits and underscore, starting with a letter or underscore. No table prefix and no expression: the name has to be usable as an identifier so this test can one day be handed to the source as a WHERE. Rename anything else in a transform first."
+      />
+      <SelectField
+        label="Test"
+        ariaLabel="What kind of test this condition makes"
+        value={predicate.kind}
+        onValueChange={(kind) => {
+          if (!isWorkflowFilterPredicateKind(kind)) return;
+          onChange(retargetFilterCondition(predicate, kind));
+        }}
+        options={[
+          { value: 'compare', label: 'Compare against a value' },
+          { value: 'oneOf', label: 'Is one of a list' },
+          { value: 'present', label: 'Is empty, or has a value' },
+        ]}
+        disabled={!canEdit}
+      />
+      <FilterConditionFields predicate={predicate} canEdit={canEdit} onChange={onChange} />
+
+      {onRemove && canEdit && (
+        <div className="flex justify-end">
+          <Button variant="ghost" size="sm" onClick={onRemove}>
+            Remove condition
+          </Button>
+        </div>
+      )}
+      {depth === 0 && canEdit && (
+        // The root starts as a single condition, so the only way to reach a
+        // group is from here. Wrapping rather than offering a group at the top
+        // level keeps a one-condition filter looking like a one-condition
+        // filter, which is what nearly all of them are.
+        <div className="flex justify-end">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => onChange({ kind: 'all', children: [predicate, freshFilterCondition()] })}
+          >
+            Add another condition
+          </Button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * The fields one kind of condition has, and none of the fields the others have.
+ *
+ * Split per kind and ending in a refusal, for the reason `PredicateFields`
+ * gives about gates: a kind added to the model without a form here would be a
+ * condition somebody can select, that shows nothing to fill in, and that decides
+ * which rows a published type contains.
+ */
+function FilterConditionFields({
+  predicate,
+  canEdit,
+  onChange,
+}: {
+  predicate: Exclude<WorkflowFilterPredicate, { kind: 'all' } | { kind: 'any' }>;
+  canEdit: boolean;
+  onChange: (predicate: WorkflowFilterPredicate) => void;
+}) {
+  if (predicate.kind === 'present') {
+    return (
+      <SelectField
+        label="Has a value?"
+        ariaLabel="Whether the column has to be empty or has to hold something"
+        value={predicate.operator}
+        onValueChange={(operator) => {
+          if (operator !== 'isNull' && operator !== 'isNotNull') return;
+          onChange({ ...predicate, operator });
+        }}
+        options={[
+          { value: 'isNotNull', label: 'Has a value' },
+          { value: 'isNull', label: 'Is empty' },
+        ]}
+        disabled={!canEdit}
+        hint="The only test that can see an empty column. Every other test here treats an empty value as “cannot say”, which never matches."
+      />
+    );
+  }
+  if (predicate.kind === 'oneOf') {
+    return (
+      <>
+        <SelectField
+          label="In the list?"
+          ariaLabel="Whether the column has to be in the list or out of it"
+          value={predicate.operator}
+          onValueChange={(operator) => {
+            if (operator !== 'in' && operator !== 'notIn') return;
+            onChange({ ...predicate, operator });
+          }}
+          options={[
+            { value: 'in', label: 'Is one of these' },
+            { value: 'notIn', label: 'Is none of these' },
+          ]}
+          disabled={!canEdit}
+        />
+        <FilterValueTypeField
+          value={predicate.values[0]}
+          canEdit={canEdit}
+          onChange={(sample) =>
+            onChange({
+              ...predicate,
+              values: predicate.values.map((existing) => castFilterValue(existing, sample)),
+            })
+          }
+        />
+        <TextAreaField
+          label="Values"
+          value={predicate.values.map((value) => String(value)).join('\n')}
+          onChange={(text) =>
+            onChange({ ...predicate, values: parseFilterValues(text, predicate.values[0]) })
+          }
+          rows={4}
+          mono
+          disabled={!canEdit}
+          hint={`One per line. At most ${WORKFLOW_FILTER_MAX_VALUES} — past that this is a join against another dataset rather than a filter, and the thing to do is read that dataset in as a second source.`}
+        />
+      </>
+    );
+  }
+  if (predicate.kind === 'compare') {
+    return (
+      <>
+        <SelectField
+          label="Comparison"
+          ariaLabel="How the column is compared against the value"
+          value={predicate.operator}
+          onValueChange={(operator) => {
+            if (!isWorkflowFilterOperator(operator)) return;
+            onChange({ ...predicate, operator });
+          }}
+          options={WORKFLOW_FILTER_OPERATORS.map((operator) => ({
+            value: operator,
+            label: FILTER_OPERATOR_LABELS[operator],
+          }))}
+          disabled={!canEdit}
+        />
+        <FilterValueTypeField
+          value={predicate.value}
+          canEdit={canEdit}
+          onChange={(sample) =>
+            onChange({ ...predicate, value: castFilterValue(predicate.value, sample) })
+          }
+        />
+        <FilterValueField
+          value={predicate.value}
+          canEdit={canEdit}
+          onChange={(value) => onChange({ ...predicate, value })}
+        />
+      </>
+    );
+  }
+  return unreachableFilterPredicateKind(predicate, 'FilterConditionFields');
+}
+
+/**
+ * Each operator, spelled out in a sentence rather than in symbols.
+ *
+ * The node's face uses `>` and `≥` because it has 224 pixels; a dropdown has
+ * room, and "is after / greater than" is what somebody scanning a list of ten
+ * options is actually reading for. A `Record` keyed by the union, so an operator
+ * added to core without a label here stops the build rather than rendering an
+ * empty row in a select.
+ */
+const FILTER_OPERATOR_LABELS: Record<WorkflowFilterOperator, string> = {
+  equals: 'equals',
+  notEquals: 'does not equal',
+  greaterThan: 'is greater than',
+  greaterThanOrEqual: 'is greater than or equal to',
+  lessThan: 'is less than',
+  lessThanOrEqual: 'is less than or equal to',
+  contains: 'contains',
+  notContains: 'does not contain',
+  startsWith: 'starts with',
+  notStartsWith: 'does not start with',
+};
+
+/**
+ * Whether the value is text, a number, or true/false.
+ *
+ * A visible choice rather than something inferred from what was typed, and this
+ * is the field most likely to be mistaken for clutter. It is not: `"10"` and
+ * `10` are different values here and neither matches the other, exactly as a
+ * strongly-typed column would answer, and a form that guessed from the
+ * characters would silently flip a text column's test to numeric the moment
+ * somebody filtered on an order number. The run log reports those rows as
+ * incomparable; this field is how they are avoided in the first place.
+ */
+function FilterValueTypeField({
+  value,
+  canEdit,
+  onChange,
+}: {
+  value: WorkflowFilterValue | undefined;
+  canEdit: boolean;
+  onChange: (sample: WorkflowFilterValue) => void;
+}) {
+  return (
+    <SelectField
+      label="Value type"
+      ariaLabel="Whether the value is text, a number, or true/false"
+      value={typeof value === 'number' ? 'number' : typeof value === 'boolean' ? 'boolean' : 'text'}
+      onValueChange={(type) => {
+        if (type === 'number') return onChange(0);
+        if (type === 'boolean') return onChange(true);
+        onChange('');
+      }}
+      options={[
+        { value: 'text', label: 'Text' },
+        { value: 'number', label: 'A number' },
+        { value: 'boolean', label: 'True or false' },
+      ]}
+      disabled={!canEdit}
+      hint="Text and numbers are never equal to each other here, and neither is greater or less than the other — a row whose column holds the wrong one of the two is reported on the run rather than quietly matching. Dates are text: ISO-8601 sorts correctly."
+    />
+  );
+}
+
+/** The value itself, in whichever control the chosen type deserves. */
+function FilterValueField({
+  value,
+  canEdit,
+  onChange,
+}: {
+  value: WorkflowFilterValue;
+  canEdit: boolean;
+  onChange: (value: WorkflowFilterValue) => void;
+}) {
+  if (typeof value === 'boolean') {
+    return (
+      <SelectField
+        label="Value"
+        ariaLabel="The true or false value this column is compared against"
+        value={value ? 'true' : 'false'}
+        onValueChange={(chosen) => onChange(chosen === 'true')}
+        options={[
+          { value: 'true', label: 'True' },
+          { value: 'false', label: 'False' },
+        ]}
+        disabled={!canEdit}
+      />
+    );
+  }
+  if (typeof value === 'number') {
+    return (
+      <TextField
+        label="Value"
+        // A text box with a numeric keypad rather than `type="number"`, which is
+        // the rule the row-count threshold above already writes down: that
+        // control drops what it cannot parse and answers a scroll wheel.
+        value={Number.isFinite(value) ? String(value) : ''}
+        onChange={(typed) => {
+          const cleaned = typed.replace(/[^0-9.-]/g, '');
+          const parsed = Number.parseFloat(cleaned);
+          // An unparseable box stores 0 rather than `NaN`: every comparison
+          // against `NaN` is false, so a filter holding one drops every row
+          // while looking perfectly well configured — and the model refuses to
+          // store it, so the graph could not be saved to find that out.
+          onChange(Number.isFinite(parsed) ? parsed : 0);
+        }}
+        inputMode="numeric"
+        placeholder="0"
+        disabled={!canEdit}
+      />
+    );
+  }
+  return (
+    <TextField
+      label="Value"
+      value={value}
+      onChange={onChange}
+      placeholder="OPEN"
+      disabled={!canEdit}
+      hint="Compared exactly, with no trimming and no case folding. Collation is a property of the column in every database this runs against, so a case-insensitive test evaluated here and the same one evaluated in the source would legitimately disagree — normalise in a transform instead."
+    />
+  );
+}
+
+/** A condition somebody has not filled in yet. Refused by the validator until they do. */
+function freshFilterCondition(): WorkflowFilterPredicate {
+  return { kind: 'compare', column: '', operator: 'equals', value: '' };
+}
+
+/**
+ * The same condition, asked to be a different kind of test.
+ *
+ * The **column is carried across** and nothing else is, which is the split worth
+ * arguing: the column is what somebody typed and is the expensive half to
+ * retype, while an operator and a value belong to the test that is being left
+ * behind — `greaterThan` has no meaning for a presence check and a value has
+ * none either.
+ */
+function retargetFilterCondition(
+  predicate: Exclude<WorkflowFilterPredicate, { kind: 'all' } | { kind: 'any' }>,
+  kind: WorkflowFilterPredicateKind,
+): WorkflowFilterPredicate {
+  if (kind === 'compare') {
+    return { kind: 'compare', column: predicate.column, operator: 'equals', value: '' };
+  }
+  if (kind === 'oneOf') {
+    return { kind: 'oneOf', column: predicate.column, operator: 'in', values: [''] };
+  }
+  if (kind === 'present') {
+    return { kind: 'present', column: predicate.column, operator: 'isNotNull' };
+  }
+  // The two group kinds are reachable from the select's type but never from its
+  // options, because a group is added by its own button and is not a *test* a
+  // condition can be switched to. Refusing rather than building one keeps the
+  // exhaustiveness honest without pretending this is a conversion.
+  if (kind === 'all' || kind === 'any') return predicate;
+  return unreachableFilterPredicateKind(kind, 'retargetFilterCondition');
+}
+
+/** One value, moved to the type of a sample, keeping whatever survives the move. */
+function castFilterValue(
+  value: WorkflowFilterValue,
+  sample: WorkflowFilterValue,
+): WorkflowFilterValue {
+  if (typeof sample === 'number') {
+    const parsed = typeof value === 'number' ? value : Number.parseFloat(String(value));
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+  if (typeof sample === 'boolean') return value === true || value === 'true';
+  return String(value);
+}
+
+/**
+ * A textarea of values, one per line, in the type the list is already in.
+ *
+ * Blank lines are dropped rather than kept as empty strings, because a trailing
+ * newline is what a textarea has after every entry and a list ending in `""`
+ * would filter for a value nobody typed. An entirely empty box keeps one blank
+ * entry: the model refuses an empty list, and clearing the box should leave a
+ * condition to finish rather than a graph that cannot be saved with no visible
+ * cause.
+ */
+function parseFilterValues(
+  text: string,
+  sample: WorkflowFilterValue | undefined,
+): WorkflowFilterValue[] {
+  const lines = text
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  if (lines.length === 0) return [''];
+  const cast = sample ?? '';
+  return lines.slice(0, WORKFLOW_FILTER_MAX_VALUES).map((line) => castFilterValue(line, cast));
+}
 
 /**
  * The parameter box's two directions, kept together because they are inverses.
@@ -3811,6 +4869,7 @@ function parseConfigText(text: string): Record<string, unknown> | undefined {
  */
 function KindInspector({
   node,
+  graph,
   transforms,
   connections,
   typeOptions,
@@ -3826,6 +4885,16 @@ function KindInspector({
   createTransformError,
 }: {
   node: WorkflowNode;
+  /**
+   * The graph the node sits in.
+   *
+   * Only one branch reads it, and it is the one that has to: whether a filter
+   * narrows a published type is a fact about what is downstream of it, not about
+   * the node. Passed as the graph rather than as a precomputed list so the
+   * inspector calls core's `workflowNarrowedTypes` — the same function the
+   * validator does — instead of being handed an answer this file worked out.
+   */
+  graph: WorkflowGraph;
   transforms: CatalogTransform[];
   connections: CatalogConnection[];
   typeOptions: SelectOption[];
@@ -3884,15 +4953,40 @@ function KindInspector({
     // being pointed at a different node.
     return <CallInspector key={node.id} node={node} canEdit={canEdit} onChange={onChange} />;
   }
-  return (
-    <SinkInspector
-      node={node}
-      typeOptions={typeOptions}
-      canEdit={canEdit}
-      modelHref={modelHref}
-      onChange={onChange}
-    />
-  );
+  if (node.kind === 'if') {
+    return <IfInspector key={node.id} node={node} canEdit={canEdit} onChange={onChange} />;
+  }
+  if (node.kind === 'filter') {
+    // Given the whole graph, not only the node, because the one question this
+    // inspector cannot answer from the node alone is the important one: which
+    // published types this filter stands in front of. See
+    // `WorkflowFilterNode.narrows`.
+    return (
+      <FilterInspector
+        key={node.id}
+        node={node}
+        graph={graph}
+        canEdit={canEdit}
+        onChange={onChange}
+      />
+    );
+  }
+  if (node.kind === 'sink') {
+    return (
+      <SinkInspector
+        node={node}
+        typeOptions={typeOptions}
+        canEdit={canEdit}
+        modelHref={modelHref}
+        onChange={onChange}
+      />
+    );
+  }
+  // The chain ends in a refusal rather than a fallthrough, so a kind added to
+  // core without a form here is a type error naming this file — which is the
+  // whole reason the docblock above says a missing branch shows up as "a node
+  // with a name and nothing to configure". It no longer can.
+  return unreachableNodeKind(node, 'KindInspector');
 }
 
 function NodeInspector({
@@ -3913,6 +5007,7 @@ function NodeInspector({
   onConnect,
   onConnectToNew,
   onDisconnect,
+  onBranch,
   onDelete,
   onEditCode,
   onCreateTransform,
@@ -3938,6 +5033,7 @@ function NodeInspector({
   onConnect: (from: string, to: string) => void;
   onConnectToNew: (from: string, kind: WorkflowNodeKind) => void;
   onDisconnect: (edge: WorkflowEdge) => void;
+  onBranch: (edge: WorkflowEdge, branch: WorkflowBranchLabel) => void;
   onDelete: (nodeId: string) => void;
   onEditCode: (nodeId: string) => void;
   onCreateTransform: (nodeId: string) => void;
@@ -4044,6 +5140,7 @@ function NodeInspector({
 
           <KindInspector
             node={node}
+            graph={draft}
             transforms={transforms}
             connections={connections}
             typeOptions={typeOptions}
@@ -4082,6 +5179,10 @@ function NodeInspector({
             describeRemoval={(name) => `Stop this node feeding ${name}`}
             canEdit={canEdit}
             onDisconnect={onDisconnect}
+            // Only a gate's wires have a side to be on. `validateWorkflow`
+            // refuses a label on any other wire, so offering the control there
+            // would be offering a change the server will not take.
+            onBranch={node.kind === 'if' ? onBranch : undefined}
           >
             {canEdit && (
               <div className="mt-2 flex items-end gap-2">

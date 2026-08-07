@@ -2,9 +2,12 @@ import { Handle, type NodeProps, Position } from '@xyflow/react';
 import {
   CircleAlert,
   CircleCheck,
+  CircleSlash,
   Code2,
   Database,
   ExternalLink,
+  Filter,
+  GitBranch,
   Loader2,
   Plug,
   Repeat,
@@ -20,7 +23,7 @@ import {
 } from 'react';
 import { cn } from '../cn';
 import { Tooltip } from '../ui/tooltip';
-import { NODE_WIDTH, type WorkflowFlowNode, type WorkflowNodeData } from './graph';
+import { NODE_WIDTH, type WorkflowFlowNode, type WorkflowNodeData, describeDrop } from './graph';
 import type { WorkflowNodeKind } from './model';
 import type { WiringHandleType, WorkflowWiring } from './wiring';
 
@@ -125,6 +128,31 @@ const KIND_STYLE: Record<
     wash: 'bg-amber-50/70 dark:bg-amber-950/30',
     icon: ExternalLink,
     noun: 'call',
+  },
+  // Violet and a fork, because an if is the only node whose effect is on the
+  // *graph* rather than on the rows: everything else here does something to
+  // data, and this one decides which boxes exist for this run. It should not
+  // read as another step in the line.
+  if: {
+    accent: 'bg-gradient-to-b from-fuchsia-400 to-fuchsia-600',
+    chip: 'text-fuchsia-700 dark:text-fuchsia-300',
+    wash: 'bg-fuchsia-50/70 dark:bg-fuchsia-950/30',
+    icon: GitBranch,
+    noun: 'if',
+  },
+  // Rose and a funnel. It is the only kind whose effect is *subtraction* — every
+  // other node either produces rows, reshapes them or decides which boxes run —
+  // and the whole reason it is a node rather than a transform returning a subset
+  // is that "rows are being dropped here" should be visible without opening
+  // anything. Deliberately not the fuchsia an `if` wears: both of them make a
+  // load smaller and they do it in completely different ways, so they are the
+  // two that must never be confused at a glance.
+  filter: {
+    accent: 'bg-gradient-to-b from-rose-400 to-rose-600',
+    chip: 'text-rose-700 dark:text-rose-300',
+    wash: 'bg-rose-50/70 dark:bg-rose-950/30',
+    icon: Filter,
+    noun: 'filter',
   },
 };
 
@@ -259,11 +287,34 @@ function RunBadge({ run }: { run: NonNullable<WorkflowNodeData['run']> }) {
             ? // The single most useful fact on a resumed run, and there is
               // nowhere else on the screen to read it from.
               'Replayed from a checkpoint — this step did not run again.'
-            : `Ran${typeof run.rows === 'number' ? `, ${run.rows} rows` : ''}.`
+            : // A filter reports the pair rather than the total, and it is the
+              // one kind for which "42 rows" would be an actively misleading
+              // badge: the number that matters is what it *removed*, and a node
+              // that showed only its output would make a filter that dropped
+              // nine tenths of a load look identical to a source that read a
+              // tenth as much. `describeDrop` answers for filters and stays
+              // silent for everything else, so this stays one expression.
+              `${describeBranchTaken(run) ?? 'Ran'}${describeRunSize(run)}.`
         }
       >
         <span className="flex items-center">
           <CircleCheck size={11} className={run.replayed ? 'text-zinc-400' : 'text-emerald-500'} />
+        </span>
+      </Tooltip>
+    );
+  }
+  // Drawn rather than left blank, which is what this was.
+  //
+  // A skipped node used to render nothing at all, which was defensible while
+  // `skipped` meant only "the run stopped before here" — the failed node beside
+  // it carried the story. It is not defensible now that a node can be skipped by
+  // a branch on a run that went perfectly: a sink that quietly shows no badge is
+  // exactly the "nothing loaded and nothing said so" this feature has to avoid.
+  if (run.status === 'skipped') {
+    return (
+      <Tooltip content={describeSkip(run)}>
+        <span className="flex items-center">
+          <CircleSlash size={11} className="text-zinc-400" />
         </span>
       </Tooltip>
     );
@@ -285,6 +336,42 @@ function RunBadge({ run }: { run: NonNullable<WorkflowNodeData['run']> }) {
  * for whether skipping an animation costs anybody information.
  */
 const ARRIVE = { type: 'spring', stiffness: 420, damping: 34, mass: 0.7 } as const;
+
+/**
+ * How much data went through a node, in the terms that node is measured in.
+ *
+ * A filter reports the pair — in, out, and what that means as a share — because
+ * for a filter the number that matters is what it *removed*, and a badge showing
+ * only its output would make one that dropped nine tenths of a load look exactly
+ * like a source that read a tenth as much. Everything else reports what it
+ * produced, which is what "rows" has always meant on this badge.
+ */
+function describeRunSize(run: NonNullable<WorkflowNodeData['run']>): string {
+  const dropped = describeDrop(run);
+  if (dropped) return `: ${dropped}`;
+  return typeof run.rows === 'number' ? `, ${run.rows} rows` : '';
+}
+
+/** What an `if` node's badge says it decided. Absent on every other kind. */
+function describeBranchTaken(run: WorkflowNodeData['run']): string | undefined {
+  if (!run?.branch) return undefined;
+  return `Took the "${run.branch}" branch`;
+}
+
+/**
+ * The two meanings of `skipped`, told apart.
+ *
+ * The branch wording deliberately says what did **not** happen to the data,
+ * because for a sink that is the whole question: a node that never ran committed
+ * nothing, so whatever was published before this run is still published. A
+ * reader who is not told that assumes the load emptied it.
+ */
+function describeSkip(run: NonNullable<WorkflowNodeData['run']>): string {
+  if (run.skippedBecause === 'branch-not-taken') {
+    return 'Skipped: this is on the branch that was not taken. It did not run, so it wrote nothing and committed nothing — anything it publishes is still whatever was there before this run.';
+  }
+  return 'Skipped: the run stopped before reaching this step.';
+}
 
 export function WorkflowNodeBody({ id, data, selected }: NodeProps<WorkflowFlowNode>) {
   const { onInspect, onEditCode, canEdit, wiring } = useWorkflowNodeHandlers();

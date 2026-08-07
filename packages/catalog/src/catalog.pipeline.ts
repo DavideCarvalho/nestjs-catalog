@@ -708,18 +708,79 @@ export interface ConnectorRun {
   nodeOutcomes?: Record<string, WorkflowNodeOutcome>;
 }
 
+/**
+ * Why a `skipped` node did not run, when there is more to say than "the run
+ * stopped".
+ *
+ * **One entry, and the omission is the point.** `skipped` already meant one
+ * thing before branches existed — the run failed upstream and never reached
+ * this node — and every outcome ever stored records that meaning by *not*
+ * carrying a reason. Adding `run-stopped` to this list would not describe those
+ * rows, it would leave them describing an unknown reason, so the pre-existing
+ * meaning stays the absent one and this names only the new fact: the node is on
+ * a branch an {@link WorkflowIfNode} did not take.
+ *
+ * The distinction is not cosmetic. A sink skipped by a branch **committed
+ * nothing and left the live snapshot alone**, which is a correct, successful
+ * outcome; a sink skipped by a failure is part of a load that went wrong. A run
+ * panel that rendered both as "did not run" would answer "why is there no data
+ * in X" with the same shrug in both cases.
+ */
+export const WORKFLOW_SKIP_REASONS = ['branch-not-taken'] as const;
+
+export type WorkflowSkipReason = (typeof WORKFLOW_SKIP_REASONS)[number];
+
+/** Same reason as {@link isConnectorKind}: one list, no second copy to drift. */
+export function isWorkflowSkipReason(value: unknown): value is WorkflowSkipReason {
+  return WORKFLOW_SKIP_REASONS.some((reason) => reason === value);
+}
+
 /** What one node did during a run. Small by construction — counters, not rows. */
 export interface WorkflowNodeOutcome {
   /**
    * `skipped` exists for the nodes downstream of a failure. Without it, a
    * ten-node graph that died at node seven records three nodes with no entry at
    * all, which reads the same as three nodes nobody has looked at yet.
+   *
+   * It now carries a second, legitimate meaning as well — a node on the branch
+   * an `if` did not take — and {@link skippedBecause} is what tells the two
+   * apart.
    */
   status: 'succeeded' | 'failed' | 'skipped';
   /** Rows this node produced, or committed if it is the sink. */
   rows: number;
+  /**
+   * Rows this node was *given*, for a node whose whole purpose is that the two
+   * numbers differ. Set by {@link WorkflowFilterNode} and absent everywhere else.
+   *
+   * Two numbers rather than a `dropped` counter, because `dropped` is
+   * `rowsIn - rows` and a third stored number is a third thing that can
+   * disagree with the other two. A run panel subtracts.
+   *
+   * Optional, so an outcome written before filters existed reads back as what it
+   * is — a node that never reported an input count — rather than as one that
+   * received nothing. Absent and zero are different facts here, and conflating
+   * them would make every historical transform look like it dropped everything.
+   */
+  rowsIn?: number;
   /** For a transform node: which version of its code ran. */
   transformVersion?: number;
+  /**
+   * For an {@link WorkflowIfNode}: the branch this run took.
+   *
+   * **Written once, on the first evaluation, and read back on every replay.**
+   * This is the record the durable path replays from rather than re-evaluating:
+   * a predicate reads the environment, and an environment is pod-local, so a
+   * replay landing on another pod could otherwise take the other branch halfway
+   * through a run and load through a shape nobody chose. See
+   * `WorkflowRunnerService.runIf`.
+   *
+   * It is also the answer to "why did nothing load into X", which is the
+   * question a branch makes askable and nothing else on a run can answer.
+   */
+  branch?: WorkflowBranchLabel;
+  /** See {@link WORKFLOW_SKIP_REASONS}. Absent means the run stopped short. */
+  skippedBecause?: WorkflowSkipReason;
   elapsedMs?: number;
   error?: string;
 }
@@ -761,13 +822,28 @@ export interface WorkflowNodeOutcome {
  * The kinds that were considered and rejected, since a small vocabulary is only
  * defensible if the omissions are:
  *
- * - **filter** — a transform whose code returns a subset of what it was given.
- *   It needs no new execution path, only a different body, and adding the kind
- *   would mean two ways to drop rows and two places to look when rows go
- *   missing.
- * - **branch / split** — already expressible: a node with two outbound edges is
- *   read by both successors, each of which filters differently. There is
- *   nothing for a branch node to *do*.
+ * - **filter** — *this entry used to be a rejection, and it is worth leaving the
+ *   reversal visible rather than editing the history out.* The argument was that
+ *   a transform whose code returns a subset already filters, so the kind bought
+ *   a second way to drop rows and a second place to look when rows went missing.
+ *   That argument is sound about *code* and it is the reason
+ *   {@link WorkflowFilterNode} does not take any: what changed is that the
+ *   predicate is a **closed structure** rather than a body, and a closed
+ *   structure can be read by something other than a JavaScript engine. Only a
+ *   declarative predicate can be translated into a `WHERE` and pushed into the
+ *   query the source already runs, and that is not a micro-optimisation — a
+ *   transform filtering `obj_pribuybuylistdetail` reads all 7,637,391 rows off
+ *   disk, over the network, and into JS objects of ~80 properties each before
+ *   anything decides they were unwanted. See {@link WorkflowFilterNode} for what
+ *   is actually built today (an in-memory, per-batch pass) and for where the
+ *   pushdown seam is, which is a promise about a shape rather than a claim about
+ *   a measurement.
+ * - **branch / split (unconditional)** — already expressible, and still is: a
+ *   node with two outbound edges is read by both successors, each of which
+ *   filters differently. There is nothing for an *unconditional* split to do.
+ *   {@link WorkflowIfNode} is the conditional one, and it earns its kind by
+ *   doing something no wiring can express — deciding that one of those
+ *   successors, and everything only it feeds, does not run at all.
  * - **merge / join** — a node with several inbound edges receives its inputs
  *   concatenated in edge order (see {@link WorkflowEdge}). A keyed join is then
  *   ordinary code inside the transform, which can already see every record.
@@ -793,6 +869,10 @@ export const WORKFLOW_NODE_KINDS = [
   'sink',
   /** Hands this position to an existing durable workflow. See {@link WorkflowCallNode}. */
   'call',
+  /** Sends the rows down one of its outbound branches. See {@link WorkflowIfNode}. */
+  'if',
+  /** Drops the rows that fail a declarative test. See {@link WorkflowFilterNode}. */
+  'filter',
 ] as const;
 
 export type WorkflowNodeKind = (typeof WORKFLOW_NODE_KINDS)[number];
@@ -800,6 +880,34 @@ export type WorkflowNodeKind = (typeof WORKFLOW_NODE_KINDS)[number];
 /** Same reason as {@link isConnectorKind}: one list, no second copy to drift. */
 export function isWorkflowNodeKind(value: unknown): value is WorkflowNodeKind {
   return WORKFLOW_NODE_KINDS.some((kind) => kind === value);
+}
+
+/**
+ * The kind that never compiles quietly.
+ *
+ * Every place that decides something *per kind* ends in a call to this, so a
+ * kind added to {@link WORKFLOW_NODE_KINDS} without a branch there is a type
+ * error naming the file rather than a graph that saves, validates, draws and
+ * then does the wrong thing. This codebase has been bitten by exactly that
+ * shape — a `toGraph` branch forgetting a field, a node-kind map missing a kind
+ * — and the fix each time was to make the omission impossible rather than to
+ * remember harder.
+ *
+ * It throws as well as failing to compile, because the narrowing that reaches
+ * it is over data that arrives as JSON: a node whose `kind` passed
+ * {@link isWorkflowNodeKind} in an older build and reaches a newer one is
+ * possible, and returning a default for it would be the silent path this exists
+ * to close.
+ */
+export function unreachableNodeKind(node: never, where: string): never {
+  // Takes either the node or its kind, because the call sites differ: a
+  // narrowing chain over a union hands it the node, while one over the kind
+  // string — which is what a boundary reading JSON has before it has a node —
+  // hands it the string.
+  const kind = typeof node === 'string' ? node : Reflect.get(Object(node), 'kind');
+  throw new Error(
+    `${where} does not handle a workflow node of kind ${JSON.stringify(kind)}. The kind list and every decision made per kind are meant to move together.`,
+  );
 }
 
 /**
@@ -1020,6 +1128,910 @@ export interface WorkflowCallNode extends WorkflowNodeBase {
 }
 
 /**
+ * The kinds of test an {@link WorkflowIfNode} can make.
+ *
+ * A second predicate shape was always going to arrive — the note on
+ * {@link WorkflowIfNode} says so about `code` — and the shape it arrives into is
+ * the decision worth arguing about, because the alternative was to keep both
+ * tests' fields flat on the node and mark them optional. That version types a
+ * gate as "an env var, maybe, and a threshold, maybe": a node carrying both is
+ * representable, a node carrying neither is representable, and every reader has
+ * to invent its own rule for which one wins. It is the same mistake the note on
+ * {@link WorkflowNode} refuses for node kinds, one level down.
+ *
+ * So the predicate is a union with a discriminant of its own, and every decision
+ * made per predicate kind ends in {@link unreachablePredicateKind} — a third
+ * shape is then a build failure listing the files that have to answer for it,
+ * rather than a gate that saves, draws, and quietly always takes the `else`.
+ */
+export const WORKFLOW_PREDICATE_KINDS = [
+  /** Reads a variable where the load runs. See {@link WorkflowEnvPredicate}. */
+  'env',
+  /** Counts the rows handed to the gate. See {@link WorkflowRowCountPredicate}. */
+  'rowCount',
+] as const;
+
+export type WorkflowPredicateKind = (typeof WORKFLOW_PREDICATE_KINDS)[number];
+
+/** Same reason as {@link isConnectorKind}: one list, no second copy to drift. */
+export function isWorkflowPredicateKind(value: unknown): value is WorkflowPredicateKind {
+  return WORKFLOW_PREDICATE_KINDS.some((kind) => kind === value);
+}
+
+/**
+ * {@link unreachableNodeKind}, one level down, and for the identical reason.
+ *
+ * Every branch over {@link WorkflowIfPredicate} ends here, so a predicate kind
+ * added to the list without a rule for hashing it, validating it or evaluating
+ * it is a type error naming the file — not a graph that runs and decides
+ * something nobody authored. It throws as well, because predicates arrive as
+ * JSON out of a column and a build older than the data is a thing that happens.
+ */
+export function unreachablePredicateKind(predicate: never, where: string): never {
+  const kind = typeof predicate === 'string' ? predicate : Reflect.get(Object(predicate), 'kind');
+  throw new Error(
+    `${where} does not handle an if-node predicate of kind ${JSON.stringify(kind)}. The predicate kinds and every decision made per kind are meant to move together.`,
+  );
+}
+
+/**
+ * Tests a variable on the machine that runs the load.
+ *
+ * The original predicate, and the one the node was built for: a deployment that
+ * has a ClickHouse has its URL and one that does not has nothing. It names the
+ * variable and never its value — see the note on {@link WorkflowIfNode} for why
+ * that is a safety property rather than a convenience.
+ */
+export interface WorkflowEnvPredicate {
+  kind: 'env';
+  /**
+   * The name of the environment variable to read on the machine that runs the
+   * node. **The name, never the value** — nothing about a credential is stored
+   * in a catalog.
+   */
+  envVar: string;
+  /**
+   * What it has to equal for the `then` branch to be taken.
+   *
+   * Absent means "is it set to anything non-empty", which is the ClickHouse
+   * case: a deployment that has one has the URL, a deployment that does not has
+   * nothing. Present means an exact string comparison, which is the
+   * `DEPLOY_ENV = local` case.
+   */
+  equals?: string;
+}
+
+/**
+ * Tests how many rows reached the gate.
+ *
+ * ## The case
+ *
+ * "Only run the sink if the source returned anything." A nightly export that
+ * comes back empty because the upstream system is mid-maintenance is not a
+ * failure — nothing is broken, there is simply nothing to load — but committing
+ * it repoints the live view of a type at an empty snapshot, and the run reports
+ * success while doing it. A gate in front of the sink turns that into a skip,
+ * and a skipped node is never executed, so nothing commits. That is the same
+ * guarantee the `else` branch already gives, pointed at the case that actually
+ * happens.
+ *
+ * ## Which rows
+ *
+ * The ones on the single inbound edge. `validateWorkflow` refuses a gate with
+ * more than one (`if-needs-one-input`) and refuses one with none as unreachable,
+ * so "how many rows" has exactly one answer — and it is the count on the very
+ * {@link WorkflowStageRef} the gate hands on, so the number tested and the rows
+ * carried cannot disagree.
+ *
+ * ## Where the number comes from, which is the replay argument
+ *
+ * `WorkflowStageRef.rowCount`, off {@link WorkflowNodeStepInput.inputs}, which
+ * is part of the step's checkpointed input and was itself produced by an
+ * upstream step's checkpointed output. Nothing counts rows at evaluation time
+ * and nothing reads the stage store: a resumed run on another pod sees the same
+ * number the first attempt saw, and the branch it produced is read back off
+ * {@link WorkflowNodeStepOutput.branch} anyway.
+ *
+ * ## Why a threshold and not "greater than zero"
+ *
+ * `atLeast: 1` *is* "did anything arrive", so the common case costs nothing to
+ * express — and "a full export is never under ten thousand rows, so treat a
+ * hundred as a broken upstream rather than as data" is the next thing anybody
+ * asks for, and it would otherwise need a second predicate kind for one integer.
+ *
+ * One comparison and one direction, deliberately. `atMost`, `equals` and a
+ * chosen operator were all considered and are all the same mistake the node's
+ * own `negate` flag would have been: the inverse test is already expressible by
+ * swapping which successor is on `then` and which is on `else`, and two ways to
+ * say one thing is two places to look when a load takes the branch nobody
+ * expected.
+ */
+export interface WorkflowRowCountPredicate {
+  kind: 'rowCount';
+  /**
+   * How many rows have to reach the gate for the `then` branch to be taken.
+   *
+   * A whole number of at least one, and `validateWorkflow` says so. Zero is
+   * refused rather than treated as "always" because it is a gate that can only
+   * ever answer one way — the `else` subtree would never run on any deployment,
+   * which is the silent half-graph this node's whole design is arranged against.
+   */
+  atLeast: number;
+}
+
+/**
+ * What an `if` node tests. See {@link WORKFLOW_PREDICATE_KINDS}.
+ */
+export type WorkflowIfPredicate = WorkflowEnvPredicate | WorkflowRowCountPredicate;
+
+/**
+ * Narrow a stored predicate, for the same reason {@link isWorkflowNode} narrows
+ * a stored node: it arrives as JSON out of a column, and a gate read back
+ * without its test is a gate that has to invent one.
+ *
+ * A row count that is not a whole number — `NaN` from a JSON round trip of an
+ * unparsed field, an `Infinity` that serialised as `null` — is refused rather
+ * than kept, because every comparison against it is false and the symptom is a
+ * `then` branch that silently never runs again.
+ */
+export function isWorkflowIfPredicate(value: unknown): value is WorkflowIfPredicate {
+  if (typeof value !== 'object' || value === null) return false;
+  const kind = Reflect.get(value, 'kind');
+  if (!isWorkflowPredicateKind(kind)) return false;
+  if (kind === 'env') {
+    // The variable name is required and its expected value is not, exactly as
+    // the type says: an absent `equals` is the "is it set at all" test, so a
+    // stored predicate without one is complete rather than half-narrowed.
+    const equals = Reflect.get(value, 'equals');
+    return (
+      typeof Reflect.get(value, 'envVar') === 'string' &&
+      (equals === undefined || typeof equals === 'string')
+    );
+  }
+  if (kind === 'rowCount') {
+    const atLeast = Reflect.get(value, 'atLeast');
+    return typeof atLeast === 'number' && Number.isInteger(atLeast) && atLeast >= 0;
+  }
+  return isWorkflowPredicateKindUnhandled(kind);
+}
+
+/** The narrowing counterpart of {@link unreachablePredicateKind}. */
+function isWorkflowPredicateKindUnhandled(kind: never): false {
+  void kind;
+  return false;
+}
+
+/**
+ * Sends the rows down one of its two outbound branches, and skips the other.
+ *
+ * The node the maintainer asked for, and the reason it is a node rather than a
+ * flag on an edge: a deployment that has a ClickHouse and a deployment that does
+ * not are the *same graph*, and the difference between them is one decision made
+ * at run time. Modelling it as two workflows means two things to keep in step;
+ * modelling it as an edge flag means the decision has nowhere to be recorded and
+ * nothing on the canvas to open.
+ *
+ * ## What it does to the rows: nothing
+ *
+ * An `if` is a gate, not a stage. It passes its input through untouched — its
+ * output ref *is* its input's ref — so a branch costs no copy of the dataset and
+ * no second write into the stage store. That is also why it takes **exactly one
+ * inbound edge**: a node hands its successors one {@link WorkflowStageRef}, so a
+ * gate fed by two inputs could only either copy the rows to merge them (paying
+ * for the whole dataset to make a decision that reads none of it) or silently
+ * drop one. Merging is what a transform is for; put one in front.
+ *
+ * That holds for {@link WorkflowRowCountPredicate} too, which is the one
+ * predicate that sounds like it reads the data and does not: the count it tests
+ * is the number already written on the {@link WorkflowStageRef} it was handed,
+ * so a gate still touches no rows — and with one inbound edge there is exactly
+ * one count for "how many rows" to mean.
+ *
+ * ## The predicate is declarative, and that is the safety property
+ *
+ * It is one of {@link WORKFLOW_PREDICATE_KINDS} — a variable's name, or a count
+ * off a checkpoint — and never a value and never code. Three reasons, in order
+ * of how much they cost to get wrong:
+ *
+ * 1. **Replay.** The durable engine replays a run, possibly on another pod. A
+ *    predicate is by definition the thing whose answer decides which half of the
+ *    graph exists, so an answer that can differ between the run and its replay
+ *    is a run that loads through a shape nobody chose — and it would show up as
+ *    a non-determinism error two nodes later, naming neither the branch nor the
+ *    variable. The outcome is therefore recorded on first evaluation
+ *    ({@link WorkflowNodeOutcome.branch}) and read back afterwards, and the
+ *    declarative form is what keeps that record small enough to be a checkpoint.
+ *    Both predicate kinds are answerable from what a step was handed:
+ *    {@link WorkflowRowCountPredicate} reads a number that arrived on the step's
+ *    own checkpointed input rather than counting anything.
+ * 2. **A predicate is not a place for a secret.** A name is stored; a value
+ *    never is. This is the same rule {@link WorkflowSourceNode.secretEnvVar}
+ *    follows and for the same reason.
+ * 3. **Code would need a context to read, and this node does not own it.** What
+ *    code-bearing nodes may see — allow-listed variables, a `catalog` object —
+ *    is a question being answered elsewhere. A `code` predicate is additive the
+ *    day it lands: it becomes another member of {@link WorkflowIfPredicate}, and
+ *    everything that reads a branch reads it off the recorded outcome exactly as
+ *    it does now.
+ *
+ * To invert the test, swap which successor is on `then` and which is on `else`.
+ * There is deliberately no `negate` flag: two ways to say one thing is two
+ * places to look when a load takes the branch you did not expect.
+ */
+export interface WorkflowIfNode extends WorkflowNodeBase {
+  kind: 'if';
+  /**
+   * What it tests. A union rather than a field per test — see
+   * {@link WORKFLOW_PREDICATE_KINDS} for why that is the whole point.
+   */
+  predicate: WorkflowIfPredicate;
+}
+
+/* ---------------------------------------------------------------------------
+ * The filter node, and the predicate language it drops rows by.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The shapes a {@link WorkflowFilterPredicate} can take.
+ *
+ * Two leaf kinds plus a presence test plus two ways to combine them, and the
+ * list is closed for the same reason {@link WORKFLOW_PREDICATE_KINDS} is: every
+ * decision made per kind ends in {@link unreachableFilterPredicateKind}, so a
+ * sixth shape is a build failure naming the files that owe it an answer rather
+ * than a filter that saves, draws, and quietly keeps everything.
+ *
+ * **There is deliberately no `not`.** Every leaf carries its own inverse
+ * ({@link WORKFLOW_FILTER_OPERATORS} pairs each operator with one, `oneOf` has
+ * `notIn`, `present` has `isNotNull`) and `all`/`any` are duals, so De Morgan
+ * already writes any negation with the kinds here. A `not` node would be a
+ * second spelling of every predicate — two shapes to read when a load comes out
+ * short, and a UI with a checkbox nobody agrees on the placement of. The one
+ * case it does not cover is stated on {@link workflowFilterMatches}: a value the
+ * test cannot compare fails *both* a form and its inverse, on purpose.
+ *
+ * **There is deliberately no free-form expression and no code.** That is the
+ * whole argument for the node existing — see {@link WorkflowFilterNode}.
+ */
+export const WORKFLOW_FILTER_PREDICATE_KINDS = [
+  /** One column against one value. See {@link WorkflowFilterComparison}. */
+  'compare',
+  /** One column against a list. See {@link WorkflowFilterOneOf}. */
+  'oneOf',
+  /** Whether a column has a value at all. See {@link WorkflowFilterPresence}. */
+  'present',
+  /** Every child holds. See {@link WorkflowFilterGroup}. */
+  'all',
+  /** At least one child holds. See {@link WorkflowFilterGroup}. */
+  'any',
+] as const;
+
+export type WorkflowFilterPredicateKind = (typeof WORKFLOW_FILTER_PREDICATE_KINDS)[number];
+
+/** Same reason as {@link isConnectorKind}: one list, no second copy to drift. */
+export function isWorkflowFilterPredicateKind(
+  value: unknown,
+): value is WorkflowFilterPredicateKind {
+  return WORKFLOW_FILTER_PREDICATE_KINDS.some((kind) => kind === value);
+}
+
+/**
+ * {@link unreachablePredicateKind}, for the filter language, and for the
+ * identical reason.
+ *
+ * It throws as well as failing to compile: a predicate arrives as JSON out of a
+ * column, so a graph saved by a newer build and read by an older one is a thing
+ * that happens, and returning a default for a shape this build has no rule for
+ * would mean silently keeping — or silently dropping — every row.
+ */
+export function unreachableFilterPredicateKind(predicate: never, where: string): never {
+  const kind = typeof predicate === 'string' ? predicate : Reflect.get(Object(predicate), 'kind');
+  throw new Error(
+    `${where} does not handle a filter predicate of kind ${JSON.stringify(kind)}. The predicate kinds and every decision made per kind are meant to move together.`,
+  );
+}
+
+/**
+ * What a {@link WorkflowFilterComparison} does with its column and its value.
+ *
+ * Ten, in five inverse pairs, and the pairing is the reason there is no `not`
+ * kind. Each one has an obvious single-expression form in both dialects this
+ * repository speaks, which is not a coincidence — it is the constraint the list
+ * was chosen under, so that the day a predicate is pushed into a source query
+ * the translation is a `switch` and not a design.
+ *
+ * The omissions, since a closed list is only defensible if they are:
+ *
+ * - **`between`** — `all` of a `greaterThanOrEqual` and a `lessThanOrEqual`, in
+ *   one more click and with no second shape to validate, hash and translate.
+ * - **`endsWith`** — asked for far less than the other two, and unlike them it
+ *   has no index that could ever serve it in either dialect, so offering it in a
+ *   palette would advertise something that is a full scan by construction.
+ *   `contains` covers it at the same cost.
+ * - **regular expressions** — the dialects disagree about the syntax, the
+ *   engines disagree about the semantics, and a predicate whose meaning depends
+ *   on which database answered it is a predicate that cannot be pushed down
+ *   without changing what the load returns. That is the one property this list
+ *   exists to hold.
+ * - **case-insensitive variants** — collation is a property of the column in
+ *   both dialects, so a `equalsIgnoreCase` evaluated in memory and the same
+ *   predicate evaluated in a `WHERE` would legitimately disagree. Normalise in a
+ *   transform, where the disagreement is visible.
+ */
+export const WORKFLOW_FILTER_OPERATORS = [
+  'equals',
+  'notEquals',
+  'greaterThan',
+  'lessThanOrEqual',
+  'greaterThanOrEqual',
+  'lessThan',
+  'contains',
+  'notContains',
+  'startsWith',
+  'notStartsWith',
+] as const;
+
+export type WorkflowFilterOperator = (typeof WORKFLOW_FILTER_OPERATORS)[number];
+
+/** Same reason as {@link isConnectorKind}: one list, no second copy to drift. */
+export function isWorkflowFilterOperator(value: unknown): value is WorkflowFilterOperator {
+  return WORKFLOW_FILTER_OPERATORS.some((operator) => operator === value);
+}
+
+/**
+ * {@link unreachableFilterPredicateKind}, one level further down.
+ *
+ * An operator added to the list without a rule for evaluating it, describing it
+ * or hashing it is a type error naming the file — not a comparison that silently
+ * answers false for every row, which is a filter that drops the whole dataset
+ * and reports success.
+ */
+export function unreachableFilterOperator(operator: never, where: string): never {
+  throw new Error(
+    `${where} does not handle the filter operator ${JSON.stringify(operator)}. The operator list and every decision made per operator are meant to move together.`,
+  );
+}
+
+/**
+ * What a predicate may be compared against.
+ *
+ * Three scalars and nothing else. No `null` — {@link WorkflowFilterPresence} is
+ * how absence is tested, and folding it in here would make `equals: null` and
+ * `isNull` two spellings of one question with different answers under the
+ * three-valued logic on {@link workflowFilterMatches}. No object and no array —
+ * an array is {@link WorkflowFilterOneOf.values}, and an object compared with
+ * `===` never matches anything a source produced.
+ *
+ * **Dates are strings.** A source hands back whatever its driver decoded, and a
+ * catalog that tried to parse dates here would have to pick a format, get it
+ * wrong for one dialect, and produce a comparison that silently ordered rows
+ * differently from the `WHERE` this predicate is meant to become. ISO-8601
+ * strings sort correctly under `<` and under every SQL collation, which is why
+ * `boundStatement` already compares watermarks as text.
+ */
+export type WorkflowFilterValue = string | number | boolean;
+
+/** Whether a stored value is one this language can compare against. */
+export function isWorkflowFilterValue(value: unknown): value is WorkflowFilterValue {
+  if (typeof value === 'string' || typeof value === 'boolean') return true;
+  // `NaN` and the infinities are refused rather than kept: every comparison
+  // against `NaN` is false, so a predicate holding one is a filter that drops
+  // every row while looking perfectly well configured, and `Infinity` does not
+  // survive a JSON round trip at all — it comes back as `null`.
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+/**
+ * The column names a predicate may name.
+ *
+ * **The same pattern `boundStatement` requires of a watermark column**, and that
+ * is the point rather than a coincidence: an identifier cannot be bound by any
+ * driver, so pushing a predicate into a query means quoting the column into the
+ * SQL, and a name carrying a quote, a dot or a space is refused rather than
+ * escaped. Requiring it *now*, while the predicate is only ever evaluated in
+ * memory, is what stops a graph being authored today that could never be pushed
+ * down tomorrow.
+ *
+ * The cost, and it is real: a source whose column is called `Part Number` cannot
+ * be filtered directly. Rename it in a transform first — which is a node that
+ * already exists and whose output is a column this can name.
+ */
+export const WORKFLOW_FILTER_COLUMN_PATTERN = /^[A-Za-z_][A-Za-z0-9_$]*$/;
+
+/**
+ * How deep `all`/`any` may nest.
+ *
+ * A bound rather than a trust, because a predicate arrives as JSON out of a
+ * column and every function that walks one is recursive: a graph carrying a
+ * thousand-deep tree would be a stack overflow inside a durable step rather than
+ * a refusal naming the node. Six is past anything a person builds in a form and
+ * far short of anything that costs a frame to walk.
+ */
+export const WORKFLOW_FILTER_MAX_DEPTH = 6;
+
+/**
+ * How many values one {@link WorkflowFilterOneOf} may list.
+ *
+ * Bounded because the list travels in the graph, into the graph fingerprint, and
+ * eventually into an `IN (...)` — and past a few hundred entries all three of
+ * those stop being reasonable and the thing being expressed is a join against
+ * another dataset rather than a filter. Wire that dataset in as a second source
+ * and join it in a transform, which is the node that can.
+ */
+export const WORKFLOW_FILTER_MAX_VALUES = 500;
+
+/** One column against one value. The leaf almost every filter is made of. */
+export interface WorkflowFilterComparison {
+  kind: 'compare';
+  /** A bare column name. See {@link WORKFLOW_FILTER_COLUMN_PATTERN}. */
+  column: string;
+  operator: WorkflowFilterOperator;
+  value: WorkflowFilterValue;
+}
+
+/**
+ * One column against a list of values.
+ *
+ * Its own kind rather than an `equals` whose value is allowed to be an array,
+ * because that shape makes `value` mean two things and every reader has to test
+ * which — the flat-optional-fields mistake {@link WORKFLOW_PREDICATE_KINDS}
+ * argues against, one level down again. It also has no honest single spelling in
+ * SQL as a comparison: `IN (…)` takes a parenthesised list and one bound
+ * parameter per entry.
+ */
+export interface WorkflowFilterOneOf {
+  kind: 'oneOf';
+  column: string;
+  /** `notIn` rather than a `negated` flag, so the two read alike in a palette. */
+  operator: 'in' | 'notIn';
+  /** At most {@link WORKFLOW_FILTER_MAX_VALUES}, and never empty. */
+  values: WorkflowFilterValue[];
+}
+
+/**
+ * Whether a column has a value at all.
+ *
+ * The one test the other two cannot express, and the reason they cannot is the
+ * three-valued logic on {@link workflowFilterMatches}: every `compare` and every
+ * `oneOf` is false when the column is null, *including the inverses*, exactly as
+ * a `WHERE` would answer. So "the ones with no delivery date" has to be its own
+ * shape or it would be unaskable.
+ */
+export interface WorkflowFilterPresence {
+  kind: 'present';
+  column: string;
+  operator: 'isNull' | 'isNotNull';
+}
+
+/**
+ * What `all` and `any` share, which is everything except the word.
+ *
+ * **An empty group is refused**, by `validateWorkflow`, by
+ * {@link isWorkflowFilterPredicate} and at the HTTP boundary. It is not a
+ * pedantic refusal: `all` of nothing is vacuously true, so it keeps every row
+ * and the filter does nothing; `any` of nothing is vacuously false, so it drops
+ * every row and the load comes out empty. Both are silent, both are reached by
+ * deleting the last condition in a form, and they are opposite catastrophes.
+ */
+interface WorkflowFilterGroupBase {
+  /** Never empty. Nested no deeper than {@link WORKFLOW_FILTER_MAX_DEPTH}. */
+  children: WorkflowFilterPredicate[];
+}
+
+/**
+ * Every child holds.
+ *
+ * Two interfaces rather than one carrying `kind: 'all' | 'any'`, which was
+ * written first and does not work: TypeScript will not remove a union member
+ * from the union when its discriminant is itself a union of literals and the two
+ * are tested separately, so `unreachableFilterPredicateKind` at the end of every
+ * `switch`-by-`if` chain stopped compiling — which is to say the exhaustiveness
+ * this whole file is arranged around was silently unavailable for these two
+ * kinds. Two declarations over a shared base costs one line and buys the
+ * property back.
+ */
+export interface WorkflowFilterAll extends WorkflowFilterGroupBase {
+  kind: 'all';
+}
+
+/** At least one child holds. Two declarations, for the reason on {@link WorkflowFilterAll}. */
+export interface WorkflowFilterAny extends WorkflowFilterGroupBase {
+  kind: 'any';
+}
+
+export type WorkflowFilterGroup = WorkflowFilterAll | WorkflowFilterAny;
+
+/** What a filter node tests. See {@link WORKFLOW_FILTER_PREDICATE_KINDS}. */
+export type WorkflowFilterPredicate =
+  | WorkflowFilterComparison
+  | WorkflowFilterOneOf
+  | WorkflowFilterPresence
+  | WorkflowFilterAll
+  | WorkflowFilterAny;
+
+/**
+ * Narrow a stored filter predicate, refusing rather than repairing.
+ *
+ * The same contract {@link isWorkflowIfPredicate} has and for a sharper version
+ * of the same reason: a gate read back without its test picks a branch nobody
+ * authored, and a *filter* read back without its test decides which rows exist.
+ * Repairing a broken predicate — dropping an unreadable child out of an `all`,
+ * say — would silently widen or narrow what a load publishes, which is precisely
+ * the failure the node is built to make visible.
+ *
+ * Depth is carried rather than tracked globally so that the bound is on the
+ * *tree*, not on how many predicates have been checked: two sibling branches
+ * five deep are fine, and one branch seven deep is not.
+ */
+export function isWorkflowFilterPredicate(
+  value: unknown,
+  depth = 0,
+): value is WorkflowFilterPredicate {
+  if (depth > WORKFLOW_FILTER_MAX_DEPTH) return false;
+  if (typeof value !== 'object' || value === null) return false;
+  const kind = Reflect.get(value, 'kind');
+  if (!isWorkflowFilterPredicateKind(kind)) return false;
+
+  if (kind === 'all' || kind === 'any') {
+    const children = Reflect.get(value, 'children');
+    if (!Array.isArray(children) || children.length === 0) return false;
+    return children.every((child) => isWorkflowFilterPredicate(child, depth + 1));
+  }
+
+  const column = Reflect.get(value, 'column');
+  if (typeof column !== 'string' || !WORKFLOW_FILTER_COLUMN_PATTERN.test(column)) return false;
+  return isFilterLeaf(value, kind);
+}
+
+/**
+ * The half of {@link isWorkflowFilterPredicate} that is about one condition.
+ *
+ * Split off because the two halves have nothing to do with each other: above is
+ * a tree walk with a depth bound, and this is three shapes checked field by
+ * field. Reached only with the column already accepted, which is why it does not
+ * check one.
+ */
+function isFilterLeaf(
+  value: object,
+  kind: Exclude<WorkflowFilterPredicateKind, 'all' | 'any'>,
+): boolean {
+  const operator = Reflect.get(value, 'operator');
+  if (kind === 'present') {
+    return operator === 'isNull' || operator === 'isNotNull';
+  }
+  if (kind === 'oneOf') {
+    const values = Reflect.get(value, 'values');
+    if (operator !== 'in' && operator !== 'notIn') return false;
+    return (
+      Array.isArray(values) &&
+      values.length > 0 &&
+      values.length <= WORKFLOW_FILTER_MAX_VALUES &&
+      values.every((entry) => isWorkflowFilterValue(entry))
+    );
+  }
+  if (kind === 'compare') {
+    return isWorkflowFilterOperator(operator) && isWorkflowFilterValue(Reflect.get(value, 'value'));
+  }
+  return isWorkflowFilterPredicateKindUnhandled(kind);
+}
+
+/** The narrowing counterpart of {@link unreachableFilterPredicateKind}. */
+function isWorkflowFilterPredicateKindUnhandled(kind: never): false {
+  void kind;
+  return false;
+}
+
+/**
+ * Whether one row passes a predicate.
+ *
+ * Pure, allocation-free on the common path, and in core rather than in the
+ * runner so that the console can describe — and one day preview — exactly what
+ * the load will do, from the same function that does it. It is called once per
+ * row, so everything about it is arranged to be cheap: no closures built per
+ * row, no array built per row, and `note` is optional so a caller that does not
+ * want the diagnostics pays nothing for them.
+ *
+ * ## Null is unknown, and unknown does not pass
+ *
+ * A column that is `null`, `undefined`, or simply absent from the row fails
+ * **every** `compare` and **every** `oneOf`, *including the negative forms*.
+ * `status notEquals "CLOSED"` does not pass a row with no status.
+ *
+ * That is SQL's three-valued logic rather than JavaScript's, and it is chosen
+ * deliberately over the more intuitive JS answer for one reason: this predicate
+ * is meant to become a `WHERE`, and the day it does, the database will answer
+ * this way. A filter that kept those rows in memory and dropped them once pushed
+ * down would be a performance change that quietly altered what a type contains —
+ * which is the one thing a pushdown must never be able to do. {@link
+ * WorkflowFilterPresence} is how absence is tested on purpose.
+ *
+ * ## A value it cannot compare fails both a test and its inverse
+ *
+ * `qty greaterThan 10` against a `qty` holding `"n/a"` is not false because the
+ * string is small; there is no ordering between a string and a number that any
+ * two systems would agree on. Rather than invent one, the leaf answers false and
+ * calls `note` with the column, and the runner turns those counts into a line on
+ * the run: *"12,431 rows held a value in `qty` the test could not compare."*
+ *
+ * A row nothing can judge is therefore dropped rather than kept. That is the
+ * direction with a backstop — the sink's row-count bound sees the shrink, and a
+ * full sink refuses to commit nothing at all — whereas keeping unjudged rows
+ * would publish them into the type with nothing anywhere to notice.
+ */
+export function workflowFilterMatches(
+  predicate: WorkflowFilterPredicate,
+  row: Record<string, unknown>,
+  note?: (column: string) => void,
+): boolean {
+  if (predicate.kind === 'all' || predicate.kind === 'any') {
+    // One loop for both, because they differ only in which answer is decisive:
+    // an `all` stops at the first false and an `any` stops at the first true.
+    //
+    // **Short-circuiting is why `note` may under-count**, and that is the right
+    // trade rather than an accident: an `any` that matched on its first child
+    // never looks at the second, so a value it could not have compared there is
+    // not reported. Evaluating every child to make the diagnostics complete
+    // would run every comparison against every row for a count nobody acts on
+    // per row — and this function is called seven million times.
+    const decisive = predicate.kind === 'any';
+    for (const child of predicate.children) {
+      if (workflowFilterMatches(child, row, note) === decisive) return decisive;
+    }
+    return !decisive;
+  }
+  return matchFilterLeaf(predicate, row, note);
+}
+
+/** One condition against one row. Split from the recursion above, which is all it is. */
+function matchFilterLeaf(
+  predicate: WorkflowFilterComparison | WorkflowFilterOneOf | WorkflowFilterPresence,
+  row: Record<string, unknown>,
+  note: ((column: string) => void) | undefined,
+): boolean {
+  // `Object.hasOwn` rather than a bare index, because `row` is somebody else's
+  // record and a column named `constructor` would otherwise reach up the
+  // prototype chain and compare against a function.
+  const held = Object.hasOwn(row, predicate.column)
+    ? Reflect.get(row, predicate.column)
+    : undefined;
+
+  if (predicate.kind === 'present') {
+    const missing = held === null || held === undefined;
+    return predicate.operator === 'isNull' ? missing : !missing;
+  }
+  // Three-valued logic — see the docblock above. Not noted, because an absent
+  // value is an ordinary fact about data rather than a predicate that does not
+  // fit it.
+  if (held === null || held === undefined) return false;
+  if (predicate.kind === 'oneOf') return matchFilterList(predicate, held, note);
+  if (predicate.kind === 'compare') return compareFilterValue(predicate, held, note);
+  return unreachableFilterPredicateKind(predicate, 'workflowFilterMatches');
+}
+
+/** One `IN`/`NOT IN`, over a value already known to be present. */
+function matchFilterList(
+  predicate: WorkflowFilterOneOf,
+  held: unknown,
+  note: ((column: string) => void) | undefined,
+): boolean {
+  if (!isWorkflowFilterValue(held)) {
+    note?.(predicate.column);
+    return false;
+  }
+  const found = predicate.values.includes(held);
+  return predicate.operator === 'in' ? found : !found;
+}
+
+/**
+ * One leaf comparison, with the type rules written out once.
+ *
+ * Split from {@link workflowFilterMatches} so the recursion above stays readable
+ * and so the ten operators are answered in one place that ends in
+ * {@link unreachableFilterOperator}.
+ */
+function compareFilterValue(
+  predicate: WorkflowFilterComparison,
+  held: unknown,
+  note: ((column: string) => void) | undefined,
+): boolean {
+  const operator = predicate.operator;
+  const wanted = predicate.value;
+
+  if (operator === 'equals' || operator === 'notEquals') {
+    // Same type or nothing. `"5" === 5` is false in JavaScript and `'5' = 5` is
+    // *true* in MySQL, so a cross-type equality is precisely a comparison whose
+    // answer would change under pushdown — reported rather than picked.
+    if (typeof held !== typeof wanted) {
+      note?.(predicate.column);
+      return false;
+    }
+    return operator === 'equals' ? held === wanted : held !== wanted;
+  }
+
+  if (
+    operator === 'greaterThan' ||
+    operator === 'greaterThanOrEqual' ||
+    operator === 'lessThan' ||
+    operator === 'lessThanOrEqual'
+  ) {
+    // Ordered types only, and both sides the same one. Booleans are excluded on
+    // purpose: `true > false` is an answer JavaScript will give and no reader of
+    // a filter ever meant to ask for.
+    const ordered =
+      (typeof held === 'number' && typeof wanted === 'number') ||
+      (typeof held === 'string' && typeof wanted === 'string');
+    if (!ordered) {
+      note?.(predicate.column);
+      return false;
+    }
+    return orderedHolds(operator, held, wanted);
+  }
+
+  // The four string tests. A non-string on either side is not coerced: coercing
+  // would make `contains` match the digits of a number, which is a full scan
+  // producing rows nobody asked for rather than a comparison.
+  if (typeof held !== 'string' || typeof wanted !== 'string') {
+    note?.(predicate.column);
+    return false;
+  }
+  return textHolds(operator, held, wanted);
+}
+
+/**
+ * The four string tests, over two values already known to be strings.
+ *
+ * Split out for the same reason {@link orderedHolds} is: the type rule and the
+ * comparison are separate concerns, and keeping them in one function put a
+ * chain of ten operators and three type rules into one place the linter would
+ * not hold in one head — which is a fair description of how a comparison ends up
+ * silently answering the wrong way.
+ */
+function textHolds(
+  operator: 'contains' | 'notContains' | 'startsWith' | 'notStartsWith',
+  held: string,
+  wanted: string,
+): boolean {
+  if (operator === 'contains') return held.includes(wanted);
+  if (operator === 'notContains') return !held.includes(wanted);
+  if (operator === 'startsWith') return held.startsWith(wanted);
+  if (operator === 'notStartsWith') return !held.startsWith(wanted);
+  return unreachableFilterOperator(operator, 'workflowFilterMatches');
+}
+
+/**
+ * The four orderings, over two values already known to be the same ordered type.
+ *
+ * Its own function so the type check above and the comparison here are separate
+ * concerns rather than one branch doing both. Generic over the pair so that
+ * `held` and `wanted` are compared as the *same* type — the signature is what
+ * stops a future edit passing a string and a number to `>`, which is the exact
+ * silent coercion the caller went to trouble to rule out.
+ */
+function orderedHolds<T extends number | string>(
+  operator: 'greaterThan' | 'greaterThanOrEqual' | 'lessThan' | 'lessThanOrEqual',
+  held: T,
+  wanted: T,
+): boolean {
+  if (operator === 'greaterThan') return held > wanted;
+  if (operator === 'greaterThanOrEqual') return held >= wanted;
+  if (operator === 'lessThan') return held < wanted;
+  return held <= wanted;
+}
+
+/**
+ * Drops the rows that fail a declarative test, and reports how many.
+ *
+ * ## Why this is a node and not a transform that returns a subset
+ *
+ * A transform can already filter, so the kind has to earn itself. Three reasons,
+ * in increasing order of how much they decide the shape:
+ *
+ * 1. **It is legible on the canvas.** "Keep the open orders" is readable from
+ *    the box; the same rule inside a transform is readable only by opening the
+ *    code, and only by somebody who can read the language it is written in.
+ * 2. **Its effect is reportable.** A filter records rows in *and* rows out
+ *    ({@link WorkflowNodeOutcome.rowsIn}), so a run panel can say what was
+ *    dropped. A transform records one number, and a transform that quietly
+ *    started dropping 90% of its input looks exactly like a source that got
+ *    smaller. A filter whose effect is invisible is how data goes missing.
+ * 3. **Only a declarative predicate can be pushed into the source.** This is the
+ *    one that fixes the design. Arbitrary code cannot be translated to SQL, so a
+ *    code filter is *always* the expensive path: every row is read off disk, sent
+ *    over the network and turned into a JS object before anything decides it was
+ *    unwanted. A closed structure of column, operator and value can become a
+ *    `WHERE`, and then the rows are never read at all.
+ *
+ * ## Where it runs today, and where it does not yet
+ *
+ * **Today: in memory, one staged batch at a time, always.** The predicate is
+ * shaped so it *could* be pushed into a SQL source's query, and it is not, and
+ * saying so plainly is better than implying a win that has not been measured.
+ * What stands in the way is not the predicate — `boundStatement` in
+ * `sources.ts` already wraps an author's SQL in `SELECT * FROM (…) WHERE …`
+ * with a quoted identifier and a bound parameter, which is exactly the mechanism
+ * a pushdown would reuse — but the fetcher contract: `SourceFetcher` receives a
+ * connector, a secret, a watermark and a mode, and knows nothing about the
+ * graph, while the runner that *does* know the graph dispatches by connector
+ * kind alone. Threading a graph-derived predicate through that also drags in the
+ * schema-discovery path, which shares `sqlTarget`.
+ *
+ * There is a second reason, and it is the more interesting one: a pushed-down
+ * filter **cannot honestly report rows in**. The rows it dropped were never
+ * fetched, so "7,637,391 in, 96,204 out" would become "96,204 in, 96,204 out,
+ * nothing dropped" — reason 2 above, deleted by reason 3. Recovering the number
+ * means a second `COUNT(*)` over the unfiltered query, which is the scan the
+ * pushdown existed to avoid. Whichever way that is resolved, it is a decision
+ * about what a run reports and not a refactor, so it belongs in the change that
+ * makes the move rather than in a field added speculatively here.
+ *
+ * The seam is therefore one marked place in `WorkflowRunnerService.runFilter`
+ * rather than an unused translator sitting in this file waiting to rot.
+ *
+ * ## The trap this node had to be designed against: {@link narrows}
+ *
+ * Dropping a filter onto an existing `source → sink` wire replaces the published
+ * snapshot of that type with a subset — and every part of the run reports
+ * success, because from the run's point of view everything did succeed. See
+ * {@link narrows} for how the graph is made to tell that apart from filtering to
+ * derive something new, and why it cannot be told apart structurally.
+ */
+export interface WorkflowFilterNode extends WorkflowNodeBase {
+  kind: 'filter';
+  /**
+   * What a row has to satisfy to pass. See
+   * {@link WORKFLOW_FILTER_PREDICATE_KINDS}.
+   */
+  predicate: WorkflowFilterPredicate;
+  /**
+   * The object types whose published snapshot this filter is acknowledged to
+   * narrow.
+   *
+   * ## The two intentions, and why the graph cannot tell them apart
+   *
+   * Filtering to **derive a new type** — `source → filter → sink(OpenOrders)` —
+   * and filtering before **recommitting the same type** —
+   * `source → filter → sink(PriBuy)`, where `PriBuy` was until this morning the
+   * whole table — are *structurally identical graphs*. The only thing that
+   * differs is what the type on the sink already means to everybody reading it,
+   * and there is nothing in the nodes or the edges that knows that. Any rule
+   * claiming to distinguish them from the shape alone would be inventing a
+   * signal, and would then either refuse the safe case or wave the dangerous one
+   * through.
+   *
+   * So the graph makes the author **name the types**, and that naming is the
+   * whole mechanism: typing `OpenOrders` is a different act from typing
+   * `PriBuy`, and nobody types the second one by accident. What makes it a
+   * safeguard rather than a checkbox is that it is *required exactly where it
+   * matters and refused everywhere else*, both checked by `validateWorkflow`:
+   *
+   * - It must list **every** full-mode sink this filter stands in front of *on
+   *   every path* — that is, every sink whose entire snapshot would be a subset
+   *   because of this node. Removing the node would make that sink unreachable;
+   *   see `workflowNarrowedTypes`, which is the one implementation both the
+   *   validator and the console call.
+   * - It must list **nothing else**. A type named here that this filter does not
+   *   in fact narrow is refused, for the reason a branch label on a plain wire
+   *   is: an acknowledgement nothing reads is worse than none, because it is
+   *   drawn.
+   *
+   * A filter on one of several paths into a sink narrows nothing — other rows
+   * still reach it — and a filter in front of an incremental sink narrows
+   * nothing either, because an incremental commit merges into what is already
+   * there rather than replacing it. Neither has anything to declare, and neither
+   * may declare it.
+   *
+   * The consequence is the intended one: dragging a filter onto a working
+   * `source → sink` wire produces a graph that **will not save** until somebody
+   * writes down the name of the type they are about to shrink. It is in the
+   * graph fingerprint, so acknowledging it is a new version of the graph.
+   *
+   * The run-time backstop is unchanged and still the last word: the sink's
+   * row-count bound (`maxShrink`) refuses a commit that loses more of the served
+   * snapshot than the type allows, whatever this field says.
+   */
+  narrows?: string[];
+}
+
+/**
  * A discriminated union, so narrowing a node is `node.kind === "sink"` and
  * never a type assertion. This is why the kind list is not simply a string on
  * one node shape with every field optional: that shape lets a source node carry
@@ -1029,7 +2041,36 @@ export type WorkflowNode =
   | WorkflowSourceNode
   | WorkflowTransformNode
   | WorkflowSinkNode
-  | WorkflowCallNode;
+  | WorkflowCallNode
+  | WorkflowIfNode
+  | WorkflowFilterNode;
+
+/**
+ * Which side of an {@link WorkflowIfNode} a wire leaves by.
+ *
+ * **Two closed values rather than free-form labels**, which was the other design
+ * and is worse in the one way that matters here: an unlabelled branch is a
+ * branch that never runs, and a *misspelled* branch is one too. With a free
+ * string, `thn` is a subtree that silently never executes and a graph that
+ * validates perfectly; with these, it is refused at the boundary and is a type
+ * error in the console. The failure a branch introduces is "nothing loaded and
+ * nothing complained", so the vocabulary is the place to make it impossible.
+ *
+ * An N-way `switch` node was considered and is deliberately not this: it would
+ * have to carry its own case list plus a default, the cases would have to be
+ * validated against the labels, and an unmatched value would need a rule. That
+ * is a different node, and it can be added later without changing this one —
+ * because a boolean question is what a predicate answers, and an `if` is exactly
+ * the shape of a boolean question.
+ */
+export const WORKFLOW_BRANCH_LABELS = ['then', 'else'] as const;
+
+export type WorkflowBranchLabel = (typeof WORKFLOW_BRANCH_LABELS)[number];
+
+/** Same reason as {@link isConnectorKind}: one list, no second copy to drift. */
+export function isWorkflowBranchLabel(value: unknown): value is WorkflowBranchLabel {
+  return WORKFLOW_BRANCH_LABELS.some((label) => label === value);
+}
 
 /**
  * One wire.
@@ -1047,6 +2088,22 @@ export type WorkflowNode =
 export interface WorkflowEdge {
   from: string;
   to: string;
+  /**
+   * Which branch of an {@link WorkflowIfNode} this wire leaves by.
+   *
+   * **Optional, and absent on every edge that existed before branches did.** An
+   * edge with no label is a plain wire that always carries rows when its source
+   * ran — which is what every stored edge is, so nothing about an existing graph
+   * changes, including its fingerprint. The label is *required* on an edge
+   * leaving an `if` and *refused* on any other, both by `validateWorkflow`: a
+   * label on a wire nothing branches at would look like a decision and be
+   * ignored, and an unlabelled wire out of an `if` has no branch to belong to.
+   *
+   * Several wires may share a label. An `if` whose `then` side fans out to two
+   * nodes is ordinary fan-out that happens to be conditional; what is refused is
+   * two wires between the *same pair*, which was already refused as a duplicate.
+   */
+  branch?: WorkflowBranchLabel;
 }
 
 /** Just the executable part of a workflow, for validating a canvas draft. */
@@ -1303,7 +2360,25 @@ export interface WorkflowNodeStepOutput {
   committed?: { snapshotId: string; rowCount: number };
   /** Which transform version ran, for a transform node. */
   transformVersion?: number;
+  /**
+   * Which branch an `if` node took, for an `if` node.
+   *
+   * **On the step's output, which is the whole mechanism.** A step's output is
+   * what the durable engine checkpoints and hands back on replay without running
+   * the step again, so putting the evaluated branch here means the decision is
+   * made exactly once, in the run's own history, and every later turn reads the
+   * recorded one. A body that asked the predicate itself would be re-evaluating
+   * a pod-local fact on a pod that may not be the same one.
+   */
+  branch?: WorkflowBranchLabel;
   rows: number;
+  /**
+   * What a {@link WorkflowFilterNode} was handed, against `rows` above, which is
+   * what it passed on. See {@link WorkflowNodeOutcome.rowsIn}: it travels on the
+   * step's output so that a replayed node reports the same drop the first
+   * attempt did, rather than reporting nothing because it was not re-run.
+   */
+  rowsIn?: number;
   elapsedMs: number;
   /**
    * The one thing here that is not a counter, and the one exception worth
@@ -1575,6 +2650,14 @@ export const WORKFLOW_ISSUE_CODES = [
   'dead-end',
   'transform-not-named',
   'call-not-named',
+  'if-not-named',
+  'if-threshold-invalid',
+  'if-needs-one-input',
+  'branch-not-labelled',
+  'branch-on-plain-edge',
+  'filter-predicate-invalid',
+  'filter-narrows-unacknowledged',
+  'filter-narrows-nothing',
 ] as const;
 
 export type WorkflowIssueCode = (typeof WORKFLOW_ISSUE_CODES)[number];
@@ -1637,6 +2720,8 @@ export function validateWorkflow(graph: WorkflowGraph): WorkflowValidationIssue[
 
   checkNodeWiring(nodes, incoming, outgoing, issues);
   checkEndpoints(originators, sinks, issues);
+  checkBranches(edges, byId, issues);
+  checkFilterNarrowing({ nodes, edges }, originators, outgoing, issues);
 
   const looped = findCycle(nodes, incoming, outgoing);
   if (looped) {
@@ -1791,8 +2876,60 @@ function checkNodeWiring(
         message: `Sink "${node.name}" (${node.id}) has an outbound edge. The sink commits the snapshot, so nothing can run after it.`,
       });
     }
+    // Exactly one, not "at least one". A gate hands its successors the ref of
+    // the stage it was given rather than staging a copy — see `WorkflowIfNode`
+    // — and one output ref cannot name two inputs, so a second inbound edge
+    // would be silently dropped. Zero is caught by `unreachable` instead, which
+    // points at the same fix with the better message.
+    if (node.kind === 'if' && (incoming.get(node.id)?.length ?? 0) > 1) {
+      issues.push({
+        code: 'if-needs-one-input',
+        nodeIds: [node.id],
+        message: `If "${node.name}" (${node.id}) has ${incoming.get(node.id)?.length} inbound edges, and it can only carry one through. An if node is a gate: it passes the rows it is given straight down whichever branch it takes, so it has one output to hand on and cannot merge. Wire those inputs into a transform and gate the transform instead.`,
+      });
+    }
     const unconfigured = nodeIsUnconfigured(node);
     if (unconfigured) issues.push(unconfigured);
+  }
+}
+
+/**
+ * Every wire out of an `if` names a branch, and no other wire does.
+ *
+ * Both halves, because the two failures are opposite and both are silent. An
+ * unlabelled wire out of an `if` belongs to no branch, so nothing would ever
+ * take it and the subtree behind it would be skipped on every run of every
+ * deployment — a graph that draws correctly and quietly does half its work. A
+ * label on a wire whose source does not branch is the reverse: a decision
+ * somebody wrote down that nothing reads, which is worse than no decision
+ * because the canvas draws it.
+ *
+ * Run after the structural checks, so `byId` has every endpoint and this cannot
+ * report a wire whose real problem is that it points at a node that was deleted.
+ */
+function checkBranches(
+  edges: readonly WorkflowEdge[],
+  byId: ReadonlyMap<string, WorkflowNode>,
+  issues: WorkflowValidationIssue[],
+): void {
+  for (const edge of edges) {
+    const from = byId.get(edge.from);
+    if (!from) continue;
+    if (from.kind === 'if' && edge.branch === undefined) {
+      issues.push({
+        code: 'branch-not-labelled',
+        nodeIds: [edge.from, edge.to],
+        message: `The wire from "${from.name}" (${from.id}) to "${byId.get(edge.to)?.name ?? edge.to}" does not say which branch it is on. Every wire out of an if node belongs to "then" or to "else", because that is what decides whether it runs — an unlabelled one would never be taken, and everything only it feeds would be skipped on every run with nothing to say why.`,
+      });
+      continue;
+    }
+    if (from.kind !== 'if' && edge.branch !== undefined) {
+      issues.push({
+        code: 'branch-on-plain-edge',
+        nodeIds: [edge.from, edge.to],
+        message: `The wire from "${from.name}" (${from.id}) is labelled "${edge.branch}", but "${from.name}" is a ${from.kind} node and does not branch. A label nothing decides on is a decision that is drawn and never read; remove it, or put an if node where the choice is meant to be made.`,
+      });
+    }
   }
 }
 
@@ -1813,7 +2950,214 @@ function nodeIsUnconfigured(node: WorkflowNode): WorkflowValidationIssue | undef
     };
   }
   if (node.kind === 'call') return callIsUnnamed(node);
+  if (node.kind === 'if') return ifIsUnconfigured(node);
+  if (node.kind === 'filter') return filterIsUnconfigured(node);
   return undefined;
+}
+
+/**
+ * A filter whose test cannot decide anything.
+ *
+ * The whole predicate, checked by the same guard that reads one back out of a
+ * database, rather than a field-by-field re-implementation here. That is not
+ * only tidiness: the failures it catches are all *silent* ones and they point in
+ * opposite directions — an empty `all` keeps every row so the filter does
+ * nothing, an empty `any` drops every row so the load comes out empty, and a
+ * predicate whose operator this build does not recognise would do neither
+ * because {@link workflowFilterMatches} throws inside a step. A canvas has to
+ * say so before any of that.
+ */
+function filterIsUnconfigured(node: WorkflowFilterNode): WorkflowValidationIssue | undefined {
+  if (isWorkflowFilterPredicate(node.predicate)) return undefined;
+  return {
+    code: 'filter-predicate-invalid',
+    nodeIds: [node.id],
+    message: `Filter "${node.name}" (${node.id}) has no test this service can run. A filter tests bare column names (letters, digits and underscore, starting with a letter or underscore) against plain values, combined with "all" and "any"; a group has to have at least one condition in it, a list at least one value and no more than ${WORKFLOW_FILTER_MAX_VALUES}, and the whole tree may nest ${WORKFLOW_FILTER_MAX_DEPTH} deep. An empty "all" keeps every row and an empty "any" drops every row, which is why neither is stored.`,
+  };
+}
+
+/**
+ * That every filter names the published types it narrows, and names no others.
+ *
+ * See {@link WorkflowFilterNode.narrows} for the argument. This is the rule
+ * that turns dragging a filter onto a working `source → sink` wire into a graph
+ * that refuses to save until somebody writes down the name of the type they are
+ * about to shrink.
+ *
+ * Run after the structural checks and after the cycle check would have returned,
+ * so the reachability walks below are over a graph that has both ends and no
+ * loop.
+ */
+function checkFilterNarrowing(
+  graph: WorkflowGraph,
+  originators: readonly WorkflowNode[],
+  outgoing: ReadonlyMap<string, string[]>,
+  issues: WorkflowValidationIssue[],
+): void {
+  const rootIds = originators.map((one) => one.id);
+  for (const node of graph.nodes) {
+    if (node.kind !== 'filter') continue;
+    const required = workflowNarrowedTypes(graph, node.id, {
+      originators: rootIds,
+      outgoing,
+    }).sort();
+    const declared = [...new Set(node.narrows ?? [])].sort();
+
+    const missing = required.filter((type) => !declared.includes(type));
+    if (missing.length > 0) issues.push(filterNarrowsUnacknowledged(node, missing));
+
+    const spurious = declared.filter((type) => !required.includes(type));
+    if (spurious.length > 0) issues.push(filterNarrowsNothing(node, spurious));
+  }
+}
+
+/** The refusal that stops a filter quietly shrinking a type somebody else reads. */
+function filterNarrowsUnacknowledged(
+  node: WorkflowFilterNode,
+  missing: readonly string[],
+): WorkflowValidationIssue {
+  const one = missing.length === 1;
+  return {
+    code: 'filter-narrows-unacknowledged',
+    nodeIds: [node.id],
+    message: `Filter "${node.name}" (${node.id}) is the only thing feeding the sink that commits ${listTypes(missing)}, and that sink replaces the whole snapshot. So whatever this filter drops disappears from ${one ? 'that type' : 'those types'} the moment this graph runs — and the run reports success, because from its point of view nothing went wrong. If that is what you mean, acknowledge it on the node by naming ${one ? 'the type' : 'the types'}. If you meant to build something new out of a subset, point the sink at a different object type; if you meant to add rows rather than replace them, set the sink to incremental.`,
+  };
+}
+
+/** The opposite refusal: an acknowledgement the graph no longer backs up. */
+function filterNarrowsNothing(
+  node: WorkflowFilterNode,
+  spurious: readonly string[],
+): WorkflowValidationIssue {
+  const one = spurious.length === 1;
+  return {
+    code: 'filter-narrows-nothing',
+    nodeIds: [node.id],
+    message: `Filter "${node.name}" (${node.id}) says it narrows ${listTypes(spurious)}, and it does not: nothing it drops is missing from ${one ? 'that snapshot' : 'those snapshots'}, either because rows also reach the sink by another path or because the sink merges rather than replaces. An acknowledgement that nothing reads is worse than none, because the canvas draws it and the next reader believes it.`,
+  };
+}
+
+/** `"A"`, `"A" and "B"`, `"A", "B" and "C"` — for a message, not for a machine. */
+function listTypes(types: readonly string[]): string {
+  const quoted = types.map((type) => `"${type}"`);
+  if (quoted.length <= 1) return quoted.join('');
+  return `${quoted.slice(0, -1).join(', ')} and ${quoted[quoted.length - 1]}`;
+}
+
+/**
+ * The object types whose whole published snapshot a node stands in front of.
+ *
+ * A sink is in this list when it commits in `full` mode — replacing what is
+ * served rather than merging into it — **and** removing the named node would
+ * make it unreachable from everything that originates rows. That second half is
+ * the load-bearing one: a filter on one of two paths into a sink narrows
+ * nothing, because the other path still delivers, and a rule that ignored it
+ * would demand an acknowledgement for a graph where nothing is lost.
+ *
+ * Removal-reachability rather than a dominator algorithm, deliberately. The
+ * graphs here are a screenful of boxes, this runs once per filter node, and the
+ * cheaper version would be a second, subtler implementation of "does this node
+ * decide whether that one runs" living next to `checkReachability` — which is
+ * exactly the kind of duplication that eventually disagrees with the walk the
+ * rest of this file does.
+ *
+ * Exported because the console needs the same answer to offer the right
+ * acknowledgements, and a canvas that computed its own would offer a set the
+ * server then refuses.
+ *
+ * `precomputed` exists only so the validator, which has already built the
+ * adjacency it needs, does not build it twice per filter node. Callers outside
+ * this file pass a graph and nothing else.
+ */
+export function workflowNarrowedTypes(
+  graph: WorkflowGraph,
+  nodeId: string,
+  precomputed?: { originators: string[]; outgoing: ReadonlyMap<string, string[]> },
+): string[] {
+  const nodes = graph.nodes ?? [];
+  const outgoing = precomputed?.outgoing ?? buildAdjacency(nodes, graph.edges ?? []).outgoing;
+  const originators =
+    precomputed?.originators ?? nodes.filter((node) => originatesRows(node)).map((node) => node.id);
+
+  // Everything still reachable once this node is taken out. A source that *is*
+  // the node cannot originate anything, which falls out of the filter below
+  // rather than needing its own case.
+  const roots = originators.filter((id) => id !== nodeId);
+  const reachableWithout = walk(roots, stripNode(outgoing, nodeId));
+
+  const types: string[] = [];
+  for (const node of nodes) {
+    if (!narrowedByRemoval(node, reachableWithout)) continue;
+    const type = node.targetType.trim();
+    if (type.length > 0 && !types.includes(type)) types.push(type);
+  }
+  return types;
+}
+
+/**
+ * Whether this node is a full-mode sink that the removed node was the only way
+ * to reach.
+ *
+ * A sink with no explicit mode is a **full** sink — the same default `runSink`
+ * applies, read the same way here, because a graph that validated under one
+ * meaning of the absent field and ran under the other is precisely the failure
+ * this whole check exists to prevent.
+ */
+function narrowedByRemoval(
+  node: WorkflowNode,
+  reachableWithout: ReadonlySet<string>,
+): node is WorkflowSinkNode {
+  if (node.kind !== 'sink') return false;
+  if ((node.mode ?? 'full') === 'incremental') return false;
+  return !reachableWithout.has(node.id);
+}
+
+/** The same adjacency with one node's outgoing edges cut, leaving the original alone. */
+function stripNode(outgoing: ReadonlyMap<string, string[]>, nodeId: string): Map<string, string[]> {
+  const without = new Map<string, string[]>();
+  for (const [from, targets] of outgoing) {
+    if (from === nodeId) continue;
+    without.set(
+      from,
+      targets.filter((to) => to !== nodeId),
+    );
+  }
+  return without;
+}
+
+/**
+ * A gate whose test cannot decide anything.
+ *
+ * The third of the same mistake {@link nodeIsUnconfigured} describes, once per
+ * predicate kind, because "unconfigured" means something different for each and
+ * a single check would have to pick one. Both refusals exist for one reason: a
+ * gate that cannot really choose still picks a branch, and whichever it picks is
+ * a decision the graph appears to make and nobody authored — with half the
+ * pipeline silently not running as the only symptom.
+ */
+function ifIsUnconfigured(node: WorkflowIfNode): WorkflowValidationIssue | undefined {
+  const predicate = node.predicate;
+  if (predicate.kind === 'env') {
+    if (predicate.envVar.trim().length > 0) return undefined;
+    return {
+      code: 'if-not-named',
+      nodeIds: [node.id],
+      message: `If "${node.name}" (${node.id}) names no environment variable, so there is nothing for it to decide on. It reads the *name* of a variable on the machine that runs the load — that is how a graph tells a deployment with a ClickHouse apart from one without.`,
+    };
+  }
+  if (predicate.kind === 'rowCount') {
+    // At least one, so both answers are reachable. A threshold of zero is
+    // satisfied by every run including an empty one, so the `else` subtree would
+    // never execute on any deployment — the silent half-graph, arrived at by
+    // typing a number rather than by mislabelling a wire.
+    if (Number.isInteger(predicate.atLeast) && predicate.atLeast >= 1) return undefined;
+    return {
+      code: 'if-threshold-invalid',
+      nodeIds: [node.id],
+      message: `If "${node.name}" (${node.id}) branches on a row count of ${JSON.stringify(predicate.atLeast)}, and a threshold has to be a whole number of at least 1. "At least 1" is the "did anything arrive at all" test; 0 would be satisfied by every run, so the else branch — and everything only it feeds — would never run on any deployment.`,
+    };
+  }
+  return unreachablePredicateKind(predicate, 'validateWorkflow');
 }
 
 /**
@@ -2016,9 +3360,7 @@ function walk(roots: string[], adjacency: Map<string, string[]>): Set<string> {
  * order over a broken graph is a load that half-happens, which is harder to
  * recover from than one that never started.
  */
-export function workflowRunOrder(
-  graph: WorkflowGraph,
-): Array<{ node: WorkflowNode; inputs: string[] }> {
+export function workflowRunOrder(graph: WorkflowGraph): WorkflowRunOrderEntry[] {
   const issues = validateWorkflow(graph);
   if (issues.length > 0) {
     throw new Error(
@@ -2027,6 +3369,7 @@ export function workflowRunOrder(
   }
 
   const byId = new Map(graph.nodes.map((node) => [node.id, node]));
+  const labels = branchLabels(graph.edges);
   // The same adjacency the validator walks, from the same builder. Two copies of
   // "what is wired into what" is exactly how a graph that validated comes out
   // executing differently, which is the thing this function's contract rules out.
@@ -2036,7 +3379,7 @@ export function workflowRunOrder(
   );
 
   const ready = graph.nodes.filter((node) => indegree.get(node.id) === 0).map((node) => node.id);
-  const order: Array<{ node: WorkflowNode; inputs: string[] }> = [];
+  const order: WorkflowRunOrderEntry[] = [];
   while (ready.length > 0) {
     const id = ready.shift();
     if (id === undefined) break;
@@ -2046,7 +3389,8 @@ export function workflowRunOrder(
     // from, and it is part of the fingerprint precisely because it is visible in
     // the output. `buildAdjacency` fills `incoming` by walking the edges in
     // order, so that is what this already is.
-    order.push({ node, inputs: [...(incoming.get(id) ?? [])] });
+    const inputs = [...(incoming.get(id) ?? [])];
+    order.push({ node, inputs, inputBranches: labelsInto(id, inputs, labels) });
     for (const next of outgoing.get(id) ?? []) {
       const remaining = (indegree.get(next) ?? 0) - 1;
       indegree.set(next, remaining);
@@ -2054,6 +3398,110 @@ export function workflowRunOrder(
     }
   }
   return order;
+}
+
+/** One position in the order: which node, what feeds it, and on which branches. */
+export interface WorkflowRunOrderEntry {
+  node: WorkflowNode;
+  /** Upstream node ids, in inbound-edge order. */
+  inputs: string[];
+  /**
+   * The branch label of each inbound edge that has one, keyed by the upstream
+   * node id.
+   *
+   * A record rather than an array positionally aligned with {@link inputs},
+   * which was the obvious shape and is unsafe for one specific reason: this
+   * travels through a durable checkpoint as JSON, and `JSON.stringify` turns an
+   * `undefined` hole in an array into `null`. A plain wire would come back from
+   * a replay as `null` rather than absent, `null !== 'then'` would be false, and
+   * the node would be treated as dead — the graph would silently stop running
+   * half of itself on resumed runs only. A key that is simply not there
+   * round-trips exactly. The key is unique because duplicate edges are refused.
+   */
+  inputBranches: Record<string, WorkflowBranchLabel>;
+}
+
+/** Every labelled wire, keyed by the pair it joins. */
+function branchLabels(edges: readonly WorkflowEdge[]): Map<string, WorkflowBranchLabel> {
+  const labels = new Map<string, WorkflowBranchLabel>();
+  for (const edge of edges) {
+    if (edge.branch === undefined) continue;
+    labels.set(`${edge.from}\0${edge.to}`, edge.branch);
+  }
+  return labels;
+}
+
+/** The labels on the wires into one node, with the unlabelled ones left out. */
+function labelsInto(
+  to: string,
+  inputs: readonly string[],
+  labels: ReadonlyMap<string, WorkflowBranchLabel>,
+): Record<string, WorkflowBranchLabel> {
+  const into: Record<string, WorkflowBranchLabel> = {};
+  for (const from of inputs) {
+    const label = labels.get(`${from}\0${to}`);
+    if (label !== undefined) into[from] = label;
+  }
+  return into;
+}
+
+/**
+ * Whether a node runs, given what the nodes before it did.
+ *
+ * ## The rule
+ *
+ * A node runs when **at least one wire into it is live**, where a wire is live
+ * if its source ran and — when the wire carries a branch label — the source is
+ * an `if` that took that branch. A node with no inbound wires always runs, which
+ * is every source and every originating call.
+ *
+ * ## Why the obvious rule is wrong
+ *
+ * The naive version is "mark everything downstream of the untaken edge as
+ * skipped", and it is wrong on the shape branches are most often drawn in:
+ *
+ * ```
+ *      ┌ then → A ┐
+ * if ──┤          ├→ C → sink
+ *      └ else → B ┘
+ * ```
+ *
+ * `C` is downstream of `B`. Take the `then` branch and the naive rule walks from
+ * the untaken `else` edge, reaches `B`, reaches `C`, and skips it — so the sink
+ * never runs and the load silently commits nothing, on a graph whose whole
+ * purpose was that both branches converge. Reachability from the **taken** edges
+ * gets it right: `C` is reached through `A`, so it runs, and `B` — reached only
+ * through the untaken edge — does not. `C` then sees an empty stage ref for `B`,
+ * which is exactly what `stageRefsFor` already does for an upstream that
+ * produced nothing, so the positions a merge reads stay aligned with the wires
+ * that were drawn.
+ *
+ * It is evaluated incrementally rather than as a graph walk because the answers
+ * arrive as the run goes: `workflowRunOrder` is topological, so by the time a
+ * node is reached every node feeding it has an outcome. That also means this
+ * reads **only** what was recorded — no predicate is re-evaluated here, which is
+ * the property the whole branch feature rests on.
+ */
+export function workflowNodeRuns(
+  entry: {
+    inputs: readonly string[];
+    inputBranches?: Readonly<Record<string, WorkflowBranchLabel>>;
+  },
+  outcomes: Readonly<Record<string, WorkflowNodeOutcome>>,
+): boolean {
+  if (entry.inputs.length === 0) return true;
+  return entry.inputs.some((from) => {
+    const upstream = outcomes[from];
+    // Anything other than a clean success means this wire carried nothing: a
+    // skipped upstream is not on a live path, and a failed one aborts the run
+    // before this is ever asked.
+    if (upstream?.status !== 'succeeded') return false;
+    const label = entry.inputBranches?.[from];
+    // A plain wire. Live because its source ran, which is what every graph
+    // drawn before branches existed relies on.
+    if (label === undefined) return true;
+    return upstream.branch === label;
+  });
 }
 
 /**
@@ -2081,7 +3529,14 @@ export function workflowGraphHash(graph: WorkflowGraph): string {
   const nodes = [...graph.nodes]
     .sort((left, right) => (left.id < right.id ? -1 : left.id > right.id ? 1 : 0))
     .map((node) => canonicalNode(node));
-  const edges = graph.edges.map((edge) => `${edge.from}>${edge.to}`);
+  // The branch is appended only when there is one, so every edge drawn before
+  // branches existed hashes to exactly the string it always did. Adding a graph
+  // to this file must not renumber the versions of graphs that did not change.
+  const edges = graph.edges.map((edge) =>
+    edge.branch === undefined
+      ? `${edge.from}>${edge.to}`
+      : `${edge.from}>${edge.to}:${edge.branch}`,
+  );
   const canonical = JSON.stringify({ nodes, edges });
   return `${fnv1a(canonical, 0x811c9dc5)}${fnv1a(canonical, 0x01000193)}`;
 }
@@ -2124,7 +3579,90 @@ function canonicalNode(node: WorkflowNode): string {
       sortedEntries(node.config),
     ]);
   }
-  return JSON.stringify([node.id, node.kind, node.targetType, node.mode ?? 'full']);
+  if (node.kind === 'if') {
+    return JSON.stringify([node.id, node.kind, ...canonicalPredicate(node.predicate)]);
+  }
+  if (node.kind === 'filter') {
+    // `narrows` is in here as well as the predicate, and that is a decision
+    // rather than completeness. It changes nothing about what the node computes
+    // — but it is the acknowledgement that a published type is about to become a
+    // subset, and a run that happened before anybody acknowledged that must stay
+    // distinguishable from one that happened after. Sorted, so ticking the same
+    // two boxes in the other order is not an edit.
+    return JSON.stringify([
+      node.id,
+      node.kind,
+      canonicalFilterPredicate(node.predicate),
+      [...(node.narrows ?? [])].sort(),
+    ]);
+  }
+  if (node.kind === 'sink') {
+    return JSON.stringify([node.id, node.kind, node.targetType, node.mode ?? 'full']);
+  }
+  return unreachableNodeKind(node, 'workflowGraphHash');
+}
+
+/**
+ * The parts of a predicate that decide which branch runs.
+ *
+ * The kind leads, so the two tests can never canonicalise to the same string —
+ * a gate switched from "is CLICKHOUSE_URL set" to "did 1 row arrive" is a
+ * different pipeline on every deployment, and a hash that missed it would leave
+ * two runs claiming the same graph version while having taken different halves
+ * of it.
+ */
+function canonicalPredicate(predicate: WorkflowIfPredicate): unknown[] {
+  if (predicate.kind === 'env') {
+    // Both halves, because both decide which branch runs. `equals` being absent
+    // is a *different* test from `equals` being the empty string — "set to
+    // anything" against "set to nothing" — so the two must not fold together.
+    return [predicate.kind, predicate.envVar, predicate.equals ?? null];
+  }
+  if (predicate.kind === 'rowCount') {
+    return [predicate.kind, predicate.atLeast];
+  }
+  return unreachablePredicateKind(predicate, 'workflowGraphHash');
+}
+
+/**
+ * The parts of a filter predicate that decide which rows survive.
+ *
+ * Which is all of them, so this is a faithful canonicalisation rather than a
+ * selection — every field of every kind changes what a load publishes. What it
+ * adds over `JSON.stringify` of the predicate is order-independence where order
+ * is meaningless and order-*dependence* where it is not: the children of an
+ * `all` are sorted, because `A and B` and `B and A` are the same filter and a
+ * canvas that rewrites the array must not look like an edit; the `values` of a
+ * `oneOf` are sorted for the same reason. The kind and the operator lead, so no
+ * two shapes can canonicalise to the same string.
+ *
+ * `values` is deliberately *not* deduplicated. A duplicate changes nothing about
+ * the result, but removing one here would make the hash disagree with what is
+ * stored, and the fingerprint is meant to answer "is this the same graph" rather
+ * than "is this an equivalent graph".
+ */
+function canonicalFilterPredicate(predicate: WorkflowFilterPredicate): string {
+  if (predicate.kind === 'all' || predicate.kind === 'any') {
+    return JSON.stringify([
+      predicate.kind,
+      predicate.children.map((child) => canonicalFilterPredicate(child)).sort(),
+    ]);
+  }
+  if (predicate.kind === 'oneOf') {
+    return JSON.stringify([
+      predicate.kind,
+      predicate.column,
+      predicate.operator,
+      [...predicate.values].map((value) => JSON.stringify(value)).sort(),
+    ]);
+  }
+  if (predicate.kind === 'present') {
+    return JSON.stringify([predicate.kind, predicate.column, predicate.operator]);
+  }
+  if (predicate.kind === 'compare') {
+    return JSON.stringify([predicate.kind, predicate.column, predicate.operator, predicate.value]);
+  }
+  return unreachableFilterPredicateKind(predicate, 'workflowGraphHash');
 }
 
 function sortedEntries(config: Record<string, unknown>): Array<[string, unknown]> {
@@ -2182,13 +3720,66 @@ export function isWorkflowNode(value: unknown): value is WorkflowNode {
       !Array.isArray(config)
     );
   }
-  const sourceKind = Reflect.get(value, 'sourceKind');
-  const config = Reflect.get(value, 'config');
-  return isConnectorKind(sourceKind) && typeof config === 'object' && config !== null;
+  if (kind === 'if') {
+    // The predicate in full, refused rather than defaulted: a gate read back
+    // without a test it recognises would have to invent one, and inventing one
+    // means half the graph runs on a decision nobody made.
+    return isWorkflowIfPredicate(Reflect.get(value, 'predicate'));
+  }
+  if (kind === 'filter') {
+    return isNarrowsList(Reflect.get(value, 'narrows'))
+      ? isWorkflowFilterPredicate(Reflect.get(value, 'predicate'))
+      : false;
+  }
+  if (kind === 'source') {
+    const sourceKind = Reflect.get(value, 'sourceKind');
+    const config = Reflect.get(value, 'config');
+    return isConnectorKind(sourceKind) && typeof config === 'object' && config !== null;
+  }
+  return isWorkflowNodeKindUnhandled(kind);
+}
+
+/**
+ * Whether a stored `narrows` is one this build can read.
+ *
+ * Checked as strictly as the predicate beside it, and it has to be:
+ * {@link WorkflowFilterNode.narrows} is what stands between "filter into the
+ * type that already exists" and a published snapshot quietly becoming a subset.
+ * A value that is not a list of strings is refused rather than dropped, because
+ * dropping it turns a graph somebody acknowledged into one that never was — and
+ * `validateWorkflow` would then refuse it with a message about a field they did
+ * fill in.
+ *
+ * Absent is accepted, because that is what every filter narrowing nothing looks
+ * like and what every node stored before this field existed is.
+ */
+function isNarrowsList(value: unknown): boolean {
+  if (value === undefined) return true;
+  return Array.isArray(value) && value.every((type) => typeof type === 'string');
+}
+
+/**
+ * The narrowing counterpart of {@link unreachableNodeKind}.
+ *
+ * A guard cannot take a `never` — `kind` here is a string that
+ * {@link isWorkflowNodeKind} already accepted — so exhaustiveness is bought by
+ * assigning it to one, which is the compile error a new kind has to answer, and
+ * refusing the value at run time, which is what a build that skipped this file
+ * would do to a node it has no rule for.
+ */
+function isWorkflowNodeKindUnhandled(kind: never): false {
+  void kind;
+  return false;
 }
 
 export function isWorkflowEdge(value: unknown): value is WorkflowEdge {
   if (typeof value !== 'object' || value === null) return false;
+  // A `branch` that is present and unrecognised is refused rather than dropped,
+  // for the reason `isWorkflowNode` refuses an unknown node: an edge silently
+  // read back without its label is a wire that stops belonging to a branch, and
+  // everything behind it stops running with nothing to point at.
+  const branch = Reflect.get(value, 'branch');
+  if (branch !== undefined && !isWorkflowBranchLabel(branch)) return false;
   return (
     typeof Reflect.get(value, 'from') === 'string' && typeof Reflect.get(value, 'to') === 'string'
   );

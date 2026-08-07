@@ -37,9 +37,11 @@ import {
   isConnectorKind,
   isSealedSecret,
   isTransformLanguage,
+  isWorkflowBranchLabel,
   isWorkflowEdge,
   isWorkflowExecutionMode,
   isWorkflowNode,
+  isWorkflowSkipReason,
   isWorkflowStatus,
   validateWorkflow,
   workflowColumnX,
@@ -2095,10 +2097,29 @@ function toNodeOutcome(raw: unknown): WorkflowNodeOutcome | undefined {
   const transformVersion = Reflect.get(raw, 'transformVersion');
   const elapsedMs = Reflect.get(raw, 'elapsedMs');
   const error = Reflect.get(raw, 'error');
+  // The two branch fields degrade the same way every other field here does, and
+  // they have to be listed: this function rebuilds the outcome key by key rather
+  // than spreading it, so a field added to `WorkflowNodeOutcome` and not added
+  // here is silently dropped on the way back out of the database. That is the
+  // hand-maintained list going quiet, and for these two it would go quiet in the
+  // worst possible way — a sink skipped by a branch would read back as a sink
+  // skipped by a failure, and the panel would report a healthy run as broken.
+  const branch = Reflect.get(raw, 'branch');
+  const skippedBecause = Reflect.get(raw, 'skippedBecause');
+  // The same hand-maintained list, one entry longer. Left `undefined` rather
+  // than defaulted to zero when it is absent, which is the whole reason the
+  // field is optional: a node that never reported an input count and a filter
+  // that was handed nothing are different facts, and defaulting would make every
+  // outcome stored before filters existed read as "given nothing, dropped
+  // nothing" on a panel that subtracts.
+  const rowsIn = Reflect.get(raw, 'rowsIn');
   return {
     status,
     rows: typeof rows === 'number' ? rows : 0,
+    rowsIn: typeof rowsIn === 'number' ? rowsIn : undefined,
     transformVersion: typeof transformVersion === 'number' ? transformVersion : undefined,
+    branch: isWorkflowBranchLabel(branch) ? branch : undefined,
+    skippedBecause: isWorkflowSkipReason(skippedBecause) ? skippedBecause : undefined,
     elapsedMs: typeof elapsedMs === 'number' ? elapsedMs : undefined,
     error: typeof error === 'string' ? error : undefined,
   };
