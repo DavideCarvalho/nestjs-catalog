@@ -294,6 +294,8 @@ export type {
   WorkflowNodeKind,
   WorkflowNodeOutcome,
   WorkflowPredicateKind,
+  WorkflowRenameNode,
+  WorkflowRenameUnnamed,
   WorkflowRowCountPredicate,
   WorkflowRunOrderEntry,
   WorkflowSinkNode,
@@ -454,6 +456,11 @@ export {
   WORKFLOW_FILTER_MAX_VALUES,
   WORKFLOW_FILTER_OPERATORS,
   WORKFLOW_FILTER_PREDICATE_KINDS,
+  // The rename vocabulary, same argument: the inspector has to refuse a target
+  // name the server would refuse, and the two words for what happens to an
+  // unnamed column have to be exactly the two the runner branches on.
+  WORKFLOW_RENAME_MAX_COLUMNS,
+  WORKFLOW_RENAME_UNNAMED,
   WORKFLOW_SKIP_REASONS,
   isWorkflowBranchLabel,
   isWorkflowFilterOperator,
@@ -462,10 +469,22 @@ export {
   isWorkflowFilterValue,
   isWorkflowIfPredicate,
   isWorkflowPredicateKind,
+  isWorkflowRenameColumns,
+  isWorkflowRenameUnnamed,
   isWorkflowSkipReason,
   // The row test itself, so the inspector can describe — and a host can preview
   // — exactly what a load will keep, from the function that decides it.
+  workflowFilterColumns,
   workflowFilterMatches,
+  // The refusals a rename map earns, from the function the validator and the
+  // HTTP boundary both call. A form with its own copy of the identifier pattern
+  // is a form that eventually accepts a target the server refuses, after Save.
+  renameColumnRefusals,
+  workflowRenameUnnamed,
+  // What the graph can prove about the columns reaching a node — the one thing
+  // a declarative rename buys that a transform cannot. The inspector says it out
+  // loud; see `workflowKnownColumns` for how far it reaches.
+  workflowKnownColumns,
   // Which published types a filter stands in front of. The console has to offer
   // the same acknowledgements the validator requires, and a canvas computing its
   // own answer would offer a set the server then refuses.
@@ -477,6 +496,7 @@ export {
   unreachableFilterPredicateKind,
   unreachableNodeKind,
   unreachablePredicateKind,
+  unreachableRenameUnnamed,
   // The draft/ready pair, for the same reason as the list above: a canvas that
   // cannot see it restates it, and the copy is what drifts. Without this the
   // editor could not tell a graph it is allowed to store from one the server
