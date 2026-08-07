@@ -267,13 +267,22 @@ export const SOURCE_KINDS: Record<ConnectorKind, SourceKindProfile> = {
   file: {
     label: 'a file',
     required: ['path'],
-    optional: ['format', 'jsonPath', 'delimiter'],
+    optional: ['format', 'jsonPath', 'delimiter', 'sheet', 'maxBytes'],
     keysRecordsBySourceName: true,
   },
   s3: {
     label: 'an object store',
     required: ['bucket'],
-    optional: ['prefix', 'suffix', 'format', 'delimiter', 'region', 'maxObjectsPerRun'],
+    optional: [
+      'prefix',
+      'suffix',
+      'format',
+      'delimiter',
+      'sheet',
+      'maxBytes',
+      'region',
+      'maxObjectsPerRun',
+    ],
     keysRecordsBySourceName: true,
   },
   inline: {

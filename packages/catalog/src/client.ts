@@ -303,6 +303,7 @@ export type {
   ReusableNodeRef,
   ReusableSinkBody,
   ReusableSourceBody,
+  SourceFormat,
   VersionPinCopy,
 } from './catalog.pipeline';
 
@@ -311,7 +312,9 @@ export type {
 export {
   CONNECTOR_KINDS,
   isConnectorKind,
+  isSourceFormat,
   isTransformLanguage,
+  SOURCE_FORMATS,
   // The canvas narrows nodes and edges it reads back from HTTP. Without these
   // it either imports them from the package root — dragging NestJS and MikroORM
   // into a browser bundle — or writes its own copy of the checks, which is the

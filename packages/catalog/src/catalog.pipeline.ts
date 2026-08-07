@@ -51,6 +51,64 @@ export function isConnectorKind(value: unknown): value is ConnectorKind {
 }
 
 /**
+ * How the bytes behind a `file` or `s3` connector are read as records.
+ *
+ * A list rather than a loose string, for the reason {@link CONNECTOR_KINDS} is
+ * one: this used to be compared against string literals in the parser and
+ * spelled out again in a dropdown, and the two had no way to disagree loudly.
+ * The parser's chain also *ended* in JSON, so a format it did not recognise was
+ * not refused — it was read as JSON, and a spreadsheet handed to `JSON.parse`
+ * fails with a syntax error that names a byte offset rather than the format.
+ *
+ * `xlsx` is the odd one and is named for what it is: the only member whose
+ * payload is binary. The other three are text, and everything that reads them
+ * decodes the bytes first. Anything deciding something *per format* narrows
+ * against this and answers {@link unreachableSourceFormat}.
+ */
+export const SOURCE_FORMATS = [
+  /** Delimited text with a header row. The delimiter is configurable. */
+  'csv',
+  /** One JSON value per line. */
+  'ndjson',
+  /** A JSON document, optionally with the array nested in an envelope. */
+  'json',
+  /**
+   * A spreadsheet workbook — binary, and the only member that is.
+   *
+   * Named for the modern extension, but the reader identifies the container
+   * from its own bytes, so the legacy `.xls` and the macro-enabled `.xlsm` are
+   * this format too rather than three names for one decision.
+   */
+  'xlsx',
+] as const;
+
+export type SourceFormat = (typeof SOURCE_FORMATS)[number];
+
+/** Same reason as {@link isConnectorKind}: one list, no second copy to drift. */
+export function isSourceFormat(value: unknown): value is SourceFormat {
+  return SOURCE_FORMATS.some((format) => format === value);
+}
+
+/**
+ * The format that never compiles quietly.
+ *
+ * The {@link unreachableNodeKind} of formats, and it exists for the same reason:
+ * a member added to {@link SOURCE_FORMATS} without a branch in the parser should
+ * be a type error naming the file, not a connector that offers a format in a
+ * dropdown and then reads the file as JSON.
+ *
+ * It throws as well as failing to compile, because a connector config is JSON
+ * that outlives the build that wrote it: a `format` stored by a newer deployment
+ * and read by an older one is possible, and falling back to a default for it
+ * would be exactly the silent path this closes.
+ */
+export function unreachableSourceFormat(format: never, where: string): never {
+  throw new Error(
+    `${where} does not handle a source format of ${JSON.stringify(format)}. The format list and every decision made per format are meant to move together.`,
+  );
+}
+
+/**
  * What a published workflow runs as. **Not an authored object.**
  *
  * This used to be the thing somebody created: a screen, a `POST connectors`, a
