@@ -1213,6 +1213,10 @@ export class WorkflowRunnerService {
         dropped > 0 ? `, ${dropped} of which were not objects and were dropped` : ''
       }.`,
     );
+    // Immediately under the count they do not agree with, which is the whole
+    // point of them: a source that skipped rows while parsing says so here,
+    // beside the number a reader is about to believe. See `FetchResult.notes`.
+    logs.push(...(result.notes ?? []));
     // Emphatically not an error. A source with nothing to read is an ordinary
     // outcome — the sink decides what to do about a load that produced nothing,
     // because the sink is the only node that can see the whole graph's output.

@@ -57,6 +57,20 @@ export interface FetchContext {
 export interface FetchResult {
   records: unknown[];
   state?: Record<string, unknown>;
+  /**
+   * What the fetcher had to say about rows the caller will never see.
+   *
+   * The ledger for anything a source discarded on its own account, before the
+   * records reached anybody who counts them. Today that is
+   * {@link blankRowNote} — the blank lines a CSV parser skips — and the reason
+   * it is a field on the result rather than a `Logger` call is that a number
+   * about *this load* belongs on *this run*, next to the count it does not
+   * agree with, and not in a pod log an operator has to go and find.
+   *
+   * Absent when there is nothing to say, which is the overwhelmingly common
+   * case: a well-formed file produces no notes at all.
+   */
+  notes?: string[];
 }
 
 /**
@@ -148,18 +162,34 @@ export interface RecordStream {
   state(): Record<string, unknown> | undefined;
   /** Whether the source was handing rows over incrementally. */
   streamed: boolean;
+  /**
+   * {@link FetchResult.notes}, and known before the first row rather than after
+   * the last.
+   *
+   * Not a function the way `state` is, and the asymmetry is the truth about the
+   * two: a watermark is a running maximum over rows that have not been read
+   * yet, while a note is about the parse that produced the iterable and is
+   * settled the moment the fetcher returns. A streamed source has nothing to
+   * say here, because nothing that streams parses CSV.
+   */
+  notes: string[];
 }
 
 export function toRecordStream(value: unknown[] | FetchResult | StreamedFetchResult): RecordStream {
   if (Array.isArray(value)) {
-    return { records: fromArray(value), state: () => undefined, streamed: false };
+    return { records: fromArray(value), state: () => undefined, streamed: false, notes: [] };
   }
   if (isStreamedFetch(value)) {
     const settle = value.state;
-    return { records: value.records, state: () => settle?.(), streamed: true };
+    return { records: value.records, state: () => settle?.(), streamed: true, notes: [] };
   }
   const state = value.state;
-  return { records: fromArray(value.records), state: () => state, streamed: false };
+  return {
+    records: fromArray(value.records),
+    state: () => state,
+    streamed: false,
+    notes: value.notes ?? [],
+  };
 }
 
 /**
@@ -188,7 +218,16 @@ export async function toBufferedFetchResult(
   }
   if (!isStreamedFetch(value)) {
     const records = limit === undefined ? value.records : value.records.slice(0, limit);
-    return value.state === undefined ? { records } : { records, state: value.state };
+    // Notes survive the slice. They describe the *parse*, not the rows that came
+    // out of it, so "568 blank lines were skipped" is as true of a twenty-row
+    // discovery sample as it is of the whole read — and it is the discovery that
+    // most wants to hear it, because that is where somebody is still deciding
+    // what the file is.
+    return {
+      records,
+      ...(value.state === undefined ? {} : { state: value.state }),
+      ...(value.notes === undefined ? {} : { notes: value.notes }),
+    };
   }
 
   const records: unknown[] = [];
@@ -335,7 +374,11 @@ export const fetchFile: SourceFetcher = async ({ connector }) => {
       // second time for no gain.
       await readFile(source);
 
-  return parseRecords(bytes, source, connector.config);
+  const parsed = await parseRecords(bytes, source, connector.config);
+  return {
+    records: parsed.records,
+    ...(parsed.blankRows > 0 ? { notes: [blankRowNote(parsed.blankRows, `"${source}"`)] } : {}),
+  };
 };
 
 /**
@@ -397,7 +440,7 @@ export const fetchS3: SourceFetcher = async ({ connector, secret, state, mode })
     // where it was, which is what "nothing happened" should mean.
     if (consumed.length === 0) return [];
 
-    const records = await readObjectRecords({
+    const read = await readObjectRecords({
       client,
       s3,
       bucket,
@@ -410,8 +453,9 @@ export const fetchS3: SourceFetcher = async ({ connector, secret, state, mode })
     // a connector to incremental afterwards continues from here instead of
     // loading the whole prefix a second time.
     return {
-      records,
+      records: read.records,
       state: nextObjectState(consumed, previousWatermark, previousKeys),
+      ...(read.notes.length > 0 ? { notes: read.notes } : {}),
     };
   } finally {
     // The SDK keeps sockets alive for reuse, which keeps the process alive too
@@ -1095,29 +1139,45 @@ export const SOURCES: Record<string, SourceFetcher> = {
  * parsed CSV even slightly differently from a file connector would mean the
  * same drop loads two different ways depending on where it was read from, and
  * the difference would show up as a column of nulls rather than as an error.
+ *
+ * Returns what it skipped as well as what it produced. Only the CSV reader has
+ * anything to skip — the NDJSON one drops blank lines too, but a blank line in
+ * NDJSON is a line separator rather than a record with every field empty, and
+ * counting those would be counting the file's punctuation.
  */
 async function parseRecords(
   bytes: Uint8Array,
   source: string,
   config: Record<string, unknown>,
-): Promise<unknown[]> {
+): Promise<{ records: unknown[]; blankRows: number }> {
   const format = resolveFormat(source, config);
 
   // The one member whose payload is binary, and the reason this takes bytes.
   // Handled before the decode rather than after it, because the decode is what
   // would destroy it.
-  if (format === 'xlsx') return parseWorkbook(bytes, source, config);
+  //
+  // `blankRows: 0` is the truth rather than a placeholder. A workbook has no
+  // blank *line* to skip — a row of empty cells is a row of `null`s the reader
+  // hands over like any other — so there is nothing for it to under-report.
+  if (format === 'xlsx') {
+    return { records: await parseWorkbook(bytes, source, config), blankRows: 0 };
+  }
 
   const text = decodeText(bytes);
   if (format === 'ndjson') {
-    return text
-      .split('\n')
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .map((line) => JSON.parse(line));
+    return {
+      records: text
+        .split('\n')
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .map((line) => JSON.parse(line)),
+      blankRows: 0,
+    };
   }
   if (format === 'csv') return parseCsv(text, config);
-  if (format === 'json') return unwrap(JSON.parse(text), config.jsonPath);
+  if (format === 'json') {
+    return { records: unwrap(JSON.parse(text), config.jsonPath), blankRows: 0 };
+  }
 
   // Was `return unwrap(JSON.parse(text), …)` as an unconditional tail, which is
   // how a `.xlsx` used to be read as JSON. Now every member is named above and
@@ -1324,21 +1384,33 @@ function byOldestThenKey(a: S3Object, b: S3Object): number {
   return a.lastModified < b.lastModified ? -1 : 1;
 }
 
-/** Read each object and parse it into rows, in the order given. */
+/**
+ * Read each object and parse it into rows, in the order given.
+ *
+ * The blank-line counts are summed across the whole read and reported as **one**
+ * note rather than one per object. A prefix is routinely hundreds of objects,
+ * and a per-object line would be a note per part file — which the node's log cap
+ * would then truncate, pushing out the lines that say what the run did. The
+ * total is the number that matters, and the first affected key is what somebody
+ * opens to see why.
+ */
 async function readObjectRecords(input: {
   client: S3ClientLike;
   s3: S3Module;
   bucket: string;
   objects: readonly S3Object[];
   config: Record<string, unknown>;
-}): Promise<unknown[]> {
+}): Promise<{ records: unknown[]; notes: string[] }> {
   const { client, s3, bucket, objects, config } = input;
   const records: unknown[] = [];
+  let blankRows = 0;
+  const blankKeys: string[] = [];
 
   for (const object of objects) {
+    const uri = `s3://${bucket}/${object.key}`;
     const bytes = await readObjectBytes(
       await client.send(new s3.GetObjectCommand({ Bucket: bucket, Key: object.key })),
-      `s3://${bucket}/${object.key}`,
+      uri,
     );
     // Was `!text.trim()` on the decoded body. Asked of the bytes instead so the
     // skip still happens for a whitespace-only object — which matters, because
@@ -1348,17 +1420,26 @@ async function readObjectRecords(input: {
     // The same format logic a file connector uses, per object: the extension
     // decides unless the connector overrides it, which is what a prefix full of
     // `part-00000` files needs.
-    //
+    const parsed = await parseRecords(bytes, object.key, config);
+    if (parsed.blankRows > 0) {
+      blankRows += parsed.blankRows;
+      blankKeys.push(uri);
+    }
     // Appended one at a time rather than spread into `push`, because a spread
     // becomes one argument per row and a CSV drop with a few hundred thousand of
     // them overflows the call stack — a failure that only shows up on the large
     // files this connector exists to read.
-    for (const record of await parseRecords(bytes, object.key, config)) {
+    for (const record of parsed.records) {
       records.push(record);
     }
   }
 
-  return records;
+  if (blankRows === 0) return { records, notes: [] };
+  const where =
+    blankKeys.length === 1
+      ? `"${blankKeys[0]}"`
+      : `${blankKeys.length} objects read this run, the first being "${blankKeys[0]}"`;
+  return { records, notes: [blankRowNote(blankRows, where)] };
 }
 
 /** Where this run got to, carrying the tie set forward when it did not advance. */
@@ -1955,16 +2036,74 @@ function cellDateIso(api: WorkbookApi, serial: number, date1904: boolean): strin
  * Not a split on commas. Real exports contain `"Smith, John"` and multi-line
  * address fields, and a naive split turns both into silently wrong rows —
  * which is worse than failing, because nobody notices.
+ *
+ * ## Blank lines are skipped, and the count comes back
+ *
+ * A line with no content in any cell cannot be shaped into a record worth
+ * having: every column of it would be `null`, and the rows that come out of a
+ * CSV are supposed to be the rows somebody exported. So they are skipped, as
+ * they always were.
+ *
+ * What is new is that {@link blankRows} comes back with them. The skip used to
+ * be invisible — a `.filter` with no counter — and on a real 103,087-row drop
+ * it removed 568 rows that the source node then reported as 102,519 with
+ * nothing anywhere saying where the other 568 went. It survived a test only
+ * because a downstream filter happened to drop exactly those rows for its own
+ * reasons; on a graph with no filter they would have gone straight out of the
+ * committed count. That is the one thing this project refuses to do elsewhere:
+ * the filter node reports `rowsIn` and `rows` precisely so a shrink is legible,
+ * and the parser was dropping rows with no ledger at all.
+ *
+ * **A file ending in a single newline does not produce one of these**, so the
+ * note this feeds is not a thing every well-formed file says. `splitCsvRows`
+ * closes its last row at the `\n` and starts no new one, which is why a
+ * non-zero count means genuinely empty lines rather than the way the file ends.
+ *
+ * The count includes any blank line *before* the header — which shifts which
+ * line the header is read from, and is worth hearing about for that reason
+ * alone.
  */
-function parseCsv(text: string, config: Record<string, unknown>): unknown[] {
+function parseCsv(
+  text: string,
+  config: Record<string, unknown>,
+): { records: unknown[]; blankRows: number } {
   const rows = splitCsvRows(text, String(config.delimiter ?? ','));
 
-  const [header, ...body] = rows.filter((r) => r.some((c) => c.length > 0));
-  if (!header) return [];
+  // On the raw cells, and deliberately before `emptyAsNull` runs: this asks
+  // whether the *line* had any content, which is a question about the file. A
+  // row of empty cells and a row of `null`s are the same thing by the time the
+  // mapping below is done, and by then the distinction this counts is gone.
+  const kept = rows.filter((r) => r.some((c) => c.length > 0));
+  const blankRows = rows.length - kept.length;
 
-  return body.map((cells) =>
-    Object.fromEntries(header.map((name, index) => [name, emptyAsNull(cells[index])])),
-  );
+  const [header, ...body] = kept;
+  if (!header) return { records: [], blankRows };
+
+  return {
+    records: body.map((cells) =>
+      Object.fromEntries(header.map((name, index) => [name, emptyAsNull(cells[index])])),
+    ),
+    blankRows,
+  };
+}
+
+/**
+ * The one line a reader gets about rows a parse threw away.
+ *
+ * Written once and shared by every fetcher that parses, so a file connector and
+ * an object-store connector reading the same drop say the same sentence about
+ * it — the reason {@link parseRecords} is shared, one level up.
+ *
+ * It names the count, says the count above does not include them, and says what
+ * a blank line is, in that order: a reader arrives here because two numbers
+ * disagreed, and the first thing they need is the size of the disagreement.
+ * The last clause exists to head off the reflex dismissal — "that will be the
+ * trailing newline" — which would be wrong, and would put the number back to
+ * being ignored.
+ */
+function blankRowNote(blankRows: number, where: string): string {
+  const plural = blankRows === 1 ? '' : 's';
+  return `Skipped ${blankRows} blank line${plural} in ${where}: every cell on them was empty, and they are not in the record count. A file ending in one newline does not produce these, so they are empty lines in the file itself.`;
 }
 
 /**
