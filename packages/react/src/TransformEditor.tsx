@@ -3,7 +3,7 @@ import type {
   TransformLanguage,
   TransformResult,
 } from '@dudousxd/nestjs-catalog/client';
-import { isTransformLanguage } from '@dudousxd/nestjs-catalog/client';
+import { isTransformLanguage, transformShape } from '@dudousxd/nestjs-catalog/client';
 import { useMutation } from '@tanstack/react-query';
 import { ArrowLeft, Play } from 'lucide-react';
 import { type KeyboardEvent, useState } from 'react';
@@ -14,6 +14,7 @@ import { CodeEditor } from './ui/code-editor';
 import { TRANSFORM_HIGHLIGHTED_AS } from './ui/code-languages';
 import { TextField } from './ui/field';
 import { SelectField } from './ui/select';
+import { Tooltip } from './ui/tooltip';
 
 const MUTED = 'text-zinc-400 dark:text-zinc-500';
 const RULE = 'border-zinc-200 dark:border-zinc-800';
@@ -25,26 +26,48 @@ const PANEL = 'bg-white dark:bg-zinc-900';
  * Keyed by the language union rather than by `string`, so adding a language to
  * the library without a starter here is a type error rather than an editor that
  * silently opens empty.
+ *
+ * The JavaScript and TypeScript starters open in the **module shape** — a real
+ * function taking one object — because a starter is how a shape is actually
+ * adopted. Nobody reads a changelog to find out that a signature moved; they
+ * copy what the editor put in front of them, and every transform written from
+ * here on gains fields on that object for free.
+ *
+ * Nothing is migrated by this. An existing transform opens with its own saved
+ * code and keeps running exactly as it always has, in whichever shape it was
+ * written in; the starter is only what an empty editor is pre-filled with.
  */
 const STARTERS: Record<TransformLanguage, string> = {
-  typescript: `// \`records\` is the batch the connector fetched.
-// Types are stripped, never checked — the try pane is what catches a mistake.
+  // The type import is `import type`, and that is load-bearing rather than
+  // stylistic: the stripper erases the whole statement, so nothing tries to
+  // resolve the package inside a child process that has no `node_modules`. The
+  // same specifier as a value import would fail at run time.
+  typescript: `import type { CatalogTransformFunction } from '@dudousxd/nestjs-catalog/client';
+
+// Types here are erased before this runs, and never checked — a wrong one is a
+// squiggle in your editor, not a failed run. The try pane is what catches it.
 type Source = { tag: string; risk: string; kind: string };
 
-return (records as Source[]).map((r) => ({
-  assetId: r.tag,
-  riskScore: Number(r.risk),
-  vehicleTypeName: r.kind.toUpperCase(),
-  critical: Number(r.risk) >= 80,
-}));`,
-  javascript: `// \`records\` is the batch the connector fetched.
-// Return the rows to store — the keys must be property names of the target type.
-return records.map((r) => ({
-  assetId: r.tag,
-  riskScore: Number(r.risk),
-  vehicleTypeName: String(r.kind).toUpperCase(),
-  critical: Number(r.risk) >= 80,
-}));`,
+const transform: CatalogTransformFunction<Source> = ({ records, context }) =>
+  records.map((r) => ({
+    assetId: r.tag,
+    riskScore: Number(r.risk),
+    vehicleTypeName: r.kind.toUpperCase(),
+    critical: Number(r.risk) >= 80,
+  }));
+
+export default transform;`,
+  javascript: `// One object in, the rows to store out. \`records\` is the batch the connector
+// fetched; \`context\` carries the run, the counts and the admitted env vars.
+// The keys you return must be property names of the target type.
+export default function transform({ records, context }) {
+  return records.map((r) => ({
+    assetId: r.tag,
+    riskScore: Number(r.risk),
+    vehicleTypeName: String(r.kind).toUpperCase(),
+    critical: Number(r.risk) >= 80,
+  }));
+}`,
   python: `# \`records\` is the batch the connector fetched.
 # Return the rows to store — the keys must be property names of the target type.
 log("mapping", len(records), "records")
@@ -124,6 +147,48 @@ function TryOutput({ result, error }: { result: TransformResult | undefined; err
         <p className={cn('py-4 text-center text-[11px]', MUTED)}>Run it to see what it produces.</p>
       )}
     </div>
+  );
+}
+
+/**
+ * Which shape the runner will read this code as, decided by the runner's own
+ * rule.
+ *
+ * `transformShape` is imported from the library rather than re-derived here, and
+ * that is the entire point of the control. A badge that reasoned about the code
+ * independently would be a second opinion, and the day the two disagreed the
+ * badge would be reassuring somebody about a run that did the other thing.
+ *
+ * Shown at all because the two shapes are otherwise invisible: the editor is a
+ * text box, and "this ran as a bare body" is something an author currently only
+ * learns from a syntax error. Neither shape is marked as wrong — the bare body
+ * is supported, not deprecated — so this states a fact and stays out of the way.
+ *
+ * Not shown for Python, which has one shape and no rule: its harness writes the
+ * `def` itself, so there is nothing here for an author to have got wrong.
+ */
+function ShapeBadge({ language, code }: { language: TransformLanguage; code: string }) {
+  if (language === 'python') return null;
+  const shape = transformShape(code);
+  const isModule = shape === 'module';
+  return (
+    <Tooltip
+      content={
+        isModule
+          ? 'A top-level `export`, so this is imported as a module and its default export (or an export named `transform`) is called with one object: { records, context }. Fields can be added to that object later without changing this signature.'
+          : 'No top-level `export`, so this runs as the body of a function that already has `records` and `context` in scope. Supported and unchanged — `export default function transform({ records, context })` is the shape that can gain fields later.'
+      }
+    >
+      <span
+        className={cn(
+          'cursor-default rounded border px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-[0.14em]',
+          RULE,
+          MUTED,
+        )}
+      >
+        {isModule ? 'function' : 'bare body'}
+      </span>
+    </Tooltip>
   );
 }
 
@@ -282,9 +347,12 @@ export function TransformEditor({
       <div className="grid gap-3 lg:grid-cols-2">
         <div className={cn('overflow-hidden rounded-lg border', RULE, PANEL)}>
           <div className={cn('flex items-center justify-between border-b px-3 py-1.5', RULE)}>
-            <span className={cn('font-mono text-[10px] uppercase tracking-[0.14em]', MUTED)}>
-              Code
-            </span>
+            <div className="flex items-center gap-2">
+              <span className={cn('font-mono text-[10px] uppercase tracking-[0.14em]', MUTED)}>
+                Code
+              </span>
+              <ShapeBadge language={language} code={code} />
+            </div>
             <span className={cn('font-mono text-[10px]', MUTED)}>
               {language === 'python' && pythonPackages.length > 0
                 ? `imports: ${pythonPackages.join(', ')}`
