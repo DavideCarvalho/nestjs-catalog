@@ -1256,6 +1256,34 @@ export class MySqlPipelineStore
    * step re-sending its batches replaces them rather than appending a second
    * copy. An append-only stage would silently double a node's output on every
    * retry, and the only symptom would be a row count that looks merely large.
+   *
+   * ## One statement, and why it used to be two
+   *
+   * This read the row before writing it — `findOne`, then create-or-update — and
+   * that read was pure ceremony: the key is computed right here from three values
+   * the caller passed, so the answer only ever decided which of two writes to
+   * make, and both writes end in the same row. A deployment's query log had
+   * `SELECT ... FROM catalog_workflow_stage WHERE id = ?` at 29 executions per
+   * request, one per batch of every load, sitting at the top of its N+1 list.
+   *
+   * An upsert removes it, and the replace guarantee above is *strengthened*
+   * rather than preserved: read-then-write is two statements with a gap between
+   * them, so two attempts at the same batch could both read nothing and both
+   * insert. `ON DUPLICATE KEY UPDATE` makes "replace, not append" a property of
+   * one statement that the engine enforces on the primary key.
+   *
+   * `createdAt` is deliberately excluded from the merge. It is the moment this
+   * batch was first staged, and a retry is not a new batch — merging it would
+   * make the column say when the *last* attempt happened, which is what the
+   * run's own events already say and is not what a stage row is asked.
+   *
+   * Through the query builder rather than a hand-written statement, so the table
+   * and column names come from the entity's own metadata — a raw string here
+   * would be a second spelling of `catalog_workflow_stage` and of six columns,
+   * and the first rename would break it silently. And rather than `em.upsert`,
+   * which is two statements on MySQL: it reloads the row afterwards to hand back
+   * a managed entity, and this method returns a count and throws that entity
+   * away.
    */
   async writeStage(input: {
     runId: string;
@@ -1265,24 +1293,26 @@ export class MySqlPipelineStore
   }): Promise<{ written: number }> {
     const em = this.em.fork();
     const id = stageKey(input.runId, input.nodeId, input.batch);
-    const existing = await em.findOne(WorkflowStageRow, { id });
 
-    const row =
-      existing ??
-      em.create(WorkflowStageRow, {
+    await em
+      .createQueryBuilder(WorkflowStageRow)
+      .insert({
         id,
         runId: input.runId,
         nodeId: input.nodeId,
         batch: input.batch,
-        rows: [],
-        rowCount: 0,
+        rows: input.rows,
+        rowCount: input.rows.length,
         createdAt: new Date(),
-      });
+      })
+      .onConflict('id')
+      // The field-name form, not an object. Given values, the builder binds them
+      // a second time and a `json` column arrives at the driver as
+      // `[object Object]`; given names, it emits `rows = VALUES(rows)` and reuses
+      // the tuple it already serialised for the insert.
+      .merge(['rows', 'rowCount'])
+      .execute();
 
-    row.rows = input.rows;
-    row.rowCount = input.rows.length;
-    em.persist(row);
-    await em.flush();
     // Rows accepted by this call, matching what the warehouse's `write` means by
     // the same word — never a running total.
     return { written: input.rows.length };

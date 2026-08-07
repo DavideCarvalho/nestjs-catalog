@@ -33,6 +33,7 @@ import {
   LOADED_AT_COLUMN,
   PRINCIPAL_COLUMN,
   ROW_COLUMN,
+  SNAPSHOT_BATCH_INDEX,
   SNAPSHOT_COLUMN,
   ident,
   outputAlias,
@@ -203,7 +204,7 @@ export class MySqlWarehouseStore
            ${ident(LOADED_AT_COLUMN)} DATETIME NOT NULL,
            ${ident(BATCH_COLUMN)} INT NOT NULL DEFAULT 0,
            ${columns.join(',\n           ')},
-           KEY \`ix_snapshot\` (${ident(SNAPSHOT_COLUMN)})
+           KEY ${ident(SNAPSHOT_BATCH_INDEX)} (${ident(SNAPSHOT_COLUMN)}, ${ident(BATCH_COLUMN)})
          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
       );
       this.logger.log(`Created ${table} with ${type.properties.length} columns`);
@@ -228,6 +229,11 @@ export class MySqlWarehouseStore
       );
       this.logger.log(`Added reserved column ${column} to ${table}`);
     }
+
+    // And so do the indexes — which had no path at all, and that was the
+    // expensive half. See {@link ensureSnapshotBatchIndex}. Strictly after the
+    // reserved columns above, because the index it adds names one of them.
+    await this.ensureSnapshotBatchIndex(type.name, table);
 
     const missing = type.properties.filter(
       (p) => !existing.has(physicalColumn(p.name).toLowerCase()),
@@ -416,8 +422,10 @@ export class MySqlWarehouseStore
     }
 
     // The snapshot row is upserted rather than inserted so a retried batch does
-    // not create a second one. rowCount accumulates across batches of the same
-    // load, which is what a caller streaming a large type actually does.
+    // not create a second one. What it carries is identity and labels; its
+    // `rowCount` is not maintained here and is not to be read off an
+    // uncommitted row — {@link countBySnapshot} says where it comes from
+    // instead.
     const id = `${type.name}:${options.snapshotId}`;
     const snapshot =
       (await em.findOne(SnapshotRow, { id })) ??
@@ -450,15 +458,10 @@ export class MySqlWarehouseStore
       };
     }
 
-    // Counted, not accumulated: a replaced batch must not be added twice, and
-    // the table is the only thing that knows what actually survived.
-    const [{ total }] = await em
-      .getConnection()
-      .execute<Array<{ total: number }>>(
-        `SELECT COUNT(*) AS total FROM ${ident(table)} WHERE ${ident(SNAPSHOT_COLUMN)} = ?`,
-        [options.snapshotId],
-      );
-    snapshot.rowCount = Number(total ?? 0);
+    // No row count here. See {@link countBySnapshot} for where it moved to and
+    // why; the short version is that counting the whole snapshot once per batch
+    // makes a load quadratic in its own size, and nothing reads the number
+    // between the first batch and the commit.
     em.persist(snapshot);
     await em.flush();
 
@@ -725,6 +728,15 @@ export class MySqlWarehouseStore
 
     const typeRow = await em.findOne(ObjectTypeRow, { name: type.name });
 
+    // The count, and this is the only place it is taken for a snapshot that is
+    // being published. Strictly before the empty-check below, which reads it,
+    // and before the flush, which makes it the number every later reader of
+    // this committed row gets without asking the table again.
+    //
+    // After the stale-carry-forward refusal above rather than before it: a
+    // snapshot that cannot be committed should not pay for a scan to be told so.
+    snapshot.rowCount = await this.countRows(em, tableFor(type.name), snapshotId);
+
     // An empty snapshot is committed, not refused — and said out loud when it
     // replaces something.
     //
@@ -767,7 +779,9 @@ export class MySqlWarehouseStore
       principalId: snapshot.principalId,
       rowCount: snapshot.rowCount,
     });
-    return toRef(snapshot);
+    // Counted a few lines above and flushed since, so the row and the table
+    // agree: this is the committed snapshot's final size.
+    return toRef(snapshot, snapshot.rowCount);
   }
 
   async dropSnapshot(type: CatalogObjectTypeDef, snapshotId: string): Promise<void> {
@@ -818,9 +832,33 @@ export class MySqlWarehouseStore
       );
       return undefined;
     }
-    return toRef(snapshot);
+    // The stored count, not a fresh one, and that is safe for exactly one
+    // reason: `commit` is the only thing that sets `currentSnapshotId`, and it
+    // writes the count and the pointer in the same flush. A snapshot reachable
+    // through this method has therefore been counted at the moment it was
+    // published. Recounting here would put a scan on the baseline half of every
+    // row-count check to re-derive a number that cannot have moved.
+    return toRef(snapshot, snapshot.rowCount);
   }
 
+  /**
+   * The type's recent snapshots, with the uncommitted ones counted fresh.
+   *
+   * That second half is load-bearing rather than tidy. This is the method the
+   * row-count bound reads the *pending* snapshot's size from —
+   * `PublishService.assertRowCountIsPlausible` calls it immediately before
+   * `commit`, finds the snapshot about to be published, and compares its
+   * `rowCount` against the one being served. An uncommitted row's stored count
+   * is not maintained (see {@link countBySnapshot}), so reporting it verbatim
+   * would hand the bound a zero for every load and refuse all of them.
+   *
+   * One extra statement, and only when there is something uncommitted to count.
+   * The window is 50 rows and a type in the ordinary state has at most one
+   * uncommitted snapshot in it — the load in flight — so this is one index
+   * range scan per call, against the one-per-batch it replaces. A type carrying
+   * a backlog of abandoned loads costs one scan per abandoned snapshot, still
+   * in a single round trip.
+   */
   async listSnapshots(type: CatalogObjectTypeDef): Promise<SnapshotRef[]> {
     const em = this.em.fork();
     const rows = await em.find(
@@ -828,15 +866,25 @@ export class MySqlWarehouseStore
       { typeName: type.name },
       { orderBy: { createdAt: 'desc' }, limit: 50 },
     );
-    return rows.map(toRef);
+
+    const pending = rows.filter((row) => !row.committed).map((row) => row.snapshotId);
+    const counts = await this.countBySnapshot(em, tableFor(type.name), pending);
+
+    // `?? 0` and never `?? row.rowCount`: a snapshot with no rows produces no
+    // group row, and an empty load is precisely the case the bound above exists
+    // to catch. Falling back to the stored number would report a collapse as
+    // whatever size the type used to be.
+    return rows.map((row) =>
+      toRef(row, row.committed ? row.rowCount : (counts.get(row.snapshotId) ?? 0)),
+    );
   }
 
   /**
    * Rows of one type, as of one snapshot.
    *
    * **Reading history is the same read with a different id.** The snapshot is a
-   * column on this table, so `WHERE _snapshot_id = ?` against `ix_snapshot` is
-   * the whole of time travel — an old load costs exactly what the current one
+   * column on this table, so `WHERE _snapshot_id = ?` against the leading column
+   * of `ix_snapshot_batch` is the whole of time travel — an old load costs exactly what the current one
    * costs, and nothing here touches the SQL view. That matters: the view is what
    * the query console selects from and it names the *committed* snapshot, so
    * reading last Tuesday by pointing the view at last Tuesday would have every
@@ -1003,6 +1051,96 @@ export class MySqlWarehouseStore
     }
   }
 
+  /**
+   * How many rows each of these snapshots holds, asked of the table.
+   *
+   * ## Why this is not accumulated in `write`
+   *
+   * It used to be counted there, once per batch, over the whole snapshot — and
+   * the comment defending that was right about the hazard and wrong about the
+   * price. The hazard is real: a batch can be **replaced**, because a retried
+   * durable step re-sends its batches and `write` answers that with
+   * delete-then-reinsert, so a count that added each batch's rows as they
+   * arrived would count a re-sent batch twice. Counting from the table is
+   * immune to that, and to anything else that moved rows.
+   *
+   * The price is that the count is a function of the snapshot while the number
+   * of counts is a function of the load, so a load costs O(rows² / batch).
+   * Measured on a local container against the 42-column PriBuy shape: one
+   * `COUNT(*)` takes 1.7ms over 10,000 rows, 3.9ms over 25,000, 7.0ms over
+   * 50,000 and 14.4ms over 100,000 — linear in the snapshot, as an index range
+   * scan should be. Multiply by `rows / 500` batches and the counting alone is
+   * 0.03s, 0.19s, 0.70s and 2.87s: four times the cost for twice the data. On
+   * the deployment's 783,000-row Subwo load that curve is the dominant term,
+   * and on the 7.6M-row PriBuy table it is not survivable — which is what a
+   * quadratic is, and it was hiding behind a number that looked small at the
+   * size anyone had tested.
+   *
+   * ## Why arithmetic did not replace it
+   *
+   * The obvious repair is `rowCount += inserted - deleted`, and it fails twice.
+   *
+   * First, the number is not there to add. `write` issues its DELETE through
+   * `connection.execute(sql, params)`, whose default method is `all` — measured,
+   * not assumed: that call returns `[]` for a DELETE that removed 300 rows and
+   * `[]` for one that removed none. The affected-row count is reachable only by
+   * passing the method explicitly (`execute(sql, params, 'run')` returns
+   * `{ affectedRows, insertId, row, rows }`), so adopting arithmetic means
+   * changing how the statement is issued, not just what is done with its result.
+   *
+   * Second, and fatal: the arithmetic drifts on exactly the event it has to
+   * survive. `write` is three statements outside a transaction — DELETE,
+   * INSERT, then the snapshot row's flush — and a crash between the INSERT and
+   * the flush leaves the table holding N more rows than the snapshot row was
+   * told about. The retry re-sends the batch, deletes those N and inserts N,
+   * nets zero, and the snapshot is permanently N rows short. Counting has no
+   * such window: it reports what is there whenever it is asked, so a replay
+   * converges instead of accumulating error. Keeping arithmetic honest would
+   * mean putting all three statements in one transaction, which is a different
+   * and much larger claim than this class makes today (`transactional: false`).
+   *
+   * ## So it is counted, once, where the number is read
+   *
+   * Not per batch — per read. `commit` counts the snapshot it is about to
+   * publish, and `listSnapshots` counts the uncommitted ones it is about to
+   * report, which between them cover every path that can observe a count that
+   * is still moving. Committed snapshots are not recounted: `commit` is the
+   * only thing that sets the flag, and it sets the count in the same flush.
+   *
+   * One statement for however many snapshots are asked about, because the
+   * caller that needs more than one needs them together. A snapshot holding no
+   * rows produces no group row at all, so **callers must default a miss to 0
+   * and never to the stored value** — an empty snapshot is a real state here,
+   * and falling back to what the row last said is how a truncation gets
+   * reported as the size it used to be.
+   */
+  private async countBySnapshot(
+    em: EntityManager,
+    table: string,
+    snapshotIds: readonly string[],
+  ): Promise<Map<string, number>> {
+    // `IN ()` is a syntax error on MySQL, and "no uncommitted snapshots" is the
+    // ordinary state of a type nobody is loading.
+    if (snapshotIds.length === 0) return new Map();
+
+    const rows = await em.getConnection().execute<Array<{ snapshot: string; total: number }>>(
+      `SELECT ${ident(SNAPSHOT_COLUMN)} AS snapshot, COUNT(*) AS total
+           FROM ${ident(table)}
+          WHERE ${ident(SNAPSHOT_COLUMN)} IN (${snapshotIds.map(() => '?').join(',')})
+          GROUP BY ${ident(SNAPSHOT_COLUMN)}`,
+      [...snapshotIds],
+    );
+
+    const counts = new Map<string, number>();
+    for (const row of rows) counts.set(String(row.snapshot), Number(row.total ?? 0));
+    return counts;
+  }
+
+  /** One snapshot's rows. Zero when it holds none — see {@link countBySnapshot}. */
+  private async countRows(em: EntityManager, table: string, snapshotId: string): Promise<number> {
+    return (await this.countBySnapshot(em, table, [snapshotId])).get(snapshotId) ?? 0;
+  }
+
   private async existingColumns(table: string): Promise<Set<string>> {
     const rows = await this.em.getConnection().execute<Array<{ COLUMN_NAME: string }>>(
       `SELECT COLUMN_NAME FROM information_schema.COLUMNS
@@ -1010,6 +1148,109 @@ export class MySqlWarehouseStore
       [table],
     );
     return new Set(rows.map((r) => String(r.COLUMN_NAME).toLowerCase()));
+  }
+
+  private async existingIndexes(table: string): Promise<Set<string>> {
+    const rows = await this.em.getConnection().execute<Array<{ INDEX_NAME: string }>>(
+      `SELECT DISTINCT INDEX_NAME FROM information_schema.STATISTICS
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?`,
+      [table],
+    );
+    return new Set(rows.map((row) => String(row.INDEX_NAME).toLowerCase()));
+  }
+
+  /**
+   * Give an already-existing object table the index its writes need.
+   *
+   * ## What was wrong
+   *
+   * Every `obj_*` table was created with one secondary index,
+   * `ix_snapshot (_snapshot_id)`, and the statement that replaces a batch is
+   * `DELETE ... WHERE _snapshot_id = ? AND _batch = ?`. Every row of a snapshot
+   * carries the same `_snapshot_id`, so that index narrows nothing at all — and
+   * MySQL, correctly, declines to use it and scans the **whole table** instead,
+   * taking row locks the whole way. On a deployment's 313,833-row snapshot that
+   * is a full scan per batch, thirty batches per load, with the API on the same
+   * database waiting behind the locks. Its query log had that one statement at
+   * 821 seconds against 15 for the `SELECT COUNT(*)` beside it.
+   *
+   * Measured here at 300,000 rows in one snapshot (`write-path.db.spec.ts`):
+   * `EXPLAIN` went from **no index and ~296,000 rows examined** to the composite
+   * and ~19,000, and the statement from 214ms to 71ms on a warm local container.
+   * The remaining 71ms is the cost of actually removing 10,000 rows, which is
+   * the work the load asked for; the scan is what has gone.
+   *
+   * ## Why the composite replaces `ix_snapshot` on a new table
+   *
+   * A composite whose leading column is `_snapshot_id` answers every
+   * `_snapshot_id = ?` lookup as a prefix match, so the single-column index is
+   * redundant rather than complementary — confirmed rather than assumed: with
+   * `ix_snapshot` dropped, both the snapshot count and a page of snapshot rows
+   * still plan onto `ix_snapshot_batch`, at the same cost. And redundancy is not
+   * free here: the ingestion pattern is delete-and-reinsert, so every one of the
+   * 300,000 inserts a load makes would maintain a second index for nothing.
+   *
+   * ## Why it does NOT drop `ix_snapshot` on a table that already has one
+   *
+   * Adding an index is additive and recoverable; dropping one is neither, and
+   * the cost of being wrong is asymmetric — a redundant index costs write
+   * amplification, and an index dropped while something was planning onto it
+   * costs a scan on a production read path. This package also does not otherwise
+   * remove anything from a table it did not create in this process; the
+   * column path above is explicitly "additive only… dropping and retyping go
+   * through a human", and an index is the same kind of decision. So the
+   * composite is added, `ix_snapshot` is left, and the log says it can go.
+   *
+   * ## Why a failure here is a warning and not a throw
+   *
+   * The asymmetry that decides it: a missing *column* makes the next INSERT
+   * fail, so evolving it is a correctness repair and must be fatal if it cannot
+   * be done. A missing *index* makes the next INSERT slow. Refusing the load
+   * would convert a performance problem into an outage, on a deployment whose
+   * database user may simply not hold ALTER. So it is reported, with the
+   * statement to run by hand, and the load goes ahead.
+   *
+   * ## Where it runs, and why not at boot
+   *
+   * From `ensureType`, which is the first write to each table after boot and
+   * every publish — the same place the reserved column above is added, and one
+   * `information_schema` read per table per process. Deliberately not at boot:
+   * boot does not know which types exist, an `ALTER` per object table would put
+   * an unbounded amount of DDL in front of a pod becoming ready, and the pod
+   * that needs the index is the one about to write. InnoDB builds a secondary
+   * index in place without blocking DML, so the load that triggers it pays the
+   * build once — 906ms for 300,000 rows here — and every load after it is fast.
+   */
+  private async ensureSnapshotBatchIndex(typeName: string, table: string): Promise<void> {
+    const indexes = await this.existingIndexes(table);
+    if (indexes.has(SNAPSHOT_BATCH_INDEX.toLowerCase())) return;
+
+    const statement = `ALTER TABLE ${ident(table)} ADD INDEX ${ident(SNAPSHOT_BATCH_INDEX)} (${ident(SNAPSHOT_COLUMN)}, ${ident(BATCH_COLUMN)})`;
+    try {
+      await this.em.getConnection().execute(statement);
+    } catch (error) {
+      this.logger.warn(
+        `Could not add ${SNAPSHOT_BATCH_INDEX} to ${table}, so every batch this load replaces will scan the whole table: ${
+          error instanceof Error ? error.message : String(error)
+        }. Run it by hand when you can — "${statement}" — it is online and does not block writes. The load itself is unaffected and is going ahead.`,
+      );
+      return;
+    }
+
+    this.logger.log(
+      `Added ${SNAPSHOT_BATCH_INDEX} to ${table}, so replacing a batch reads that batch instead of scanning the table.${
+        indexes.has('ix_snapshot')
+          ? ` ${table} still carries ix_snapshot, which this index makes redundant — every _snapshot_id lookup matches its leading column. Dropping it is safe and saves maintaining a second index on every insert, and it is left for you to do because this package does not drop what it did not create here.`
+          : ''
+      }`,
+    );
+    emitCatalog('schema.changed', {
+      typeName,
+      table,
+      addedColumns: [],
+      addedIndexes: [SNAPSHOT_BATCH_INDEX],
+      created: false,
+    });
   }
 }
 
@@ -1241,11 +1482,21 @@ function toScalar(value: string): ScalarType {
   return SCALARS.find((s) => s === value) ?? 'unknown';
 }
 
-function toRef(row: SnapshotRow): SnapshotRef {
+/**
+ * A stored snapshot as the interface's `SnapshotRef`.
+ *
+ * `rowCount` is a parameter rather than `row.rowCount`, and the redundancy is
+ * the point: an uncommitted row's stored count is not maintained, so every
+ * caller has to say where its number came from and a new one that forgets fails
+ * to compile instead of quietly publishing a stale figure. The two honest
+ * answers are `row.rowCount` for a committed snapshot — `commit` wrote it — and
+ * a fresh {@link MySqlWarehouseStore.countBySnapshot} for anything else.
+ */
+function toRef(row: SnapshotRow, rowCount: number): SnapshotRef {
   return {
     id: row.snapshotId,
     createdAt: row.createdAt.toISOString(),
-    rowCount: row.rowCount,
+    rowCount,
     principalId: row.principalId,
     labels: row.labels,
   };

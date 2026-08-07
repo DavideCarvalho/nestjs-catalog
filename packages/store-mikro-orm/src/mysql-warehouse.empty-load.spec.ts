@@ -94,16 +94,43 @@ function warehouse(
     return tuples;
   };
 
+  /**
+   * The grouped count `commit` and `listSnapshots` take.
+   *
+   * Faithful to GROUP BY on the one point these cases turn on: a snapshot
+   * holding no rows produces **no row at all** rather than a zero. That is
+   * exactly the shape an emptied load arrives in, and it is why the store
+   * defaults a miss to 0 rather than to whatever the snapshot row last said.
+   */
+  const countBySnapshot = (params: unknown[]): Array<{ snapshot: string; total: number }> => {
+    const grouped = new Map<string, number>();
+    for (const row of table) {
+      if (!params.includes(row.snapshotId)) continue;
+      grouped.set(row.snapshotId, (grouped.get(row.snapshotId) ?? 0) + 1);
+    }
+    return [...grouped].map(([snapshot, total]) => ({ snapshot, total }));
+  };
+
   const execute = (sql: string, params: unknown[] = []): Promise<unknown> => {
     statements.push(sql.replace(/\s+/g, ' ').trim());
 
     if (sql.includes('information_schema.COLUMNS')) return Promise.resolve(columns());
+    // The index the write path needs. Answered as already present, because what
+    // these cases are about is an empty batch and not schema evolution — see
+    // `ensureSnapshotBatchIndex`, whose own behaviour is held by
+    // `write-path.db.spec.ts` against a real engine.
+    if (sql.includes('information_schema.STATISTICS')) {
+      return Promise.resolve([{ INDEX_NAME: 'ix_snapshot_batch' }]);
+    }
     if (sql.startsWith('DELETE FROM')) {
       deleteBatch(params);
       return Promise.resolve({ affectedRows: 0 });
     }
     if (sql.startsWith('INSERT INTO')) {
       return Promise.resolve({ affectedRows: insertRows(sql, params) });
+    }
+    if (sql.includes('AS snapshot, COUNT(*) AS total')) {
+      return Promise.resolve(countBySnapshot(params));
     }
     if (sql.startsWith('SELECT COUNT(*) AS total')) {
       return Promise.resolve([
@@ -249,7 +276,13 @@ describe('a load that produced no rows', () => {
     await db.store.write(WIDGET, [], { snapshotId: 'load', principalId: 'loader', batch: 1 });
 
     expect(db.rowsInTable()).toBe(1);
-    expect(db.snapshotOf('load')?.rowCount).toBe(1);
+    // Asked of the store rather than read off the snapshot row, because the row
+    // is no longer where an in-flight count lives: `write` stopped counting the
+    // whole snapshot once per batch — see `countBySnapshot` — and `commit` is
+    // what establishes the number. The property this case is about is unchanged
+    // and is the one being checked: after an empty batch replaced a full one,
+    // the snapshot is reported at what actually survived.
+    await expect(db.store.commit(WIDGET, 'load')).resolves.toMatchObject({ rowCount: 1 });
     expect(db.statements.some((sql) => sql.startsWith('DELETE FROM'))).toBe(true);
     // And no INSERT, which is only because MySQL has no syntax for inserting no
     // tuples — not a second meaning for the empty case.

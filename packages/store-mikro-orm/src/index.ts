@@ -78,6 +78,7 @@ export {
   PRINCIPAL_COLUMN,
   RESERVED_COLUMNS,
   ROW_COLUMN,
+  SNAPSHOT_BATCH_INDEX,
   SNAPSHOT_COLUMN,
   tableFor,
   toPhysicalName,

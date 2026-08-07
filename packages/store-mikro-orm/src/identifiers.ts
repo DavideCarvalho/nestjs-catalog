@@ -97,6 +97,22 @@ export const BATCH_COLUMN = '_batch';
  */
 export const ROW_COLUMN = '_row';
 /**
+ * The one secondary index every object table carries.
+ *
+ * `(_snapshot_id, _batch)`, in that order, and the order is the whole of it: a
+ * batch replace is `WHERE _snapshot_id = ? AND _batch = ?`, and the
+ * single-column `ix_snapshot` this replaces narrowed nothing — every row of a
+ * snapshot shares its `_snapshot_id`, so MySQL declined to use it and scanned
+ * the table instead. Leading on `_snapshot_id` means it still answers every
+ * snapshot-only lookup as a prefix match, which is why it is a replacement
+ * rather than an addition. See `ensureSnapshotBatchIndex`.
+ *
+ * Named here rather than written into the two statements that use it, for the
+ * reason {@link ROW_COLUMN} gives: the creation path and the evolution path have
+ * to mean the same index, and two literals is how they stop.
+ */
+export const SNAPSHOT_BATCH_INDEX = 'ix_snapshot_batch';
+/**
  * Taken from the core package rather than restated.
  *
  * These names are part of what the catalog promises a reader — the SQL console
