@@ -98,11 +98,23 @@ refusing rather than choosing: it keeps the **last** duplicate for the plan map
 (`plansMap.set`) and the **first** for the unit dictionary (`Array.find`), forty
 lines apart in one file, and neither key column has a unique constraint.
 
-## Collisions, and what the validator can now prove
+## A name the driving rows already carry: empty is filled, occupied is refused
 
-An enriched name the driving row already carries is refused, naming both — at
-save time wherever the column set is closed, and on the first row that has it
-otherwise.
+The rule is about **destroying a value**, not about a name being taken, and the
+real data is what settled it. `SubwoReplica` *declares* `planName`,
+`planDescription` and `unitMel` as properties, so all 44,720 of its rows arrive
+carrying those keys with `null` in them — which is exactly the three columns
+this node exists to fill. An earlier version refused a taken name and thereby
+refused its own motivating case, with no way to express the graph at all: there
+is no node that drops one column, and a rename that dropped what it did not name
+would have had to list all 76.
+
+So a target that is absent or holds `null` is filled. A target holding an actual
+value fails the node, naming the column, the row's key and the value that would
+have been lost. Whether a column holds a value is a fact about the data rather
+than about the graph, so the run decides it rather than the validator.
+
+## What the validator can now prove
 
 `workflowKnownColumns` takes an optional input filter, because a lookup is the
 only node whose inputs are **not interchangeable**: the reference's columns never
@@ -125,6 +137,31 @@ of somebody's values are the same value — and flip's reader is the cautionary
 tale: it normalises the driving unit and compares it against a column normalised
 at write time by a different screen, so the two agree only for as long as nobody
 edits either.
+
+## Measured against the real 44,720 rows
+
+`SubwoReplica`'s head snapshot in a real deployment, read through a `catalog`
+source, joined against `flip.vscos_work_plan` read through a `sql` source:
+
+| | |
+|---|---|
+| driving rows | 44,720 |
+| reference rows / distinct keys | 1,667 / 1,667 |
+| matched | **44,504** |
+| key matched nothing | **216** |
+| no key at all | **0** |
+
+`planName` and `planDescription` come out filled — `"FLMN-Field Level
+Maintenance"` on the `43AA` rows — where the replica had hard null. Under
+`unmatched: 'drop'` the same run passes 44,504 of the 44,720. The five unmatched
+keys the log names are `"SBL275-16-001"`, `"BODY MOUNTS"`, `"LIGHTING WARNING
+LIGHT"`, `"2AZ"`, `"L275-16-003"` — which is the diagnosis rather than a
+mystery: those are the rows where flip's reader falls back to `Work Order Desc`
+for the plan key, so they are work-order text rather than plan codes and a plan
+catalogue was never going to hold them.
+
+Adding one deliberately disagreeing second row for the real code `43AA` fails
+the node, naming `43AA` and both values.
 
 ## Nothing stored is renumbered
 

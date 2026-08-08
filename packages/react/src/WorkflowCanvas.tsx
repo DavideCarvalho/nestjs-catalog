@@ -6462,7 +6462,9 @@ function LookupInspector({
             The column on the reference rows, and the name it lands under. The reference name is
             whatever that side actually calls it — <code>Plan Name</code> is fine. The new one has
             to be a name a column can have: letters, digits and underscore, starting with a letter
-            or an underscore.
+            or an underscore. Landing on a column the rows already have is expected and works: a
+            published type declares its columns, so the ones you are filling arrive empty. A row
+            that already holds a <em>value</em> there stops the run rather than losing it.
           </>
         }
       >

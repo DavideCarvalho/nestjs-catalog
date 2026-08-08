@@ -3711,12 +3711,17 @@ export const WORKFLOW_LOOKUP_MAX_REFERENCE_ROWS = 200_000;
  * - **A key that matches nothing** — {@link unmatched}, defaulting to `null`.
  * - **Two reference rows for one key** — refused, *when they disagree*. See
  *   {@link fields}.
- * - **An enriched name the driving row already carries** — refused, naming both.
- *   There are two columns and one name and every rule for picking a winner is
- *   arbitrary — the same sentence {@link renameColumnRefusals} says, about the
- *   same problem arriving from the other direction. Refused at authoring time
- *   when the graph can prove it (see `checkColumnsProduced`), and at run time on
- *   the first row that has it otherwise.
+ * - **An enriched name the driving row already carries** — filled when it is
+ *   empty, refused when it holds a value. The rule is about destroying data
+ *   rather than about a name being taken, and the distinction is the whole
+ *   usefulness of the node: a published type *declares* the columns it holds, so
+ *   a graph reading one back to enrich it receives every one of them. The real
+ *   measurement is the argument — `SubwoReplica` hands over 44,720 rows all
+ *   carrying `planName`, `planDescription` and `unitMel` with `null` in them,
+ *   which is exactly the three columns this node was built to fill. A target
+ *   holding an actual value is two columns and one name and fails the node,
+ *   naming the row, which is the sentence {@link renameColumnRefusals} says about
+ *   the same problem arriving from the other direction.
  * - **A reference row with no key** — not indexed, and counted. A real work-plan
  *   table has them: flip writes `planId: row.planId ?? ""` when a load has no
  *   plan code, so the empty-string key is in the table by construction and can
@@ -5391,13 +5396,6 @@ export const WORKFLOW_ISSUE_CODES = [
    * below it commits an empty snapshot over what is published.
    */
   'lookup-nothing-to-enrich',
-  /**
-   * A lookup bringing a field across onto a name the rows it enriches already
-   * carry. Two columns, one name, and every rule for picking a winner is a rule
-   * about whose data survives — the sentence `rename-invalid` says about the same
-   * problem arriving from the other direction.
-   */
-  'lookup-column-collides',
   /**
    * A node naming a column that nothing upstream can produce.
    *
@@ -7368,13 +7366,15 @@ function checkNamedColumns(
  *
  * Its own function rather than a branch inside {@link checkColumnsProduced},
  * because a lookup is the one node whose named columns do not all come from one
- * place: `key` is on the rows being enriched, `referenceKey` and every field
- * source are on the reference, and the targets must not already exist on the
- * driving side. Four checks against three sets, and folding them into the loop
- * above would have meant checking all of them against the union — which is
- * *worse than not checking*, because the union would accept a key column that
- * only exists on the reference. That join matches nothing on every row and the
- * load commits, which is what this node is for.
+ * place: `key` is on the rows being enriched, and `referenceKey` and every field
+ * source are on the reference. Folding it into the loop above would have meant
+ * checking both against the union — which is *worse than not checking*, because
+ * the union would accept a key column that only exists on the reference. That
+ * join matches nothing on every row and the load commits, which is what this node
+ * is for.
+ *
+ * What is deliberately **not** checked here is a field landing on a name the
+ * driving rows already carry. See {@link checkLookupDriving}.
  *
  * Every check is skipped where the set is unknown, for the reason the walk
  * answers `undefined` rather than empty: silence is correct here, and refusing a
@@ -7398,13 +7398,23 @@ function quotedColumns(names: Iterable<string>): string {
 }
 
 /**
- * The key this lookup matches on, and the names it would land on, against the
- * rows it enriches.
+ * The key this lookup matches on, against the rows it enriches.
  *
- * Both are about the *driving* set specifically, and pooling the inputs would
- * make each of them wrong in the dangerous direction: a key column that exists
- * only on the reference would be accepted and then match nothing on every row,
- * and a collision with a driving column would be invisible.
+ * The *driving* set specifically, and pooling the inputs would make this wrong in
+ * the dangerous direction: a key column that exists only on the reference would
+ * be accepted here and then match nothing on every row.
+ *
+ * ## Why a name the driving rows already carry is not refused here
+ *
+ * Because *that is the normal case*, and refusing it made the node unable to do
+ * the one thing it was built for. A published object type declares the columns it
+ * holds, so a graph that reads a type back to enrich it receives every one of
+ * those columns — `SubwoReplica` hands over 44,720 rows all carrying `planName`,
+ * `planDescription` and `unitMel` with `null` in them, which is precisely the
+ * three columns the lookup exists to fill. Whether a column holds a *value* is a
+ * fact about the data and not about the graph, so the run decides it, per row:
+ * empty is filled and occupied fails the node, naming the row. See
+ * `withLookupFields`.
  */
 function checkLookupDriving(
   node: WorkflowLookupNode,
@@ -7418,13 +7428,6 @@ function checkLookupDriving(
       message: `Lookup "${node.name}" (${node.id}) matches on ${quotedColumns([node.key])}, and nothing feeding the rows it enriches produces that column. Something above this node closes the column set — a rename that drops what it does not name, or a source reading a published object type — so what reaches here is exactly ${quotedColumns(driving)}. A key column that is not there has no key on any row, so nothing would match and every row would come out with the enriched columns null.`,
     });
   }
-  const collides = Object.values(node.fields ?? {}).filter((to) => driving.has(to));
-  if (collides.length === 0) return;
-  issues.push({
-    code: 'lookup-column-collides',
-    nodeIds: [node.id],
-    message: `Lookup "${node.name}" (${node.id}) would bring ${quotedColumns(collides)} across onto rows that already carry ${collides.length === 1 ? 'that column' : 'those columns'}. There are two columns and one name, and every rule for picking a winner is a rule about which of somebody's data survives. Rename one of them first.`,
-  });
 }
 
 /** The reference key and every field source, against the reference side only. */

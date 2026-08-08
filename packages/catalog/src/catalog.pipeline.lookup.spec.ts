@@ -317,14 +317,23 @@ describe('the fingerprint of a graph with a lookup in it', () => {
 });
 
 describe('what the graph can prove about a lookup’s two sides', () => {
-  /** `subwo` and `plans` each behind a rename that drops what it does not name. */
-  function knownBothSides(node: WorkflowLookupNode = lookup('look')): WorkflowGraph {
+  /**
+   * `subwo` and `plans` each behind a rename that drops what it does not name,
+   * which is the one arrangement that closes a column set exactly.
+   *
+   * The reference side is renamed to identifier-shaped names rather than kept as
+   * `Plan ID` — not a convenience, a constraint: a rename's *targets* have to be
+   * names a column can have, so a fixture that closed the reference set around
+   * `Plan ID` cannot be built. Which is itself the honest note that the closed
+   * case is narrow.
+   */
+  function knownBothSides(node: WorkflowLookupNode = looking()): WorkflowGraph {
     return graph(
       [
         source('subwo'),
         rename('drive', { 'Sub Work Order Id': 'subWorkOrderId', 'Plan Id': 'planId' }),
         source('plans'),
-        rename('ref', { 'Plan ID': 'Plan ID', 'Plan Name': 'Plan Name' }),
+        rename('ref', { 'Plan ID': 'planIdRef', 'Plan Name': 'planNameRef' }),
         node,
         sink('Out'),
       ],
@@ -338,47 +347,62 @@ describe('what the graph can prove about a lookup’s two sides', () => {
     );
   }
 
+  /** A lookup pointed at the `ref` rename, on the names that fixture produces. */
+  function looking(over: Partial<WorkflowLookupNode> = {}): WorkflowLookupNode {
+    return lookup('look', {
+      reference: 'ref',
+      referenceKey: 'planIdRef',
+      fields: { planNameRef: 'planName' },
+      ...over,
+    });
+  }
+
   it('tells the driving columns from the reference columns', () => {
     // THE ONE THAT MATTERS, and the reason `workflowKnownColumns` grew a filter.
     // Every other multi-input node sees its inputs pooled, because the rows
     // arrive concatenated. A lookup's reference is held as a map and never
     // passed on, so pooling would offer a key column that exists only over there.
-    const { driving, reference } = workflowLookupColumns(
-      knownBothSides(),
-      lookup('look', { reference: 'ref' }),
-    );
+    const { driving, reference } = workflowLookupColumns(knownBothSides(), looking());
 
     expect([...(driving ?? [])].sort()).toEqual(['planId', 'subWorkOrderId']);
-    expect([...(reference ?? [])].sort()).toEqual(['Plan ID', 'Plan Name']);
+    expect([...(reference ?? [])].sort()).toEqual(['planIdRef', 'planNameRef']);
   });
 
   it('refuses a key column that is only on the reference side', () => {
     // Pooled, this would validate — and then match nothing on every row, and
     // commit. It is the exact failure `checkColumnsProduced` exists to catch,
     // produced by the check itself.
-    const drawn = knownBothSides(lookup('look', { reference: 'ref', key: 'Plan ID' }));
+    const drawn = knownBothSides(looking({ key: 'planIdRef' }));
 
     expect(codesOf(drawn)).toContain('column-not-produced');
   });
 
   it('refuses a reference column that is only on the driving side', () => {
-    const drawn = knownBothSides(lookup('look', { reference: 'ref', referenceKey: 'planId' }));
+    const drawn = knownBothSides(looking({ referenceKey: 'planId' }));
 
     expect(codesOf(drawn)).toContain('column-not-produced');
   });
 
-  it('refuses a field landing on a name the driving rows already carry', () => {
-    const drawn = knownBothSides(
-      lookup('look', { reference: 'ref', fields: { 'Plan Name': 'subWorkOrderId' } }),
-    );
+  it('does not refuse a field landing on a name the driving rows already carry', () => {
+    // THE ONE THE REAL DATA CORRECTED. A published type declares the columns it
+    // holds, so a graph reading one back to enrich it receives every one of them
+    // — `SubwoReplica` hands over 44,720 rows all carrying `planName` with null
+    // in it, which is exactly the column the lookup is there to fill. Refusing a
+    // taken name made the node's own motivating case unexpressible: there is no
+    // node that drops one column, and a rename that dropped what it did not name
+    // would have to list all 76.
+    //
+    // Whether the column holds a *value* is a fact about the data rather than
+    // about the graph, so the run decides it per row. See `withLookupFields`.
+    const drawn = knownBothSides(looking({ fields: { planNameRef: 'subWorkOrderId' } }));
 
-    expect(codesOf(drawn)).toContain('lookup-column-collides');
+    expect(codesOf(drawn)).toEqual([]);
   });
 
   it('says exactly what leaves the node when what arrives is known', () => {
     // What a lookup passes on is what arrived plus the names it was told to add,
     // and nothing else — so the set stays closed for whatever is below it.
-    const drawn = knownBothSides(lookup('look', { reference: 'ref' }));
+    const drawn = knownBothSides();
 
     expect([...(workflowKnownColumns(drawn, 'Out') ?? [])].sort()).toEqual([
       'planId',
@@ -388,12 +412,12 @@ describe('what the graph can prove about a lookup’s two sides', () => {
   });
 
   it('does not leak the reference’s columns downstream', () => {
-    // The half of the claim above that would go unnoticed: `Plan Name` is on the
-    // reference and lands as `planName`, so the reference's own spelling must not
-    // be offerable to a filter below this node.
-    const drawn = knownBothSides(lookup('look', { reference: 'ref' }));
+    // The half of the claim above that would go unnoticed: `planNameRef` is on
+    // the reference and lands as `planName`, so the reference's own spelling must
+    // not be offerable to a filter below this node.
+    const drawn = knownBothSides();
 
-    expect(workflowKnownColumns(drawn, 'Out')?.has('Plan Name')).toBe(false);
+    expect(workflowKnownColumns(drawn, 'Out')?.has('planNameRef')).toBe(false);
   });
 
   it('says nothing at all when the sides are not known, rather than saying empty', () => {

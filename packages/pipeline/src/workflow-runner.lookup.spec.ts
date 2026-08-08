@@ -590,11 +590,29 @@ describe('a reference row with no key', () => {
   });
 });
 
-describe('a column collision', () => {
-  it('fails naming both rather than overwriting one', async () => {
+describe('a name the driving rows already carry', () => {
+  it('fills it when it is empty, which is the case this node exists for', async () => {
+    // THE ONE THE REAL DATA CORRECTED. `SubwoReplica` declares `planName`,
+    // `planDescription` and `unitMel` as properties, so all 44,720 of its rows
+    // arrive carrying those keys with null in them — and an earlier version of
+    // this node refused a taken name, which made its own motivating case
+    // unexpressible. There is no node that drops one column.
+    const { run, stages } = await runOver({
+      driving: [{ planId: '43AA', planName: null }],
+      reference: PLANS,
+      fields: { 'Plan Name': 'planName' },
+    });
+
+    expect(run.status).toBe('succeeded');
+    expect(enriched(stages)).toEqual([{ planId: '43AA', planName: 'VEHICLE MAINTENANCE' }]);
+  });
+
+  it('fails naming the row when it holds a value, rather than overwriting it', async () => {
     // Two columns, one name, and every rule for picking a winner is a rule about
     // which of somebody's data survives — the sentence `renameColumnRefusals`
-    // says about the same problem arriving from the other direction.
+    // says about the same problem arriving from the other direction. The message
+    // names the row's key, because on a load of forty thousand "some row has a
+    // value there" is not something anybody can act on.
     const { run } = await runOver({
       driving: [{ planId: '43AA', planName: 'ALREADY HERE' }],
       reference: PLANS,
@@ -602,7 +620,9 @@ describe('a column collision', () => {
     });
 
     expect(run.status).toBe('failed');
-    expect(run.nodeOutcomes?.enrich?.error).toContain('already carry a column called "planName"');
+    const error = run.nodeOutcomes?.enrich?.error ?? '';
+    expect(error).toContain('already holds "ALREADY HERE" there');
+    expect(error).toContain('"43AA"');
   });
 });
 

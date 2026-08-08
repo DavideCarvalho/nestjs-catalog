@@ -3163,12 +3163,32 @@ function lookupMiss(
  * it would be fine today and would be the kind of thing that stops being fine the
  * moment a store hands back a cached decode.
  *
- * `undefined` values are written as `null` rather than left off. A reference row
- * that simply has nothing in a field and a row that was never matched at all are
- * both "no value here", and a column that is *absent* from some rows and present
- * in others makes the staged batch grow a second shape for no reason — the shape
- * dictionary is per distinct key-set, so an inconsistently-present column
- * multiplies the shapes rather than the rows.
+ * ## A name the row already carries: empty is filled, occupied is refused
+ *
+ * The rule is about **destroying a value**, not about a name being taken, and the
+ * difference is the whole usefulness of the node. It was got wrong first and the
+ * real data said so: `SubwoReplica` *declares* `planName`, `planDescription` and
+ * `unitMel` as properties, so every one of its 44,720 rows arrives carrying those
+ * keys with `null` in them — and a rule that refused a taken name refused this
+ * node's own motivating case, with no way to express the graph at all. There is
+ * no node that drops one column; a rename that dropped what it did not name would
+ * have to list all 76.
+ *
+ * So a target holding `null` or `undefined`, or absent from the row, is filled.
+ * A target holding an actual value fails the node, naming the column, the row's
+ * key and the value that would have been lost, because *that* is two columns and
+ * one name and every rule for picking a winner is a rule about whose data
+ * survives.
+ *
+ * Per row rather than per batch, because a batch legitimately holds rows with
+ * different key-sets — the same reason the stage encoding is a shape
+ * *dictionary*. It is also genuinely a per-row fact here: the column can hold a
+ * value on one row and nothing on the next.
+ *
+ * `undefined` is written as `null` rather than left off. A reference row that
+ * simply has nothing in a field and a row that was never matched at all are both
+ * "no value here", and a column that is *absent* from some rows and present in
+ * others makes the staged batch grow a second shape for no reason.
  */
 function withLookupFields(
   node: WorkflowLookupNode,
@@ -3179,14 +3199,10 @@ function withLookupFields(
   const enriched: Record<string, unknown> = { ...row };
   for (const [at, entry] of fields.entries()) {
     const to = entry[1];
-    // Refused rather than silently overwritten, and per row rather than per batch
-    // because a batch legitimately holds rows with different key-sets — the same
-    // reason the stage encoding is a shape *dictionary*. The validator catches
-    // this at save time wherever the column set is closed; this is the case where
-    // it is not, and the first row that has it stops the node.
-    if (Object.hasOwn(row, to)) {
+    const standing = row[to];
+    if (standing !== undefined && standing !== null) {
       throw new BadRequestException(
-        `Lookup "${node.name}" (${node.id}) brings ${JSON.stringify(entry[0])} across as ${JSON.stringify(to)}, and the rows it is enriching already carry a column called ${JSON.stringify(to)}. There are two columns and one name, and every rule for picking a winner is a rule about which of somebody's data survives. Rename one of them before this node.`,
+        `Lookup "${node.name}" (${node.id}) brings ${JSON.stringify(entry[0])} across as ${JSON.stringify(to)}, and a row it is enriching already holds ${JSON.stringify(standing)} there — the row keyed ${JSON.stringify(row[node.key])} in ${JSON.stringify(node.key)}. A column that is present and empty is what this node is for and is filled; one that holds a value is two columns and one name, and every rule for picking a winner is a rule about which of somebody's data survives. Rename one of them before this node, or filter out the rows that are already populated.`,
       );
     }
     const value = found === undefined ? null : found[at];
