@@ -389,6 +389,16 @@ const NODE_FACTORIES: NodeFactories = {
   // that do not exist in whatever the reader wired up — and the symptom of that
   // is not an error, it is a target column absent from every row.
   rename: (id, name, init) => ({ id, name, kind: 'rename', ...init }),
+  // `aggregate` arrived fifth, and the map stopped the build a fifth time.
+  //
+  // Unused by every template below, and the reason is the strongest of the
+  // five. A template's job is to make a decision once on a reader's behalf, and
+  // an aggregate is nothing *but* decisions about one dataset: which columns
+  // define a group, and which function is right for each of the rest. `max` and
+  // `min` over the same column answer different questions, and picking wrong
+  // does not error — it commits a plausible number. A prefilled aggregate would
+  // be a summary of somebody else's data, shipped with an air of authority.
+  aggregate: (id, name, init) => ({ id, name, kind: 'aggregate', ...init }),
 };
 
 /* -------------------------------------------------------------------------- */

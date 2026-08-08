@@ -282,6 +282,9 @@ export type {
   WorkflowExecutionMode,
   WorkflowFilterAll,
   WorkflowFilterAny,
+  WorkflowAggregate,
+  WorkflowAggregateFunction,
+  WorkflowAggregateNode,
   WorkflowFilterComparison,
   WorkflowFilterGroup,
   WorkflowFilterNode,
@@ -481,6 +484,20 @@ export {
   // unnamed column have to be exactly the two the runner branches on.
   WORKFLOW_RENAME_MAX_COLUMNS,
   WORKFLOW_RENAME_UNNAMED,
+  // The aggregate vocabulary, same argument at the highest stakes yet: an
+  // inspector offering a function the fold cannot compute is a graph that saves
+  // and then fails inside a durable step, and every bound here is one the form
+  // has to refuse *before* the server does. The group ceiling in particular is a
+  // number a person has to be shown while they are choosing what to group on.
+  WORKFLOW_AGGREGATE_DEFAULT_SEPARATOR,
+  WORKFLOW_AGGREGATE_FUNCTIONS,
+  WORKFLOW_AGGREGATE_GROUPS_CEILING,
+  WORKFLOW_AGGREGATE_JOIN_LENGTH_CEILING,
+  WORKFLOW_AGGREGATE_JOIN_MAX_LENGTH,
+  WORKFLOW_AGGREGATE_MAX_AGGREGATES,
+  WORKFLOW_AGGREGATE_MAX_GROUP_BY,
+  WORKFLOW_AGGREGATE_MAX_GROUPS,
+  WORKFLOW_AGGREGATE_MAX_SEPARATOR,
   WORKFLOW_SKIP_REASONS,
   isWorkflowBranchLabel,
   isWorkflowFilterOperator,
@@ -489,6 +506,8 @@ export {
   isWorkflowFilterValue,
   isWorkflowIfPredicate,
   isWorkflowPredicateKind,
+  isWorkflowAggregateFunction,
+  isWorkflowAggregates,
   isWorkflowRenameColumns,
   isWorkflowRenameUnnamed,
   isWorkflowSkipReason,
@@ -501,6 +520,18 @@ export {
   // is a form that eventually accepts a target the server refuses, after Save.
   renameColumnRefusals,
   workflowRenameUnnamed,
+  // The refusals an aggregate earns, and the readers of its defaults. Same
+  // function the validator, the HTTP boundary and the fold call, so a node the
+  // canvas draws as finished is one the server will store and the runner will
+  // run. `workflowAggregateOutputColumns` is what the inspector shows for the
+  // columns leaving the node — exact, which no other kind can say.
+  aggregateRefusals,
+  workflowAggregateColumns,
+  workflowAggregateJoinMaxLength,
+  workflowAggregateMaxGroups,
+  workflowAggregateNeedsColumn,
+  workflowAggregateOutputColumns,
+  workflowAggregateSeparator,
   // What the graph can prove about the columns reaching a node — the one thing
   // a declarative rename buys that a transform cannot. The inspector says it out
   // loud; see `workflowKnownColumns` for how far it reaches.
@@ -523,6 +554,7 @@ export {
   unreachableConnectorKind,
   unreachableNodeKind,
   unreachablePredicateKind,
+  unreachableAggregateFunction,
   unreachableRenameUnnamed,
   // The draft/ready pair, for the same reason as the list above: a canvas that
   // cannot see it restates it, and the copy is what drifts. Without this the

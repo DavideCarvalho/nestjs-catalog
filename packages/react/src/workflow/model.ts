@@ -44,6 +44,9 @@ export type {
   WorkflowGraph,
   WorkflowIfNode,
   WorkflowIfPredicate,
+  WorkflowAggregate,
+  WorkflowAggregateFunction,
+  WorkflowAggregateNode,
   WorkflowNode,
   WorkflowNodeKind,
   WorkflowPredicateKind,
@@ -69,7 +72,21 @@ export {
   isWorkflowFilterValue,
   isWorkflowNodeKind,
   isWorkflowPredicateKind,
+  isWorkflowAggregateFunction,
   isWorkflowRenameUnnamed,
+  // The aggregate rules, core's for the reason every rule here is core's: an
+  // inspector that offered a function the fold cannot compute would save a
+  // graph that fails inside a durable step, and one with its own copy of the
+  // group ceiling would show a person a bound the runner does not enforce.
+  // `workflowAggregateOutputColumns` is the payoff of the config being data —
+  // the columns leaving the node, exactly, which no other kind can say.
+  aggregateRefusals,
+  workflowAggregateColumns,
+  workflowAggregateJoinMaxLength,
+  workflowAggregateMaxGroups,
+  workflowAggregateNeedsColumn,
+  workflowAggregateOutputColumns,
+  workflowAggregateSeparator,
   // The rename rules, core's for the reason every rule here is core's: a form
   // that checked a target name against its own copy of the identifier pattern
   // would accept a name the server refuses, after Save — and `workflowKnownColumns`
@@ -91,6 +108,7 @@ export {
   unreachableFilterPredicateKind,
   unreachableNodeKind,
   unreachablePredicateKind,
+  unreachableAggregateFunction,
   unreachableRenameUnnamed,
   // Core's, not a copy, for the reason every other rule here is core's: the
   // inspector has to offer exactly the acknowledgements `validateWorkflow`
@@ -104,6 +122,15 @@ export {
   WORKFLOW_FILTER_OPERATORS,
   WORKFLOW_FILTER_PREDICATE_KINDS,
   WORKFLOW_PREDICATE_KINDS,
+  WORKFLOW_AGGREGATE_DEFAULT_SEPARATOR,
+  WORKFLOW_AGGREGATE_FUNCTIONS,
+  WORKFLOW_AGGREGATE_GROUPS_CEILING,
+  WORKFLOW_AGGREGATE_JOIN_LENGTH_CEILING,
+  WORKFLOW_AGGREGATE_JOIN_MAX_LENGTH,
+  WORKFLOW_AGGREGATE_MAX_AGGREGATES,
+  WORKFLOW_AGGREGATE_MAX_GROUP_BY,
+  WORKFLOW_AGGREGATE_MAX_GROUPS,
+  WORKFLOW_AGGREGATE_MAX_SEPARATOR,
   WORKFLOW_RENAME_MAX_COLUMNS,
   WORKFLOW_RENAME_UNNAMED,
   WORKFLOW_NODE_ID_PATTERN,

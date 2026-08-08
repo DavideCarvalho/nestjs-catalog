@@ -8,6 +8,7 @@ import {
   WORKFLOW_FILTER_MAX_DEPTH,
   WORKFLOW_FILTER_MAX_VALUES,
   WORKFLOW_PREDICATE_KINDS,
+  type WorkflowAggregate,
   type WorkflowBranchLabel,
   type WorkflowCallMode,
   type WorkflowEdge,
@@ -15,7 +16,9 @@ import {
   type WorkflowIfPredicate,
   type WorkflowNode,
   type WorkflowSkipReason,
+  aggregateRefusals,
   isConnectorKind,
+  isWorkflowAggregateFunction,
   isWorkflowBranchLabel,
   isWorkflowCallMode,
   isWorkflowFilterPredicate,
@@ -174,47 +177,11 @@ function toNode(raw: unknown): WorkflowNode {
   const position = readPosition(raw);
 
   if (kind === 'transform') {
-    const transformId = readString(raw, 'transformId');
-    if (!transformId) {
-      throw new BadRequestException(
-        `Transform node "${name}" (${id}) names no transform, so there would be no code for it to run.`,
-      );
-    }
-    return {
-      id,
-      name,
-      kind,
-      transformId,
-      transformVersion: readVersion(raw, 'transformVersion', { id, name }),
-      position,
-    };
+    return toTransformNode(raw, { id, name, position });
   }
 
   if (kind === 'sink') {
-    // The sink's own type, and nowhere else to fall back to. A workflow may now
-    // have several sinks writing different types, so a graph-level default
-    // would silently make two sinks agree that were meant to differ.
-    const type = readString(raw, 'targetType');
-    if (!type) {
-      throw new BadRequestException(
-        `Sink "${name}" (${id}) writes no object type, so there would be nothing for the run to commit into.`,
-      );
-    }
-    // `position` like every other kind. Its absence here meant a sink could not
-    // be placed at all — by any route. Drag one on the canvas, save, reload, and
-    // it is back where the automatic layout puts it; a `POST` carrying explicit
-    // coordinates answers 201 and drops them. The read is already done above for
-    // every node, so this was one branch forgetting to hand it back rather than
-    // a decision about sinks.
-    return {
-      id,
-      name,
-      kind,
-      targetType: type,
-      mode: readMode(raw),
-      ...readReuse(raw, { id, name }),
-      position,
-    };
+    return toSinkNode(raw, { id, name, position });
   }
 
   const config = readRecord(raw, 'config');
@@ -233,6 +200,10 @@ function toNode(raw: unknown): WorkflowNode {
 
   if (kind === 'rename') {
     return toRenameNode(raw, { id, name, position });
+  }
+
+  if (kind === 'aggregate') {
+    return toAggregateNode(raw, { id, name, position });
   }
 
   // Everything below is a source. Written as a refusal rather than as a fallthrough
@@ -543,6 +514,63 @@ function toFilterNode(
 }
 
 /**
+ * A transform node as it arrived over HTTP.
+ *
+ * Its own function rather than a branch of {@link toNode}, which the complexity
+ * bound will not hold any more of — the same split `isWorkflowNode` already
+ * makes one package over, and the same reason: every kind that reads more than
+ * one field gets a place of its own to say why.
+ */
+function toTransformNode(
+  raw: unknown,
+  base: { id: string; name: string; position?: { x: number; y: number } },
+): WorkflowNode {
+  const transformId = readString(raw, 'transformId');
+  if (!transformId) {
+    throw new BadRequestException(
+      `Transform node "${base.name}" (${base.id}) names no transform, so there would be no code for it to run.`,
+    );
+  }
+  return {
+    ...base,
+    kind: 'transform',
+    transformId,
+    transformVersion: readVersion(raw, 'transformVersion', base),
+  };
+}
+
+/**
+ * A sink node as it arrived over HTTP.
+ *
+ * The sink's own type, and nowhere else to fall back to. A workflow may have
+ * several sinks writing different types, so a graph-level default would silently
+ * make two sinks agree that were meant to differ.
+ *
+ * `position` comes through `base`, like every other kind. Its absence here once
+ * meant a sink could not be placed at all — by any route: drag one on the canvas,
+ * save, reload, and it was back where the automatic layout puts it, while a
+ * `POST` carrying explicit coordinates answered 201 and dropped them.
+ */
+function toSinkNode(
+  raw: unknown,
+  base: { id: string; name: string; position?: { x: number; y: number } },
+): WorkflowNode {
+  const type = readString(raw, 'targetType');
+  if (!type) {
+    throw new BadRequestException(
+      `Sink "${base.name}" (${base.id}) writes no object type, so there would be nothing for the run to commit into.`,
+    );
+  }
+  return {
+    ...base,
+    kind: 'sink',
+    targetType: type,
+    mode: readMode(raw),
+    ...readReuse(raw, base),
+  };
+}
+
+/**
  * A rename node as it arrived over HTTP, refused rather than repaired.
  *
  * The map is checked entry by entry against `renameColumnRefusals` — the same
@@ -596,6 +624,101 @@ function toRenameNode(
     kind: 'rename',
     columns: map,
     unnamed: unnamed === 'drop' ? 'drop' : undefined,
+  };
+}
+
+/**
+ * An aggregate node as it arrived over HTTP, refused rather than repaired.
+ *
+ * The whole node goes through `aggregateRefusals` — the same function
+ * `validateWorkflow`, the canvas and the fold itself call — so a graph posted by
+ * curl and one saved from the screen are refused by one sentence. Repairing it
+ * is the one thing this must not do, and here that is sharper than it was for a
+ * rename: dropping an unreadable aggregate stores a node that computes one fewer
+ * column than it says, and dropping an unreadable group-by column changes
+ * sixteen thousand rows into one. Both commit, and both report success.
+ *
+ * The optional numbers are read one by one rather than spread off the payload,
+ * so a `maxLength` arriving as the string `"1024"` is refused here instead of
+ * being compared against a number at run time — where `'1024' > 500` is a
+ * comparison JavaScript is happy to make and nobody meant.
+ */
+function toAggregateNode(
+  raw: unknown,
+  base: { id: string; name: string; position?: { x: number; y: number } },
+): WorkflowNode {
+  const groupByRaw = readUnknown(raw, 'groupBy');
+  const aggregatesRaw = readUnknown(raw, 'aggregates');
+  const maxGroups = readUnknown(raw, 'maxGroups');
+
+  const refusals = aggregateRefusals({
+    groupBy: groupByRaw,
+    aggregates: aggregatesRaw,
+    maxGroups,
+  });
+  if (refusals.length > 0) {
+    throw new BadRequestException(
+      `Aggregate node "${base.name}" (${base.id}) cannot be stored as it is. ${refusals.join(' ')}`,
+    );
+  }
+  if (!Array.isArray(groupByRaw) || !Array.isArray(aggregatesRaw)) {
+    // Unreachable while `aggregateRefusals` refuses a non-array, and written as
+    // a refusal rather than a cast for exactly that reason: the narrowing is
+    // what makes the two arrays below typed, and a type assertion here would be
+    // a promise about another function's behaviour rather than a check.
+    throw new BadRequestException(
+      `Aggregate node "${base.name}" (${base.id}) carries no columns to group on and no aggregates to compute.`,
+    );
+  }
+
+  const groupBy: string[] = [];
+  for (const column of groupByRaw) {
+    if (typeof column !== 'string') continue;
+    groupBy.push(column);
+  }
+
+  const aggregates: WorkflowAggregate[] = [];
+  for (const entry of aggregatesRaw) {
+    const aggregate = toAggregate(entry);
+    if (aggregate !== undefined) aggregates.push(aggregate);
+  }
+
+  return {
+    ...base,
+    kind: 'aggregate',
+    groupBy,
+    aggregates,
+    // Stored absent when it was absent, so the default has one spelling and
+    // picking up this release cannot renumber a graph. Same rule as a rename's
+    // `unnamed`.
+    ...(typeof maxGroups === 'number' ? { maxGroups } : {}),
+  };
+}
+
+/**
+ * One entry of an aggregate list, narrowed field by field.
+ *
+ * `undefined` for anything unreadable, which is only reachable because
+ * `aggregateRefusals` has already refused the node — so this cannot silently
+ * drop an entry a caller meant. The optional fields are read one by one rather
+ * than spread off the payload, so a `maxLength` arriving as the string `"1024"`
+ * is dropped here instead of being compared against a number at run time, where
+ * `'1024' > 500` is a comparison JavaScript is happy to make and nobody meant.
+ */
+function toAggregate(entry: unknown): WorkflowAggregate | undefined {
+  if (typeof entry !== 'object' || entry === null) return undefined;
+  const as = Reflect.get(entry, 'as');
+  const fn = Reflect.get(entry, 'fn');
+  if (typeof as !== 'string' || !isWorkflowAggregateFunction(fn)) return undefined;
+  const column = Reflect.get(entry, 'column');
+  const separator = Reflect.get(entry, 'separator');
+  const maxLength = Reflect.get(entry, 'maxLength');
+  return {
+    as,
+    fn,
+    ...(typeof column === 'string' ? { column } : {}),
+    ...(typeof separator === 'string' ? { separator } : {}),
+    ...(typeof maxLength === 'number' ? { maxLength } : {}),
   };
 }
 

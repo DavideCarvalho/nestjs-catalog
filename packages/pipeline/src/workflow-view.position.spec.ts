@@ -48,6 +48,13 @@ const MINIMAL: Record<WorkflowNodeKind, Record<string, unknown>> = {
   // And the seventh. Three for three, which is as close to proof as a claim
   // about the next person ever gets.
   rename: { kind: 'rename', columns: { 'Mgmt Cd': 'mgmtCd' } },
+  // And the eighth. Four for four — the claim about the next person has now
+  // survived two node kinds nobody had in mind when it was written down.
+  aggregate: {
+    kind: 'aggregate',
+    groupBy: ['workOrderId'],
+    aggregates: [{ as: 'lines', fn: 'count' }],
+  },
 };
 
 const KINDS = Object.keys(MINIMAL) as WorkflowNodeKind[];

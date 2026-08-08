@@ -228,7 +228,44 @@ export {
   type WorkflowStatus,
   type WorkflowTransformNode,
   type WorkflowValidationIssue,
+  // The aggregate vocabulary. The functions and their bounds are core's for the
+  // reason every rule here is: an inspector offering a function the fold cannot
+  // compute is a graph that saves and then fails inside a durable step, and a
+  // form with its own copy of the identifier pattern accepts an output name the
+  // server refuses, after Save.
+  aggregateRefusals,
+  isWorkflowAggregateFunction,
+  isWorkflowAggregates,
+  unreachableAggregateFunction,
+  WORKFLOW_AGGREGATE_DEFAULT_SEPARATOR,
+  WORKFLOW_AGGREGATE_FUNCTIONS,
+  WORKFLOW_AGGREGATE_GROUPS_CEILING,
+  WORKFLOW_AGGREGATE_JOIN_LENGTH_CEILING,
+  WORKFLOW_AGGREGATE_JOIN_MAX_LENGTH,
+  WORKFLOW_AGGREGATE_MAX_AGGREGATES,
+  WORKFLOW_AGGREGATE_MAX_GROUP_BY,
+  WORKFLOW_AGGREGATE_MAX_GROUPS,
+  WORKFLOW_AGGREGATE_MAX_SEPARATOR,
+  type WorkflowAggregate,
+  workflowAggregateColumns,
+  type WorkflowAggregateFunction,
+  workflowAggregateJoinMaxLength,
+  workflowAggregateMaxGroups,
+  workflowAggregateNeedsColumn,
+  type WorkflowAggregateNode,
+  workflowAggregateOutputColumns,
+  workflowAggregateSeparator,
 } from './catalog.pipeline';
+// The fold itself. Exported because the runner is in another package and because
+// a host previewing a graph should be able to get the same answer a run will,
+// out of the same code rather than out of a second implementation that agrees
+// until it does not.
+export {
+  AggregateTable,
+  type AggregateTableStats,
+  aggregateInputColumns,
+  WorkflowAggregateError,
+} from './catalog.aggregate';
 // How a staged batch is written down. Exported because `CatalogStageStore` is a
 // seam a host can implement — a stage kept in object storage or a columnar
 // warehouse rather than the catalog database is the case the interface exists

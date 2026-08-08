@@ -108,6 +108,29 @@ export function newNodeOfKind(
     // snapshot.
     return { id, name, kind: 'rename', columns: { '': '' }, position };
   }
+  if (kind === 'aggregate') {
+    // One blank group-by column and one blank aggregate, so the validator
+    // refuses it by name from the moment it is dropped. The same stance
+    // `filter` and `rename` take, and here the empty states are the two most
+    // dangerous in the file: an aggregate with no group-by columns commits
+    // exactly one row whether the source held everything or nothing, and one
+    // with no aggregates commits the distinct group keys with every other
+    // column of every row gone. Neither errors. So the node starts visibly
+    // incomplete rather than invisibly destructive.
+    //
+    // `count` as the starting function because it is the only one that needs no
+    // column to mean something, so the half-filled node the person is looking
+    // at is refused for the fields they have not reached yet rather than for a
+    // choice the form made on their behalf.
+    return {
+      id,
+      name,
+      kind: 'aggregate',
+      groupBy: [''],
+      aggregates: [{ as: '', fn: 'count' }],
+      position,
+    };
+  }
   if (kind === 'sink') {
     return { id, name, kind: 'sink', targetType: '', position };
   }

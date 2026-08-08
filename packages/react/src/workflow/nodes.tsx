@@ -11,6 +11,7 @@ import {
   Loader2,
   Plug,
   Repeat,
+  Sigma,
   TextCursorInput,
   TriangleAlert,
 } from 'lucide-react';
@@ -167,6 +168,20 @@ const KIND_STYLE: Record<
     wash: 'bg-teal-50/70 dark:bg-teal-950/30',
     icon: TextCursorInput,
     noun: 'rename',
+  },
+  // Amber, and a mark that funnels. An aggregate is the one node in the graph
+  // where the row count *changes shape* rather than merely shrinking — a filter
+  // drops rows and leaves the survivors untouched, an aggregate replaces every
+  // row it read with a summary of several. It also has to stand out from the
+  // teal beside it, because a rename is provably cheap and an aggregate is
+  // cheap only while the grouping is sane, and a canvas where those two read
+  // alike hides the one node worth looking twice at.
+  aggregate: {
+    accent: 'bg-gradient-to-b from-amber-400 to-amber-600',
+    chip: 'text-amber-700 dark:text-amber-300',
+    wash: 'bg-amber-50/70 dark:bg-amber-950/30',
+    icon: Sigma,
+    noun: 'aggregate',
   },
 };
 
