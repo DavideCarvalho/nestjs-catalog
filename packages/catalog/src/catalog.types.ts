@@ -20,7 +20,32 @@ import type { CatalogFilterOperator } from './catalog.filters';
 
 export type ScalarType = 'string' | 'number' | 'boolean' | 'date' | 'json' | 'uuid' | 'unknown';
 
-export type RelationKind = '1:1' | '1:m' | 'm:1' | 'm:n';
+/**
+ * The four shapes a link can have. **One list, and everything that needs to
+ * know the four reads it.**
+ *
+ * A const rather than a bare union because two places have to decide whether a
+ * *runtime* string is one of them, and until this existed they each held their
+ * own copy of the four: the stored registry narrows what came out of a JSON
+ * column on the way to a def, and the publish path refuses a payload that names
+ * a kind nothing can draw. Two copies of a closed set is the shape of a bug
+ * where a fifth kind is added to one of them, and the symptom is a link that
+ * publishes cleanly and then renders as something else entirely.
+ */
+export const RELATION_KINDS = ['1:1', '1:m', 'm:1', 'm:n'] as const;
+
+export type RelationKind = (typeof RELATION_KINDS)[number];
+
+/**
+ * Whether a runtime value is one of the four.
+ *
+ * Same shape as {@link isReusableNodeKind} in `catalog.pipeline.ts` and for the
+ * same reason: a narrowing that reads the list rather than restating it cannot
+ * disagree with the list.
+ */
+export function isRelationKind(value: unknown): value is RelationKind {
+  return RELATION_KINDS.some((kind) => kind === value);
+}
 
 /** A single scalar field on an object type. */
 export interface CatalogPropertyDef {

@@ -464,6 +464,7 @@ export type {
   RelationKind,
   ScalarType,
 } from './catalog.types';
+export { isRelationKind, RELATION_KINDS } from './catalog.types';
 export {
   REQUIRED_SCOPES,
   REQUIRES_HUMAN,

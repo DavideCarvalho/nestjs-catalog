@@ -22,12 +22,11 @@ import type {
   RelationKind,
   ScalarType,
 } from './catalog.types';
-
-const RELATION_KINDS: RelationKind[] = ['1:1', '1:m', 'm:1', 'm:n'];
-
-function isRelationKind(kind: string): kind is RelationKind {
-  return RELATION_KINDS.includes(kind as RelationKind);
-}
+// The one list of the four kinds, shared with the stored registry's read-time
+// narrowing and the publish route's refusal. This file used to hold its own
+// copy — three copies of a closed set, and the one here needed a cast to check
+// against it.
+import { isRelationKind } from './catalog.types';
 
 /**
  * Which end of the link holds the key.

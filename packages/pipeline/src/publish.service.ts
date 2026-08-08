@@ -42,6 +42,7 @@ import {
   describeStoredUnpublishableNames,
   refuseUnpublishablePropertyNames,
 } from './property-names';
+import { refuseUnusableRelations } from './relation-shape';
 import {
   CATALOG_PIPELINE_EM,
   CATALOG_PIPELINE_REGISTRY,
@@ -187,6 +188,7 @@ export class PublishService {
     // Before the row is created, before the flush and before `ensureType`, which
     // is the whole point.
     this.assertPropertyNamesArePublishable(published, known);
+    this.assertRelationsAreUsable(published);
 
     const row =
       existing ??
@@ -247,14 +249,12 @@ export class PublishService {
     // that says nothing about links leaves the ones already stored alone; one
     // that sends an empty array has said there are none, and the merge drops
     // them.
+    //
+    // Both the array guard and the per-link checks ran in
+    // `assertRelationsAreUsable` above, before anything was created — so by here
+    // this is an array of links that can be stored, and the merge is the only
+    // decision left.
     if (published.relations !== undefined) {
-      // The body is whatever arrived over HTTP, so this is the same guard
-      // `appendRows` puts on `rows`: without it a publisher that sent
-      // `"relations": {}` gets a 500 out of `.map` rather than being told what
-      // it sent wrong.
-      if (!Array.isArray(published.relations)) {
-        throw new BadRequestException('`relations` must be an array.');
-      }
       row.mergeRelations(published.relations);
     }
 
@@ -306,6 +306,39 @@ export class PublishService {
 
     const stored = describeStoredUnpublishableNames(published.name, known.keys());
     if (stored) this.warnOnce(`unpublishable-names:${published.name}`, stored);
+  }
+
+  /**
+   * Refuse a publish whose links cannot be stored as written.
+   *
+   * Beside `assertPropertyNamesArePublishable` and called in the same place for
+   * the same reason: everything needed to answer is in the payload, so it is
+   * answered before a row exists rather than left to surface as a picture that
+   * is quietly wrong. `relation-shape.ts` holds every decision and the argument
+   * for each — including the three this deliberately does NOT make.
+   *
+   * **A refusal, where the property check has a warning half.** There is no
+   * `describeStored…` counterpart, and the asymmetry is real rather than an
+   * omission: a property is additive and permanent, so a bad one already stored
+   * can never be republished away and warning is all that is left. Relations are
+   * replaced wholesale on every publish — `mergeRelations` drops anything the
+   * publisher stopped sending — so a bad one stored before this check existed is
+   * fixed by the very next publish that gets it right. Nothing is stranded, so
+   * nothing needs to be tolerated.
+   *
+   * The array guard lives here rather than at the merge, so that the shape of
+   * the field and the shape of its contents are answered together and both
+   * before anything is created. It is the same guard `appendRows` puts on
+   * `rows`: without it a publisher that sent `"relations": {}` gets a 500 out of
+   * `.map` rather than being told what it sent wrong.
+   */
+  private assertRelationsAreUsable(published: PublishedType): void {
+    if (published.relations === undefined) return;
+    if (!Array.isArray(published.relations)) {
+      throw new BadRequestException('`relations` must be an array.');
+    }
+    const refusal = refuseUnusableRelations(published.name, published.relations);
+    if (refusal) throw new BadRequestException(refusal);
   }
 
   async appendRows(
