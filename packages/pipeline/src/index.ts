@@ -61,6 +61,7 @@ export {
   refuseUnpublishablePropertyNames,
   type NamedProperty,
 } from './property-names';
+export { refuseUnusableRelations } from './relation-shape';
 export { createPublishController } from './publish.controller';
 export { PublishService, type PublishedType } from './publish.service';
 export { AbandonedRunReconciler, CATALOG_RECONCILE_RUNS } from './run-reconciler.service';

@@ -8,6 +8,7 @@ import {
   type ScalarType,
   curationActor,
   emitCatalog,
+  isRelationKind,
 } from '@dudousxd/nestjs-catalog';
 import type { MikroORM } from '@mikro-orm/core';
 import type { EntityManager } from '@mikro-orm/sql';
@@ -175,8 +176,6 @@ function settledAt(row: unknown): boolean {
   return now - Math.max(...written) >= 1_000;
 }
 
-const RELATION_KINDS: RelationKind[] = ['1:1', '1:m', 'm:1', 'm:n'];
-
 /**
  * Narrow a stored kind, the same way {@link toScalar} narrows a stored type.
  *
@@ -184,10 +183,17 @@ const RELATION_KINDS: RelationKind[] = ['1:1', '1:m', 'm:1', 'm:n'];
  * best-guess kind is a catalog that refuses to load over one bad row written by
  * a publisher nobody can reach right now. The kind decides an arrowhead; the
  * link itself is still true.
+ *
+ * **The fallback is the reason `refuseUnusableRelations` exists**, over in the
+ * pipeline package: a kind this cannot recognise arrives here silently as `m:1`
+ * and is then drawn with an arrowhead nobody chose, which is worse than either
+ * refusing or reporting it — so the payload is refused where it is typed, and
+ * this stays the lenient reader of rows already stored. The list it is checked
+ * against is {@link isRelationKind}'s, deliberately the same one, so what the
+ * publish route accepts and what this recognises cannot drift apart.
  */
 function toRelationKind(value: string): RelationKind {
-  const found = RELATION_KINDS.find((kind) => kind === value);
-  return found ?? 'm:1';
+  return isRelationKind(value) ? value : 'm:1';
 }
 
 /**
