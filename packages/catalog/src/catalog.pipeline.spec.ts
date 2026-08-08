@@ -902,6 +902,43 @@ describe('whether an announced workflow can be pinned onto a call node', () => {
     // It says what to do instead, because the workflow is real and callable —
     // what cannot be done is choosing it in one click.
     expect(block?.message).toContain('type the name and the version you mean');
+    // And what that typed pin is worth, which is the thing an author choosing a
+    // version could not otherwise find out until a load had run: with nothing
+    // declaring a version, the run carries the routing default and the load
+    // reports the pin as unverified rather than kept.
+    expect(block?.message).toContain('unverified');
+  });
+
+  /**
+   * The two tiers of evidence get their own sentence.
+   *
+   * `'observed'` means nothing described this workflow at all — it is on the
+   * list because a live routing token of the name exists, which is what a call
+   * would be routed on and the whole of what is known. Calling that "a worker
+   * that has not been upgraded to publish its registrations in full" would
+   * assert a worker whose description was seen, and none was.
+   */
+  it('says which kind of silence it is, when nothing was described at all', () => {
+    const block = callableWorkflowBlock(
+      ref({ evidence: 'observed', name: 'processing', version: undefined, group: undefined }),
+    );
+
+    expect(block?.code).toBe('no-version');
+    expect(block?.message).toContain('Nothing describes "processing"');
+    expect(block?.message).toContain('live queue');
+    // The strongest of the caveats, and only available on this tier: a
+    // heartbeat cannot say the token serves a workflow rather than a step
+    // handler of the same name.
+    expect(block?.message).toContain('step handler');
+  });
+
+  it('keeps the un-upgraded-worker wording for an entry that WAS described', () => {
+    const block = callableWorkflowBlock(
+      ref({ evidence: 'declared', version: undefined, group: undefined }),
+    );
+
+    expect(block?.message).toContain('without saying which version it runs');
+    expect(block?.message).not.toContain('live queue');
   });
 
   it('refuses a version that is present but blank, which is the same non-answer', () => {

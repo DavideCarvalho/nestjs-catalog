@@ -643,11 +643,23 @@ export class WorkflowRunnerService {
     childRunId: string;
     /** Whatever the child returned. Narrowed here, never trusted. */
     result: unknown;
+    /**
+     * What the version check was worth, from `WorkflowCallCheckResult`.
+     *
+     * `false` means the callee announces no version, so the pin above was
+     * compared against the engine's routing default and nothing was verified —
+     * which this node's log has to say, because the log line names a version
+     * and would otherwise read as a version that was kept. `undefined` (a
+     * checkpoint older than the field, or a caller that did not check) is read
+     * as "declared" and changes nothing.
+     */
+    versionDeclared?: boolean;
     elapsedMs: number;
   }): WorkflowNodeStepOutput {
     const called = `${input.target.name}@${input.target.version}`;
     const mode = input.target.mode ?? 'envelope';
-    if (mode === 'plain') return this.plainCallOutput(input, called);
+    const unverified = unverifiedPinLine(input, called);
+    if (mode === 'plain') return this.plainCallOutput(input, called, unverified);
     if (mode !== 'envelope') return unreachableCallMode(mode, 'WorkflowRunnerService.callOutput');
 
     let staged: WorkflowCallOutput | undefined;
@@ -674,6 +686,9 @@ export class WorkflowRunnerService {
           // workflow I called is broken" would look identical.
           `Called ${called} as child run ${input.childRunId}; it returned nothing this graph can read rows from, so this node passes on 0 rows.`,
         ];
+    // Second, not first: what the node did is the line somebody came for, and
+    // the caveat is about the line above it.
+    if (unverified) logs.push(unverified);
 
     return {
       nodeId: input.nodeId,
@@ -705,18 +720,21 @@ export class WorkflowRunnerService {
   private plainCallOutput(
     input: { nodeId: string; runId: string; elapsedMs: number; childRunId: string },
     called: string,
+    unverified: string | undefined,
   ): WorkflowNodeStepOutput {
+    const logs = [
+      `Called ${called} as child run ${input.childRunId} as a plain call: its parameters went across on their own, with no run id and no node id, so it had nowhere to stage rows and this node passes on 0. Whatever it returned is on the child run, not read here.`,
+    ];
+    // On both modes, because the pin is a property of the call and not of what
+    // came back: a plain call names a version in exactly the same way and is,
+    // in practice, the mode a cross-SDK callee is reached through.
+    if (unverified) logs.push(unverified);
     return {
       nodeId: input.nodeId,
       output: { runId: input.runId, nodeId: input.nodeId, batches: 0, rowCount: 0 },
       rows: 0,
       elapsedMs: input.elapsedMs,
-      logs: safeLogLines(
-        [
-          `Called ${called} as child run ${input.childRunId} as a plain call: its parameters went across on their own, with no run id and no node id, so it had nowhere to stage rows and this node passes on 0. Whatever it returned is on the child run, not read here.`,
-        ],
-        LOG_LINES_PER_NODE,
-      ),
+      logs: safeLogLines(logs, LOG_LINES_PER_NODE),
     };
   }
 
@@ -3439,4 +3457,33 @@ function positiveInt(raw: string | undefined, fallback: number): number {
 
 function say(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * The line a node writes when its version pin was never actually checked, or
+ * `undefined` when it was.
+ *
+ * Written here rather than in the step that discovered it because the step's
+ * warning lands on the durable step log and this lands on the node's outcome,
+ * and those are two screens: a reader looking at a load's nodes would otherwise
+ * see `Called processing@1` — a sentence naming a version — with nothing saying
+ * that the version in it was assumed. The whole of the change this belongs to is
+ * that a pin must never report a guarantee it did not obtain, and a log line is
+ * where a run reports.
+ *
+ * Only `false` produces it. `undefined` means nothing asked, which is what a
+ * step checkpoint written before the field existed replays as, and inventing a
+ * caveat for those would be the same offence in the other direction.
+ *
+ * Written to fit inside `LOG_LINE_CHARS` with a real child run id in it. A line
+ * this one truncates loses its last sentence, and the last sentence is the
+ * remedy — measured at 422 characters against a 400-character cap on a live
+ * run, which is exactly the part a reader came for.
+ */
+function unverifiedPinLine(
+  input: { versionDeclared?: boolean; childRunId: string },
+  called: string,
+): string | undefined {
+  if (input.versionDeclared !== false) return undefined;
+  return `Nothing verified the pin on ${called}: no live worker announces a version for it, so child run ${input.childRunId} carries the routing default and the tag version:undeclared. It ran rather than being refused — refusing would make every worker on an older SDK uncallable — but the pin met a placeholder. Deploy the callee on a worker that publishes a version.`;
 }

@@ -5210,13 +5210,35 @@ function describeCount(value: unknown): string {
 export interface CallableWorkflowRef {
   name: string;
   /**
+   * How strong the fleet's claim about this entry is, mirroring durable core's
+   * `AnnouncementEvidence` rather than re-deriving it.
+   *
+   * - `'declared'` — a live worker published a descriptor naming this workflow,
+   *   so everything populated here was stated by that worker.
+   * - `'observed'` — nobody described it. What exists is a live routing token of
+   *   this name, which is exactly the condition convention routing uses, so the
+   *   name IS reachable — and nothing else is known: no version, no origin, no
+   *   runtime, and no assurance the token serves a workflow rather than a step
+   *   handler of the same name. A live queue, not a promise.
+   *
+   * Carried because the two tiers answer a question a picker cannot otherwise
+   * put: **will a pin on this name mean anything?** An `'observed'` entry never
+   * declares a version, so a version typed against it is compared, at run time,
+   * against the engine's routing default — the run comes back tagged
+   * `version:undeclared` and `checkCall` reports the pin as unverified rather
+   * than kept. Absent when the deployment answering predates the distinction.
+   */
+  evidence?: 'declared' | 'observed';
+  /**
    * The version to pin, and **absent is a real answer**.
    *
    * A worker that has not been upgraded announces a bare name with no version
-   * and no group. Silence is not a claim, so no version is invented for it from
-   * another announcer's — and an entry without one cannot satisfy the pin, which
-   * is why {@link callableWorkflowBlock} refuses it rather than letting a picker
-   * offer a name that would run whatever is newest on the day it runs.
+   * and no group — or announces nothing at all and is here on its heartbeat
+   * alone ({@link evidence} `'observed'`). Silence is not a claim, so no version
+   * is invented for it from another announcer's — and an entry without one
+   * cannot satisfy the pin, which is why {@link callableWorkflowBlock} refuses
+   * it rather than letting a picker offer a name that would run whatever is
+   * newest on the day it runs.
    */
   version?: string;
   /** What it does, if the deployment publishes one. Shown beside the name. */
@@ -5270,11 +5292,17 @@ export interface CallableWorkflowDisagreement {
  * Two refusals, and they are refusals rather than warnings because in both cases
  * committing the entry would write a node whose meaning nobody can state:
  *
- * - `no-version` — an un-upgraded worker announced a bare name. The call node's
- *   whole point is the pin; a node holding a name and no version follows
- *   whatever gets deployed next, which is the failure the version field exists
- *   to prevent. The name is still perfectly typeable by hand *with* a version
- *   the author knows, so this refuses the one-click commit and not the workflow.
+ * - `no-version` — nothing live states a version for this name, either because an
+ *   un-upgraded worker announced a bare name or because nobody described it at
+ *   all and it is here on its heartbeat ({@link CallableWorkflowRef.evidence}
+ *   `'observed'`). The call node's whole point is the pin; a node holding a name
+ *   and no version follows whatever gets deployed next, which is the failure the
+ *   version field exists to prevent. The name is still perfectly typeable by hand
+ *   *with* a version the author knows — and the message says what that costs,
+ *   because a version typed against a callee that declares none is compared at run
+ *   time against the engine's routing default and comes back reported as
+ *   unverified, not as kept. That is the one thing an author choosing a pin from
+ *   this list could not otherwise find out until a load ran.
  * - `ambiguous-group` — two live workers claim this exact `name@version` from
  *   different groups. Two groups means two queues, and nothing here can know
  *   which one a run would land on, so the two bodies may not even be the same
@@ -5295,9 +5323,17 @@ export interface CallableWorkflowBlock {
 export function callableWorkflowBlock(ref: CallableWorkflowRef): CallableWorkflowBlock | undefined {
   const version = typeof ref.version === 'string' ? ref.version.trim() : '';
   if (version.length === 0) {
+    // The two tiers differ in what they can even be asked, so they get their own
+    // sentence rather than one that fits neither: an `'observed'` entry has no
+    // descriptor at all behind it, and calling that "not upgraded to publish its
+    // registrations in full" would overstate what was seen.
+    const seen =
+      ref.evidence === 'observed'
+        ? `Nothing describes "${ref.name}" — it is here because a live queue of that name exists, which is what an engine routes a call on and all it knows. No version, no origin and no runtime were stated, and not even that the queue serves a workflow rather than a step handler of the same name.`
+        : `A live worker announces "${ref.name}" without saying which version it runs, which is what a worker announces before it has been upgraded to publish its registrations in full.`;
     return {
       code: 'no-version',
-      message: `A live worker announces "${ref.name}" without saying which version it runs, which is what a worker announces before it has been upgraded to publish its registrations in full. A name with no version cannot be pinned, so this cannot be chosen — type the name and the version you mean.`,
+      message: `${seen} A name with no version cannot be pinned, so this cannot be chosen — type the name and the version you mean. Be aware of what that pin is worth: with nothing declaring a version, a run of it carries the engine's routing default and the load reports the pin as unverified rather than kept, until the worker serving it publishes one.`,
     };
   }
   const groups = ref.disagreements?.find((entry) => entry.axis === 'group')?.values ?? [];

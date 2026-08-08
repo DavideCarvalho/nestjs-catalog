@@ -1537,6 +1537,30 @@ describe('choosing a workflow a live worker announces', () => {
     await waitFor(() => expect(field('Version')).toHaveProperty('value', ''));
   });
 
+  /**
+   * The weaker tier of evidence, said out loud rather than folded into the one above.
+   *
+   * An `observed` entry has no descriptor behind it at all: it is here because a live routing
+   * token of the name exists, which is the condition a call is routed on and the whole of what
+   * is known. That is a different thing from a worker that published a description and left the
+   * version out, and it is the entry whose runs come back tagged `version:undeclared` — so the
+   * row says which, and the sentence under the fields says what a pin typed against it is worth.
+   */
+  it('tells a live queue apart from a worker that described itself and left the version out', async () => {
+    await openCallInspector(fleet([{ name: 'processing', evidence: 'observed', workers: 1 }]));
+
+    await screen.findByText(/Nothing describes "processing"/);
+    // The consequence, on the screen where a version is about to be typed by hand.
+    expect(screen.getByText(/reports the pin as unverified rather than kept/)).toBeDefined();
+
+    fireEvent.change(field('Workflow'), { target: { value: 'processing' } });
+    await openField('Version');
+
+    const row = screen.getByRole('option', { name: /no version announced/ });
+    expect(within(row).getByText(/live queue only, nothing declared/)).toBeDefined();
+    expect(row.getAttribute('aria-disabled')).toBe('true');
+  });
+
   it('names the group, which is the one signal a missing body could never give', async () => {
     await openCallInspector(
       fleet([{ name: 'billing.reconcile', version: '2', group: 'python-billing', workers: 1 }]),
