@@ -420,6 +420,50 @@ describe('what the graph can prove about a lookup’s two sides', () => {
     expect(workflowKnownColumns(drawn, 'Out')?.has('planNameRef')).toBe(false);
   });
 
+  /**
+   * `aggregate` and `lookup` were written the same afternoon without sight of
+   * each other, and this is the one place their answers actually meet: an
+   * aggregate is the only kind whose output set is exact from config alone, and
+   * a lookup is the only kind whose inputs are not interchangeable. A graph with
+   * both in it is where a merge that compiled could still be wrong.
+   */
+  describe('with an aggregate below it', () => {
+    /** The same graph, with the aggregate spliced between the lookup and the sink. */
+    function summarised(groupBy: string[]): WorkflowGraph {
+      const drawn = knownBothSides();
+      return {
+        nodes: [
+          ...drawn.nodes,
+          {
+            id: 'agg',
+            name: 'agg',
+            kind: 'aggregate',
+            groupBy,
+            aggregates: [{ as: 'lines', fn: 'count' }],
+          },
+        ],
+        edges: [
+          ...drawn.edges.filter((edge) => edge.to !== 'Out'),
+          { from: 'look', to: 'agg' },
+          { from: 'agg', to: 'Out' },
+        ],
+      };
+    }
+
+    it('lets the aggregate group on a column the lookup brought across', () => {
+      expect(codesOf(summarised(['planName']))).toEqual([]);
+    });
+
+    it('refuses an aggregate grouping on the reference’s own spelling', () => {
+      // The payoff of the two answers meeting. `planNameRef` exists — on the
+      // reference — and a walk that pooled a lookup's inputs would have offered
+      // it here. Grouping on a column that is not there puts every record into
+      // one null-keyed group, so 44,720 rows would summarise to a single row and
+      // commit. Refused when the graph is saved instead.
+      expect(codesOf(summarised(['planNameRef']))).toContain('column-not-produced');
+    });
+  });
+
   it('says nothing at all when the sides are not known, rather than saying empty', () => {
     // Refusing a column the graph merely has no opinion about would make every
     // lookup below a transform unsaveable.
