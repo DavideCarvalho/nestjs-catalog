@@ -335,6 +335,9 @@ export {
 // Values, not types: a form that offers the kinds should read them from here
 // rather than keeping a copy that drifts.
 export {
+  // The config key a `catalog` source names its object type in, so the
+  // inspector writing it and the fetcher reading it cannot spell it differently.
+  CATALOG_SOURCE_TYPE_KEY,
   CONNECTOR_KINDS,
   isConnectorKind,
   isSourceFormat,
@@ -502,6 +505,9 @@ export {
   // a declarative rename buys that a transform cannot. The inspector says it out
   // loud; see `workflowKnownColumns` for how far it reaches.
   workflowKnownColumns,
+  // Which object type a `catalog` source reads, read off the node by the one
+  // function the validator and the fetcher also use.
+  workflowSourceObjectType,
   // Which published types a filter stands in front of. The console has to offer
   // the same acknowledgements the validator requires, and a canvas computing its
   // own answer would offer a set the server then refuses.
@@ -511,6 +517,10 @@ export {
   workflowNodeRuns,
   unreachableFilterOperator,
   unreachableFilterPredicateKind,
+  // The kind exhaustiveness helper for *sources*, beside the one for nodes: a
+  // console deciding something per source kind is meant to stop compiling when a
+  // sixth kind arrives, exactly as the server does.
+  unreachableConnectorKind,
   unreachableNodeKind,
   unreachablePredicateKind,
   unreachableRenameUnnamed,
@@ -536,6 +546,10 @@ export {
 export type {
   CallableWorkflowBlock,
   CallableWorkflowDisagreement,
+  // What a caller can tell the column walk that the graph does not hold. The
+  // canvas already loads the object types for the sink inspector, so it can
+  // answer it and get column checking through a `catalog` source.
+  WorkflowColumnKnowledge,
   WorkflowStatus,
 } from './catalog.pipeline';
 

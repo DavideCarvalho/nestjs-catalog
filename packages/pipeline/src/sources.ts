@@ -1,10 +1,15 @@
 import { readFile } from 'node:fs/promises';
 import {
+  CATALOG_SOURCE_TYPE_KEY,
   type CatalogConnection,
   type CatalogConnector,
+  type CatalogObjectTypeDef,
+  type CatalogReadStore,
+  type ConnectorKind,
   SOURCE_FORMATS,
   type SourceFormat,
   isSourceFormat,
+  supportsSnapshotStreams,
   unreachableSourceFormat,
 } from '@dudousxd/nestjs-catalog';
 import { Logger } from '@nestjs/common';
@@ -71,6 +76,31 @@ export interface FetchContext {
    * way — see {@link noStorageDetail}.
    */
   storage?: StorageManagerLike;
+  /**
+   * The catalog's own registry and store, for a source that reads a type.
+   *
+   * Optional, and absent is refused rather than worked around — see
+   * {@link fetchCatalog}. It is a seam for the same reason `storage` above is
+   * one: a fetcher is a function, and the two things a `catalog` source needs
+   * are objects the surrounding service holds. Passing them rather than
+   * importing them keeps this file free of Nest and keeps every other fetcher
+   * unable to reach the warehouse.
+   */
+  catalog?: CatalogTypeReader;
+}
+
+/**
+ * What a `catalog` source reads through.
+ *
+ * The registry answers "what is this type", the store answers "what rows does it
+ * currently hold". Both are already mounted in any process that can run a
+ * workflow — the publish path uses the same two — which is the point: reading
+ * the catalog's own data needs no connection URL on the pod and no entry on the
+ * secret allowlist, because there is no second way in to configure.
+ */
+export interface CatalogTypeReader {
+  getType(name: string): CatalogObjectTypeDef | undefined;
+  store: CatalogReadStore;
 }
 
 /**
@@ -723,6 +753,175 @@ export const fetchSql: SourceFetcher = async ({ connector, secret, state, mode }
   };
 };
 
+/**
+ * The catalog's own data: the current snapshot of one object type.
+ *
+ * ## The failure this replaces
+ *
+ * A workflow that needed rows the catalog already holds had exactly one route —
+ * a `sql` connector naming the physical table, `SELECT … FROM obj_subworeplica`
+ * — and the store **retains every committed snapshot in that table**. So the
+ * read was not the dataset, it was every load that had ever run, concatenated.
+ *
+ * Measured against a real deployment with two snapshots present: 89,440 rows
+ * read where the type holds 44,720, run status `succeeded`, rows written
+ * unchanged at 16,119 because a downstream `GROUP BY` collapsed the duplicates,
+ * and every `SUM` exactly doubled. Nothing reported a problem and the one number
+ * anybody checks did not move. That graph had been correct once, by the accident
+ * of a single snapshot existing when it was first run.
+ *
+ * ## What this does instead, in order
+ *
+ * 1. **Resolves the type by name**, off the registry. A name nothing publishes
+ *    is refused here rather than becoming an empty read.
+ * 2. **Resolves the current snapshot, now.** `read` with no snapshot goes to the
+ *    store's pointer and reports which id it served, so "current" means current
+ *    at the moment the run reached this node — not at the moment somebody drew
+ *    the graph. That one page also yields `total`, which is a second, independent
+ *    count of the same snapshot and is worth having beside the number this
+ *    fetcher goes on to produce.
+ * 3. **Streams that snapshot by id.** Pinned, so a commit landing halfway
+ *    through cannot splice two loads into one read, and streamed so nothing
+ *    holds the dataset — see {@link CatalogSnapshotStreamStore} for why a paged
+ *    read is not the fallback it looks like.
+ *
+ * ## Nothing committed yet is a refusal
+ *
+ * Not an empty read. A type that exists and has never been loaded has no current
+ * snapshot at all, and the difference between "this type is empty" and "this
+ * type has never been loaded" is exactly the difference this whole fetcher is
+ * about: reading zero rows and reporting success is the same silent, total,
+ * green failure as reading twice too many.
+ *
+ * A store that keeps no history is the one case where an absent snapshot means
+ * something else — there is no snapshot to have, the rows are the current state
+ * — and it is told apart by the store's own `capabilities.snapshots`, not
+ * guessed at.
+ *
+ * ## No watermark, and no incremental mode
+ *
+ * A snapshot is the complete state of a type, so "what changed" is not a
+ * question this source can be asked without comparing two snapshots — which is a
+ * different feature and would need somewhere to keep the previous id. Reading
+ * everything is what it does, `state` is not written, and `mode` is ignored
+ * rather than half-honoured.
+ */
+export const fetchCatalog: SourceFetcher = async ({ connector, catalog }) => {
+  const named = String(connector.config[CATALOG_SOURCE_TYPE_KEY] ?? '').trim();
+  if (named.length === 0) {
+    throw new Error(
+      `This source reads from the catalog but names no object type. Set \`${CATALOG_SOURCE_TYPE_KEY}\` to the type it should read; there is no default, because a default would read somebody else's data.`,
+    );
+  }
+  if (!catalog) {
+    throw new Error(
+      `"${named}" cannot be read here: nothing wired a catalog store into this read, so there is nothing holding the type's rows. A catalog source reads through the store the application already has rather than through a connection URL — which is why it needs no address and no credential, and why an absent store is refused rather than worked around.`,
+    );
+  }
+
+  const type = catalog.getType(named);
+  if (!type) {
+    throw new Error(
+      `This source reads the object type "${named}", and the catalog has no type by that name. Nothing is read rather than an empty load being committed over whatever the sink is pointed at.`,
+    );
+  }
+
+  // Every property, because a source hands its records over unshaped and it is
+  // the transform's or the sink's job to decide what is wanted. Narrowing here
+  // would silently drop a column somebody's graph reads.
+  const fields = type.properties.map((property) => property.name);
+
+  // One page of one row, for its `snapshot` and its `total` rather than for its
+  // rows. This is the resolution step: the store answers with the id its pointer
+  // names, which is the only place that answer exists.
+  const probe = await catalog.store.read(type, fields, { page: 1, size: 1 });
+  const snapshotId = probe.snapshot?.id;
+
+  if (snapshotId === undefined) {
+    // A store that keeps no history has no snapshot to name and its rows *are*
+    // the current state, so there is nothing to pin and nothing to refuse.
+    if (catalog.store.capabilities.snapshots === 'none') {
+      return {
+        records: pagedRows(catalog.store, type, fields, probe.total),
+        notes: () => [
+          `"${type.name}" was read from a store that keeps no history, so there is no snapshot to pin this read to and no way to tell a type that is empty from one that has never been loaded.`,
+        ],
+      };
+    }
+    throw new Error(
+      `The object type "${named}" has no committed snapshot, so there is nothing current to read. It has been published but never loaded, or every load of it failed. This is refused rather than read as zero rows, because a load that quietly committed nothing over a downstream type is the failure this source exists to avoid.`,
+    );
+  }
+
+  if (!supportsSnapshotStreams(catalog.store)) {
+    throw new Error(
+      `The object type "${named}" cannot be read here: this deployment's catalog store cannot hand a whole snapshot over a row at a time. Reading it page by page instead is not offered — an offset walk is quadratic in the size of the type, and paging is only correct under an ordering the store does not promise, so a paged read of a large type would be slow and could skip rows without saying so.`,
+    );
+  }
+
+  const expected = probe.total;
+  let seen = 0;
+  const rows = catalog.store.streamSnapshot(type, fields, snapshotId);
+  return {
+    records: counting(rows, () => {
+      seen += 1;
+    }),
+    notes: () => {
+      const said = [
+        `Read snapshot ${snapshotId} of "${type.name}" — the one the catalog is currently serving, resolved when this node ran.`,
+      ];
+      // Two counts of one snapshot, from two statements. A committed snapshot is
+      // immutable, so they agree; saying so when they do not is cheap and is the
+      // only thing that would catch a predicate that stopped matching what the
+      // count matched.
+      if (seen !== expected) {
+        said.push(
+          `The snapshot reported ${expected} rows and ${seen} were read. Those two are counted by different statements over the same snapshot and are meant to agree.`,
+        );
+      }
+      return said;
+    },
+  };
+};
+
+/** Every row, unchanged, counted on the way past. */
+async function* counting(
+  rows: AsyncIterable<Record<string, unknown>>,
+  seen: () => void,
+): AsyncGenerator<unknown> {
+  for await (const row of rows) {
+    seen();
+    yield row;
+  }
+}
+
+/**
+ * The rows of a store that keeps no history, a page at a time.
+ *
+ * The one place paging is used, and it is used because there is nothing to
+ * stream and nothing to pin: a store reporting `snapshots: 'none'` holds one
+ * state, so there is no second snapshot for a page boundary to slip into. The
+ * hazards {@link CatalogSnapshotStreamStore} lists still apply to the *order*,
+ * which is why the note beside this says out loud that the read is unpinned.
+ *
+ * `total` is read once, up front, and the loop stops on a short page rather than
+ * on the count, so a store that grew under the read ends the pass rather than
+ * looping.
+ */
+async function* pagedRows(
+  store: CatalogReadStore,
+  type: CatalogObjectTypeDef,
+  fields: string[],
+  total: number,
+): AsyncGenerator<unknown> {
+  const size = 500;
+  for (let page = 1; (page - 1) * size < total; page += 1) {
+    const answered = await store.read(type, fields, { page, size });
+    for (const row of answered.rows) yield row;
+    if (answered.rows.length < size) return;
+  }
+}
+
 /** Every row, unchanged, with the watermark tracker shown each one on the way past. */
 async function* observing(
   rows: AsyncIterable<unknown>,
@@ -1284,12 +1483,40 @@ function asInteger(value: string | number): bigint | undefined {
   return /^-?\d+$/.test(value) ? BigInt(value) : undefined;
 }
 
-export const SOURCES: Record<string, SourceFetcher> = {
+/**
+ * The fetcher map's type: **total over the kinds, and open beyond them.**
+ *
+ * Total is the repair — see {@link SOURCES}. Open is what keeps a test able to
+ * register a fetcher under a name that is not a kind, which is how the connector
+ * runner's specs reach the lookup without adding a sixth member to a vocabulary
+ * every screen and validator would then have to answer for.
+ */
+type SourceRegistry = Record<ConnectorKind, SourceFetcher> & Record<string, SourceFetcher>;
+
+/**
+ * Which fetcher reads which kind.
+ *
+ * Keyed by {@link ConnectorKind} and not by `string`, and that is the load-bearing
+ * part rather than tidiness. It used to be a `Record<string, SourceFetcher>`, so
+ * a kind added to the vocabulary and forgotten here compiled perfectly and
+ * failed at run time inside a durable step — the exact failure the kind list's
+ * own docblock says it exists to prevent, one file across. Every caller already
+ * guards the lookup anyway, and those guards stay: a `kind` read out of a
+ * database row written by a newer deployment is a string this program has never
+ * heard of, whatever the type says.
+ *
+ * Open as well as total, which is the second half of {@link SourceRegistry}: the
+ * connector runner's own specs register a fetcher under a name the vocabulary
+ * does not have, so that they can exercise the lookup without inventing a kind
+ * the whole system would then have to answer for.
+ */
+export const SOURCES: SourceRegistry = {
   http: fetchHttp,
   file: fetchFile,
   s3: fetchS3,
   sql: fetchSql,
   inline: fetchInline,
+  catalog: fetchCatalog,
 };
 
 /**

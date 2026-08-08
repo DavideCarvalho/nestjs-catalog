@@ -2,8 +2,10 @@ import { randomUUID } from 'node:crypto';
 import {
   CATALOG_PIPELINE_STORE,
   CATALOG_REVISION_LIMIT,
+  CATALOG_STORE,
   type CatalogConnector,
   type CatalogPipelineStore,
+  type CatalogReadStore,
   type CatalogStageStore,
   type CatalogTransform,
   type CatalogWorkflow,
@@ -71,7 +73,14 @@ import { EXPECT_SHRINK_LABEL } from './load-expectations';
 import { CatalogStorage } from './media-storage';
 import { PublishService } from './publish.service';
 import { redactLines, redactSecrets, safeLogLines } from './run-logs';
-import { SOURCES, applyConnection, resolveSecret, toRecordStream } from './sources';
+import { CATALOG_PIPELINE_REGISTRY, type CatalogPipelineRegistry } from './seams';
+import {
+  type CatalogTypeReader,
+  SOURCES,
+  applyConnection,
+  resolveSecret,
+  toRecordStream,
+} from './sources';
 
 /**
  * Re-exported from where it now lives.
@@ -340,7 +349,36 @@ export class WorkflowRunnerService {
      * done; only a source node whose connector names a `disk` reaches for this.
      */
     @Optional() private readonly storage?: CatalogStorage,
+    /**
+     * The catalog's own store and registry, for a source that reads a type.
+     *
+     * Optional and last for the reason the two above it are: every spec that
+     * constructs this by hand keeps compiling. A process without them cannot
+     * run a `catalog` source and `fetchCatalog` says so in those words —
+     * refused, never worked around, because the whole point of the kind is that
+     * it reads through the store this application already has.
+     */
+    @Optional() @Inject(CATALOG_STORE) private readonly objects?: CatalogReadStore,
+    @Optional()
+    @Inject(CATALOG_PIPELINE_REGISTRY)
+    private readonly registry?: CatalogPipelineRegistry,
   ) {}
+
+  /**
+   * The seam a `catalog` source reads through, or nothing when this process has
+   * not got both halves.
+   *
+   * Both, never one: a registry with no store can name a type and not read it,
+   * and a store with no registry has rows and no shape to ask for. Handing over
+   * half of it would move the failure from "this deployment cannot do that" to a
+   * `TypeError` inside a durable step.
+   */
+  catalogReader(): CatalogTypeReader | undefined {
+    const store = this.objects;
+    const registry = this.registry;
+    if (!store || !registry) return undefined;
+    return { getType: (name) => registry.getType(name), store };
+  }
 
   /**
    * The store, narrowed to one that can actually hold a graph and its rows.
@@ -1224,6 +1262,7 @@ export class WorkflowRunnerService {
         state: state.committed,
         mode,
         storage: this.storage?.manager(),
+        catalog: this.catalogReader(),
       }),
     );
 

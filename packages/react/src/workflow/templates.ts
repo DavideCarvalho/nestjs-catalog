@@ -1,4 +1,5 @@
 import {
+  CATALOG_SOURCE_TYPE_KEY,
   CONNECTOR_KINDS,
   type ConnectorKind,
   type DeleteReconciliation,
@@ -298,6 +299,17 @@ export const SOURCE_KINDS: Record<ConnectorKind, SourceKindProfile> = {
     optional: [],
     // The keys are whatever the author typed, so there is no source spelling to
     // disagree with a property name and nothing for the refusal to check.
+    keysRecordsBySourceName: false,
+  },
+  catalog: {
+    label: "this catalog's own data",
+    required: [CATALOG_SOURCE_TYPE_KEY],
+    optional: [],
+    // False, and it is the strongest `false` in this record. The rows come out
+    // of the store keyed by the *property names of the type they were read
+    // from* — that is what `read` and `streamSnapshot` both hand back — so there
+    // is no source spelling to disagree with anything. It is the one kind whose
+    // records are already in the catalog's own vocabulary.
     keysRecordsBySourceName: false,
   },
 };

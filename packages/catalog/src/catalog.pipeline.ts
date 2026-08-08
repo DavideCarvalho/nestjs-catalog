@@ -38,6 +38,45 @@ export const CONNECTOR_KINDS = [
   's3',
   /** Records pasted into the config. For trying a transform against real shapes. */
   'inline',
+  /**
+   * The catalog's own data: the **current snapshot** of one object type.
+   *
+   * ## Why this is a kind and not a `sql` connector with a clever query
+   *
+   * Because that is what it was, and it was silently wrong. A workflow that
+   * needed rows the catalog already holds had exactly one way to get them — a
+   * `sql` connector naming the physical table, `SELECT … FROM obj_subworeplica`
+   * — and the store **retains every committed snapshot in that table**. So the
+   * read is not the dataset, it is every load that has ever run, stacked.
+   *
+   * Measured, with two snapshots present: the source read 89,440 rows against a
+   * type holding 44,720; the run finished `succeeded`; the rows *written* were
+   * unchanged at 16,119 because the downstream `GROUP BY` collapsed the
+   * duplicates; and every `SUM` doubled — `actualLaborCost` from 212,192,113 to
+   * 424,384,226. The row count, which is the one number anybody checks, did not
+   * move. The graph had been correct once, by the accident of exactly one
+   * snapshot existing at the time it was first run.
+   *
+   * Three things follow, and each of them is why this is a kind of its own
+   * rather than a documented convention about which table to name:
+   *
+   * - **The author names a type, not a table.** `obj_<type>` and `_snapshot_id`
+   *   are internal schema. A graph that spells them is coupled to a storage
+   *   layout it does not own and — as measured — quietly wrong about it.
+   * - **There is no URL and no credential.** Every other kind that reaches a
+   *   database needs an address and a secret, and pointing the catalog at its
+   *   own database meant an operator putting a connection URL on the pod and on
+   *   the secret allowlist: a credential that did not need to exist. This kind
+   *   reads through the store the process already holds.
+   * - **"Current" is resolved when the run starts**, by asking the store which
+   *   snapshot it serves, and a type with nothing committed is refused rather
+   *   than read as zero rows. See `fetchCatalog` in the pipeline package.
+   *
+   * Not connectable — see `CONNECTION_KINDS` in the react package. A connection
+   * is an address and a credential shared by several loads, and this kind has
+   * neither.
+   */
+  'catalog',
 ] as const;
 
 export type ConnectorKind = (typeof CONNECTOR_KINDS)[number];
@@ -53,6 +92,63 @@ export type ConnectorKind = (typeof CONNECTOR_KINDS)[number];
  */
 export function isConnectorKind(value: unknown): value is ConnectorKind {
   return CONNECTOR_KINDS.some((kind) => kind === value);
+}
+
+/**
+ * The connector kind that never compiles quietly.
+ *
+ * The {@link unreachableNodeKind} of source kinds, and it arrived with
+ * `'catalog'` for the reason that kind arrived: two of the places that decide
+ * something *per source kind* — the fetcher map and the column question below —
+ * were keyed by `string` or answered for `source` as a whole, so a sixth kind
+ * could be added and be picked up by neither. A palette that offers a kind
+ * nothing can read is the failure {@link CONNECTOR_KINDS} opens by describing,
+ * one level down.
+ *
+ * It throws as well as failing to compile, for the reason its sibling does: a
+ * connector's `kind` is a string in a database row, so one written by a newer
+ * deployment and read by an older one is possible, and returning a default for
+ * it would read the wrong system entirely.
+ */
+export function unreachableConnectorKind(kind: never, where: string): never {
+  throw new Error(
+    `${where} does not handle a source of kind ${JSON.stringify(kind)}. The kind list and every decision made per kind are meant to move together.`,
+  );
+}
+
+/**
+ * The config key a `catalog` source names its object type in.
+ *
+ * A constant rather than a literal in four files, because it is the one field
+ * that kind has and it is written by a form, read by a fetcher, checked by a
+ * validator and hashed into the graph's fingerprint.
+ */
+export const CATALOG_SOURCE_TYPE_KEY = 'objectType';
+
+/**
+ * Which object type a source reads, when it is a `catalog` source that names one.
+ *
+ * `undefined` covers both "not that kind" and "that kind, unconfigured", and the
+ * two callers want the same thing from both: a source that does not name a type
+ * is not one whose columns are known, and it is one the validator refuses. The
+ * string is trimmed, because a name that differs from a published type only by
+ * surrounding whitespace is a load that resolves nothing at run time and a
+ * refusal nobody can see the cause of.
+ */
+export function workflowSourceObjectType(
+  node: WorkflowNode | Record<string, unknown>,
+): string | undefined {
+  // Both fields read reflectively rather than promised by the signature, for two
+  // reasons that point the same way: the parameter has to accept any node of the
+  // union — a sink carries neither field — and a node arrives out of a JSON
+  // column, where a `config` can be anything at all.
+  if (Reflect.get(node, 'sourceKind') !== 'catalog') return undefined;
+  const config = Reflect.get(node, 'config');
+  if (typeof config !== 'object' || config === null) return undefined;
+  const named = Reflect.get(config, CATALOG_SOURCE_TYPE_KEY);
+  if (typeof named !== 'string') return undefined;
+  const trimmed = named.trim();
+  return trimmed.length === 0 ? undefined : trimmed;
 }
 
 /**
@@ -4068,6 +4164,16 @@ export const WORKFLOW_ISSUE_CODES = [
   'unreachable',
   'dead-end',
   'transform-not-named',
+  /**
+   * A `catalog` source that does not say which object type it reads.
+   *
+   * The sibling of `transform-not-named`, and it earns a code of its own for the
+   * reason that one has one: the field is the *whole* of what the node does, and
+   * a node missing it fails inside a durable step halfway through a load rather
+   * than on the canvas. Refused rather than defaulted — there is no sensible
+   * type to guess, and guessing would read somebody else's data.
+   */
+  'source-type-not-named',
   'call-not-named',
   /**
    * A plain call wired into something. See {@link WORKFLOW_CALL_MODES}: a plain
@@ -4148,8 +4254,19 @@ export interface WorkflowValidationIssue {
  * point at nodes which do not exist produces a second page of consequences, and
  * burying the one real problem under them is how a validation message stops
  * being read.
+ *
+ * `knowledge` is optional and adds only refusals that could not otherwise be
+ * made: with it, a filter or a rename below a `catalog` source can be told it
+ * names a column the published type does not have. Omitting it is a supported
+ * call and the answer is a subset, never a different one — see
+ * {@link WorkflowColumnKnowledge}. The pure, dependency-free promise this
+ * function opens with is unchanged: the lookup is the caller's, and this reaches
+ * nothing.
  */
-export function validateWorkflow(graph: WorkflowGraph): WorkflowValidationIssue[] {
+export function validateWorkflow(
+  graph: WorkflowGraph,
+  knowledge?: WorkflowColumnKnowledge,
+): WorkflowValidationIssue[] {
   const issues: WorkflowValidationIssue[] = [];
   const nodes = graph.nodes ?? [];
   const edges = graph.edges ?? [];
@@ -4202,7 +4319,7 @@ export function validateWorkflow(graph: WorkflowGraph): WorkflowValidationIssue[
   checkReachability(nodes, roots, sinks, incoming, outgoing, issues);
   // After the cycle check has returned, so the walk it does cannot meet a loop
   // on a graph this function has already accepted as acyclic.
-  checkColumnsProduced({ nodes, edges }, issues);
+  checkColumnsProduced({ nodes, edges }, issues, knowledge);
 
   return issues;
 }
@@ -4578,10 +4695,10 @@ function checkBranches(
 /**
  * A node that names none of the thing it exists to run.
  *
- * The two kinds that point at something outside themselves — a transform at
- * stored code, a call at a registered workflow — and both are reported the same
- * way because they are the same mistake: a box on the canvas with nothing
- * behind it, which looks finished and fails at run time.
+ * The kinds that point at something outside themselves — a transform at stored
+ * code, a call at a registered workflow, a `catalog` source at an object type —
+ * and they are reported the same way because they are the same mistake: a box on
+ * the canvas with nothing behind it, which looks finished and fails at run time.
  */
 function nodeIsUnconfigured(node: WorkflowNode): WorkflowValidationIssue | undefined {
   if (node.kind === 'transform' && node.transformId.length === 0) {
@@ -4590,6 +4707,20 @@ function nodeIsUnconfigured(node: WorkflowNode): WorkflowValidationIssue | undef
       nodeIds: [node.id],
       message: `Transform node "${node.name}" (${node.id}) names no transform, so there is no code for it to run.`,
     };
+  }
+  if (node.kind === 'source' && node.sourceKind === 'catalog') {
+    // Only this kind, and only from the config: every other kind's address is
+    // allowed to arrive from a named connection, so a blank field on the node is
+    // not evidence of anything. A `catalog` source has no connection to borrow
+    // from — the type name is the whole configuration — so a blank one is
+    // decidable here.
+    if (workflowSourceObjectType(node) === undefined) {
+      return {
+        code: 'source-type-not-named',
+        nodeIds: [node.id],
+        message: `Source "${node.name}" (${node.id}) reads from the catalog but does not say which object type, so there is nothing for it to read. Name the type on the node; there is no default, because a default would read somebody else's data.`,
+      };
+    }
   }
   if (node.kind === 'call') return callIsUnnamed(node);
   if (node.kind === 'if') return ifIsUnconfigured(node);
@@ -5489,9 +5620,23 @@ export function workflowFilterColumns(predicate: WorkflowFilterPredicate): strin
  *   with some keys re-labelled, and its input is unknown unless something
  *   upstream closed it. So `undefined` propagates, and that is the honest
  *   answer rather than an empty set.
- * - **A source, a transform and a call are always unknown.** A source's shape is
- *   discovered against the live system rather than declared in the graph; a
- *   transform is a function body; a call is a workflow this graph does not own.
+ * - **A transform and a call are always unknown.** A transform is a function
+ *   body; a call is a workflow this graph does not own.
+ * - **A source is unknown, with one exception, and the exception needs a
+ *   lookup.** Every kind that reaches an outside system has a shape discovered
+ *   against that system rather than declared in the graph. A `catalog` source
+ *   is the one kind whose shape is *already published*: it names an object
+ *   type, and the type's properties are exactly the keys its records carry —
+ *   see `fetchCatalog`, which asks the store for those properties by name.
+ *
+ *   But the properties are not in the graph either. The graph holds a type
+ *   **name**; the columns live in the catalog's registry, which this function is
+ *   pure and dependency-free in order not to reach. So the answer is a lookup
+ *   the caller supplies — {@link WorkflowColumnKnowledge} — and with no lookup
+ *   the answer stays `undefined`. That is the honest shape of the claim: a
+ *   caller that can see the catalog gets column checking through a source, which
+ *   nothing else in this file can offer, and a caller that cannot see it is told
+ *   nothing rather than told an empty set.
  * - **It says nothing about a sink's declared properties.** That is the check
  *   worth wanting — "this sink writes a property no upstream node produces" —
  *   and it is *not* available here: a {@link WorkflowSinkNode} carries a
@@ -5506,6 +5651,7 @@ export function workflowFilterColumns(predicate: WorkflowFilterPredicate): strin
 export function workflowKnownColumns(
   graph: WorkflowGraph,
   nodeId: string,
+  knowledge?: WorkflowColumnKnowledge,
 ): ReadonlySet<string> | undefined {
   const nodes = graph.nodes ?? [];
   const byId = new Map(nodes.map((node) => [node.id, node]));
@@ -5521,7 +5667,7 @@ export function workflowKnownColumns(
     const node = byId.get(id);
     if (!node) return undefined;
     open.add(id);
-    const produced = producedColumns(node, () => intoNode(id));
+    const produced = producedColumns(node, () => intoNode(id), knowledge);
     open.delete(id);
     answered.set(id, produced);
     return produced;
@@ -5546,6 +5692,24 @@ export function workflowKnownColumns(
 }
 
 /**
+ * What a caller can tell the column walk that the graph does not hold.
+ *
+ * One lookup, because there is one thing: the properties of a published object
+ * type, which is what a `catalog` source's records are keyed by. Optional in
+ * every signature that takes it and `undefined` is a supported answer with its
+ * own meaning — "this console cannot see a type by that name" is not "that type
+ * has no columns", and an empty set would be read as the second.
+ *
+ * A lookup rather than a map, so a caller that already holds the types answers
+ * from what it holds, and one that would have to fetch them can decline by not
+ * passing this at all.
+ */
+export interface WorkflowColumnKnowledge {
+  /** The property names of a published type, or nothing if it cannot be seen. */
+  columnsOfType(typeName: string): Iterable<string> | undefined;
+}
+
+/**
  * What one node passes on, given what reaches it.
  *
  * The upstream set is a thunk rather than a value because the one case that
@@ -5560,6 +5724,7 @@ export function workflowKnownColumns(
 function producedColumns(
   node: WorkflowNode,
   upstream: () => ReadonlySet<string> | undefined,
+  knowledge: WorkflowColumnKnowledge | undefined,
 ): ReadonlySet<string> | undefined {
   if (node.kind === 'rename') {
     if (workflowRenameUnnamed(node) === 'drop') return new Set(Object.values(node.columns ?? {}));
@@ -5573,28 +5738,75 @@ function producedColumns(
   // an `if` decides which *nodes* run. Both hand on exactly the shape they were
   // given, which is what makes a closed set survive one.
   if (node.kind === 'filter' || node.kind === 'if') return upstream();
-  // A source's shape is discovered against the live system, a transform's is
-  // inside a function body, a call's belongs to a workflow this graph does not
-  // own, and nothing reads a sink's output. See {@link workflowKnownColumns}.
-  if (
-    node.kind === 'source' ||
-    node.kind === 'transform' ||
-    node.kind === 'call' ||
-    node.kind === 'sink'
-  ) {
+  // A source is the one kind whose answer depends on which *source* kind it is.
+  if (node.kind === 'source') return sourceProducedColumns(node, knowledge);
+  // A transform's shape is inside a function body, a call's belongs to a workflow
+  // this graph does not own, and nothing reads a sink's output. See
+  // {@link workflowKnownColumns}.
+  if (node.kind === 'transform' || node.kind === 'call' || node.kind === 'sink') {
     return undefined;
   }
   return unreachableNodeKind(node, 'workflowKnownColumns');
 }
 
 /**
+ * What a source produces, per source kind.
+ *
+ * Exhaustive over {@link CONNECTOR_KINDS} rather than one blanket `undefined`
+ * for the whole node kind, and that is the point of the function existing: the
+ * blanket answer was correct for five kinds and became wrong for the sixth
+ * without anything failing to compile. Ending in
+ * {@link unreachableConnectorKind} makes the seventh a build error here.
+ *
+ * Four of the five outside systems answer `undefined` for the same reason: what
+ * an HTTP endpoint, a file, a bucket or a query produces is discovered against
+ * the live system, and the graph holds an address rather than a shape.
+ *
+ * `inline` answers `undefined` too, and that one is a judgement rather than an
+ * absence. The records are *in the config*, so their keys could be read off
+ * them — but they are a sample somebody pasted to try a transform against, and
+ * a set derived from a sample is not closed: the real load reads the same source
+ * with more records in it and no reason for them to share a key set. Treating
+ * three pasted objects as the definition of a column set would refuse a filter
+ * that is going to be right.
+ *
+ * `catalog` is the one that answers, when a caller supplied the lookup. Its
+ * records are the store's own rows, keyed by the property names of the type it
+ * names — `fetchCatalog` asks for exactly those and the store returns exactly
+ * those — so the set is closed in the sense {@link workflowKnownColumns}
+ * requires: an upper bound that holds whatever is upstream, since nothing is.
+ */
+function sourceProducedColumns(
+  node: WorkflowSourceNode,
+  knowledge: WorkflowColumnKnowledge | undefined,
+): ReadonlySet<string> | undefined {
+  const kind = node.sourceKind;
+  if (kind === 'http' || kind === 'sql' || kind === 'file' || kind === 's3' || kind === 'inline') {
+    return undefined;
+  }
+  if (kind === 'catalog') {
+    const named = workflowSourceObjectType(node);
+    if (named === undefined || knowledge === undefined) return undefined;
+    const columns = knowledge.columnsOfType(named);
+    // Absent means "this caller cannot see a type by that name", which is not
+    // the same as a type with no columns and must not become an empty set — a
+    // graph read by a console that has not loaded its types would otherwise have
+    // every filter below the source refused.
+    return columns === undefined ? undefined : new Set(columns);
+  }
+  return unreachableConnectorKind(kind, 'workflowKnownColumns');
+}
+
+/**
  * That no node names a column the graph can prove is not there.
  *
- * Only where {@link workflowKnownColumns} answers, which is only downstream of a
- * rename that drops what it does not name. Everywhere else this is silent, and
- * that silence is correct rather than a gap being tolerated: refusing a column
- * the graph merely has no opinion about would make every filter downstream of a
- * transform unsaveable.
+ * Only where {@link workflowKnownColumns} answers: downstream of a rename that
+ * drops what it does not name, or — when the caller supplied a
+ * {@link WorkflowColumnKnowledge} — downstream of a `catalog` source, whose
+ * columns are the named type's published properties. Everywhere else this is
+ * silent, and that silence is correct rather than a gap being tolerated:
+ * refusing a column the graph merely has no opinion about would make every
+ * filter downstream of a transform unsaveable.
  *
  * A refusal rather than a warning, because both failures are silent and total.
  * A filter on a column that cannot exist matches no row — a comparison against
@@ -5605,7 +5817,11 @@ function producedColumns(
  * commits NULL into every row. That is the exact shape `property-names.ts` was
  * written about, one node upstream of where it can be caught.
  */
-function checkColumnsProduced(graph: WorkflowGraph, issues: WorkflowValidationIssue[]): void {
+function checkColumnsProduced(
+  graph: WorkflowGraph,
+  issues: WorkflowValidationIssue[],
+  knowledge: WorkflowColumnKnowledge | undefined,
+): void {
   for (const node of graph.nodes ?? []) {
     // Narrowed off the union rather than tested with a property check, so a kind
     // that starts naming columns without being answered for here is a type error
@@ -5616,7 +5832,7 @@ function checkColumnsProduced(graph: WorkflowGraph, issues: WorkflowValidationIs
         ? workflowFilterColumns(node.predicate)
         : Object.keys(node.columns ?? {});
     if (named.length === 0) continue;
-    const known = workflowKnownColumns(graph, node.id);
+    const known = workflowKnownColumns(graph, node.id, knowledge);
     if (known === undefined) continue;
     const missing = named.filter((column) => column.length > 0 && !known.has(column));
     if (missing.length === 0) continue;
@@ -5640,7 +5856,7 @@ function missingColumnMessage(
     node.kind === 'filter'
       ? 'A test on a column that is not there matches no row — not even a "does not equal" test — so this load would come out empty and every node would report success.'
       : 'A rename of a column that is not there does nothing, so the column it was meant to produce is absent and a sink writing it commits NULL into every row.';
-  return `${node.kind === 'filter' ? 'Filter' : 'Rename'} "${node.name}" (${node.id}) names ${quoted(missing)}, and nothing upstream produces ${missing.length === 1 ? 'that column' : 'those columns'}. A rename above this node drops every column it does not name, so what reaches here is exactly ${quoted(known)}. ${consequence}`;
+  return `${node.kind === 'filter' ? 'Filter' : 'Rename'} "${node.name}" (${node.id}) names ${quoted(missing)}, and nothing upstream produces ${missing.length === 1 ? 'that column' : 'those columns'}. Something above this node closes the column set — a rename that drops what it does not name, or a source reading a published object type — so what reaches here is exactly ${quoted(known)}. ${consequence}`;
 }
 
 function sortedEntries(config: Record<string, unknown>): Array<[string, unknown]> {
