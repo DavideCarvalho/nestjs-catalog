@@ -6010,22 +6010,7 @@ function checkLookupWiring(
     const feeds = incoming.get(node.id) ?? [];
     const named = typeof node.reference === 'string' ? node.reference : '';
     if (named.length === 0 || !feeds.includes(named)) {
-      const known = byId.get(named);
-      issues.push({
-        code: 'lookup-reference-not-wired',
-        nodeIds: known ? [node.id, named] : [node.id],
-        message: `Lookup "${node.name}" (${node.id}) takes its reference rows from ${
-          named.length === 0
-            ? 'no node at all'
-            : known
-              ? `"${known.name}" (${named})`
-              : `"${named}"`
-        }, which is not wired into it. ${
-          feeds.length === 0
-            ? 'Nothing is wired into it.'
-            : `What is wired into it is ${listNodes(feeds, byId)}.`
-        } A lookup holds one of its inputs in memory as a map and streams the rest past it, so it has to be told which one — and with no reference rows to hold, every row would come out enriched with nulls and the load would commit.`,
-      });
+      issues.push(lookupReferenceNotWired(node, named, feeds, byId));
       continue;
     }
     if (feeds.length < 2) {
@@ -6036,6 +6021,36 @@ function checkLookupWiring(
       });
     }
   }
+}
+
+/**
+ * The sentence for a reference that is not one of this node's inbound edges.
+ *
+ * Its own function because it has three cases to name — a reference that is
+ * blank, one that names a node in the graph, and one that names nothing at all —
+ * and each has to say something different for the message to be worth reading.
+ * The last two are genuinely different mistakes: the first is a wire that was
+ * never drawn, the second is an id that was typed or that survived a node being
+ * deleted.
+ */
+function lookupReferenceNotWired(
+  node: WorkflowLookupNode,
+  named: string,
+  feeds: readonly string[],
+  byId: ReadonlyMap<string, WorkflowNode>,
+): WorkflowValidationIssue {
+  const known = byId.get(named);
+  const names =
+    named.length === 0 ? 'no node at all' : known ? `"${known.name}" (${named})` : `"${named}"`;
+  const wired =
+    feeds.length === 0
+      ? 'Nothing is wired into it.'
+      : `What is wired into it is ${listNodes(feeds, byId)}.`;
+  return {
+    code: 'lookup-reference-not-wired',
+    nodeIds: known ? [node.id, named] : [node.id],
+    message: `Lookup "${node.name}" (${node.id}) takes its reference rows from ${names}, which is not wired into it. ${wired} A lookup holds one of its inputs in memory as a map and streams the rest past it, so it has to be told which one — and with no reference rows to hold, every row would come out enriched with nulls and the load would commit.`,
+  };
 }
 
 /**
@@ -7160,24 +7175,7 @@ function producedColumns(
   upstream: (only?: WorkflowInputFilter) => ReadonlySet<string> | undefined,
   knowledge: WorkflowColumnKnowledge | undefined,
 ): ReadonlySet<string> | undefined {
-  if (node.kind === 'lookup') {
-    // The reference side is asked *not* to contribute, which is the whole reason
-    // `upstream` takes a filter. Its rows are held as a map and never passed on,
-    // so a column that only exists over there is not a column anything below this
-    // node can see — and a set that claimed otherwise would make the validator
-    // accept a filter that matches no row.
-    const named = typeof node.reference === 'string' ? node.reference : '';
-    const driving = upstream((from) => from !== named);
-    if (driving === undefined) return undefined;
-    // Exact rather than an upper bound, and that is the payoff of the config
-    // being data: what leaves a lookup is what arrived plus the names it was told
-    // to add, and nothing else can appear. Under `unmatched: 'null'` and `'fail'`
-    // every row carries every target; under `'drop'` the rows that would not have
-    // are gone, so it holds there too.
-    const enriched = new Set(driving);
-    for (const to of Object.values(node.fields ?? {})) enriched.add(to);
-    return enriched;
-  }
+  if (node.kind === 'lookup') return lookupProducedColumns(node, upstream);
   if (node.kind === 'rename') {
     if (workflowRenameUnnamed(node) === 'drop') return new Set(Object.values(node.columns ?? {}));
     const known = upstream();
@@ -7205,6 +7203,34 @@ function producedColumns(
     return undefined;
   }
   return unreachableNodeKind(node, 'workflowKnownColumns');
+}
+
+/**
+ * What a lookup passes on, which is not what it was given.
+ *
+ * The reference side is asked *not* to contribute, and that is the whole reason
+ * {@link producedColumns} hands its caller a filter. Its rows are held as a map
+ * and never passed on, so a column that only exists over there is not a column
+ * anything below this node can see — and a set that claimed otherwise would make
+ * the validator accept a filter that matches no row, which is the precise failure
+ * `checkColumnsProduced` exists to catch.
+ *
+ * Exact rather than an upper bound, and that is the payoff of the config being
+ * data: what leaves a lookup is what arrived plus the names it was told to add,
+ * and nothing else can appear. Under `unmatched: 'null'` and `'fail'` every row
+ * carries every target; under `'drop'` the rows that would not have are gone, so
+ * it holds there too.
+ */
+function lookupProducedColumns(
+  node: WorkflowLookupNode,
+  upstream: (only?: WorkflowInputFilter) => ReadonlySet<string> | undefined,
+): ReadonlySet<string> | undefined {
+  const named = typeof node.reference === 'string' ? node.reference : '';
+  const driving = upstream((from) => from !== named);
+  if (driving === undefined) return undefined;
+  const enriched = new Set(driving);
+  for (const to of Object.values(node.fields ?? {})) enriched.add(to);
+  return enriched;
 }
 
 /**
@@ -7281,25 +7307,13 @@ function checkColumnsProduced(
   knowledge: WorkflowColumnKnowledge | undefined,
 ): void {
   for (const node of graph.nodes ?? []) {
-    if (node.kind === 'lookup') {
-      checkLookupColumns(graph, node, issues, knowledge);
-      continue;
-    }
     // Narrowed off the union rather than tested with a property check, so a kind
     // that starts naming columns without being answered for here is a type error
     // at `missingColumnMessage` and not a check that silently passes.
-    if (node.kind !== 'filter' && node.kind !== 'rename' && node.kind !== 'aggregate') continue;
-    const named = columnsNamedBy(node);
-    if (named.length === 0) continue;
-    const known = workflowKnownColumns(graph, node.id, knowledge);
-    if (known === undefined) continue;
-    const missing = named.filter((column) => column.length > 0 && !known.has(column));
-    if (missing.length === 0) continue;
-    issues.push({
-      code: 'column-not-produced',
-      nodeIds: [node.id],
-      message: missingColumnMessage(node, missing, known),
-    });
+    if (node.kind === 'lookup') checkLookupColumns(graph, node, issues, knowledge);
+    else if (node.kind === 'filter' || node.kind === 'rename' || node.kind === 'aggregate') {
+      checkNamedColumns(graph, node, issues, knowledge);
+    }
   }
 }
 
@@ -7317,6 +7331,36 @@ function columnsNamedBy(
   if (node.kind === 'filter') return workflowFilterColumns(node.predicate);
   if (node.kind === 'rename') return Object.keys(node.columns ?? {});
   return workflowAggregateColumns(node);
+}
+
+/**
+ * The columns a filter, a rename or an aggregate names, checked against
+ * everything reaching the node.
+ *
+ * The union is the right set for these three, and it is the whole difference
+ * from {@link checkLookupColumns}: the rows a multi-input node receives arrive
+ * concatenated, so a column any one of its inputs carries is a column it can
+ * see. A lookup is the one kind that is not like that — its reference is held as
+ * a map and never passed on — which is why it is dispatched away from here
+ * rather than folded in.
+ */
+function checkNamedColumns(
+  graph: WorkflowGraph,
+  node: WorkflowFilterNode | WorkflowRenameNode | WorkflowAggregateNode,
+  issues: WorkflowValidationIssue[],
+  knowledge: WorkflowColumnKnowledge | undefined,
+): void {
+  const named = columnsNamedBy(node);
+  if (named.length === 0) return;
+  const known = workflowKnownColumns(graph, node.id, knowledge);
+  if (known === undefined) return;
+  const missing = named.filter((column) => column.length > 0 && !known.has(column));
+  if (missing.length === 0) return;
+  issues.push({
+    code: 'column-not-produced',
+    nodeIds: [node.id],
+    message: missingColumnMessage(node, missing, known),
+  });
 }
 
 /**
@@ -7343,29 +7387,52 @@ function checkLookupColumns(
   issues: WorkflowValidationIssue[],
   knowledge: WorkflowColumnKnowledge | undefined,
 ): void {
-  const quoted = (names: Iterable<string>) =>
-    [...names].map((column) => JSON.stringify(column)).join(', ');
   const { driving, reference } = workflowLookupColumns(graph, node, knowledge);
+  if (driving !== undefined) checkLookupDriving(node, driving, issues);
+  if (reference !== undefined) checkLookupReference(node, reference, issues);
+}
 
-  if (driving !== undefined && typeof node.key === 'string' && node.key.length > 0) {
-    if (!driving.has(node.key)) {
-      issues.push({
-        code: 'column-not-produced',
-        nodeIds: [node.id],
-        message: `Lookup "${node.name}" (${node.id}) matches on ${quoted([node.key])}, and nothing feeding the rows it enriches produces that column. Something above this node closes the column set — a rename that drops what it does not name, or a source reading a published object type — so what reaches here is exactly ${quoted(driving)}. A key column that is not there has no key on any row, so nothing would match and every row would come out with the enriched columns null.`,
-      });
-    }
-    const collides = Object.values(node.fields ?? {}).filter((to) => driving.has(to));
-    if (collides.length > 0) {
-      issues.push({
-        code: 'lookup-column-collides',
-        nodeIds: [node.id],
-        message: `Lookup "${node.name}" (${node.id}) would bring ${quoted(collides)} across onto rows that already carry ${collides.length === 1 ? 'that column' : 'those columns'}. There are two columns and one name, and every rule for picking a winner is a rule about which of somebody's data survives. Rename one of them first.`,
-      });
-    }
+/** `"a", "b"`, for a message that has to name a set of columns. */
+function quotedColumns(names: Iterable<string>): string {
+  return [...names].map((column) => JSON.stringify(column)).join(', ');
+}
+
+/**
+ * The key this lookup matches on, and the names it would land on, against the
+ * rows it enriches.
+ *
+ * Both are about the *driving* set specifically, and pooling the inputs would
+ * make each of them wrong in the dangerous direction: a key column that exists
+ * only on the reference would be accepted and then match nothing on every row,
+ * and a collision with a driving column would be invisible.
+ */
+function checkLookupDriving(
+  node: WorkflowLookupNode,
+  driving: ReadonlySet<string>,
+  issues: WorkflowValidationIssue[],
+): void {
+  if (typeof node.key === 'string' && node.key.length > 0 && !driving.has(node.key)) {
+    issues.push({
+      code: 'column-not-produced',
+      nodeIds: [node.id],
+      message: `Lookup "${node.name}" (${node.id}) matches on ${quotedColumns([node.key])}, and nothing feeding the rows it enriches produces that column. Something above this node closes the column set — a rename that drops what it does not name, or a source reading a published object type — so what reaches here is exactly ${quotedColumns(driving)}. A key column that is not there has no key on any row, so nothing would match and every row would come out with the enriched columns null.`,
+    });
   }
+  const collides = Object.values(node.fields ?? {}).filter((to) => driving.has(to));
+  if (collides.length === 0) return;
+  issues.push({
+    code: 'lookup-column-collides',
+    nodeIds: [node.id],
+    message: `Lookup "${node.name}" (${node.id}) would bring ${quotedColumns(collides)} across onto rows that already carry ${collides.length === 1 ? 'that column' : 'those columns'}. There are two columns and one name, and every rule for picking a winner is a rule about which of somebody's data survives. Rename one of them first.`,
+  });
+}
 
-  if (reference === undefined) return;
+/** The reference key and every field source, against the reference side only. */
+function checkLookupReference(
+  node: WorkflowLookupNode,
+  reference: ReadonlySet<string>,
+  issues: WorkflowValidationIssue[],
+): void {
   const wanted = [
     ...(typeof node.referenceKey === 'string' && node.referenceKey.length > 0
       ? [node.referenceKey]
@@ -7377,7 +7444,7 @@ function checkLookupColumns(
   issues.push({
     code: 'column-not-produced',
     nodeIds: [node.id, node.reference],
-    message: `Lookup "${node.name}" (${node.id}) reads ${quoted(missing)} off its reference rows, and nothing on that side produces ${missing.length === 1 ? 'that column' : 'those columns'} — what reaches it is exactly ${quoted(reference)}. A reference key that is not there means no reference row has a key, so nothing matches; a field that is not there lands as undefined on every row that did.`,
+    message: `Lookup "${node.name}" (${node.id}) reads ${quotedColumns(missing)} off its reference rows, and nothing on that side produces ${missing.length === 1 ? 'that column' : 'those columns'} — what reaches it is exactly ${quotedColumns(reference)}. A reference key that is not there means no reference row has a key, so nothing matches; a field that is not there lands as undefined on every row that did.`,
   });
 }
 

@@ -51,6 +51,7 @@ import {
   supportsWorkflows,
   transformMode,
   unreachableCallMode,
+  unreachableLookupUnmatched,
   unreachableNodeKind,
   unreachablePredicateKind,
   workflowAggregateMaxGroups,
@@ -1978,46 +1979,12 @@ export class WorkflowRunnerService {
   ): Promise<WorkflowNodeStepOutput> {
     const store = this.requireStore();
     const logs: string[] = [];
-    const unmatchedIs = workflowLookupUnmatched(node);
     const fields = Object.entries(node.fields);
-
-    const referenceRefs = input.inputs.filter((ref) => ref.nodeId === node.reference);
-    const drivingRefs = input.inputs.filter((ref) => ref.nodeId !== node.reference);
-    // Both refused rather than approximated, and both mean the graph moved under
-    // a run in flight — `validateWorkflow` refuses either at save time. Carrying
-    // on would produce the exact defect this node exists to end: no reference to
-    // match against, every row enriched with nulls, and a green run.
-    if (referenceRefs.length === 0) {
-      throw new BadRequestException(
-        `Lookup "${node.name}" (${node.id}) takes its reference rows from ${node.reference}, and no stage by that name reached it. The graph was edited while this run was in flight; finishing it would enrich every row with nulls and commit the result.`,
-      );
-    }
-    if (drivingRefs.length === 0) {
-      throw new BadRequestException(
-        `Lookup "${node.name}" (${node.id}) was given nothing but its reference, so there are no rows for it to enrich. The graph was edited while this run was in flight; finishing it would commit an empty snapshot.`,
-      );
-    }
-
-    const referenceRows = referenceRefs.reduce((total, ref) => total + ref.rowCount, 0);
-    if (referenceRows > WORKFLOW_LOOKUP_MAX_REFERENCE_ROWS) {
-      throw new BadRequestException(
-        `Lookup "${node.name}" (${node.id}) would hold ${referenceRows} reference rows in memory, and at most ${WORKFLOW_LOOKUP_MAX_REFERENCE_ROWS} may be held. Exactly one side of a join can stream and this node streams the other one, so the reference is the side that has to fit. Filter it down before it reaches this node — or, if the reference is the larger dataset by accident, point this node's reference at the other input instead.`,
-      );
-    }
-
+    const { referenceRefs, drivingRefs, referenceRows } = lookupInputs(node, input);
     const reference = await this.buildLookupReference(node, referenceRefs, fields, logs);
 
-    let rowsIn = 0;
-    let matched = 0;
-    let unmatched = 0;
-    let keyless = 0;
+    const tally = lookupTally();
     let batches = 0;
-    // A few, not all: the point is to turn "nothing matched" into "nothing
-    // matched, and the keys look like this", which is what tells somebody in one
-    // glance that the two sides disagree about type or about whitespace. Kept in
-    // insertion order and capped, so a run that misses forty thousand rows does
-    // not write forty thousand keys into the run log.
-    const misses = new Set<string>();
     const carry: Array<Record<string, unknown>> = [];
     const flush = async (rows: Array<Record<string, unknown>>) => {
       batches += 1;
@@ -2027,48 +1994,22 @@ export class WorkflowRunnerService {
     for (const ref of drivingRefs) {
       for (let batch = 1; batch <= ref.batches; batch += 1) {
         const rows = await store.readStage({ runId: ref.runId, nodeId: ref.nodeId, batch });
-        rowsIn += rows.length;
-        for (const row of rows) {
-          const key = workflowLookupKey(row[node.key]);
-          const found = key === undefined ? undefined : reference.get(key);
-          if (found === undefined) {
-            if (key === undefined) keyless += 1;
-            else {
-              unmatched += 1;
-              if (misses.size < LOOKUP_MISSES_LOGGED) misses.add(key);
-            }
-            if (unmatchedIs === 'drop') continue;
-            if (unmatchedIs === 'fail') {
-              throw new BadRequestException(
-                `Lookup "${node.name}" (${node.id}) found no reference row for ${
-                  key === undefined
-                    ? `a row with no value in "${node.key}"`
-                    : `${JSON.stringify(key)} in "${node.key}"`
-                }, and this node is set to fail rather than enrich that row with nulls. ${matched} rows had matched before it. Either the reference is missing rows it is meant to hold, or the two sides do not spell their keys the same way.`,
-              );
-            }
-            carry.push(withLookupFields(node, row, fields, undefined));
-            continue;
-          }
-          matched += 1;
-          carry.push(withLookupFields(node, row, fields, found));
-        }
+        tally.rowsIn += rows.length;
+        joinBatch({ node, rows, reference, fields, tally, carry });
         while (carry.length >= BATCH_SIZE) await flush(carry.splice(0, BATCH_SIZE));
       }
     }
     if (carry.length > 0) await flush(carry.splice(0, carry.length));
 
-    const rows = unmatchedIs === 'drop' ? matched : rowsIn;
-    logs.push(
-      ...lookupLogLines(node, { rowsIn, rows, matched, unmatched, keyless, misses, referenceRows }),
-    );
+    const rows = workflowLookupUnmatched(node) === 'drop' ? tally.matched : tally.rowsIn;
+    logs.push(...lookupLogLines(node, { ...tally, rows, referenceRows }));
     await this.clearStaleTail(input.runId, node.id, batches, logs);
 
     return {
       nodeId: node.id,
       output: { runId: input.runId, nodeId: node.id, batches, rowCount: rows },
       rows,
-      rowsIn,
+      rowsIn: tally.rowsIn,
       elapsedMs: Date.now() - startedAt,
       logs: safeLogLines(logs, LOG_LINES_PER_NODE),
     };
@@ -2149,40 +2090,14 @@ export class WorkflowRunnerService {
             continue;
           }
           repeated += 1;
-          const disagreed = fields.findIndex(([, to], at) => {
-            void to;
-            // `Object.is` rather than `===`, so two rows holding `NaN` in the
-            // same field agree — which they plainly do — and `0` and `-0` do
-            // not silently fold together.
-            return !Object.is(already[at], values[at]);
-          });
-          if (disagreed < 0) continue;
-          const field = fields[disagreed];
-          throw new BadRequestException(
-            `Lookup "${node.name}" (${node.id}) found two reference rows keyed ${JSON.stringify(key)} that disagree about ${JSON.stringify(field?.[0] ?? '')}: ${JSON.stringify(already[disagreed]) ?? 'undefined'} and ${JSON.stringify(values[disagreed]) ?? 'undefined'}. One of them would have to win on every row that matched this key, and every rule for picking which is a rule about whose data survives. Make the reference one row per key — a filter or a transform on the reference side is where that decision belongs, because it is a decision somebody has to make rather than one this node can make for them.`,
-          );
+          refuseDisagreeingReference(node, key, fields, already, values);
         }
       }
     }
 
     logs.push(
-      `"${node.name}" read ${rowsRead} reference rows from "${node.reference}" and indexed ${reference.size} distinct keys off "${node.referenceKey}".`,
+      ...lookupReferenceLogLines(node, { rowsRead, keyless, repeated, keys: reference.size }),
     );
-    if (repeated > 0) {
-      logs.push(
-        `${repeated} reference rows repeated a key that was already indexed and agreed with it about every field this node brings across, so they were collapsed. Nothing was chosen over anything.`,
-      );
-    }
-    if (keyless > 0) {
-      logs.push(
-        `${keyless} reference rows had no value in "${node.referenceKey}" and were not indexed. A row with no key cannot be matched by anything; nothing can reach it.`,
-      );
-    }
-    if (rowsRead > 0 && reference.size === 0) {
-      logs.push(
-        `Not one reference row had a key, so this lookup will match nothing at all. Check that "${node.referenceKey}" is the column the reference rows actually carry.`,
-      );
-    }
     return reference;
   }
 
@@ -3051,6 +2966,194 @@ function aggregateLogLines(node: WorkflowAggregateNode, stats: AggregateTableSta
  * which is the diagnosis this list exists for.
  */
 const LOOKUP_MISSES_LOGGED = 5;
+
+/** What a lookup counts while it works, and what the run log is built from. */
+interface LookupTally {
+  rowsIn: number;
+  matched: number;
+  unmatched: number;
+  keyless: number;
+  /**
+   * A few of the keys the reference did not hold, not all of them.
+   *
+   * The point is to turn "nothing matched" into "nothing matched, and the keys
+   * look like this", which is what tells somebody in one glance that the two
+   * sides disagree about type or about whitespace. Capped, so a run that misses
+   * forty thousand rows does not write forty thousand keys into a log column.
+   */
+  misses: Set<string>;
+}
+
+function lookupTally(): LookupTally {
+  return { rowsIn: 0, matched: 0, unmatched: 0, keyless: 0, misses: new Set() };
+}
+
+/**
+ * A lookup's two sides, told apart, and the three refusals that come before any
+ * of them is read.
+ *
+ * Here rather than inline in {@link WorkflowRunnerService.runLookup} because it
+ * is the part with no loop in it: three conditions, each of which ends the node,
+ * and none of which is allowed to hold a row first.
+ *
+ * The first two mean the graph moved under a run in flight — `validateWorkflow`
+ * refuses both at save time — and carrying on would produce the exact defect
+ * this node exists to end: no reference to match against, every row enriched
+ * with nulls, and a green run.
+ *
+ * The third is the memory bound, and it is answered from the announced
+ * `rowCount` rather than by reading. See
+ * {@link WORKFLOW_LOOKUP_MAX_REFERENCE_ROWS}.
+ */
+function lookupInputs(
+  node: WorkflowLookupNode,
+  input: WorkflowNodeStepInput,
+): {
+  referenceRefs: WorkflowStageRef[];
+  drivingRefs: WorkflowStageRef[];
+  referenceRows: number;
+} {
+  const referenceRefs = input.inputs.filter((ref) => ref.nodeId === node.reference);
+  const drivingRefs = input.inputs.filter((ref) => ref.nodeId !== node.reference);
+  if (referenceRefs.length === 0) {
+    throw new BadRequestException(
+      `Lookup "${node.name}" (${node.id}) takes its reference rows from ${node.reference}, and no stage by that name reached it. The graph was edited while this run was in flight; finishing it would enrich every row with nulls and commit the result.`,
+    );
+  }
+  if (drivingRefs.length === 0) {
+    throw new BadRequestException(
+      `Lookup "${node.name}" (${node.id}) was given nothing but its reference, so there are no rows for it to enrich. The graph was edited while this run was in flight; finishing it would commit an empty snapshot.`,
+    );
+  }
+  const referenceRows = referenceRefs.reduce((total, ref) => total + ref.rowCount, 0);
+  if (referenceRows > WORKFLOW_LOOKUP_MAX_REFERENCE_ROWS) {
+    throw new BadRequestException(
+      `Lookup "${node.name}" (${node.id}) would hold ${referenceRows} reference rows in memory, and at most ${WORKFLOW_LOOKUP_MAX_REFERENCE_ROWS} may be held. Exactly one side of a join can stream and this node streams the other one, so the reference is the side that has to fit. Filter it down before it reaches this node — or, if the reference is the larger dataset by accident, point this node's reference at the other input instead.`,
+    );
+  }
+  return { referenceRefs, drivingRefs, referenceRows };
+}
+
+/**
+ * One batch of driving rows, joined against the map.
+ *
+ * The only synchronous part of the node, and it is deliberately the only part:
+ * everything above it is a read, a write or a decision, and everything about
+ * *this* is per record. Nothing here holds a batch beyond the one it was given —
+ * `carry` is the caller's coalescing buffer and is capped at `BATCH_SIZE` by the
+ * caller, so the heap holds the map plus one batch whatever the driving side
+ * weighs.
+ */
+function joinBatch(work: {
+  node: WorkflowLookupNode;
+  rows: ReadonlyArray<Record<string, unknown>>;
+  reference: ReadonlyMap<string, unknown[]>;
+  fields: ReadonlyArray<[string, string]>;
+  tally: LookupTally;
+  carry: Array<Record<string, unknown>>;
+}): void {
+  const { node, rows, reference, fields, tally, carry } = work;
+  for (const row of rows) {
+    const key = workflowLookupKey(row[node.key]);
+    const found = key === undefined ? undefined : reference.get(key);
+    if (found === undefined && lookupMiss(node, key, tally) === 'drop') continue;
+    if (found !== undefined) tally.matched += 1;
+    carry.push(withLookupFields(node, row, fields, found));
+  }
+}
+
+/**
+ * Two reference rows for one key: collapsed when they agree, refused when they do
+ * not.
+ *
+ * The rule {@link WorkflowLookupNode.fields} argues for, and it is decided over
+ * the **named fields only** — two reference rows that differ in a column this
+ * node does not bring across are not a conflict, because nothing about them
+ * reaches the output, so there is no winner to pick.
+ *
+ * `Object.is` rather than `===`, so two rows holding `NaN` in the same field
+ * agree — which they plainly do — and `0` and `-0` do not silently fold together.
+ */
+function refuseDisagreeingReference(
+  node: WorkflowLookupNode,
+  key: string,
+  fields: ReadonlyArray<[string, string]>,
+  already: readonly unknown[],
+  values: readonly unknown[],
+): void {
+  const at = fields.findIndex((_field, index) => !Object.is(already[index], values[index]));
+  if (at < 0) return;
+  throw new BadRequestException(
+    `Lookup "${node.name}" (${node.id}) found two reference rows keyed ${JSON.stringify(key)} that disagree about ${JSON.stringify(fields[at]?.[0] ?? '')}: ${JSON.stringify(already[at])} and ${JSON.stringify(values[at])}. One of them would have to win on every row that matched this key, and every rule for picking which is a rule about whose data survives. Make the reference one row per key — a filter or a transform on the reference side is where that decision belongs, because it is a decision somebody has to make rather than one this node can make for them.`,
+  );
+}
+
+/**
+ * What the reference side says about itself, before a driving row is read.
+ *
+ * The distinct-key count is the load-bearing line: it is how "the reference read
+ * fine and indexed nothing" — a wrong key column — is told apart from "the
+ * reference was empty", which is a different fix in a different place.
+ */
+function lookupReferenceLogLines(
+  node: WorkflowLookupNode,
+  counts: { rowsRead: number; keyless: number; repeated: number; keys: number },
+): string[] {
+  const { rowsRead, keyless, repeated, keys } = counts;
+  const lines = [
+    `"${node.name}" read ${rowsRead} reference rows from "${node.reference}" and indexed ${keys} distinct keys off "${node.referenceKey}".`,
+  ];
+  if (repeated > 0) {
+    lines.push(
+      `${repeated} reference rows repeated a key that was already indexed and agreed with it about every field this node brings across, so they were collapsed. Nothing was chosen over anything.`,
+    );
+  }
+  if (keyless > 0) {
+    lines.push(
+      `${keyless} reference rows had no value in "${node.referenceKey}" and were not indexed. A row with no key cannot be matched by anything; nothing can reach it.`,
+    );
+  }
+  if (rowsRead > 0 && keys === 0) {
+    lines.push(
+      `Not one reference row had a key, so this lookup will match nothing at all. Check that "${node.referenceKey}" is the column the reference rows actually carry.`,
+    );
+  }
+  return lines;
+}
+
+/**
+ * One row that matched nothing: counted, and then disposed of as the node says.
+ *
+ * The counting happens whichever disposition is chosen, and that is the point —
+ * `fail` and `drop` and `null` are three answers to what the row should *become*,
+ * and none of them is an answer to whether anybody is told. A missing key and a
+ * key the reference does not hold are counted apart because they have different
+ * causes and different fixes; flip's reader folds both into the same NULL.
+ */
+function lookupMiss(
+  node: WorkflowLookupNode,
+  key: string | undefined,
+  tally: LookupTally,
+): 'pass' | 'drop' {
+  if (key === undefined) tally.keyless += 1;
+  else {
+    tally.unmatched += 1;
+    if (tally.misses.size < LOOKUP_MISSES_LOGGED) tally.misses.add(key);
+  }
+  const disposition = workflowLookupUnmatched(node);
+  if (disposition === 'drop') return 'drop';
+  if (disposition === 'null') return 'pass';
+  if (disposition === 'fail') {
+    throw new BadRequestException(
+      `Lookup "${node.name}" (${node.id}) found no reference row for ${
+        key === undefined
+          ? `a row with no value in "${node.key}"`
+          : `${JSON.stringify(key)} in "${node.key}"`
+      }, and this node is set to fail rather than enrich that row with nulls. ${tally.matched} rows had matched before it. Either the reference is missing rows it is meant to hold, or the two sides do not spell their keys the same way.`,
+    );
+  }
+  return unreachableLookupUnmatched(disposition, 'WorkflowRunnerService.runLookup');
+}
 
 /**
  * One driving row, with the reference's fields on it.

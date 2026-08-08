@@ -6570,28 +6570,7 @@ function LookupInspector({
         </p>
       )}
 
-      <p className={cn('text-[11px] leading-relaxed', MUTED)}>
-        {driving ? (
-          <>
-            The graph knows exactly what reaches the rows being enriched:{' '}
-            <span className="font-mono">{[...driving].join(', ') || 'nothing at all'}</span>.
-          </>
-        ) : (
-          <>
-            The graph cannot say which columns reach the rows being enriched — a source discovers
-            its shape against the live system, and a transform is code — so the key is taken on
-            trust and the run reports the counts.
-          </>
-        )}{' '}
-        {reference ? (
-          <>
-            On the reference side it is{' '}
-            <span className="font-mono">{[...reference].join(', ') || 'nothing at all'}</span>.
-          </>
-        ) : (
-          <>The reference side is unknown for the same reason.</>
-        )}
-      </p>
+      <LookupSidesNote driving={driving} reference={reference} />
     </div>
   );
 }
@@ -6628,6 +6607,52 @@ const AGGREGATE_HINTS: Record<WorkflowAggregateFunction, string> = {
   max: 'the greatest value — same comparison',
   join: 'the values run together, refusing past a length rather than truncating',
 };
+
+/**
+ * Which columns the graph can prove are on each of a lookup's two sides.
+ *
+ * Its own component because it is the sentence that is *only* true of this node
+ * kind: every other multi-input inspector could say "the columns reaching this
+ * node" as one list, and saying that here would offer a key column that exists
+ * only on the reference — a join that matches nothing on every row.
+ *
+ * Either side answering "unknown" is the ordinary case and is said out loud
+ * rather than papered over, the stance `RenameInspector` takes about the same
+ * question. `undefined` is not "no columns": treating it as empty would refuse
+ * every lookup below a transform.
+ */
+function LookupSidesNote({
+  driving,
+  reference,
+}: {
+  driving: ReadonlySet<string> | undefined;
+  reference: ReadonlySet<string> | undefined;
+}) {
+  return (
+    <p className={cn('text-[11px] leading-relaxed', MUTED)}>
+      {driving ? (
+        <>
+          The graph knows exactly what reaches the rows being enriched:{' '}
+          <span className="font-mono">{[...driving].join(', ') || 'nothing at all'}</span>.
+        </>
+      ) : (
+        <>
+          The graph cannot say which columns reach the rows being enriched — a source discovers its
+          shape against the live system, and a transform is code — so the key is taken on trust and
+          the run reports the counts.
+        </>
+      )}{' '}
+      {reference ? (
+        <>
+          On the reference side it is{' '}
+          <span className="font-mono">{[...reference].join(', ') || 'nothing at all'}</span>.
+        </>
+      ) : (
+        <>The reference side is unknown for the same reason.</>
+      )}
+    </p>
+  );
+}
 
 function FilterInspector({
   node,

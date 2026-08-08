@@ -82,6 +82,10 @@ describe('what may be saved as a reusable node', () => {
     // groups a graph it was not written for on a column that is not there —
     // which collapses everything into one null-keyed group rather than failing.
     expect(nodeKindIsReusable('aggregate')).toBe(false);
+    // A lookup's `reference` is a node id in the graph it lives in, so a shared
+    // body would carry the id of a node the adopting graph has never had — and
+    // it is the field that decides which side of the join is held in memory.
+    expect(nodeKindIsReusable('lookup')).toBe(false);
   });
 });
 
