@@ -5,6 +5,7 @@ import type {
 } from '@dudousxd/nestjs-catalog';
 import {
   type RemoteTask,
+  VERSION_UNDECLARED_TAG,
   type WorkflowCtx,
   WorkflowSuspended,
   runStepHandler,
@@ -100,7 +101,7 @@ function harness(options: {
   plan?: WorkflowPlanResult;
   /** One entry per attempt: what the join does. A string throws; anything else resolves. */
   childResults: unknown[];
-  checks?: Array<{ started: boolean; version?: string }>;
+  checks?: Array<{ started: boolean; version?: string; versionDeclared?: boolean }>;
   /** The run's own input, when a test is about a field of it rather than the graph. */
   input?: CatalogWorkflowRunInput;
 }): Harness {
@@ -288,6 +289,67 @@ describe('a call node, executed by the workflow body', () => {
     expect(test.finished[0].logs.join(' ')).toContain('returned nothing this graph can read');
   });
 
+  /**
+   * The step warned on its own log; this is the other screen.
+   *
+   * Somebody reading a load's nodes sees `Called billing.reconcile@2` — a
+   * sentence naming a version — and would otherwise have nothing telling them
+   * that the version in it was assumed rather than kept.
+   */
+  it("says on the node's own log that nothing verified the pin", async () => {
+    const test = harness({
+      childResults: [{ batches: 1, rowCount: 5 }],
+      checks: [{ started: true, version: '1', versionDeclared: false }],
+    });
+
+    await test.run();
+
+    const logs = test.finished[0].logs.join(' ');
+    expect(logs).toContain('Nothing verified the pin on billing.reconcile@2');
+    expect(logs).toContain('version:undeclared');
+    // The load itself is unaffected: an undeclared callee is called, not refused.
+    expect(test.finished[0].nodeOutcomes.c).toMatchObject({ status: 'succeeded', rows: 5 });
+  });
+
+  it('says nothing of the sort when the callee declared its version', async () => {
+    const test = harness({
+      childResults: [{ batches: 1, rowCount: 5 }],
+      checks: [{ started: true, version: '2', versionDeclared: true }],
+    });
+
+    await test.run();
+
+    expect(test.finished[0].logs.join(' ')).not.toContain('Nothing verified the pin');
+  });
+
+  // What an in-flight run's checkpoint replays as, written before the field
+  // existed. Read as "declared", so a resumed run says exactly what it said
+  // when it suspended rather than growing a caveat mid-flight.
+  it('invents no caveat for a check that predates the question', async () => {
+    const test = harness({
+      childResults: [{ batches: 1, rowCount: 5 }],
+      checks: [{ started: true, version: '2' }],
+    });
+
+    await test.run();
+
+    expect(test.finished[0].logs.join(' ')).not.toContain('Nothing verified the pin');
+  });
+
+  // The first check found no run row, so what the pin was worth is whatever the
+  // re-check after the join found — the first answer knows nothing about it.
+  it('takes what the pin was worth from the re-check, when there was one', async () => {
+    const test = harness({
+      childResults: [{ batches: 1, rowCount: 5 }],
+      checks: [{ started: false }, { started: true, version: '1', versionDeclared: false }],
+    });
+
+    await test.run();
+
+    expect(test.checks).toHaveLength(2);
+    expect(test.finished[0].logs.join(' ')).toContain('Nothing verified the pin');
+  });
+
   it('fails the node when the child answers with half a staging contract', async () => {
     const test = harness({ childResults: [{ batches: 2 }] });
 
@@ -441,7 +503,11 @@ describe('checking that the child is the version the node pinned', () => {
       getRun: async () => ({ id: CHECK.childRunId, workflowVersion: '2' }),
     });
 
-    expect(await steps.checkCall(CHECK)).toEqual({ started: true, version: '2' });
+    expect(await steps.checkCall(CHECK)).toEqual({
+      started: true,
+      version: '2',
+      versionDeclared: true,
+    });
   });
 
   // The engine starts the newest registered version and takes no version
@@ -515,6 +581,111 @@ describe('checking that the child is the version the node pinned', () => {
     await expect(checkSteps({ start: async () => undefined }).checkCall(CHECK)).rejects.toThrow(
       /no durable engine it can read a run from/,
     );
+  });
+});
+
+/* --- a callee nobody declared a version for ----------------------------- */
+
+/**
+ * The run row a convention-resolved remote produces when the fleet says nothing.
+ *
+ * `workflowVersion: '1'` is the engine's routing default rather than an
+ * observation, and `version:undeclared` is what durable core 0.66.0 stamps to
+ * say so. Both together, because a test that set only one of them would be
+ * testing a row the engine cannot produce.
+ */
+function undeclaredRun(version = '1') {
+  return {
+    id: CHECK.childRunId,
+    workflowVersion: version,
+    tags: [VERSION_UNDECLARED_TAG],
+  };
+}
+
+describe('a pin against a callee whose version nobody declared', () => {
+  // The defect this whole change is about: `'1' === '1'` was reported as a
+  // version that had been checked, when the `'1'` on both sides was a
+  // placeholder the engine wrote before anybody was asked.
+  it('does not report a match it did not make when the placeholder equals the pin', async () => {
+    const steps = checkSteps({ getRun: async () => undeclaredRun() });
+
+    expect(await steps.checkCall({ ...CHECK, callVersion: '1' })).toEqual({
+      started: true,
+      version: '1',
+      versionDeclared: false,
+    });
+  });
+
+  // The same defect wearing the other face. Refusing here would be acting on
+  // the same placeholder, and would make every callee on an older SDK
+  // uncallable with any pin but `1` — remediable only by changing the callee,
+  // which is the rule durable rejected one layer down.
+  it('does not refuse on the placeholder either, whatever the pin says', async () => {
+    const cancelled: string[] = [];
+    const steps = checkSteps({
+      getRun: async () => undeclaredRun(),
+      cancel: async (runId: string) => {
+        cancelled.push(runId);
+      },
+    });
+
+    expect(await steps.checkCall({ ...CHECK, callVersion: '7' })).toEqual({
+      started: true,
+      version: '1',
+      versionDeclared: false,
+    });
+    expect(cancelled).toEqual([]);
+  });
+
+  it('says so on the step log, where the engine records what a step did', async () => {
+    const warnings: string[] = [];
+    const steps = checkSteps({ getRun: async () => undeclaredRun() });
+
+    await steps.checkCall(CHECK, stub({ warn: (line: string) => warnings.push(line) }));
+
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/nothing checked it/);
+    expect(warnings[0]).toMatch(/version:undeclared/);
+  });
+
+  it('takes no log line at all rather than failing when the step has no logger', async () => {
+    const steps = checkSteps({ getRun: async () => undeclaredRun() });
+
+    expect(await steps.checkCall(CHECK)).toEqual({
+      started: true,
+      version: '1',
+      versionDeclared: false,
+    });
+  });
+
+  // The tag is the whole of the signal. A callee that DOES declare a version is
+  // the case durable just made work, and nothing here may soften it.
+  it('still keeps the pin against a callee that declares a version', async () => {
+    const cancelled: string[] = [];
+    const steps = checkSteps({
+      getRun: async () => ({ id: CHECK.childRunId, workflowVersion: '3', tags: ['nightly'] }),
+      cancel: async (runId: string) => {
+        cancelled.push(runId);
+      },
+    });
+
+    await expect(steps.checkCall(CHECK)).rejects.toThrow(/pins billing\.reconcile@2/);
+    expect(cancelled).toEqual([CHECK.childRunId]);
+  });
+
+  // The row crosses a wire and a store. A `tags` that arrived as something else
+  // reads as "no tag" — the check it would otherwise skip is the check that
+  // keeps a pin — rather than throwing inside a step.
+  it('reads a tags field that is not an array as carrying no tag', async () => {
+    const steps = checkSteps({
+      getRun: async () => ({ id: CHECK.childRunId, workflowVersion: '2', tags: 'nightly' }),
+    });
+
+    expect(await steps.checkCall(CHECK)).toEqual({
+      started: true,
+      version: '2',
+      versionDeclared: true,
+    });
   });
 });
 
@@ -749,6 +920,21 @@ describe('a plain call node, executed by the workflow body', () => {
     expect(logs).toContain('as a plain call');
     expect(logs).toContain('wf-run-1.call.c.0');
     expect(logs).toContain('nowhere to stage rows');
+  });
+
+  // On both modes, because the pin is a property of the call rather than of
+  // what came back — and plain is, in practice, how a cross-SDK callee (the one
+  // most likely to announce no version at all) is reached.
+  it('says nothing verified the pin here too', async () => {
+    const test = harness({
+      plan: plainPlan(),
+      childResults: [{ ok: true }],
+      checks: [{ started: true, version: '1', versionDeclared: false }],
+    });
+
+    await test.run();
+
+    expect(test.finished[0].logs.join(' ')).toContain('Nothing verified the pin');
   });
 
   /**

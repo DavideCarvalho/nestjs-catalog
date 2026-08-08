@@ -1,6 +1,6 @@
 import type { WorkflowNodeStepInput, WorkflowNodeStepOutput } from '@dudousxd/nestjs-catalog';
 import { Step, WorkflowEngine } from '@dudousxd/nestjs-durable';
-import { FatalError, type StepLogger } from '@dudousxd/nestjs-durable-core';
+import { FatalError, type StepLogger, VERSION_UNDECLARED_TAG } from '@dudousxd/nestjs-durable-core';
 import {
   BadRequestException,
   Inject,
@@ -61,7 +61,31 @@ export interface WorkflowCallCheckInput {
  */
 export interface WorkflowCallCheckResult {
   started: boolean;
+  /**
+   * The version the child run recorded, exactly as the run row carries it.
+   *
+   * Read together with {@link versionDeclared} and never on its own: on a run
+   * the fleet said nothing about, this is the engine's routing default and not
+   * an observation of anything.
+   */
   version?: string;
+  /**
+   * Whether {@link version} is a version somebody stated, or the engine's
+   * placeholder for one nobody did.
+   *
+   * `false` only when the child run carries durable core's
+   * `version:undeclared` tag — a remote resolved by convention against a fleet
+   * that announces no version for it, which is what a worker on an SDK older
+   * than the descriptor handshake looks like. The comparison this step exists
+   * to make is not performed on such a run, in either direction; see
+   * {@link WorkflowRunSteps.checkCall}.
+   *
+   * Absent means the question was not asked, which is what a step checkpoint
+   * written before this field existed replays as. Treated as `true` by
+   * everything downstream, so an in-flight run resumes reading exactly as it
+   * did when it suspended.
+   */
+  versionDeclared?: boolean;
 }
 
 /**
@@ -169,12 +193,17 @@ export class WorkflowRunSteps {
    *
    * ## Why this step exists at all
    *
-   * Because the engine has no way to start a *particular* version.
-   * `engine.start(name, …)` resolves `latest.get(name)` and takes no version
-   * argument; a version is honoured only on **resume**, where a run continues
-   * on the version it began on. `ctx.child` therefore starts whatever is
-   * newest, and a node that recorded a version and did nothing else would be
-   * decoration on a promise nobody keeps.
+   * Because the engine cannot start a *particular* version of the workflows a
+   * call node points at. `@dudousxd/nestjs-durable-core` 0.66.0 does give
+   * `ctx.child`/`ctx.startChild` a `version` — and it resolves the by-name@version
+   * registry and stops there, deliberately, because none of the synthesized
+   * fallbacks can prove the version exists. The routes it therefore refuses are
+   * exactly the ones a call node lives on: the `registerRemote` and
+   * convention-resolved remotes through which every cross-SDK body is reached.
+   * Passing it would trade a pin that can be kept for a start that cannot
+   * happen. So an unpinned start it is, `latest` and the fallback chain, and a
+   * node that recorded a version and did nothing else would be decoration on a
+   * promise nobody keeps.
    *
    * What *is* available is the truth after the fact: the run row carries
    * `workflowVersion`, set at start and never changed. So the pin is enforced
@@ -200,6 +229,35 @@ export class WorkflowRunSteps {
    * `started: false` and lets the join say what actually happened. The body
    * then re-runs this step after the join, which is what closes the gap for a
    * child whose row merely arrived late.
+   *
+   * ## When nobody declared a version, nothing here is compared
+   *
+   * A convention-resolved remote used to be stamped `workflowVersion: '1'`
+   * before the resolver ran, and the resolver echoed it back — so this
+   * comparison was inert: a pin of `1` passed by construction and any other pin
+   * failed by construction, whatever the callee actually was. Durable core
+   * 0.66.0 fixed its half. The version now comes from the fleet's descriptor
+   * announcement, so a pin against a callee that declares one is genuinely
+   * checked. And when the fleet declares nothing, the run keeps the routing
+   * default *and carries `VERSION_UNDECLARED_TAG`*, which is the fact this step
+   * had been missing.
+   *
+   * Read it and the comparison stops being available, in **both** directions.
+   * Passing `1` is the defect as it stands: a match against a placeholder
+   * reported as a match. Failing `2` is the same defect wearing the other face
+   * — a mismatch against a placeholder, refusing on the strength of a number
+   * nobody stated, which would make every callee on an older SDK uncallable
+   * with any pin but `1` and be remediable only by changing the callee. That is
+   * the rule durable rejected one layer down and it is rejected here for the
+   * same reason. So the call proceeds and the *unverifiability* travels: on
+   * this step's log, on the result it checkpoints, and from there onto the
+   * node's own log lines. The property being kept is that a pin never reports a
+   * guarantee it did not obtain — not that it always obtains one.
+   *
+   * The remedy is on the callee and is a deploy, not a graph edit: a worker on
+   * an SDK new enough to publish descriptors, declaring a version. Nothing in
+   * this repository can make that pin checkable, which is why this says so
+   * rather than pretending either way.
    */
   @Step({
     name: WORKFLOW_CALL_CHECK_STEP,
@@ -211,7 +269,10 @@ export class WorkflowRunSteps {
     backoffMaxMs: 5_000,
     jitter: true,
   })
-  async checkCall(input: WorkflowCallCheckInput): Promise<WorkflowCallCheckResult> {
+  async checkCall(
+    input: WorkflowCallCheckInput,
+    log?: StepLogger,
+  ): Promise<WorkflowCallCheckResult> {
     // `getRun` is checked, not assumed. The `WorkflowEngine` token does not
     // always resolve to an engine with a store behind it: a thin/tenant worker
     // gets a start-only facade under the same token, whose `getRun` does not
@@ -235,7 +296,24 @@ export class WorkflowRunSteps {
     if (!run) return { started: false };
 
     const started = typeof run.workflowVersion === 'string' ? run.workflowVersion : '';
-    if (started === input.callVersion) return { started: true, version: started };
+    // `Array.isArray` for the same reason `getRun` is feature-checked above: the
+    // run row crosses a wire and a store, and a `tags` that arrived as something
+    // other than an array must read as "no tag" rather than throw inside a step.
+    // Absent is the ordinary case — the tag is stamped only on a convention
+    // resolution the fleet said nothing about.
+    if (Array.isArray(run.tags) && run.tags.includes(VERSION_UNDECLARED_TAG)) {
+      // Said on the step, where the engine's own tables and Telescope will show
+      // it against this run, and returned as well so the checkpoint records it
+      // and the node's log lines can carry it. See the docblock: neither a pass
+      // nor a refusal is derived from `started` here, because `started` is the
+      // routing default and not an observation of anything.
+      log?.warn(
+        `Call node "${input.nodeName}" (${input.nodeId}) pins ${input.callName}@${input.callVersion}, and nothing checked it: no live worker announces a version for ${input.callName}, so child run ${input.childRunId} carries the engine's routing default (${started || 'no version'}) and the tag ${VERSION_UNDECLARED_TAG}. The call runs — refusing an undeclared callee would make every worker on an older SDK uncallable — but this pin was compared against a placeholder, so treat it as unverified until the worker serving ${input.callName} publishes a version.`,
+      );
+      return { started: true, version: started, versionDeclared: false };
+    }
+    if (started === input.callVersion)
+      return { started: true, version: started, versionDeclared: true };
 
     // Cancelled before the refusal is thrown, and best-effort: the run is being
     // failed either way, and a cancel that could not be delivered must not turn

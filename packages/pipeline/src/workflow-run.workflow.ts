@@ -378,7 +378,7 @@ export class CatalogWorkflowRunWorkflow {
         // which means it did start and nothing has checked its version. The
         // pin is worth less late than early — the work is done — but it still
         // stops this run from *using* the output of a version nobody chose.
-        if (!seen.started) await ctx.step(this.steps.checkCall, check);
+        const checked = seen.started ? seen : await ctx.step(this.steps.checkCall, check);
 
         return this.runner.callOutput({
           nodeId: entry.nodeId,
@@ -387,6 +387,13 @@ export class CatalogWorkflowRunWorkflow {
           target,
           childRunId,
           result,
+          // Forwarded so the node's own log says what the pin was worth. The
+          // step already warned on its own log; a reader of this run's node
+          // lines is on a different screen and would otherwise see a call that
+          // named a version and no sign that nothing verified it. `undefined`
+          // for a checkpoint written before the field existed, and read as
+          // "declared" — see `WorkflowCallCheckResult.versionDeclared`.
+          versionDeclared: checked.versionDeclared,
           elapsedMs: (await ctx.now()) - startedAt,
         });
       } catch (error) {

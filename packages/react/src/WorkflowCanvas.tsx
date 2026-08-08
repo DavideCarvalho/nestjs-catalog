@@ -5466,9 +5466,26 @@ function callableNameOption(name: string, forName: CallableWorkflowRef[]): Combo
 function refusalFacts(forName: CallableWorkflowRef[]): string[] {
   const codes = new Set(forName.map((ref) => callableWorkflowBlock(ref)?.code));
   const facts: string[] = [];
-  if (codes.has('no-version')) facts.push('no version announced — cannot be pinned');
+  if (codes.has('no-version')) facts.push(noVersionFact(forName));
   if (codes.has('ambiguous-group')) facts.push('claimed by two groups — ambiguous');
   return facts;
+}
+
+/**
+ * Which flavour of "no version" this is, in the few words a row has.
+ *
+ * `'observed'` means nothing described the workflow at all — it is on the list
+ * because a live queue of that name exists, which is what a call would be routed
+ * on and the whole of what is known. That is a weaker thing than a worker which
+ * published a description and left the version out, and the row says which,
+ * because they call for different reading: the first is "there is a queue here",
+ * the second is "there is a worker here that did not say".
+ */
+function noVersionFact(refs: CallableWorkflowRef[]): string {
+  const described = refs.some((ref) => ref.evidence !== 'observed');
+  return described
+    ? 'no version announced — cannot be pinned'
+    : 'live queue only, nothing declared — cannot be pinned';
 }
 
 /**
@@ -5489,7 +5506,7 @@ function callableVersionOptions(forName: CallableWorkflowRef[]): ComboOption[] {
 function callableVersionOption(ref: CallableWorkflowRef): ComboOption {
   const block = callableWorkflowBlock(ref);
   const facts: string[] = [];
-  if (block?.code === 'no-version') facts.push('no version announced — cannot be pinned');
+  if (block?.code === 'no-version') facts.push(noVersionFact([ref]));
   if (block?.code === 'ambiguous-group')
     facts.push(`two groups (${groupsOf(ref).join(', ')}) — ambiguous`);
   if (ref.group) facts.push(`group ${ref.group}`);

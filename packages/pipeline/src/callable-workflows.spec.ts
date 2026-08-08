@@ -70,6 +70,10 @@ function announced(overrides: Partial<AnnouncedWorkflow> = {}): AnnouncedWorkflo
   const name = overrides.name ?? 'billing.reconcile';
   const version = 'version' in overrides ? overrides.version : '2';
   return {
+    // The ordinary tier: a live worker published a descriptor. A test about the
+    // weaker one says `evidence: 'observed'` and drops the version, because that
+    // is the only shape the engine ever produces it in.
+    evidence: 'declared',
     key: version === undefined ? name : `${name}@${version}`,
     name,
     version,
@@ -108,8 +112,20 @@ describe('what a call node could be pointed at', () => {
 
     expect(answer.supported).toBe(true);
     expect(answer.workflows).toEqual([
-      { name: 'billing.reconcile', version: '1', group: 'billing', workers: 1 },
-      { name: 'billing.reconcile', version: '2', group: 'billing', workers: 1 },
+      {
+        evidence: 'declared',
+        name: 'billing.reconcile',
+        version: '1',
+        group: 'billing',
+        workers: 1,
+      },
+      {
+        evidence: 'declared',
+        name: 'billing.reconcile',
+        version: '2',
+        group: 'billing',
+        workers: 1,
+      },
     ]);
   });
 
@@ -141,6 +157,36 @@ describe('what a call node could be pointed at', () => {
     expect(bare).toBeDefined();
     expect(bare?.version).toBeUndefined();
     expect(bare?.group).toBeUndefined();
+  });
+
+  /**
+   * The weaker tier, carried across rather than flattened into "no version".
+   *
+   * An `'observed'` entry is on the list because a live routing token of that
+   * name exists and nothing else — no descriptor, no version, no runtime. It is
+   * exactly the callee whose runs come back tagged `version:undeclared`, so an
+   * author reading the picker can be told that a version typed against it will
+   * not be verified, which is the only place that could be known before a load
+   * ran.
+   */
+  it('carries how strong the fleet claim is, not merely whether a version came with it', async () => {
+    const answer = await launcher([
+      announced({
+        evidence: 'observed',
+        name: 'processing',
+        version: undefined,
+        key: 'processing',
+        groups: ['processing'],
+        origins: [],
+        runtimes: [],
+      }),
+      announced({ name: 'billing.reconcile', version: '2' }),
+    ]).callableWorkflows();
+
+    expect(answer.workflows.find((ref) => ref.name === 'processing')?.evidence).toBe('observed');
+    expect(answer.workflows.find((ref) => ref.name === 'billing.reconcile')?.evidence).toBe(
+      'declared',
+    );
   });
 
   it('names the group only when the announcers agree on exactly one', async () => {

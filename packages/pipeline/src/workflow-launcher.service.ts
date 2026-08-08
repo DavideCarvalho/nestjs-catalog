@@ -72,6 +72,12 @@ function toCallableWorkflowRef(announced: AnnouncedWorkflow): CallableWorkflowRe
   }));
   const ref: CallableWorkflowRef = {
     name: announced.name,
+    // Copied straight across rather than folded into "has a version": the two
+    // are not the same question. `'observed'` says nothing described this at
+    // all, which is what a callee whose runs come back tagged
+    // `version:undeclared` looks like from the outside — the fact an author
+    // choosing a pin needs and could not previously get.
+    evidence: announced.evidence,
     workers: announced.instances.length,
   };
   if (announced.version !== undefined) ref.version = announced.version;
