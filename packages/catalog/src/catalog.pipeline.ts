@@ -1423,12 +1423,25 @@ export interface WorkflowNodeOutcome {
  *   {@link WorkflowIfNode} is the conditional one, and it earns its kind by
  *   doing something no wiring can express — deciding that one of those
  *   successors, and everything only it feeds, does not run at all.
- * - **merge / join** — a node with several inbound edges receives its inputs
- *   concatenated in edge order (see {@link WorkflowEdge}). A keyed join is then
- *   ordinary code inside the transform, which can already see every record.
- *   A `merge` kind would have had to carry a strategy field whose values the
- *   runner would have to implement one by one, and an unimplemented strategy in
- *   a dropdown is the failure this list exists to avoid.
+ * - **merge (unkeyed)** — a node with several inbound edges already receives its
+ *   inputs concatenated in edge order (see {@link WorkflowEdge}), so a `merge`
+ *   kind would be a box that draws what the wires already say. It would also
+ *   have had to carry a strategy field whose values the runner implements one by
+ *   one, and an unimplemented strategy in a dropdown is the failure this list
+ *   exists to avoid.
+ * - **join (keyed)** — *this half used to be refused with the entry above, and
+ *   the reversal is left visible rather than edited out*, the way the `filter`
+ *   entry leaves its own. The old argument was that a keyed join is ordinary
+ *   code inside a transform, which can already see every record. Every word of
+ *   that is true and it is exactly the problem: "can already see every record"
+ *   is the same sentence as "holds the whole load", and it is why a transform
+ *   makes `ConnectorRunnerService` log *"Held all N records in memory"*. A join
+ *   does not need both sides held. It needs **one** side held — as a map, keyed
+ *   — while the other streams past it, and that asymmetry is a property of the
+ *   operation that a function over a batch cannot express and a runner therefore
+ *   cannot exploit. {@link WorkflowLookupNode} is the keyed half, built narrow:
+ *   one key, named enrichment fields, and a reference side that is bounded and
+ *   refused loudly rather than held quietly.
  * - **call a durable *step*** — the sibling of {@link WorkflowCallNode} that
  *   somebody will eventually come looking for, and it cannot be built. A
  *   durable step has no global identity: it is dispatched by a routing name
@@ -1456,6 +1469,8 @@ export const WORKFLOW_NODE_KINDS = [
   'rename',
   /** Groups records and summarises each group. See {@link WorkflowAggregateNode}. */
   'aggregate',
+  /** Enriches each row from a reference dataset, by key. See {@link WorkflowLookupNode}. */
+  'lookup',
 ] as const;
 
 export type WorkflowNodeKind = (typeof WORKFLOW_NODE_KINDS)[number];
@@ -3154,6 +3169,46 @@ export function unreachableAggregateFunction(fn: never, where: string): never {
   );
 }
 
+/* --- lookup -------------------------------------------------------------- */
+
+/**
+ * What happens to a driving row whose key matches no reference row.
+ *
+ * Three words rather than a boolean, because the three are the three joins SQL
+ * has names for and each is a different node. See
+ * {@link WorkflowLookupNode.unmatched} for which one to reach for.
+ */
+export const WORKFLOW_LOOKUP_UNMATCHED = [
+  /** The enriched columns are set to `null` on that row. A LEFT JOIN. The default. */
+  'null',
+  /** The row does not reach the next node at all. An INNER JOIN. */
+  'drop',
+  /** The node fails, naming the key. For a reference that is a prerequisite. */
+  'fail',
+] as const;
+
+export type WorkflowLookupUnmatched = (typeof WORKFLOW_LOOKUP_UNMATCHED)[number];
+
+/** Same reason as {@link isConnectorKind}: one list, no second copy to drift. */
+export function isWorkflowLookupUnmatched(value: unknown): value is WorkflowLookupUnmatched {
+  return WORKFLOW_LOOKUP_UNMATCHED.some((each) => each === value);
+}
+
+/**
+ * The exhaustiveness guard for {@link WORKFLOW_LOOKUP_UNMATCHED}.
+ *
+ * {@link unreachableNodeKind}, one level down, and for the identical reason: the
+ * three words decide whether a row keeps its data, disappears from the load, or
+ * stops the run, and a fourth added without a branch would silently pick
+ * whichever the last `if` was — which here means silently changing which rows
+ * reach a published type.
+ */
+export function unreachableLookupUnmatched(value: never, where: string): never {
+  throw new Error(
+    `${where} does not handle the lookup disposition ${JSON.stringify(value)}. The list and every decision made per entry are meant to move together.`,
+  );
+}
+
 /**
  * How many columns one node may group on.
  *
@@ -3524,6 +3579,357 @@ export function aggregateRefusals(node: {
 }
 
 /**
+ * How many fields one lookup may bring across.
+ *
+ * The same argument {@link WORKFLOW_RENAME_MAX_COLUMNS} makes, plus one that is
+ * specific to this node: every named field is held *per distinct key* for the
+ * whole run, so this number multiplies {@link WORKFLOW_LOOKUP_MAX_REFERENCE_ROWS}
+ * into the actual memory bill. Past a few dozen the thing being expressed is
+ * "give me that whole table beside this one", which is a second source and a
+ * union, not an enrichment.
+ */
+export const WORKFLOW_LOOKUP_MAX_FIELDS = 64;
+
+/**
+ * How many rows the reference side may have before the node refuses to run.
+ *
+ * ## Why there is a number here at all
+ *
+ * Because exactly one side of a join can stream, and this node holds the other
+ * one. That is the whole property it exists to have (see
+ * {@link WorkflowLookupNode}) and it is also the whole hazard: a graph whose
+ * reference edge is accidentally wired to the 7.6-million-row side does not fail,
+ * it allocates until the pod is killed — and a pod killed by the kernel produces
+ * no run log, no failed node and no message, which is the silence this file is
+ * arranged against.
+ *
+ * ## Why it is measured in rows, and why it is free
+ *
+ * A staged input announces its `rowCount` before a single row is read back (see
+ * `WorkflowStageRef`), so the refusal happens *before* anything is held. A bound
+ * in bytes would have to be discovered by holding rows until they weighed too
+ * much, which is a bound that has already done the damage by the time it fires.
+ *
+ * Two hundred thousand, and the arithmetic rather than a round number that feels
+ * safe: what is retained per key is the key string plus the values of the named
+ * fields — not the reference row — so a reference of this size with a handful of
+ * short fields is tens of megabytes, and one at {@link WORKFLOW_LOOKUP_MAX_FIELDS}
+ * is the point where it stops being obviously fine. The real reference tables
+ * this was built against are three orders of magnitude below it: a work-plan code
+ * table is hundreds of rows and a unit dictionary is dozens.
+ *
+ * The refusal names the count, the bound and the fix, because the fix is
+ * genuinely available in the graph: put a filter on the reference side, or swap
+ * the two edges if the smaller side is the one being streamed.
+ */
+export const WORKFLOW_LOOKUP_MAX_REFERENCE_ROWS = 200_000;
+
+/**
+ * Enriches each row with fields from a reference dataset, matched by key.
+ *
+ * ## The property that justifies a kind rather than a transform
+ *
+ * **One side is held; the other streams.** The reference is read once into a map
+ * keyed by its key column, and then the driving rows go past it one batch at a
+ * time and never accumulate. That asymmetry is the entire content of the node,
+ * and it is not something a {@link WorkflowTransformNode} can express: a
+ * transform is a function over what it is given, so a join written as one has to
+ * be handed *both* sides at once — which is why a transform makes
+ * `ConnectorRunnerService` log *"Held all N records in memory"*, and why the
+ * whole-batch version of this exact join reached 78% of a hard 32 MiB output
+ * bound on 44,720 rows before it did anything interesting.
+ *
+ * A per-record transform ({@link CatalogTransform} in `record` mode) cannot do it
+ * either, and the reason is sharper: a function over one record has nowhere to
+ * put the map. It would rebuild it per record, or reach a database per record,
+ * and 44,720 round trips is not a shape anybody would choose on purpose.
+ *
+ * ## What it stays narrow about, deliberately
+ *
+ * The generic transform still exists, and that is what lets this node refuse
+ * every next field forever — the argument {@link WorkflowRenameNode} makes at
+ * length. No join *type* beyond {@link unmatched}, no composite keys, no
+ * expressions on either side, no aggregation of the matched rows. The answer to
+ * "I need more than this" is always *use a transform*, and never *add a field
+ * here*. Two of those refusals have a second reason on top:
+ *
+ * - **No composite key.** Two columns concatenated is a rule about a separator,
+ *   and a separator that occurs inside a value silently merges two different
+ *   keys into one. A {@link WorkflowRenameNode} cannot build one either, which is
+ *   the honest statement: build the key in a transform, then join on it, and the
+ *   separator is a decision somebody wrote down.
+ * - **No expressions on either side.** `UPPER(key)` looks harmless and is the
+ *   single most dangerous thing that could be added, because normalising a key
+ *   is a rule about which of two values are "the same value" — see the note on
+ *   {@link key} about what happens when only one side is normalised.
+ *
+ * ## Where the reference comes from: an edge, named
+ *
+ * The reference is **another node in this graph**, wired into this one, and
+ * {@link reference} says which of the inbound edges it is. Not a connector on
+ * this node, and not the first inbound edge.
+ *
+ * *Not a connector on this node*, because a source is already a modelled thing
+ * with a kind, an optional named connection, a secret, a mode, a config, schema
+ * discovery and a staging path — and putting a second, smaller copy of all that
+ * inside this node would fork it. Wiring a source in instead means the reference
+ * composes with everything: a `catalog` source reads the **current** snapshot of
+ * a published type, resolved when the run reaches it (see `sourceKind: 'catalog'`),
+ * which is the natural reference and names no physical table; a `sql` source
+ * reads a code table straight out of an operational database; and a filter or a
+ * rename may sit in between, which is how a reference with duplicate keys is
+ * made unambiguous (see below) without this node growing a rule for it.
+ *
+ * *Not the first inbound edge*, and this one is the sharp decision. Edge order
+ * is defined and does decide what a multi-input node receives — but for every
+ * other kind, reordering two wires changes only the order rows are concatenated
+ * in, which is at worst cosmetic. Here it would decide **which side is held
+ * entirely in memory**, and swapping them silently turns a working graph into
+ * one that either holds 44,720 rows to enrich 200, or joins the two datasets the
+ * wrong way round and reports success. Reordering edges is invisible on a canvas.
+ * So the node names its reference by node id, and `validateWorkflow` refuses a
+ * name that is not one of its inbound edges.
+ *
+ * ## The counts, which are the point
+ *
+ * The failure this node was built against is not a crash. flip's SUBWO reader
+ * builds exactly these two maps and reads them per row, and when the reference
+ * table is empty it produces **unenriched rows and a green run** — 44,720 rows
+ * with `planName`, `planDescription` and `unitMel` hard null, no error, no
+ * warning, and a documented seeding prerequisite that nothing checks. A zero-match
+ * join is indistinguishable from a working one by looking at the run.
+ *
+ * So the run log always carries three numbers, whatever {@link unmatched} says:
+ * how many rows matched, how many had a key that matched nothing, and how many
+ * had no key at all. The third is separate from the second on purpose — they
+ * have different causes and different fixes, and flip's reader folds both into
+ * the same NULL. A run where nothing matched gets a line of its own, the way
+ * `filterLogLines` calls out a filter that kept nothing.
+ *
+ * ## The decisions, each made rather than discovered
+ *
+ * - **A key that matches nothing** — {@link unmatched}, defaulting to `null`.
+ * - **Two reference rows for one key** — refused, *when they disagree*. See
+ *   {@link fields}.
+ * - **An enriched name the driving row already carries** — refused, naming both.
+ *   There are two columns and one name and every rule for picking a winner is
+ *   arbitrary — the same sentence {@link renameColumnRefusals} says, about the
+ *   same problem arriving from the other direction. Refused at authoring time
+ *   when the graph can prove it (see `checkColumnsProduced`), and at run time on
+ *   the first row that has it otherwise.
+ * - **A reference row with no key** — not indexed, and counted. A real work-plan
+ *   table has them: flip writes `planId: row.planId ?? ""` when a load has no
+ *   plan code, so the empty-string key is in the table by construction and can
+ *   never be matched by anything. Refusing the whole reference over one of those
+ *   would make the node unusable against the data it was built for; indexing it
+ *   silently would let one keyless row become the answer for every keyless
+ *   driving row.
+ */
+export interface WorkflowLookupNode extends WorkflowNodeBase {
+  kind: 'lookup';
+  /**
+   * The id of the inbound node whose rows are the reference side.
+   *
+   * Held in memory for the whole node; everything else wired in streams past it.
+   * `validateWorkflow` refuses an id that is not one of this node's inbound
+   * edges, and refuses a lookup whose *only* inbound edge is this one — a lookup
+   * with nothing to enrich produces nothing, and would commit an empty snapshot.
+   */
+  reference: string;
+  /**
+   * The column on the **driving** row holding the key.
+   *
+   * Deliberately unconstrained in spelling, the way a rename's *source* names
+   * are: `Reg Number` and `Mgmt Cd` are what real drops are keyed by.
+   *
+   * ## How two keys are compared, stated once because it is the whole join
+   *
+   * A key is read off the row, and a value of `null` or `undefined` — or a
+   * column that is absent from that row — means the row **has no key**. It is
+   * counted separately and never matches, including against a reference row
+   * that also has no key.
+   *
+   * Anything else is compared **as a string**, by `String(value)`, with no
+   * trimming, no case folding and no other normalisation.
+   *
+   * The coercion is a decision and so is its limit. It is there because the two
+   * sides routinely come from different engines: a work-plan code arriving as a
+   * MySQL `VARCHAR` and the same code arriving as a number out of a spreadsheet
+   * parser are the same key to everyone except `===`, and a join that matched
+   * nothing for that reason is the exact silent-zero this node reports counts to
+   * prevent. What is *not* done is normalising the shape of the value, because
+   * every one of those is a rule about which of somebody's values are the same
+   * value: `"21 CES"` and `"21CES"` are not the same unit unless a person says
+   * so, and flip's own reader is the cautionary tale — it normalises the driving
+   * unit and compares it against a reference column normalised at write time by
+   * a different screen, so the two agree only for as long as nobody edits either.
+   * If a key needs normalising, normalise it in a transform, on both sides,
+   * where it is visible.
+   */
+  key: string;
+  /** The column on the **reference** row holding the key. Compared as {@link key} describes. */
+  referenceKey: string;
+  /**
+   * Reference column → the name it lands under on the driving row. Never empty;
+   * at most {@link WORKFLOW_LOOKUP_MAX_FIELDS} entries; every target matches
+   * {@link WORKFLOW_FILTER_COLUMN_PATTERN} and no two share one.
+   *
+   * A `Record` rather than a list of pairs, for the reason
+   * {@link WorkflowRenameNode.columns} is one: a key cannot appear twice, so
+   * bringing one reference column across twice is unrepresentable. Two brought
+   * across *onto* one name is representable and refused.
+   *
+   * The target pattern is the identifier rule and it is here for the reason the
+   * rename's targets are: a load looks every field up as `row[name]`, so a name
+   * no property can carry loads NULL into every row and reports success. That is
+   * the failure this node is supposed to be *fixing*, so producing it would be
+   * the trap re-armed one node further along.
+   *
+   * ## Empty is refused rather than treated as a no-op
+   *
+   * A lookup that brings nothing across is a node that draws as configured,
+   * costs a full pass over both sides, and changes nothing — except under `drop`,
+   * where it silently becomes a semi-join that deletes every row whose key is not
+   * in the reference. Two silent opposites reached by deleting the last row of a
+   * form, which is exactly the argument {@link renameColumnRefusals} makes.
+   *
+   * ## Why the fields decide the duplicate-key rule
+   *
+   * Two reference rows for one key means either the join multiplies rows or
+   * something picks a winner, and picking a winner is a rule about whose data
+   * survives — the reasoning {@link renameColumnRefusals} already refused, for
+   * two columns renamed onto one name. Multiplying rows is worse here than it
+   * looks: this node's contract is that it enriches, so a sink downstream would
+   * commit more rows than were read with nothing on the canvas saying why.
+   *
+   * So: **two reference rows for one key are refused when they disagree about
+   * any named field, and collapsed when they agree.** Agreeing costs nobody
+   * anything — there is no winner, the answer is the same either way — and it is
+   * what a real reference table looks like when it has one row per key *and*
+   * something else, which is the common case. Disagreeing fails the node, naming
+   * the key, the field and both values.
+   *
+   * Note what makes this rule cheap and total: it is decided over the **named
+   * fields only**, so two reference rows that differ in a column this node does
+   * not bring across are not a conflict, because nothing about them reaches the
+   * output. And it is decided while the map is built, before a single driving
+   * row is read, so it fails at the start of the node rather than at row ninety
+   * thousand.
+   *
+   * flip's own reader is the argument for refusing rather than choosing. It
+   * builds the plan map with `plansMap.set(plan.planId, plan)`, which keeps the
+   * **last** row; it resolves the unit dictionary with `Array.prototype.find`,
+   * which keeps the **first**; neither key column has a unique constraint; and
+   * the two rules live forty lines apart in one file. Nobody chose either of
+   * them.
+   */
+  fields: Record<string, string>;
+  /**
+   * What happens to a driving row whose key matches nothing. Absent means `null`.
+   *
+   * `null` is the default because it is the only one of the three that changes
+   * neither which rows exist nor whether the run finishes, so it is the one that
+   * can be the answer for a graph nobody has thought about yet. It is also what
+   * flip does today — and the difference this node makes is not the disposition,
+   * it is that the count is reported rather than left to be discovered by
+   * querying the committed snapshot.
+   *
+   * `drop` is an INNER JOIN and it removes rows, so it is never a default: a
+   * lookup wired in front of a full-mode sink under `drop` shrinks a published
+   * type, which is the accident {@link WorkflowFilterNode.narrows} exists about.
+   *
+   * `fail` is for a reference that is a **documented prerequisite**, which is not
+   * a hypothetical: flip's docs make seeding the unit dictionary a prerequisite
+   * of MEL, MVR and SUBWO, and an unseeded one yields unnormalized rows rather
+   * than an error. A load that cannot be enriched is a load that should not
+   * commit, and this is how somebody says so.
+   */
+  unmatched?: WorkflowLookupUnmatched;
+}
+
+/** {@link WorkflowLookupNode.unmatched}, resolved. One reader of the default. */
+export function workflowLookupUnmatched(node: WorkflowLookupNode): WorkflowLookupUnmatched {
+  return node.unmatched ?? 'null';
+}
+
+/**
+ * A key, as this node compares them, or `undefined` for a row that has none.
+ *
+ * One function, exported, and called by the runner for both sides — because the
+ * one way a join goes silently wrong is the two sides being read by two pieces
+ * of code that agree today. See {@link WorkflowLookupNode.key} for what it does
+ * and, more to the point, what it deliberately does not do.
+ */
+export function workflowLookupKey(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  // Objects and arrays are refused rather than stringified: `String({})` is
+  // `"[object Object]"`, which is a key that every JSON column in a row would
+  // share, so a join on a mis-chosen column would match everything to everything
+  // and report a very large number of matches.
+  if (typeof value === 'object') return undefined;
+  const key = String(value);
+  // The empty string is "no key", not a key. A reference table writes it where a
+  // code was missing (flip's `planId: row.planId ?? ""`), so treating it as a
+  // value would make one keyless reference row the answer for every keyless
+  // driving row.
+  return key.length === 0 ? undefined : key;
+}
+
+/**
+ * Every reason a lookup's configuration cannot be stored, as sentences, or empty.
+ *
+ * One function, called by {@link validateWorkflow}, by the HTTP boundary and by
+ * the canvas, for the reason {@link renameColumnRefusals} is: a screen that
+ * checked a target name against its own copy of the pattern is a screen that
+ * eventually accepts something the server refuses, halfway through a save.
+ *
+ * All of them rather than the first, for the reason `refuseUnpublishablePropertyNames`
+ * gives: a form filled in one sitting is usually wrong about several things in
+ * the same way.
+ *
+ * The *wiring* rules — that {@link WorkflowLookupNode.reference} names an inbound
+ * edge, and that something other than the reference is wired in — are not here,
+ * and that is not an omission. They are facts about the graph rather than about
+ * the node, so they cannot be answered from the node alone; `validateWorkflow`
+ * owns them and the inspector reads them from `validateWorkflow`.
+ */
+export function lookupConfigRefusals(node: {
+  key?: unknown;
+  referenceKey?: unknown;
+  fields?: Record<string, string>;
+}): string[] {
+  const refusals: string[] = [];
+
+  if (typeof node.key !== 'string' || node.key.length === 0) {
+    refusals.push(
+      'It names no key column on the rows being enriched, so there is nothing to match on.',
+    );
+  }
+  if (typeof node.referenceKey !== 'string' || node.referenceKey.length === 0) {
+    refusals.push(
+      'It names no key column on the reference rows, so there is nothing to match against.',
+    );
+  }
+
+  refusals.push(...lookupFieldRefusals(node.fields ?? {}));
+
+  // Last, so a blank key has already been reported as a blank key rather than as
+  // a collision with itself, and so this reads after the sentences about the map.
+  if (typeof node.key === 'string' && node.key.length > 0) {
+    const onto = Object.entries(node.fields ?? {})
+      .filter(([, to]) => to === node.key)
+      .map(([from]) => JSON.stringify(from));
+    if (onto.length > 0) {
+      refusals.push(
+        `${onto.join(' and ')} would land as ${JSON.stringify(node.key)}, which is the column this node matches on. The key would be overwritten by the reference's copy of it on every row that matched and left alone on every row that did not, so afterwards the column would no longer say which rows were enriched.`,
+      );
+    }
+  }
+
+  return refusals;
+}
+
+/**
  * What the grouping half can be wrong about, and the names it accepted.
  *
  * The accepted set is threaded out rather than recomputed, because the sharpest
@@ -3647,6 +4053,57 @@ function oneAggregateRefusals(
 }
 
 /**
+ * The half of {@link lookupConfigRefusals} that a field map answers on its own.
+ *
+ * Split out because {@link isWorkflowLookupFields} is handed a map and nothing
+ * else, and calling the whole function with invented key columns would either
+ * report two refusals about keys it was not asked about, or — with plausible
+ * stand-ins — report a collision between a real target and a made-up key. A
+ * guard that fires on the value it was given plus two values it made up is a
+ * guard that rejects a graph for a reason that is not in the graph.
+ */
+function lookupFieldRefusals(fields: Record<string, string>): string[] {
+  const refusals: string[] = [];
+  const entries = Object.entries(fields);
+  if (entries.length === 0) {
+    refusals.push(
+      'It brings no fields across. An empty list is refused rather than stored: it is a node that draws as configured, costs a pass over both sides and changes nothing — and with unmatched rows dropped it silently becomes a filter that deletes every row whose key is not in the reference.',
+    );
+  }
+  if (entries.length > WORKFLOW_LOOKUP_MAX_FIELDS) {
+    refusals.push(
+      `It brings ${entries.length} fields across, and at most ${WORKFLOW_LOOKUP_MAX_FIELDS} may come from one lookup. Every one of them is held per distinct key for the whole run, and past this the thing being expressed is a second dataset beside this one rather than an enrichment.`,
+    );
+  }
+
+  const targets = new Map<string, string[]>();
+  for (const [from, to] of entries) {
+    if (from.length === 0) {
+      refusals.push(
+        'One field names no column on the reference rows, so there is nothing for it to bring across.',
+      );
+      continue;
+    }
+    if (typeof to !== 'string' || !WORKFLOW_FILTER_COLUMN_PATTERN.test(to)) {
+      refusals.push(
+        `${JSON.stringify(from)} would land as ${JSON.stringify(to)}, which is not a name a column can have: letters, digits and underscore, starting with a letter or an underscore. A load looks every field up as \`row[name]\`, so a column this service cannot name downstream is one that loads NULL into every row and reports success — which is the failure this node exists to end, not to relocate.`,
+      );
+      continue;
+    }
+    targets.set(to, [...(targets.get(to) ?? []), from]);
+  }
+
+  for (const [to, sources] of targets) {
+    if (sources.length < 2) continue;
+    refusals.push(
+      `${sources.map((from) => JSON.stringify(from)).join(' and ')} would both land as ${JSON.stringify(to)}. Two columns cannot share one name, and picking a winner would be a rule about which of somebody's data survives.`,
+    );
+  }
+
+  return refusals;
+}
+
+/**
  * The two fields only `join` reads.
  *
  * Refused on any other function rather than ignored, which is the rule the whole
@@ -3722,6 +4179,30 @@ export function isWorkflowAggregates(value: unknown): value is WorkflowAggregate
 }
 
 /**
+ * Whether a stored field map is one this build can run.
+ *
+ * Refused rather than repaired, the stance {@link isWorkflowRenameColumns} takes
+ * and for the same reason: a map read back with one entry silently dropped is a
+ * graph that commits a column of NULLs under a name nobody can now explain.
+ *
+ * `Object.entries` rather than a `for…in`, so an inherited key cannot enter the
+ * map. The key columns are not checked here because they are not this value;
+ * {@link lookupConfigRefusals} is what sees the whole node.
+ */
+export function isWorkflowLookupFields(value: unknown): value is Record<string, string> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const entries = Object.entries(value);
+  const fields: Record<string, string> = {};
+  for (const [from, to] of entries) {
+    if (typeof to !== 'string') return false;
+    fields[from] = to;
+  }
+  // Only the field-shaped refusals can be answered from this value alone. See
+  // {@link lookupFieldRefusals} for why the whole function is not called here.
+  return lookupFieldRefusals(fields).length === 0;
+}
+
+/**
  * A discriminated union, so narrowing a node is `node.kind === "sink"` and
  * never a type assertion. This is why the kind list is not simply a string on
  * one node shape with every field optional: that shape lets a source node carry
@@ -3735,7 +4216,8 @@ export type WorkflowNode =
   | WorkflowIfNode
   | WorkflowFilterNode
   | WorkflowRenameNode
-  | WorkflowAggregateNode;
+  | WorkflowAggregateNode
+  | WorkflowLookupNode;
 
 /* --- reusable nodes ------------------------------------------------------ */
 
@@ -3807,6 +4289,11 @@ export function isReusableNodeKind(value: unknown): value is ReusableNodeKind {
  *   its *output* column set is the thing downstream nodes are validated against,
  *   so a shared node editable from elsewhere would silently change what another
  *   graph's sink is allowed to write.
+ * - `lookup` — that argument, and one that is not an argument at all but an
+ *   impossibility: {@link WorkflowLookupNode.reference} is **a node id in this
+ *   graph**. A shared body carrying one would name a node the adopting graph has
+ *   never had, and it is not a cosmetic field — it is the one that decides which
+ *   side of the join is held in memory.
  */
 export const NODE_KIND_IS_REUSABLE = {
   source: true,
@@ -3817,6 +4304,7 @@ export const NODE_KIND_IS_REUSABLE = {
   filter: false,
   rename: false,
   aggregate: false,
+  lookup: false,
 } as const satisfies Record<WorkflowNodeKind, boolean> & Record<ReusableNodeKind, true>;
 
 /** Whether this kind can be saved as a reusable node. Reads {@link NODE_KIND_IS_REUSABLE}. */
@@ -4881,6 +5369,36 @@ export const WORKFLOW_ISSUE_CODES = [
    */
   'aggregate-invalid',
   /**
+   * A lookup whose configuration cannot be stored: no key on one side or the
+   * other, no fields, too many, or a target that is not a column name, that two
+   * reference columns share, or that would overwrite the key. All from the node
+   * alone — see {@link lookupConfigRefusals} for the sentences.
+   */
+  'lookup-invalid',
+  /**
+   * A lookup whose `reference` does not name one of its inbound edges.
+   *
+   * A code of its own rather than part of `lookup-invalid`, because it is a fact
+   * about the *graph* and points at two boxes: this node and, when it exists, the
+   * node it wrongly names. It is also the one lookup mistake that produces a
+   * green run — with no reference rows to hold, every row comes out enriched with
+   * nulls and the load commits.
+   */
+  'lookup-reference-not-wired',
+  /**
+   * A lookup with nothing wired in but its reference. The reference is held as a
+   * map and never passed on, so the node produces no rows and a full-mode sink
+   * below it commits an empty snapshot over what is published.
+   */
+  'lookup-nothing-to-enrich',
+  /**
+   * A lookup bringing a field across onto a name the rows it enriches already
+   * carry. Two columns, one name, and every rule for picking a winner is a rule
+   * about whose data survives — the sentence `rename-invalid` says about the same
+   * problem arriving from the other direction.
+   */
+  'lookup-column-collides',
+  /**
    * A node naming a column that nothing upstream can produce.
    *
    * The one thing a declarative rename buys the *validator*, and it is the whole
@@ -4979,6 +5497,10 @@ export function validateWorkflow(
   const sinks = nodes.filter((node): node is WorkflowSinkNode => node.kind === 'sink');
 
   checkNodeWiring(nodes, incoming, outgoing, issues);
+  // After `checkEdges` has returned, so every id named by an edge is a node that
+  // exists and this cannot report a reference whose real problem is a wire
+  // pointing at something deleted.
+  checkLookupWiring(nodes, incoming, byId, issues);
   checkEndpoints(originators, sinks, issues);
   checkBranches(edges, byId, issues);
   checkPlainCallOutputs(nodes, outgoing, byId, issues);
@@ -5410,6 +5932,7 @@ function nodeIsUnconfigured(node: WorkflowNode): WorkflowValidationIssue | undef
   if (node.kind === 'filter') return filterIsUnconfigured(node);
   if (node.kind === 'rename') return renameIsUnconfigured(node);
   if (node.kind === 'aggregate') return aggregateIsUnconfigured(node);
+  if (node.kind === 'lookup') return lookupIsUnconfigured(node);
   return undefined;
 }
 
@@ -5432,6 +5955,87 @@ function aggregateIsUnconfigured(node: WorkflowAggregateNode): WorkflowValidatio
     nodeIds: [node.id],
     message: `Aggregate "${node.name}" (${node.id}) cannot be stored as it is. ${refusals.join(' ')}`,
   };
+}
+
+/**
+ * A lookup whose configuration this service will not store.
+ *
+ * The refusals come from {@link lookupConfigRefusals} rather than being restated
+ * here, so the canvas, the HTTP boundary and this validator say the same sentence
+ * about the same node. Every one of them is a *silent* failure if let through: no
+ * key column is a join that matches nothing, no fields is a node that either does
+ * nothing or quietly becomes a filter, and a target this service cannot name
+ * downstream loads NULL into every row and reports success.
+ *
+ * The wiring rules are next door in {@link checkLookupWiring}, because they are
+ * facts about the graph rather than about the node — and because a lookup with
+ * the reference edge missing has to point at *two* boxes, which is a thing an
+ * `unconfigured` issue about one node cannot do.
+ */
+function lookupIsUnconfigured(node: WorkflowLookupNode): WorkflowValidationIssue | undefined {
+  const refusals = lookupConfigRefusals(node);
+  if (refusals.length === 0) return undefined;
+  return {
+    code: 'lookup-invalid',
+    nodeIds: [node.id],
+    message: `Lookup "${node.name}" (${node.id}) cannot be stored as it is. ${refusals.join(' ')}`,
+  };
+}
+
+/**
+ * A lookup's two edges: the reference it holds, and something to enrich.
+ *
+ * ## Why this is refused here rather than discovered at run time
+ *
+ * Both failures produce a run that finishes. A lookup whose `reference` names a
+ * node that is not wired into it has no reference rows at all, so under the
+ * default disposition every row is enriched with nulls and the load commits —
+ * which is the exact defect this node was built to end, arrived at through the
+ * wiring instead of through the data. A lookup with *only* the reference wired in
+ * has nothing to enrich, so it produces zero rows and a full-mode sink below it
+ * commits an empty snapshot over whatever was live.
+ *
+ * Named by id rather than taken from edge order, and {@link WorkflowLookupNode}
+ * argues why at length: edge order decides which side is held in memory, and
+ * reordering two wires is invisible on a canvas.
+ */
+function checkLookupWiring(
+  nodes: readonly WorkflowNode[],
+  incoming: ReadonlyMap<string, string[]>,
+  byId: ReadonlyMap<string, WorkflowNode>,
+  issues: WorkflowValidationIssue[],
+): void {
+  for (const node of nodes) {
+    if (node.kind !== 'lookup') continue;
+    const feeds = incoming.get(node.id) ?? [];
+    const named = typeof node.reference === 'string' ? node.reference : '';
+    if (named.length === 0 || !feeds.includes(named)) {
+      const known = byId.get(named);
+      issues.push({
+        code: 'lookup-reference-not-wired',
+        nodeIds: known ? [node.id, named] : [node.id],
+        message: `Lookup "${node.name}" (${node.id}) takes its reference rows from ${
+          named.length === 0
+            ? 'no node at all'
+            : known
+              ? `"${known.name}" (${named})`
+              : `"${named}"`
+        }, which is not wired into it. ${
+          feeds.length === 0
+            ? 'Nothing is wired into it.'
+            : `What is wired into it is ${listNodes(feeds, byId)}.`
+        } A lookup holds one of its inputs in memory as a map and streams the rest past it, so it has to be told which one — and with no reference rows to hold, every row would come out enriched with nulls and the load would commit.`,
+      });
+      continue;
+    }
+    if (feeds.length < 2) {
+      issues.push({
+        code: 'lookup-nothing-to-enrich',
+        nodeIds: [node.id, named],
+        message: `Lookup "${node.name}" (${node.id}) has only its reference wired into it. The reference is held as a map and is not passed on, so this node would produce no rows at all and a full-mode sink below it would commit an empty snapshot over whatever is published. Wire in the rows you want enriched as well.`,
+      });
+    }
+  }
 }
 
 /**
@@ -6134,6 +6738,7 @@ function canonicalNode(node: WorkflowNode): string {
   }
   if (node.kind === 'rename') return canonicalRename(node);
   if (node.kind === 'aggregate') return canonicalAggregate(node);
+  if (node.kind === 'lookup') return canonicalLookup(node);
   if (node.kind === 'sink') {
     return JSON.stringify([
       node.id,
@@ -6208,6 +6813,39 @@ function canonicalAggregate(node: WorkflowAggregateNode): string {
     // which is a difference between two runs of "the same" graph worth being
     // able to point at. Appended only when set, so the default has one spelling.
     ...(node.maxGroups === undefined ? [] : [node.maxGroups]),
+  ]);
+}
+
+/**
+ * A lookup, canonicalised.
+ *
+ * `reference` is in here and it is the field somebody would be tempted to leave
+ * out, because it names a node rather than describing an operation. It has to be
+ * in: repointing the reference edge at a different node is a change to what the
+ * load produces on every row, and it is one of the few edits that leaves the
+ * canvas looking identical.
+ *
+ * The fields are sorted by reference column, safe for the reason a rename's map
+ * is: the whole map is applied to one row at once, so its order changes nothing
+ * about the result and a canvas rewriting the object in another order is not an
+ * edit.
+ *
+ * `unmatched` is appended only when it is not the default, exactly as
+ * `edge.branch` is appended only when there is a label. That rule buys nothing
+ * today — no stored graph has a lookup in it, since the kind is new — and it is
+ * followed anyway, because the version *after* this one is where a default gets
+ * normalised onto the node by some canvas and renumbers every graph that has one.
+ */
+function canonicalLookup(node: WorkflowLookupNode): string {
+  const unmatched = workflowLookupUnmatched(node);
+  return JSON.stringify([
+    node.id,
+    node.kind,
+    node.reference,
+    node.key,
+    node.referenceKey,
+    sortedEntries(node.fields),
+    ...(unmatched === 'null' ? [] : [unmatched]),
   ]);
 }
 
@@ -6400,6 +7038,7 @@ export function workflowKnownColumns(
   graph: WorkflowGraph,
   nodeId: string,
   knowledge?: WorkflowColumnKnowledge,
+  onlyFrom?: WorkflowInputFilter,
 ): ReadonlySet<string> | undefined {
   const nodes = graph.nodes ?? [];
   const byId = new Map(nodes.map((node) => [node.id, node]));
@@ -6415,14 +7054,17 @@ export function workflowKnownColumns(
     const node = byId.get(id);
     if (!node) return undefined;
     open.add(id);
-    const produced = producedColumns(node, () => intoNode(id), knowledge);
+    const produced = producedColumns(node, (only) => intoNode(id, only), knowledge);
     open.delete(id);
+    // Memoised without the filter, and safe because the filter is only ever
+    // applied at the node being *asked about*: `outOf` answers what a node
+    // passes on, which does not depend on who is asking.
     answered.set(id, produced);
     return produced;
   };
 
-  const intoNode = (id: string): ReadonlySet<string> | undefined => {
-    const feeds = incoming.get(id) ?? [];
+  const intoNode = (id: string, only?: WorkflowInputFilter): ReadonlySet<string> | undefined => {
+    const feeds = (incoming.get(id) ?? []).filter((from) => only?.(from) ?? true);
     if (feeds.length === 0) return undefined;
     const union = new Set<string>();
     for (const from of feeds) {
@@ -6436,7 +7078,51 @@ export function workflowKnownColumns(
     return union;
   };
 
-  return intoNode(nodeId);
+  return intoNode(nodeId, onlyFrom);
+}
+
+/**
+ * Which of a node's inbound edges a question is about.
+ *
+ * One node kind needs this and it is {@link WorkflowLookupNode}, which is the
+ * only one whose inputs are not interchangeable: the reference side is held as a
+ * map and its columns do **not** flow on, so the union of everything wired in is
+ * the wrong answer to "what does this node pass down". Without the distinction
+ * the walk would report the reference's columns as available downstream, and a
+ * filter naming one of them would be accepted by the validator and then match no
+ * row at run time — the precise silent failure `checkColumnsProduced` exists to
+ * catch, produced by the check itself.
+ *
+ * Optional everywhere it appears, and omitting it means every inbound edge —
+ * which is what every other kind wants and what every existing caller gets.
+ */
+export type WorkflowInputFilter = (fromNodeId: string) => boolean;
+
+/**
+ * The two column sets a lookup sees, told apart.
+ *
+ * Exported because three callers need the same split and each one getting it
+ * right separately is how they come to disagree: the validator refuses a key
+ * column that is not on the driving side, the walk answers what the node passes
+ * on, and the inspector says both out loud on the screen where the columns are
+ * typed.
+ *
+ * Either side answers `undefined` for the ordinary reason — see
+ * {@link workflowKnownColumns} — and `undefined` must not be read as empty.
+ */
+export function workflowLookupColumns(
+  graph: WorkflowGraph,
+  node: WorkflowLookupNode,
+  knowledge?: WorkflowColumnKnowledge,
+): { driving: ReadonlySet<string> | undefined; reference: ReadonlySet<string> | undefined } {
+  const named = typeof node.reference === 'string' ? node.reference : '';
+  return {
+    driving: workflowKnownColumns(graph, node.id, knowledge, (from) => from !== named),
+    reference:
+      named.length === 0
+        ? undefined
+        : workflowKnownColumns(graph, node.id, knowledge, (from) => from === named),
+  };
 }
 
 /**
@@ -6471,9 +7157,27 @@ export interface WorkflowColumnKnowledge {
  */
 function producedColumns(
   node: WorkflowNode,
-  upstream: () => ReadonlySet<string> | undefined,
+  upstream: (only?: WorkflowInputFilter) => ReadonlySet<string> | undefined,
   knowledge: WorkflowColumnKnowledge | undefined,
 ): ReadonlySet<string> | undefined {
+  if (node.kind === 'lookup') {
+    // The reference side is asked *not* to contribute, which is the whole reason
+    // `upstream` takes a filter. Its rows are held as a map and never passed on,
+    // so a column that only exists over there is not a column anything below this
+    // node can see — and a set that claimed otherwise would make the validator
+    // accept a filter that matches no row.
+    const named = typeof node.reference === 'string' ? node.reference : '';
+    const driving = upstream((from) => from !== named);
+    if (driving === undefined) return undefined;
+    // Exact rather than an upper bound, and that is the payoff of the config
+    // being data: what leaves a lookup is what arrived plus the names it was told
+    // to add, and nothing else can appear. Under `unmatched: 'null'` and `'fail'`
+    // every row carries every target; under `'drop'` the rows that would not have
+    // are gone, so it holds there too.
+    const enriched = new Set(driving);
+    for (const to of Object.values(node.fields ?? {})) enriched.add(to);
+    return enriched;
+  }
   if (node.kind === 'rename') {
     if (workflowRenameUnnamed(node) === 'drop') return new Set(Object.values(node.columns ?? {}));
     const known = upstream();
@@ -6577,6 +7281,10 @@ function checkColumnsProduced(
   knowledge: WorkflowColumnKnowledge | undefined,
 ): void {
   for (const node of graph.nodes ?? []) {
+    if (node.kind === 'lookup') {
+      checkLookupColumns(graph, node, issues, knowledge);
+      continue;
+    }
     // Narrowed off the union rather than tested with a property check, so a kind
     // that starts naming columns without being answered for here is a type error
     // at `missingColumnMessage` and not a check that silently passes.
@@ -6609,6 +7317,68 @@ function columnsNamedBy(
   if (node.kind === 'filter') return workflowFilterColumns(node.predicate);
   if (node.kind === 'rename') return Object.keys(node.columns ?? {});
   return workflowAggregateColumns(node);
+}
+
+/**
+ * A lookup's columns, checked against the side each of them lives on.
+ *
+ * Its own function rather than a branch inside {@link checkColumnsProduced},
+ * because a lookup is the one node whose named columns do not all come from one
+ * place: `key` is on the rows being enriched, `referenceKey` and every field
+ * source are on the reference, and the targets must not already exist on the
+ * driving side. Four checks against three sets, and folding them into the loop
+ * above would have meant checking all of them against the union — which is
+ * *worse than not checking*, because the union would accept a key column that
+ * only exists on the reference. That join matches nothing on every row and the
+ * load commits, which is what this node is for.
+ *
+ * Every check is skipped where the set is unknown, for the reason the walk
+ * answers `undefined` rather than empty: silence is correct here, and refusing a
+ * column the graph merely has no opinion about would make every lookup below a
+ * transform unsaveable.
+ */
+function checkLookupColumns(
+  graph: WorkflowGraph,
+  node: WorkflowLookupNode,
+  issues: WorkflowValidationIssue[],
+  knowledge: WorkflowColumnKnowledge | undefined,
+): void {
+  const quoted = (names: Iterable<string>) =>
+    [...names].map((column) => JSON.stringify(column)).join(', ');
+  const { driving, reference } = workflowLookupColumns(graph, node, knowledge);
+
+  if (driving !== undefined && typeof node.key === 'string' && node.key.length > 0) {
+    if (!driving.has(node.key)) {
+      issues.push({
+        code: 'column-not-produced',
+        nodeIds: [node.id],
+        message: `Lookup "${node.name}" (${node.id}) matches on ${quoted([node.key])}, and nothing feeding the rows it enriches produces that column. Something above this node closes the column set — a rename that drops what it does not name, or a source reading a published object type — so what reaches here is exactly ${quoted(driving)}. A key column that is not there has no key on any row, so nothing would match and every row would come out with the enriched columns null.`,
+      });
+    }
+    const collides = Object.values(node.fields ?? {}).filter((to) => driving.has(to));
+    if (collides.length > 0) {
+      issues.push({
+        code: 'lookup-column-collides',
+        nodeIds: [node.id],
+        message: `Lookup "${node.name}" (${node.id}) would bring ${quoted(collides)} across onto rows that already carry ${collides.length === 1 ? 'that column' : 'those columns'}. There are two columns and one name, and every rule for picking a winner is a rule about which of somebody's data survives. Rename one of them first.`,
+      });
+    }
+  }
+
+  if (reference === undefined) return;
+  const wanted = [
+    ...(typeof node.referenceKey === 'string' && node.referenceKey.length > 0
+      ? [node.referenceKey]
+      : []),
+    ...Object.keys(node.fields ?? {}).filter((from) => from.length > 0),
+  ];
+  const missing = wanted.filter((column) => !reference.has(column));
+  if (missing.length === 0) return;
+  issues.push({
+    code: 'column-not-produced',
+    nodeIds: [node.id, node.reference],
+    message: `Lookup "${node.name}" (${node.id}) reads ${quoted(missing)} off its reference rows, and nothing on that side produces ${missing.length === 1 ? 'that column' : 'those columns'} — what reaches it is exactly ${quoted(reference)}. A reference key that is not there means no reference row has a key, so nothing matches; a field that is not there lands as undefined on every row that did.`,
+  });
 }
 
 /** The sentence {@link checkColumnsProduced} says, per kind. */
@@ -6686,6 +7456,7 @@ export function isWorkflowNode(value: unknown): value is WorkflowNode {
   }
   if (kind === 'rename') return isRenameNodeShape(value);
   if (kind === 'aggregate') return isAggregateNodeShape(value);
+  if (kind === 'lookup') return isLookupNodeShape(value);
   if (kind === 'source') {
     const sourceKind = Reflect.get(value, 'sourceKind');
     const config = Reflect.get(value, 'config');
@@ -6728,6 +7499,33 @@ function isAggregateNodeShape(value: object): boolean {
       maxGroups: Reflect.get(value, 'maxGroups'),
     }).length === 0
   );
+}
+
+/**
+ * Everything a `lookup` node carries.
+ *
+ * `reference` is checked as a non-empty string and no further, because whether
+ * it names a node that is actually wired in is a fact about the graph and this
+ * guard sees one node. `validateWorkflow` owns that, and refuses it loudly.
+ *
+ * An unrecognised `unmatched` is refused rather than defaulted, and this is the
+ * one where defaulting would be worst of the three kinds that have the same
+ * field: reading an unknown word back as `null` would turn a `fail` — which
+ * somebody chose because the reference is a prerequisite — into a load that
+ * commits nulls and reports success.
+ */
+function isLookupNodeShape(value: object): boolean {
+  const unmatched = Reflect.get(value, 'unmatched');
+  if (unmatched !== undefined && !isWorkflowLookupUnmatched(unmatched)) return false;
+  const reference = Reflect.get(value, 'reference');
+  if (typeof reference !== 'string' || reference.length === 0) return false;
+  // Read into an `unknown` before the guard, so the narrowing that follows is
+  // the guard's and not an assertion dressed as one.
+  const fields: unknown = Reflect.get(value, 'fields');
+  if (!isWorkflowLookupFields(fields)) return false;
+  const key: unknown = Reflect.get(value, 'key');
+  const referenceKey: unknown = Reflect.get(value, 'referenceKey');
+  return lookupConfigRefusals({ key, referenceKey, fields }).length === 0;
 }
 
 /**

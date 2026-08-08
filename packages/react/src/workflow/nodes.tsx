@@ -4,6 +4,7 @@ import {
   CircleCheck,
   CircleSlash,
   Code2,
+  Combine,
   Database,
   ExternalLink,
   Filter,
@@ -182,6 +183,19 @@ const KIND_STYLE: Record<
     wash: 'bg-amber-50/70 dark:bg-amber-950/30',
     icon: Sigma,
     noun: 'aggregate',
+  },
+  // Indigo and a mark of two things becoming one. A lookup is the only node with
+  // *two kinds of input* — one it holds and one it streams — and the whole way it
+  // goes wrong is somebody reading it as another step in the line and not noticing
+  // which wire is which. Deliberately not the sky a source wears, even though the
+  // reference edge usually comes straight off one: the point of the colour is that
+  // this box is where two lines meet, not where one starts.
+  lookup: {
+    accent: 'bg-gradient-to-b from-indigo-400 to-indigo-600',
+    chip: 'text-indigo-700 dark:text-indigo-300',
+    wash: 'bg-indigo-50/70 dark:bg-indigo-950/30',
+    icon: Combine,
+    noun: 'lookup',
   },
 };
 

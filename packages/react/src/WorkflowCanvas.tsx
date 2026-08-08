@@ -34,6 +34,7 @@ import {
   CircleAlert,
   CircleDashed,
   Code2,
+  Combine,
   Database,
   ExternalLink,
   Filter,
@@ -159,6 +160,8 @@ import {
   WORKFLOW_FILTER_MAX_DEPTH,
   WORKFLOW_FILTER_MAX_VALUES,
   WORKFLOW_FILTER_OPERATORS,
+  WORKFLOW_LOOKUP_MAX_FIELDS,
+  WORKFLOW_LOOKUP_MAX_REFERENCE_ROWS,
   WORKFLOW_NODE_KINDS,
   WORKFLOW_RENAME_MAX_COLUMNS,
   type WorkflowAggregate,
@@ -177,6 +180,7 @@ import {
   type WorkflowGraph,
   type WorkflowIfNode,
   type WorkflowIfPredicate,
+  type WorkflowLookupNode,
   type WorkflowNode,
   type WorkflowNodeKind,
   type WorkflowPredicateKind,
@@ -193,9 +197,11 @@ import {
   isWorkflowBranchLabel,
   isWorkflowFilterOperator,
   isWorkflowFilterPredicateKind,
+  isWorkflowLookupUnmatched,
   isWorkflowNodeKind,
   isWorkflowPredicateKind,
   isWorkflowRenameUnnamed,
+  lookupConfigRefusals,
   newLocalId,
   nodeName,
   producedTypes,
@@ -209,6 +215,8 @@ import {
   workflowAggregateOutputColumns,
   workflowCallMode,
   workflowKnownColumns,
+  workflowLookupColumns,
+  workflowLookupUnmatched,
   workflowNarrowedTypes,
   workflowRenameUnnamed,
 } from './workflow/model';
@@ -697,6 +705,11 @@ const ADD_NODE: Record<WorkflowNodeKind, { icon: typeof Plug; label: string; hin
     icon: Sigma,
     label: 'Aggregate',
     hint: 'Groups the rows and summarises each group — count, sum, average, min, max, or the values joined together. No code, and it holds only the groups rather than the rows, so a 44,720-row grouping into 16,119 groups never has more than one batch of records in memory. It refuses loudly if the grouping turns out to hold nearly everything.',
+  },
+  lookup: {
+    icon: Combine,
+    label: 'Lookup',
+    hint: 'Brings fields across from a reference dataset, matched by key. Wire two things into it and say which one is the reference: that side is held in memory as a map, the other streams past it. The run says how many rows matched and how many did not, which is the difference between a working join and one that silently filled a column with nulls.',
   },
 };
 
@@ -1408,6 +1421,11 @@ function miniMapColor(data: { kind?: unknown } | undefined): string {
   // that holds nearly every row it read is the failure this node exists to
   // avoid, and the box on the map is where somebody notices there is one.
   if (kind === 'aggregate') return '#f59e0b';
+  // Indigo-500, the lookup's own accent (see `KIND_STYLE`). The overview is where
+  // somebody looks for the shape of a graph, and a lookup is the one box where
+  // two lines meet for different reasons — so it must not read as a source, which
+  // is what the wire feeding it usually is.
+  if (kind === 'lookup') return '#6366f1';
   return '#8b5cf6';
 }
 
@@ -6302,6 +6320,283 @@ function AggregateInspector({
 }
 
 /**
+ * The lookup node's form: which input is the reference, the two key columns, and
+ * the fields to bring across.
+ *
+ * ## Why the reference is a picker over inbound edges and not a text box
+ *
+ * Because the field is a node id, and a node id typed by hand is a graph that
+ * saves and then either refuses at validation or — worse — names a node that
+ * happens to exist and holds the wrong side of the join in memory. The picker is
+ * built from this node's own inbound edges, so the only offerable answers are the
+ * ones `validateWorkflow` accepts. With nothing wired in there is nothing to
+ * offer, and the panel says that instead of showing an empty select somebody
+ * would read as a bug.
+ *
+ * ## What the panel can say that no other inspector can
+ *
+ * Which columns are on **which side**. Every other node with several inputs sees
+ * them pooled — the rows arrive concatenated — so "the columns reaching this
+ * node" is one set. A lookup is the exception: the reference's columns never flow
+ * on, so pooling them would offer a key column that only exists over there, and a
+ * join on a column the driving rows do not have matches nothing on every row and
+ * commits. `workflowLookupColumns` is core's answer to that, not this screen's.
+ *
+ * Both sides answer "unknown" often and that is stated rather than papered over,
+ * the stance `RenameInspector` takes about the same question.
+ *
+ * ## The rows are local state, the record is derived
+ *
+ * The same argument `RenameInspector` makes at length: a half-typed key is a key,
+ * and rebuilding a `Record` on every keystroke collapses two rows the moment they
+ * are briefly equal.
+ */
+function LookupInspector({
+  node,
+  graph,
+  canEdit,
+  onChange,
+}: {
+  node: WorkflowLookupNode;
+  graph: WorkflowGraph;
+  canEdit: boolean;
+  onChange: (node: WorkflowNode) => void;
+}) {
+  const map: Record<string, string> = node.fields ?? {};
+  const [rows, setRows] = useState<Array<{ from: string; to: string }>>(() => {
+    const entries = Object.entries(map).map(([from, to]) => ({ from, to }));
+    return entries.length > 0 ? entries : [{ from: '', to: '' }];
+  });
+
+  const commit = (next: Array<{ from: string; to: string }>) => {
+    setRows(next);
+    const fields: Record<string, string> = {};
+    for (const row of next) fields[row.from] = row.to;
+    onChange({ ...node, fields });
+  };
+
+  const setUnmatched = (value: string) => {
+    if (!isWorkflowLookupUnmatched(value)) return;
+    // Stored absent for `null`, so the default has one spelling and picking up
+    // this release cannot renumber a graph nobody edited. The boundary
+    // normalises the same way.
+    onChange({ ...node, unmatched: value === 'null' ? undefined : value });
+  };
+
+  const feeds = (graph.edges ?? []).filter((edge) => edge.to === node.id).map((edge) => edge.from);
+  const nameOf = (id: string) => (graph.nodes ?? []).find((each) => each.id === id)?.name ?? id;
+  const { driving, reference } = workflowLookupColumns(graph, node);
+  const refusals = lookupConfigRefusals(node);
+  const duplicated = rows
+    .map((row) => row.from)
+    .filter((from, at, all) => from.length > 0 && all.indexOf(from) !== at);
+  const unmatched = workflowLookupUnmatched(node);
+
+  return (
+    <div className="space-y-3">
+      {feeds.length === 0 ? (
+        <p className="text-[11px] leading-relaxed text-amber-600 dark:text-amber-400">
+          Nothing is wired into this node yet. A lookup needs two inputs — the rows you want
+          enriched, and the reference to match them against — and it has to be told which of them is
+          the reference, because that is the side it holds in memory.
+        </p>
+      ) : (
+        <SelectField
+          label="Reference rows come from"
+          ariaLabel="Which input holds the reference rows"
+          value={feeds.includes(node.reference) ? node.reference : ''}
+          onValueChange={(reference) => onChange({ ...node, reference })}
+          disabled={!canEdit}
+          options={feeds.map((id) => ({
+            value: id,
+            label: nameOf(id),
+            hint: id === node.reference ? 'held in memory' : 'would be held in memory',
+          }))}
+        />
+      )}
+
+      {/* Said here rather than left to the run, because it is the one thing about
+          this node that is a property of the operation rather than of the data:
+          one side streams and the other does not, and which is which is the
+          decision being made two lines above. */}
+      <p className={cn('text-[11px] leading-relaxed', MUTED)}>
+        The reference is read once and held as a map, up to{' '}
+        {WORKFLOW_LOOKUP_MAX_REFERENCE_ROWS.toLocaleString()} rows; everything else wired in streams
+        past it a batch at a time and never accumulates. Point this at the <em>smaller</em> side — a
+        run that would hold more than that refuses rather than filling the pod.
+      </p>
+
+      <div className="flex items-end gap-2">
+        <div className="min-w-0 flex-1">
+          <TextField
+            label="Match on (the rows being enriched)"
+            value={typeof node.key === 'string' ? node.key : ''}
+            placeholder="planId"
+            disabled={!canEdit}
+            onChange={(key) => onChange({ ...node, key })}
+          />
+        </div>
+        <div className="min-w-0 flex-1">
+          <TextField
+            label="Against (the reference rows)"
+            value={typeof node.referenceKey === 'string' ? node.referenceKey : ''}
+            placeholder="Plan ID"
+            disabled={!canEdit}
+            onChange={(referenceKey) => onChange({ ...node, referenceKey })}
+          />
+        </div>
+      </div>
+
+      <p className={cn('text-[11px] leading-relaxed', MUTED)}>
+        Keys are compared <strong>as text, exactly as written</strong> — no trimming, no case
+        folding. That is deliberate: deciding that <code>21 CES</code> and <code>21CES</code> are
+        the same unit is a rule about your data, and it belongs in a transform on both sides where
+        you can see it. A row with nothing in its key column is counted separately and never
+        matches.
+      </p>
+
+      <FieldGroup
+        title="Bring across"
+        hint={
+          <>
+            The column on the reference rows, and the name it lands under. The reference name is
+            whatever that side actually calls it — <code>Plan Name</code> is fine. The new one has
+            to be a name a column can have: letters, digits and underscore, starting with a letter
+            or an underscore.
+          </>
+        }
+      >
+        {rows.map((row, index) => (
+          <div
+            // Positional keys, for the reason `RenameInspector` gives.
+            // biome-ignore lint/suspicious/noArrayIndexKey: see above
+            key={index}
+            className="flex items-end gap-2"
+          >
+            <div className="min-w-0 flex-1">
+              <TextField
+                label={index === 0 ? 'On the reference' : ''}
+                value={row.from}
+                placeholder="Plan Name"
+                disabled={!canEdit}
+                onChange={(from) =>
+                  commit(rows.map((each, at) => (at === index ? { ...each, from } : each)))
+                }
+              />
+            </div>
+            <div className="min-w-0 flex-1">
+              <TextField
+                label={index === 0 ? 'Lands as' : ''}
+                value={row.to}
+                placeholder="planName"
+                disabled={!canEdit}
+                onChange={(to) =>
+                  commit(rows.map((each, at) => (at === index ? { ...each, to } : each)))
+                }
+              />
+            </div>
+            {canEdit && rows.length > 1 && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="shrink-0"
+                onClick={() => commit(rows.filter((_, at) => at !== index))}
+              >
+                Remove
+              </Button>
+            )}
+          </div>
+        ))}
+        {canEdit && (
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => commit([...rows, { from: '', to: '' }])}
+            disabled={rows.length >= WORKFLOW_LOOKUP_MAX_FIELDS}
+          >
+            Add field
+          </Button>
+        )}
+      </FieldGroup>
+
+      <SelectField
+        label="Rows whose key matches nothing"
+        ariaLabel="What happens to a row whose key matches no reference row"
+        value={unmatched}
+        onValueChange={setUnmatched}
+        disabled={!canEdit}
+        options={[
+          { value: 'null', label: 'Pass on, fields set to null', hint: 'a LEFT JOIN' },
+          { value: 'drop', label: 'Drop the row', hint: 'an INNER JOIN — removes rows' },
+          { value: 'fail', label: 'Fail this node', hint: 'the reference is a prerequisite' },
+        ]}
+      />
+
+      {/* The counts are the feature, so they are promised on the screen where the
+          node is configured rather than discovered in a run log afterwards. */}
+      <p className={cn('text-[11px] leading-relaxed', MUTED)}>
+        {unmatched === 'drop' ? (
+          <>
+            Unmatched rows <strong>will not reach the next node</strong>, so this node also removes
+            rows — a full sink below it publishes only what matched.
+          </>
+        ) : unmatched === 'fail' ? (
+          <>
+            The first unmatched row <strong>stops the run</strong>, naming the key it could not
+            find. Choose this when the reference is meant to cover everything and a load that cannot
+            be enriched is one that should not commit.
+          </>
+        ) : (
+          <>
+            Unmatched rows are passed on with these columns set to null — the same result as
+            enriching by hand, with one difference that is the whole point of the node.
+          </>
+        )}{' '}
+        Either way the run says how many rows matched, how many had a key that matched nothing, and
+        how many had no key at all. A join that matched nothing looks exactly like one that worked
+        unless somebody counts.
+      </p>
+
+      {refusals.length > 0 && (
+        <p className="text-[11px] leading-relaxed text-amber-600 dark:text-amber-400">
+          {refusals.join(' ')}
+        </p>
+      )}
+
+      {duplicated.length > 0 && (
+        <p className="text-[11px] leading-relaxed text-amber-600 dark:text-amber-400">
+          {duplicated.map((from) => `“${from}”`).join(', ')} appears more than once on the left. A
+          reference column can only land under one name, so only the last row naming it is stored.
+        </p>
+      )}
+
+      <p className={cn('text-[11px] leading-relaxed', MUTED)}>
+        {driving ? (
+          <>
+            The graph knows exactly what reaches the rows being enriched:{' '}
+            <span className="font-mono">{[...driving].join(', ') || 'nothing at all'}</span>.
+          </>
+        ) : (
+          <>
+            The graph cannot say which columns reach the rows being enriched — a source discovers
+            its shape against the live system, and a transform is code — so the key is taken on
+            trust and the run reports the counts.
+          </>
+        )}{' '}
+        {reference ? (
+          <>
+            On the reference side it is{' '}
+            <span className="font-mono">{[...reference].join(', ') || 'nothing at all'}</span>.
+          </>
+        ) : (
+          <>The reference side is unknown for the same reason.</>
+        )}
+      </p>
+    </div>
+  );
+}
+
+/**
  * One aggregate, with its function changed and the fields that no longer apply
  * dropped.
  *
@@ -7131,6 +7426,21 @@ function KindInspector({
   }
   if (node.kind === 'aggregate') {
     return <AggregateInspector node={node} graph={graph} canEdit={canEdit} onChange={onChange} />;
+  }
+  if (node.kind === 'lookup') {
+    // Given the whole graph, and it needs it more than any other inspector does:
+    // a lookup's `reference` is a node id, so the form cannot even list the
+    // choices without the edges — and `workflowLookupColumns` is what lets it say
+    // which columns are on which side rather than pooling them.
+    return (
+      <LookupInspector
+        key={node.id}
+        node={node}
+        graph={graph}
+        canEdit={canEdit}
+        onChange={onChange}
+      />
+    );
   }
   if (node.kind === 'sink') {
     return (

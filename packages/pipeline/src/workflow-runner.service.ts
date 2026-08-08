@@ -15,6 +15,7 @@ import {
   type ConnectorRun,
   type StageRenamePlan,
   SubprocessTransformRunner,
+  WORKFLOW_LOOKUP_MAX_REFERENCE_ROWS,
   WorkflowAggregateError,
   type WorkflowAggregateNode,
   type WorkflowBranchLabel,
@@ -24,6 +25,7 @@ import {
   type WorkflowExecutionMode,
   type WorkflowFilterNode,
   type WorkflowIfNode,
+  type WorkflowLookupNode,
   type WorkflowNodeKind,
   type WorkflowNodeOutcome,
   type WorkflowNodeStepInput,
@@ -54,6 +56,8 @@ import {
   workflowAggregateMaxGroups,
   workflowCallMode,
   workflowFilterMatches,
+  workflowLookupKey,
+  workflowLookupUnmatched,
   workflowNodeRuns,
   workflowRenameUnnamed,
   workflowRunOrder,
@@ -568,6 +572,9 @@ export class WorkflowRunnerService {
     }
     if (node.kind === 'aggregate') {
       return this.runAggregate(node, input, startedAt);
+    }
+    if (node.kind === 'lookup') {
+      return this.runLookup(node, input, startedAt);
     }
     if (node.kind === 'call') {
       // Not executable from here, and refused rather than approximated.
@@ -1920,6 +1927,154 @@ export class WorkflowRunnerService {
   }
 
   /**
+   * Enriching each row from a reference dataset, with only one side held.
+   *
+   * ## The shape, and it is the whole node
+   *
+   * The reference stage is read **once**, into a `Map` keyed by
+   * {@link workflowLookupKey} and holding only the values of the named fields.
+   * Then the driving stages stream past it a batch at a time, and nothing
+   * accumulates: the heap holds the map plus one batch, whatever the driving side
+   * weighs. That is why this is a node kind and not a transform — a transform is
+   * a function over what it is given, so a join written as one is handed both
+   * sides at once, and the whole-batch version of this exact join reached 78% of
+   * a hard 32 MiB output bound on 44,720 rows.
+   *
+   * The map holds the **named fields**, not the reference rows. A reference table
+   * is usually far wider than the two or three columns anybody wants off it, and
+   * retaining the rows would make the memory bill a property of somebody else's
+   * schema rather than of this node's config.
+   *
+   * ## The bound, checked before anything is held
+   *
+   * A staged input announces its `rowCount`, so the reference is refused for
+   * being too large *before* the first row is read back. A bound discovered by
+   * allocating until it hurts is a bound that has already done the damage — and
+   * the damage here is a pod killed by the kernel, which produces no run log, no
+   * failed node and no message at all.
+   *
+   * ## Why it decodes rows, unlike a rename
+   *
+   * {@link runRename} reads the staged *payload* and never decodes a row, because
+   * a rename is a rewrite of the column list. A lookup cannot do that: it adds
+   * values that differ per row, so the output batch is genuinely new data and
+   * `readStage`/`writeStage` are the honest interface. Reading the reference
+   * through the payload path would save materialising its rows once, which is not
+   * the cost that matters — the map is built either way and outlives them.
+   *
+   * ## Retries
+   *
+   * Batch numbering is a running count of the batches actually written, the rule
+   * {@link runFilter} follows and for the same reason: under
+   * `unmatched: 'drop'` the output batch count is not the input's. It is a pure
+   * function of `input.inputs` and the node's config — both checkpointed — so a
+   * retried lookup writes the same numbers over the same stage and each one
+   * replaces itself. The stale tail is cleared through the same helper.
+   */
+  private async runLookup(
+    node: WorkflowLookupNode,
+    input: WorkflowNodeStepInput,
+    startedAt: number,
+  ): Promise<WorkflowNodeStepOutput> {
+    const store = this.requireStore();
+    const logs: string[] = [];
+    const unmatchedIs = workflowLookupUnmatched(node);
+    const fields = Object.entries(node.fields);
+
+    const referenceRefs = input.inputs.filter((ref) => ref.nodeId === node.reference);
+    const drivingRefs = input.inputs.filter((ref) => ref.nodeId !== node.reference);
+    // Both refused rather than approximated, and both mean the graph moved under
+    // a run in flight — `validateWorkflow` refuses either at save time. Carrying
+    // on would produce the exact defect this node exists to end: no reference to
+    // match against, every row enriched with nulls, and a green run.
+    if (referenceRefs.length === 0) {
+      throw new BadRequestException(
+        `Lookup "${node.name}" (${node.id}) takes its reference rows from ${node.reference}, and no stage by that name reached it. The graph was edited while this run was in flight; finishing it would enrich every row with nulls and commit the result.`,
+      );
+    }
+    if (drivingRefs.length === 0) {
+      throw new BadRequestException(
+        `Lookup "${node.name}" (${node.id}) was given nothing but its reference, so there are no rows for it to enrich. The graph was edited while this run was in flight; finishing it would commit an empty snapshot.`,
+      );
+    }
+
+    const referenceRows = referenceRefs.reduce((total, ref) => total + ref.rowCount, 0);
+    if (referenceRows > WORKFLOW_LOOKUP_MAX_REFERENCE_ROWS) {
+      throw new BadRequestException(
+        `Lookup "${node.name}" (${node.id}) would hold ${referenceRows} reference rows in memory, and at most ${WORKFLOW_LOOKUP_MAX_REFERENCE_ROWS} may be held. Exactly one side of a join can stream and this node streams the other one, so the reference is the side that has to fit. Filter it down before it reaches this node — or, if the reference is the larger dataset by accident, point this node's reference at the other input instead.`,
+      );
+    }
+
+    const reference = await this.buildLookupReference(node, referenceRefs, fields, logs);
+
+    let rowsIn = 0;
+    let matched = 0;
+    let unmatched = 0;
+    let keyless = 0;
+    let batches = 0;
+    // A few, not all: the point is to turn "nothing matched" into "nothing
+    // matched, and the keys look like this", which is what tells somebody in one
+    // glance that the two sides disagree about type or about whitespace. Kept in
+    // insertion order and capped, so a run that misses forty thousand rows does
+    // not write forty thousand keys into the run log.
+    const misses = new Set<string>();
+    const carry: Array<Record<string, unknown>> = [];
+    const flush = async (rows: Array<Record<string, unknown>>) => {
+      batches += 1;
+      await store.writeStage({ runId: input.runId, nodeId: node.id, batch: batches, rows });
+    };
+
+    for (const ref of drivingRefs) {
+      for (let batch = 1; batch <= ref.batches; batch += 1) {
+        const rows = await store.readStage({ runId: ref.runId, nodeId: ref.nodeId, batch });
+        rowsIn += rows.length;
+        for (const row of rows) {
+          const key = workflowLookupKey(row[node.key]);
+          const found = key === undefined ? undefined : reference.get(key);
+          if (found === undefined) {
+            if (key === undefined) keyless += 1;
+            else {
+              unmatched += 1;
+              if (misses.size < LOOKUP_MISSES_LOGGED) misses.add(key);
+            }
+            if (unmatchedIs === 'drop') continue;
+            if (unmatchedIs === 'fail') {
+              throw new BadRequestException(
+                `Lookup "${node.name}" (${node.id}) found no reference row for ${
+                  key === undefined
+                    ? `a row with no value in "${node.key}"`
+                    : `${JSON.stringify(key)} in "${node.key}"`
+                }, and this node is set to fail rather than enrich that row with nulls. ${matched} rows had matched before it. Either the reference is missing rows it is meant to hold, or the two sides do not spell their keys the same way.`,
+              );
+            }
+            carry.push(withLookupFields(node, row, fields, undefined));
+            continue;
+          }
+          matched += 1;
+          carry.push(withLookupFields(node, row, fields, found));
+        }
+        while (carry.length >= BATCH_SIZE) await flush(carry.splice(0, BATCH_SIZE));
+      }
+    }
+    if (carry.length > 0) await flush(carry.splice(0, carry.length));
+
+    const rows = unmatchedIs === 'drop' ? matched : rowsIn;
+    logs.push(
+      ...lookupLogLines(node, { rowsIn, rows, matched, unmatched, keyless, misses, referenceRows }),
+    );
+    await this.clearStaleTail(input.runId, node.id, batches, logs);
+
+    return {
+      nodeId: node.id,
+      output: { runId: input.runId, nodeId: node.id, batches, rowCount: rows },
+      rows,
+      rowsIn,
+      elapsedMs: Date.now() - startedAt,
+      logs: safeLogLines(logs, LOG_LINES_PER_NODE),
+    };
+  }
+
+  /**
    * The fold, built before a row is read.
    *
    * Separate so the refusal a *configuration* earns is told apart from the
@@ -1933,6 +2088,102 @@ export class WorkflowRunnerService {
       if (error instanceof WorkflowAggregateError) throw new BadRequestException(error.message);
       throw error;
     }
+  }
+
+  /**
+   * The reference side, read once and indexed by key.
+   *
+   * ## What it refuses, and what it merely counts
+   *
+   * **Two reference rows for one key are refused when they disagree** about any
+   * named field, and collapsed when they agree — the rule
+   * {@link WorkflowLookupNode.fields} argues for. Agreeing costs nobody anything
+   * because there is no winner to pick; disagreeing means one row's data would
+   * survive and the other's would not, and every rule for choosing which is
+   * arbitrary. flip's own reader is the argument: it keeps the *last* duplicate
+   * for the plan map and the *first* for the unit dictionary, forty lines apart
+   * in one file, and neither key column has a unique constraint.
+   *
+   * It fails here rather than at the first driving row that hits the key, so a
+   * conflicted reference stops the node before any output is written rather than
+   * at row ninety thousand.
+   *
+   * **A reference row with no key is not indexed, and is counted.** Refusing the
+   * whole reference over one of those would make the node unusable against the
+   * data it was built for — flip writes `planId: row.planId ?? ""` when a load
+   * has no code, so an empty-string key is in the table by construction — and
+   * indexing it would make one keyless row the answer for every keyless driving
+   * row.
+   *
+   * The values are held as a positional array parallel to `fields` rather than as
+   * an object per key, which is the same argument the stage encoding makes one
+   * layer down: the names are the same for every entry, so storing them per entry
+   * is the map's largest cost and none of it is information.
+   */
+  private async buildLookupReference(
+    node: WorkflowLookupNode,
+    refs: readonly WorkflowStageRef[],
+    fields: ReadonlyArray<[string, string]>,
+    logs: string[],
+  ): Promise<Map<string, unknown[]>> {
+    const store = this.requireStore();
+    const reference = new Map<string, unknown[]>();
+    let rowsRead = 0;
+    let keyless = 0;
+    let repeated = 0;
+
+    for (const ref of refs) {
+      for (let batch = 1; batch <= ref.batches; batch += 1) {
+        const rows = await store.readStage({ runId: ref.runId, nodeId: ref.nodeId, batch });
+        rowsRead += rows.length;
+        for (const row of rows) {
+          const key = workflowLookupKey(row[node.referenceKey]);
+          if (key === undefined) {
+            keyless += 1;
+            continue;
+          }
+          const values = fields.map(([from]) => row[from]);
+          const already = reference.get(key);
+          if (already === undefined) {
+            reference.set(key, values);
+            continue;
+          }
+          repeated += 1;
+          const disagreed = fields.findIndex(([, to], at) => {
+            void to;
+            // `Object.is` rather than `===`, so two rows holding `NaN` in the
+            // same field agree — which they plainly do — and `0` and `-0` do
+            // not silently fold together.
+            return !Object.is(already[at], values[at]);
+          });
+          if (disagreed < 0) continue;
+          const field = fields[disagreed];
+          throw new BadRequestException(
+            `Lookup "${node.name}" (${node.id}) found two reference rows keyed ${JSON.stringify(key)} that disagree about ${JSON.stringify(field?.[0] ?? '')}: ${JSON.stringify(already[disagreed]) ?? 'undefined'} and ${JSON.stringify(values[disagreed]) ?? 'undefined'}. One of them would have to win on every row that matched this key, and every rule for picking which is a rule about whose data survives. Make the reference one row per key — a filter or a transform on the reference side is where that decision belongs, because it is a decision somebody has to make rather than one this node can make for them.`,
+          );
+        }
+      }
+    }
+
+    logs.push(
+      `"${node.name}" read ${rowsRead} reference rows from "${node.reference}" and indexed ${reference.size} distinct keys off "${node.referenceKey}".`,
+    );
+    if (repeated > 0) {
+      logs.push(
+        `${repeated} reference rows repeated a key that was already indexed and agreed with it about every field this node brings across, so they were collapsed. Nothing was chosen over anything.`,
+      );
+    }
+    if (keyless > 0) {
+      logs.push(
+        `${keyless} reference rows had no value in "${node.referenceKey}" and were not indexed. A row with no key cannot be matched by anything; nothing can reach it.`,
+      );
+    }
+    if (rowsRead > 0 && reference.size === 0) {
+      logs.push(
+        `Not one reference row had a key, so this lookup will match nothing at all. Check that "${node.referenceKey}" is the column the reference rows actually carry.`,
+      );
+    }
+    return reference;
   }
 
   /**
@@ -2788,6 +3039,124 @@ function aggregateLogLines(node: WorkflowAggregateNode, stats: AggregateTableSta
     );
   }
 
+  return lines;
+}
+
+/**
+ * How many distinct unmatched keys a lookup writes into the run log.
+ *
+ * Enough to see a pattern, few enough that a run missing forty thousand rows
+ * does not write forty thousand keys into a log column. Five is what it takes to
+ * tell "the reference is empty" from "the two sides spell the key differently",
+ * which is the diagnosis this list exists for.
+ */
+const LOOKUP_MISSES_LOGGED = 5;
+
+/**
+ * One driving row, with the reference's fields on it.
+ *
+ * A new object rather than a mutation of the row, because the row came out of
+ * `readStage` and the batch it belongs to is still being iterated — writing into
+ * it would be fine today and would be the kind of thing that stops being fine the
+ * moment a store hands back a cached decode.
+ *
+ * `undefined` values are written as `null` rather than left off. A reference row
+ * that simply has nothing in a field and a row that was never matched at all are
+ * both "no value here", and a column that is *absent* from some rows and present
+ * in others makes the staged batch grow a second shape for no reason — the shape
+ * dictionary is per distinct key-set, so an inconsistently-present column
+ * multiplies the shapes rather than the rows.
+ */
+function withLookupFields(
+  node: WorkflowLookupNode,
+  row: Record<string, unknown>,
+  fields: ReadonlyArray<[string, string]>,
+  found: readonly unknown[] | undefined,
+): Record<string, unknown> {
+  const enriched: Record<string, unknown> = { ...row };
+  for (const [at, entry] of fields.entries()) {
+    const to = entry[1];
+    // Refused rather than silently overwritten, and per row rather than per batch
+    // because a batch legitimately holds rows with different key-sets — the same
+    // reason the stage encoding is a shape *dictionary*. The validator catches
+    // this at save time wherever the column set is closed; this is the case where
+    // it is not, and the first row that has it stops the node.
+    if (Object.hasOwn(row, to)) {
+      throw new BadRequestException(
+        `Lookup "${node.name}" (${node.id}) brings ${JSON.stringify(entry[0])} across as ${JSON.stringify(to)}, and the rows it is enriching already carry a column called ${JSON.stringify(to)}. There are two columns and one name, and every rule for picking a winner is a rule about which of somebody's data survives. Rename one of them before this node.`,
+      );
+    }
+    const value = found === undefined ? null : found[at];
+    enriched[to] = value === undefined ? null : value;
+  }
+  return enriched;
+}
+
+/**
+ * What a lookup says about a run, and the three numbers are the point.
+ *
+ * `matched`, `unmatched` and `keyless`, always, whatever the disposition — because
+ * the failure this node was built against is not a crash. flip's SUBWO reader
+ * builds the same two maps and reads them per row, and against an unseeded
+ * reference it produces 44,720 rows with three columns hard null, no error and no
+ * warning. A zero-match join and a working one are indistinguishable from the
+ * outside unless somebody counts.
+ *
+ * `keyless` is reported separately from `unmatched` on purpose. They have
+ * different causes — a driving row with nothing in the key column, versus a key
+ * that the reference does not hold — and different fixes, and flip's reader folds
+ * both into the same NULL.
+ */
+function lookupLogLines(
+  node: WorkflowLookupNode,
+  counts: {
+    rowsIn: number;
+    rows: number;
+    matched: number;
+    unmatched: number;
+    keyless: number;
+    misses: ReadonlySet<string>;
+    referenceRows: number;
+  },
+): string[] {
+  const { rowsIn, rows, matched, unmatched, keyless, misses, referenceRows } = counts;
+  const disposition = workflowLookupUnmatched(node);
+  const lines = [
+    `"${node.name}" was given ${rowsIn} rows and matched ${matched} of them against "${node.reference}" on "${node.key}" = "${node.referenceKey}"; ${unmatched} had a key that matched nothing and ${keyless} had no key at all.`,
+  ];
+
+  if (unmatched > 0 || keyless > 0) {
+    if (disposition === 'drop') {
+      lines.push(
+        `Those ${unmatched + keyless} rows were dropped rather than passed on, so this node passed ${rows} of the ${rowsIn} it was given. A full sink downstream will publish only these.`,
+      );
+    } else {
+      lines.push(
+        `Those ${unmatched + keyless} rows were passed on with ${Object.values(node.fields)
+          .map((to) => JSON.stringify(to))
+          .join(', ')} set to null.`,
+      );
+    }
+  }
+
+  if (misses.size > 0) {
+    lines.push(
+      `Keys the reference did not hold, up to ${LOOKUP_MISSES_LOGGED} of them: ${[...misses].map((key) => JSON.stringify(key)).join(', ')}. Keys are compared as text, exactly as written — if these look like they ought to have matched, the two sides differ in spacing, case or type rather than in content.`,
+    );
+  }
+
+  if (rowsIn > 0 && matched === 0) {
+    // The loudest thing this node can do short of failing, and it deliberately
+    // does not fail: `unmatched: 'fail'` is how somebody asks for that, and a
+    // reference that legitimately covers none of today's rows is a real outcome.
+    // What it must never be is quiet, because "the reference was never seeded"
+    // and "the load worked" produce the same green run otherwise.
+    lines.push(
+      referenceRows === 0
+        ? `"${node.name}" matched nothing at all, because the reference side produced no rows. Check that "${node.reference}" ran and that it reads what you think it does — an unseeded reference table is the single most common cause, and it is the failure this node reports rather than commits.`
+        : `"${node.name}" matched nothing at all, and the reference was not empty: ${referenceRows} rows were read from it. The two sides simply share no key, so check that "${node.key}" and "${node.referenceKey}" are the columns you meant.`,
+    );
+  }
   return lines;
 }
 

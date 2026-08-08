@@ -303,6 +303,9 @@ export type {
   WorkflowNodeKind,
   WorkflowNodeOutcome,
   WorkflowPredicateKind,
+  WorkflowInputFilter,
+  WorkflowLookupNode,
+  WorkflowLookupUnmatched,
   WorkflowRenameNode,
   WorkflowRenameUnnamed,
   WorkflowRowCountPredicate,
@@ -482,6 +485,13 @@ export {
   // The rename vocabulary, same argument: the inspector has to refuse a target
   // name the server would refuse, and the two words for what happens to an
   // unnamed column have to be exactly the two the runner branches on.
+  // The lookup vocabulary, same argument again, plus the two bounds: an inspector
+  // that cannot see the reference-row bound cannot warn before a run refuses, and
+  // a screen offering a fourth disposition is a graph somebody saves and a node
+  // that throws inside a durable step.
+  WORKFLOW_LOOKUP_MAX_FIELDS,
+  WORKFLOW_LOOKUP_MAX_REFERENCE_ROWS,
+  WORKFLOW_LOOKUP_UNMATCHED,
   WORKFLOW_RENAME_MAX_COLUMNS,
   WORKFLOW_RENAME_UNNAMED,
   // The aggregate vocabulary, same argument at the highest stakes yet: an
@@ -508,6 +518,8 @@ export {
   isWorkflowPredicateKind,
   isWorkflowAggregateFunction,
   isWorkflowAggregates,
+  isWorkflowLookupFields,
+  isWorkflowLookupUnmatched,
   isWorkflowRenameColumns,
   isWorkflowRenameUnnamed,
   isWorkflowSkipReason,
@@ -532,6 +544,14 @@ export {
   workflowAggregateNeedsColumn,
   workflowAggregateOutputColumns,
   workflowAggregateSeparator,
+  // The lookup's refusals, and the two functions that decide what its screen can
+  // honestly say: which columns reach each of its two sides, and when two keys
+  // are the same key. The last one especially — a canvas previewing a match with
+  // its own comparison would show a join the runner does not perform.
+  lookupConfigRefusals,
+  workflowLookupColumns,
+  workflowLookupKey,
+  workflowLookupUnmatched,
   // What the graph can prove about the columns reaching a node — the one thing
   // a declarative rename buys that a transform cannot. The inspector says it out
   // loud; see `workflowKnownColumns` for how far it reaches.
@@ -553,6 +573,7 @@ export {
   // sixth kind arrives, exactly as the server does.
   unreachableConnectorKind,
   unreachableNodeKind,
+  unreachableLookupUnmatched,
   unreachablePredicateKind,
   unreachableAggregateFunction,
   unreachableRenameUnnamed,

@@ -22,8 +22,10 @@ import {
   isWorkflowBranchLabel,
   isWorkflowCallMode,
   isWorkflowFilterPredicate,
+  isWorkflowLookupUnmatched,
   isWorkflowNodeKind,
   isWorkflowRenameUnnamed,
+  lookupConfigRefusals,
   renameColumnRefusals,
   unreachableNodeKind,
   workflowRunOrder,
@@ -204,6 +206,10 @@ function toNode(raw: unknown): WorkflowNode {
 
   if (kind === 'aggregate') {
     return toAggregateNode(raw, { id, name, position });
+  }
+
+  if (kind === 'lookup') {
+    return toLookupNode(raw, { id, name, position });
   }
 
   // Everything below is a source. Written as a refusal rather than as a fallthrough
@@ -719,6 +725,91 @@ function toAggregate(entry: unknown): WorkflowAggregate | undefined {
     ...(typeof column === 'string' ? { column } : {}),
     ...(typeof separator === 'string' ? { separator } : {}),
     ...(typeof maxLength === 'number' ? { maxLength } : {}),
+  };
+}
+
+/**
+ * A lookup node as it arrived over HTTP, refused rather than repaired.
+ *
+ * The field map is checked entry by entry against `lookupConfigRefusals` — the
+ * same function `validateWorkflow` and the canvas call — so a graph posted by
+ * curl and one saved from the screen are refused by one sentence. Repairing it is
+ * the one thing this must not do: dropping an unreadable field would store a
+ * lookup that silently brings less across than it says, and the symptom of *that*
+ * is a column of NULLs under a name somebody put in an object type on purpose,
+ * which is the exact failure this node kind exists to end.
+ *
+ * `reference` is read as a plain string and checked only for being one. Whether
+ * it names a node that is actually wired into this one is a fact about the graph
+ * rather than about the node, and `validateWorkflow` — which runs on the graph
+ * this function returns — is what answers it, pointing at both boxes.
+ *
+ * `unmatched` absent means `null` and is stored absent rather than normalised to
+ * the word, so there is one spelling of the default and picking up this release
+ * cannot renumber a stored graph. A value that is present and unrecognised is
+ * refused: reading it as `null` would turn a `fail` — chosen because the
+ * reference is a prerequisite — into a load that commits nulls and reports
+ * success.
+ */
+function toLookupNode(
+  raw: unknown,
+  base: { id: string; name: string; position?: { x: number; y: number } },
+): WorkflowNode {
+  const reference = readString(raw, 'reference');
+  if (!reference) {
+    throw new BadRequestException(
+      `Lookup node "${base.name}" (${base.id}) names no reference node, so there is nothing for it to match against. Send \`reference\` as the id of the node whose rows are the reference side — it is held in memory as a map while everything else wired in streams past it, so the node has to be told which one.`,
+    );
+  }
+
+  const fields = readUnknown(raw, 'fields');
+  if (typeof fields !== 'object' || fields === null || Array.isArray(fields)) {
+    throw new BadRequestException(
+      `Lookup node "${base.name}" (${base.id}) carries no map of fields, so there is nothing for it to bring across. Send \`fields\` as an object of reference column to the name it lands under.`,
+    );
+  }
+  const map: Record<string, string> = {};
+  for (const [from, to] of Object.entries(fields)) {
+    if (typeof to !== 'string') {
+      throw new BadRequestException(
+        `Lookup node "${base.name}" (${base.id}) brings ${JSON.stringify(from)} across as ${JSON.stringify(to)}, and the name a field lands under has to be a string.`,
+      );
+    }
+    map[from] = to;
+  }
+
+  const key = readString(raw, 'key');
+  const referenceKey = readString(raw, 'referenceKey');
+  const refusals = lookupConfigRefusals({ key, referenceKey, fields: map });
+  if (refusals.length > 0) {
+    throw new BadRequestException(
+      `Lookup node "${base.name}" (${base.id}) cannot be stored as it is. ${refusals.join(' ')}`,
+    );
+  }
+  // Narrowed by `lookupConfigRefusals` having found nothing to say about them,
+  // and re-tested here rather than asserted, because the refusals are sentences
+  // rather than a type guard and the compiler is right not to take their word.
+  if (key === undefined || referenceKey === undefined) {
+    throw new BadRequestException(
+      `Lookup node "${base.name}" (${base.id}) names no key column on one of its two sides, so there is nothing to match on.`,
+    );
+  }
+
+  const unmatched = readUnknown(raw, 'unmatched');
+  if (unmatched !== undefined && unmatched !== null && !isWorkflowLookupUnmatched(unmatched)) {
+    throw new BadRequestException(
+      `Lookup node "${base.name}" (${base.id}) says unmatched rows are ${JSON.stringify(unmatched)}, and the only three answers are "null", "drop" and "fail". Reading an unrecognised one as "null" would turn a lookup somebody set to fail on a missing reference into one that commits nulls and reports success.`,
+    );
+  }
+
+  return {
+    ...base,
+    kind: 'lookup',
+    reference,
+    key,
+    referenceKey,
+    fields: map,
+    unmatched: unmatched === 'drop' || unmatched === 'fail' ? unmatched : undefined,
   };
 }
 

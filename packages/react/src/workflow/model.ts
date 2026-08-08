@@ -50,6 +50,8 @@ export type {
   WorkflowNode,
   WorkflowNodeKind,
   WorkflowPredicateKind,
+  WorkflowLookupNode,
+  WorkflowLookupUnmatched,
   WorkflowRenameNode,
   WorkflowRenameUnnamed,
   WorkflowRowCountPredicate,
@@ -70,6 +72,8 @@ export {
   isWorkflowFilterPredicate,
   isWorkflowFilterPredicateKind,
   isWorkflowFilterValue,
+  isWorkflowLookupFields,
+  isWorkflowLookupUnmatched,
   isWorkflowNodeKind,
   isWorkflowPredicateKind,
   isWorkflowAggregateFunction,
@@ -95,6 +99,15 @@ export {
   renameColumnRefusals,
   workflowKnownColumns,
   workflowRenameUnnamed,
+  // The lookup rules, core's for the same reason. `workflowLookupColumns` is the
+  // one that earns its place on this screen: a lookup is the only node whose two
+  // inputs are not interchangeable, so an inspector that worked out for itself
+  // which columns are on which side would eventually offer a key column that only
+  // exists on the reference — a join that matches nothing, which is the failure
+  // the node was built to end.
+  lookupConfigRefusals,
+  workflowLookupColumns,
+  workflowLookupUnmatched,
   // The two wire formats a call node can be authored in, plus the reader that
   // applies the default. Core's, not a copy, for the reason every rule here is:
   // an inspector offering a mode the runner cannot build a payload for is a
@@ -109,6 +122,7 @@ export {
   unreachableNodeKind,
   unreachablePredicateKind,
   unreachableAggregateFunction,
+  unreachableLookupUnmatched,
   unreachableRenameUnnamed,
   // Core's, not a copy, for the reason every other rule here is core's: the
   // inspector has to offer exactly the acknowledgements `validateWorkflow`
@@ -131,6 +145,9 @@ export {
   WORKFLOW_AGGREGATE_MAX_GROUP_BY,
   WORKFLOW_AGGREGATE_MAX_GROUPS,
   WORKFLOW_AGGREGATE_MAX_SEPARATOR,
+  WORKFLOW_LOOKUP_MAX_FIELDS,
+  WORKFLOW_LOOKUP_MAX_REFERENCE_ROWS,
+  WORKFLOW_LOOKUP_UNMATCHED,
   WORKFLOW_RENAME_MAX_COLUMNS,
   WORKFLOW_RENAME_UNNAMED,
   WORKFLOW_NODE_ID_PATTERN,
