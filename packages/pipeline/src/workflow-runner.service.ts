@@ -3474,11 +3474,16 @@ function say(error: unknown): string {
  * Only `false` produces it. `undefined` means nothing asked, which is what a
  * step checkpoint written before the field existed replays as, and inventing a
  * caveat for those would be the same offence in the other direction.
+ *
+ * Written to fit inside `LOG_LINE_CHARS` with a real child run id in it. A line
+ * this one truncates loses its last sentence, and the last sentence is the
+ * remedy — measured at 422 characters against a 400-character cap on a live
+ * run, which is exactly the part a reader came for.
  */
 function unverifiedPinLine(
-  input: { versionDeclared?: boolean; childRunId: string; target: WorkflowCallTarget },
+  input: { versionDeclared?: boolean; childRunId: string },
   called: string,
 ): string | undefined {
   if (input.versionDeclared !== false) return undefined;
-  return `Nothing verified the pin on ${called}: no live worker announces a version for ${input.target.name}, so child run ${input.childRunId} carries the engine's routing default and durable core's version:undeclared tag. The call ran — an undeclared callee is called, not refused, because refusing one would make every worker on an older SDK uncallable — but this node pinned a version that was compared against a placeholder. Deploy the callee on a worker that publishes a version to make the pin mean something.`;
+  return `Nothing verified the pin on ${called}: no live worker announces a version for it, so child run ${input.childRunId} carries the routing default and the tag version:undeclared. It ran rather than being refused — refusing would make every worker on an older SDK uncallable — but the pin met a placeholder. Deploy the callee on a worker that publishes a version.`;
 }

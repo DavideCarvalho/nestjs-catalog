@@ -11,6 +11,7 @@ import {
   runStepHandler,
 } from '@dudousxd/nestjs-durable-core';
 import { describe, expect, it, vi } from 'vitest';
+import { LOG_LINE_CHARS } from './run-logs';
 import { passthroughScope } from './seams';
 import {
   WORKFLOW_CALL_CHECK_STEP,
@@ -304,9 +305,15 @@ describe('a call node, executed by the workflow body', () => {
 
     await test.run();
 
-    const logs = test.finished[0].logs.join(' ');
-    expect(logs).toContain('Nothing verified the pin on billing.reconcile@2');
-    expect(logs).toContain('version:undeclared');
+    const line = test.finished[0].logs.find((entry) => entry.startsWith('Nothing verified'));
+    expect(line).toBeDefined();
+    expect(line).toContain('billing.reconcile@2');
+    expect(line).toContain('version:undeclared');
+    // The remedy is the LAST sentence and `safeLogLines` truncates at
+    // `LOG_LINE_CHARS`, so a line that grows past the cap loses precisely the
+    // part a reader came for. Measured with a real child run id in it.
+    expect(line?.length).toBeLessThanOrEqual(LOG_LINE_CHARS);
+    expect(line).toContain('Deploy the callee on a worker that publishes a version.');
     // The load itself is unaffected: an undeclared callee is called, not refused.
     expect(test.finished[0].nodeOutcomes.c).toMatchObject({ status: 'succeeded', rows: 5 });
   });
