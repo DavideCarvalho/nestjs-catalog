@@ -264,6 +264,79 @@ export interface CatalogReadStore {
   listSnapshots?(type: CatalogObjectTypeDef): Promise<SnapshotRef[]>;
 }
 
+/**
+ * A store that can hand over the whole of one snapshot, a row at a time.
+ *
+ * ## What this is for, and why `read` was not enough
+ *
+ * A workflow reading data the catalog already holds. Until this existed the only
+ * route was a `sql` connector naming `obj_<type>` — the physical table, which
+ * **retains every committed snapshot** — so a graph reading a type with two
+ * loads behind it read both, reported success, and doubled every sum while
+ * leaving the row count it wrote unchanged. See `CONNECTOR_KINDS`' `'catalog'`
+ * entry for the measurement.
+ *
+ * {@link CatalogReadStore.read} resolves "current" correctly and could be paged.
+ * It is not the right tool for a whole dataset, for two separate reasons:
+ *
+ * - **A page is `LIMIT`/`OFFSET`.** Reading seven million rows in pages makes the
+ *   engine walk the offset each time, so the cost is quadratic in the size of
+ *   the thing being read. That is not a tuning detail here — the row counts this
+ *   feature exists for are exactly the ones that make it fatal.
+ * - **Paging is only correct under a total order**, and `read` does not promise
+ *   one: a store free to return "some page of the matching rows" would let a
+ *   paged loop skip and duplicate rows silently, which is the same class of
+ *   failure this whole feature is repairing.
+ *
+ * ## Optional, and the option is the store's to take
+ *
+ * Exactly as {@link CatalogQueryStore.streamQuery} is, and for the same reason: a
+ * store fronting an API, or one on a driver that buffers a result set before
+ * resolving, cannot do this honestly, and a shim that collected every row and
+ * yielded them back would satisfy the type while doing the one thing the type
+ * exists to avoid. So an absent `streamSnapshot` is a real answer, and the
+ * caller refuses out loud rather than falling back to a paged read — a fallback
+ * whose two hazards are listed above.
+ *
+ * The contract on an implementation is one sentence: **do not read ahead of the
+ * consumer.** Whatever the driver offers must pause when the consumer stops
+ * pulling, all the way to the socket, or the memory has only moved.
+ */
+export interface CatalogSnapshotStreamStore extends CatalogReadStore {
+  /**
+   * Every row of one snapshot, keyed by property name.
+   *
+   * `snapshotId` is required and never defaulted, which is the whole shape of
+   * the fix: the caller resolves which snapshot is current — once, when its run
+   * starts — and then reads *that one*, so a commit landing mid-read cannot have
+   * the first half of a load come from one snapshot and the second half from
+   * another. A store with no id to be given has nothing to stream.
+   *
+   * Keys are property names, matching what {@link CatalogReadStore.read} returns
+   * and what the write path looks a field up by (`row[property.name]`), so rows
+   * read out of one type can be written into another without a translation step
+   * that could disagree with either side.
+   *
+   * Returned synchronously — an async generator, not a promise for one — so a
+   * consumer's `for await` owns the resource from the first pull and an
+   * abandoned iteration runs the generator's `finally`.
+   */
+  streamSnapshot(
+    type: CatalogObjectTypeDef,
+    fields: string[],
+    snapshotId: string,
+  ): AsyncIterable<Record<string, unknown>>;
+}
+
+/** A store that can stream a whole snapshot. See {@link CatalogSnapshotStreamStore}. */
+export function supportsSnapshotStreams(store: unknown): store is CatalogSnapshotStreamStore {
+  return (
+    typeof store === 'object' &&
+    store !== null &&
+    typeof Reflect.get(store, 'streamSnapshot') === 'function'
+  );
+}
+
 /** A store that owns its copy of the data and can be loaded into. */
 export interface CatalogWriteStore extends CatalogReadStore {
   /**

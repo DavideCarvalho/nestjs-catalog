@@ -7,6 +7,7 @@ import {
   isReservedColumn,
 } from '@dudousxd/nestjs-catalog';
 import {
+  type CatalogTypeReader,
   SOURCES,
   type SqlDescription,
   type StorageManagerLike,
@@ -247,6 +248,16 @@ export interface DiscoverSchemaInput {
    * take the refusal path and report a source that runs perfectly well.
    */
   storage?: StorageManagerLike;
+  /**
+   * The catalog's own store and registry, for a `catalog` source.
+   *
+   * Passed through for exactly the reason `storage` above it is: discovery
+   * reads through the run's own fetcher, so a kind that reads the catalog must
+   * be *discovered* the way it will be *read*. Without this, pressing discover
+   * on a source that reads an object type takes the refusal path and reports a
+   * source that runs perfectly well.
+   */
+  catalog?: CatalogTypeReader;
 }
 
 /**
@@ -280,7 +291,10 @@ export async function discoverSourceSchema(
   const described =
     reader.kind === 'sql'
       ? await describeFromDriver(reader, secret)
-      : await describeFromSample(reader, secret, input.sampleLimit ?? SAMPLE_LIMIT, input.storage);
+      : await describeFromSample(reader, secret, input.sampleLimit ?? SAMPLE_LIMIT, {
+          storage: input.storage,
+          catalog: input.catalog,
+        });
 
   const columns = flagUnusableNames(described.columns);
 
@@ -355,7 +369,7 @@ async function describeFromSample(
   connector: CatalogConnector,
   secret: string | undefined,
   limit: number,
-  storage: StorageManagerLike | undefined,
+  seams: { storage?: StorageManagerLike; catalog?: CatalogTypeReader },
 ): Promise<{
   basis: DiscoveryBasis;
   sampled: number;
@@ -384,7 +398,8 @@ async function describeFromSample(
       // up to date is worse than useless.
       state: {},
       mode: 'full',
-      storage,
+      storage: seams.storage,
+      catalog: seams.catalog,
     }),
     limit,
   );

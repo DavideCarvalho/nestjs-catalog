@@ -40,13 +40,13 @@ import { Switch } from './ui/switch';
  * is for — a form that renders nothing looks like a form somebody has not
  * finished typing into.
  *
- * `file` and `inline` are refusals, and deliberately: a file's path and a set of
- * pasted records belong to the load, not to a shared address. A connection there
- * would be a name with nothing behind it, and — since a connection's whole worth
- * is the button that finds out whether it answers — a "Test connection" that
- * always passes is worse than no button, because it teaches people that a green
- * tick means nothing. `ConnectionChecker.probe` says the same thing from the
- * server's side.
+ * `file`, `inline` and `catalog` are refusals, and deliberately: a file's path
+ * and a set of pasted records belong to the load, not to a shared address, and a
+ * catalog source has no address at all. A connection there would be a name with
+ * nothing behind it, and — since a connection's whole worth is the button that
+ * finds out whether it answers — a "Test connection" that always passes is worse
+ * than no button, because it teaches people that a green tick means nothing.
+ * `ConnectionChecker.probe` says the same thing from the server's side.
  */
 const KINDS = {
   http: {
@@ -87,6 +87,11 @@ const KINDS = {
   inline: {
     connectable: false,
     because: 'Inline records are pasted into the source itself. There is no address to share.',
+  },
+  catalog: {
+    connectable: false,
+    because:
+      'A catalog source reads this catalog, through the store the application already holds. There is no address and no credential — which is the point of the kind: pointing the catalog at its own database through a connection meant an operator minting a URL and a secret that did not need to exist.',
   },
 } satisfies Record<ConnectorKind, ConnectionKindSpec>;
 

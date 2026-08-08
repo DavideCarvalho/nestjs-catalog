@@ -19,6 +19,7 @@ import type {
   CatalogReadQuery,
   CatalogReadResult,
   CatalogResolvedFilter,
+  CatalogSnapshotStreamStore,
   CatalogStoreCapabilities,
   ScalarType,
   SnapshotRef,
@@ -96,7 +97,11 @@ const CARRY_FORWARD_STALE_LABEL = '_carryForwardStale';
 
 @Injectable()
 export class MikroOrmWarehouseStore
-  implements CatalogMergeStore, CatalogQueryStore, CatalogFilteringReadStore
+  implements
+    CatalogMergeStore,
+    CatalogQueryStore,
+    CatalogFilteringReadStore,
+    CatalogSnapshotStreamStore
 {
   private readonly logger = new Logger(this.constructor.name);
 
@@ -1004,6 +1009,77 @@ export class MikroOrmWarehouseStore
       rows: rows.map((row) => normalise(row, selected)),
       snapshot,
     };
+  }
+
+  /**
+   * Every row of one snapshot, as the driver produces them.
+   *
+   * ## Why this exists beside `read`
+   *
+   * `read` is a page: two statements, a `COUNT` and a `LIMIT`/`OFFSET`. A whole
+   * dataset read through it costs the offset walk once per page, so the cost is
+   * quadratic in the size of the thing being read — and the row counts this is
+   * for (7,637,391 in one type here) are exactly the ones that makes fatal.
+   * This is one statement and one pass, and nothing holds more than the driver's
+   * buffer.
+   *
+   * ## The predicate is the whole point
+   *
+   * `WHERE _snapshot_id = ?`, against the leading column of `ix_snapshot_batch`.
+   * The table retains every committed load, so a read of it *without* this
+   * predicate returns every snapshot concatenated — which is what a workflow
+   * reaching its own warehouse through a `sql` connector was doing, silently, at
+   * exactly twice the row count and with every sum doubled. See
+   * {@link CatalogSnapshotStreamStore}.
+   *
+   * The id is the caller's and is never defaulted here: resolving "current" is
+   * the caller's decision and it is made once, at the start of a run, so a
+   * commit landing mid-read cannot splice two snapshots into one load.
+   *
+   * ## What it does NOT go through
+   *
+   * The committed view. The view names the snapshot that was current when it was
+   * last refreshed, so reading through it would silently switch datasets under a
+   * long read the moment anything committed — which is the same failure this
+   * repairs, arrived at from the other side. It also aliases its columns to
+   * `outputAlias`, and rows are handed out keyed by property name here exactly as
+   * `read` hands them out, so the caller sees one vocabulary.
+   */
+  async *streamSnapshot(
+    type: CatalogObjectTypeDef,
+    fields: string[],
+    snapshotId: string,
+  ): AsyncGenerator<Record<string, unknown>> {
+    const selected = type.properties.filter((p) => fields.includes(p.name));
+    // Nothing asked for is nothing to read, and it is not an error: `read` says
+    // the same thing about the same input. A `SELECT` with no columns is not a
+    // statement.
+    if (selected.length === 0) return;
+
+    const table = tableFor(type.name);
+    const statement = `SELECT ${selected
+      .map((p) => `${this.ident(physicalColumn(p.name))} AS ${this.ident(outputAlias(p.name))}`)
+      .join(',')}
+       FROM ${this.ident(table)} WHERE ${this.ident(SNAPSHOT_COLUMN)} = ?
+       ORDER BY ${this.ident(ROW_COLUMN)} ASC`;
+
+    // Read-only, and a transaction rather than a bare statement for the reason
+    // `streamReadOnlyQuery` opens one: the handle lives as long as the iteration
+    // does, and it must be released by the generator's `finally` whether the
+    // consumer drained it or walked away.
+    const connection = this.em.fork().getConnection();
+    const trx = await connection.begin({ readOnly: true });
+    try {
+      for await (const row of connection.stream<Record<string, unknown>>(
+        statement,
+        [snapshotId],
+        trx,
+      )) {
+        yield normalise(row, selected);
+      }
+    } finally {
+      await connection.rollback(trx).catch(() => undefined);
+    }
   }
 
   async runQuery(request: CatalogQueryRequest): Promise<CatalogQueryResult> {

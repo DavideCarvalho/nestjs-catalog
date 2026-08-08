@@ -1640,6 +1640,10 @@ export function createPipelineController(
           // the engine currently sees it, which is the same object a load would
           // be written through.
           existing: workflow.targetType ? this.registry.getType(workflow.targetType) : undefined,
+          // The same argument as the disks below, for the kind that reads the
+          // catalog itself: discovery goes through the run's own fetcher, so it
+          // has to be handed the run's own store.
+          catalog: this.workflows.catalogReader(),
           // Discovery reads through the run's own fetcher, so it must be handed
           // the run's own disks. Without this a disk-backed connector would be
           // refused here and load perfectly well.

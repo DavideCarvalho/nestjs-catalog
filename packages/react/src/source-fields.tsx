@@ -1,5 +1,9 @@
 import type { ConnectorKind, SourceFormat } from '@dudousxd/nestjs-catalog/client';
-import { CONNECTOR_KINDS, SOURCE_FORMATS } from '@dudousxd/nestjs-catalog/client';
+import {
+  CATALOG_SOURCE_TYPE_KEY,
+  CONNECTOR_KINDS,
+  SOURCE_FORMATS,
+} from '@dudousxd/nestjs-catalog/client';
 import { cn } from './cn';
 import { CONNECTION_KINDS, type ConnectableKind } from './connection-form';
 import { FieldGroup, TextAreaField, TextField } from './ui/field';
@@ -53,13 +57,30 @@ export function usesConnection(kind: ConnectorKind): kind is ConnectableKind {
   return CONNECTION_KINDS[kind].connectable;
 }
 
-export const KIND_OPTIONS = [
-  { value: 'http', label: 'HTTP — a JSON endpoint' },
-  { value: 'sql', label: 'SQL — a database query' },
-  { value: 'file', label: 'File — CSV, NDJSON, JSON, Excel or Parquet' },
-  { value: 's3', label: 'S3 — a bucket prefix' },
-  { value: 'inline', label: 'Inline — records pasted below' },
-];
+/**
+ * How each kind reads in the picker.
+ *
+ * `satisfies Record<ConnectorKind, string>` for the reason {@link FORMAT_LABELS}
+ * below has it, and this one had to be repaired to get it: the picker was a
+ * hand-written array of five objects, so a sixth kind added to the library
+ * arrived in the vocabulary, in the validator, in the fetcher map — and never in
+ * the dropdown. A kind nobody can choose is a kind that has shipped invisible,
+ * which has happened in this repository before.
+ */
+const KIND_LABELS = {
+  http: 'HTTP — a JSON endpoint',
+  sql: 'SQL — a database query',
+  file: 'File — CSV, NDJSON, JSON, Excel or Parquet',
+  s3: 'S3 — a bucket prefix',
+  inline: 'Inline — records pasted below',
+  catalog: "Catalog — an object type in this catalog's own data",
+} satisfies Record<ConnectorKind, string>;
+
+/** The kinds, in the order the library declares them, never a copy of the list. */
+export const KIND_OPTIONS = CONNECTOR_KINDS.map((kind) => ({
+  value: kind,
+  label: KIND_LABELS[kind],
+}));
 
 /**
  * How each format is labelled, and the reason this is a map rather than a list.
@@ -130,6 +151,8 @@ export interface SourceDraft {
   forcePathStyle: boolean;
   maxObjectsPerRun: string;
   watermarkColumn: string;
+  /** The object type a `catalog` source reads. Its whole configuration. */
+  objectType: string;
 }
 
 export function sourceDraftFrom(config: Record<string, unknown> | undefined): SourceDraft {
@@ -155,6 +178,7 @@ export function sourceDraftFrom(config: Record<string, unknown> | undefined): So
     maxObjectsPerRun:
       typeof source.maxObjectsPerRun === 'number' ? String(source.maxObjectsPerRun) : '',
     watermarkColumn: text('watermarkColumn'),
+    objectType: text(CATALOG_SOURCE_TYPE_KEY),
   };
 }
 
@@ -284,6 +308,7 @@ export function sourceConfigFrom(
   if (kind === 'sql') return sqlConfig(draft, viaConnection, incremental);
   if (kind === 'file') return fileConfig(draft);
   if (kind === 's3') return s3Config(draft, viaConnection);
+  if (kind === 'catalog') return { [CATALOG_SOURCE_TYPE_KEY]: draft.objectType.trim() };
   return inlineConfig(draft);
 }
 
@@ -341,6 +366,19 @@ export function SourceFields({
   storage?: StorageAvailability;
 }) {
   const set = (patch: Partial<SourceDraft>) => onChange({ ...draft, ...patch });
+
+  if (kind === 'catalog') {
+    return (
+      <TextField
+        label="Object type"
+        value={draft.objectType}
+        onChange={(objectType) => set({ objectType })}
+        placeholder="e.g. SubwoReplica"
+        disabled={disabled}
+        hint="The type, not a table. This reads the snapshot the catalog is currently serving, resolved when the run starts — the physical table keeps every load that has ever run, so naming it directly reads them all."
+      />
+    );
+  }
 
   if (kind === 'http') {
     return (
