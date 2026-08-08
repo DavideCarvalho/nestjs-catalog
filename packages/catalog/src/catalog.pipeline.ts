@@ -6673,25 +6673,7 @@ export function workflowGraphHash(graph: WorkflowGraph): string {
 
 /** The parts of a node that change what a run produces. */
 function canonicalNode(node: WorkflowNode): string {
-  if (node.kind === 'source') {
-    return JSON.stringify([
-      node.id,
-      node.kind,
-      node.sourceKind,
-      node.connectionId ?? '',
-      node.secretEnvVar ?? '',
-      node.mode ?? 'full',
-      // Sorted keys, so a canvas that rewrites the object in a different order
-      // does not look like an edit.
-      sortedEntries(node.config),
-      // Appended only when there is a reference, exactly as `edge.branch` above
-      // is appended only when there is a label, and for the same reason: adding
-      // reusable nodes to this file must not renumber the version of a single
-      // graph that did not change. Every source drawn before they existed
-      // hashes to the string it always did.
-      ...canonicalReuse(node),
-    ]);
-  }
+  if (node.kind === 'source') return canonicalSource(node);
   if (node.kind === 'transform') {
     // The transform's *version as stored* is deliberately not in here, and that
     // has not changed: editing a transform is recorded as a new transform
@@ -6762,6 +6744,35 @@ function canonicalNode(node: WorkflowNode): string {
     ]);
   }
   return unreachableNodeKind(node, 'workflowGraphHash');
+}
+
+/**
+ * A source, canonicalised.
+ *
+ * Its own function, beside the ones every other configured kind already has, for
+ * the reason `toTransformNode` is one package over: `canonicalNode` is a
+ * dispatcher, and a dispatcher that also carries the longest of its cases inline
+ * is where the next case gets written inline too. Nothing about what is hashed
+ * changed with the move — this is the string it always produced.
+ */
+function canonicalSource(node: WorkflowSourceNode): string {
+  return JSON.stringify([
+    node.id,
+    node.kind,
+    node.sourceKind,
+    node.connectionId ?? '',
+    node.secretEnvVar ?? '',
+    node.mode ?? 'full',
+    // Sorted keys, so a canvas that rewrites the object in a different order
+    // does not look like an edit.
+    sortedEntries(node.config),
+    // Appended only when there is a reference, exactly as `edge.branch` above
+    // is appended only when there is a label, and for the same reason: adding
+    // reusable nodes to this file must not renumber the version of a single
+    // graph that did not change. Every source drawn before they existed
+    // hashes to the string it always did.
+    ...canonicalReuse(node),
+  ]);
 }
 
 /**
@@ -7174,14 +7185,7 @@ function producedColumns(
   knowledge: WorkflowColumnKnowledge | undefined,
 ): ReadonlySet<string> | undefined {
   if (node.kind === 'lookup') return lookupProducedColumns(node, upstream);
-  if (node.kind === 'rename') {
-    if (workflowRenameUnnamed(node) === 'drop') return new Set(Object.values(node.columns ?? {}));
-    const known = upstream();
-    if (known === undefined) return undefined;
-    const renamed = new Set<string>();
-    for (const column of known) renamed.add(node.columns?.[column] ?? column);
-    return renamed;
-  }
+  if (node.kind === 'rename') return renameProducedColumns(node, upstream);
   // The one kind whose output set is *exact* rather than an upper bound, and it
   // is exact without looking upstream at all: an aggregate emits its group-by
   // columns and its named aggregates on every record it produces, whatever it
@@ -7201,6 +7205,25 @@ function producedColumns(
     return undefined;
   }
   return unreachableNodeKind(node, 'workflowKnownColumns');
+}
+
+/**
+ * What a rename passes on, given what reaches it.
+ *
+ * The one that makes the upstream argument a thunk: a rename that drops its
+ * unnamed columns answers from its own config, so the walk stops here rather
+ * than climbing to a source it would learn nothing from.
+ */
+function renameProducedColumns(
+  node: WorkflowRenameNode,
+  upstream: (only?: WorkflowInputFilter) => ReadonlySet<string> | undefined,
+): ReadonlySet<string> | undefined {
+  if (workflowRenameUnnamed(node) === 'drop') return new Set(Object.values(node.columns ?? {}));
+  const known = upstream();
+  if (known === undefined) return undefined;
+  const renamed = new Set<string>();
+  for (const column of known) renamed.add(node.columns?.[column] ?? column);
+  return renamed;
 }
 
 /**
@@ -7527,12 +7550,22 @@ export function isWorkflowNode(value: unknown): value is WorkflowNode {
   if (kind === 'rename') return isRenameNodeShape(value);
   if (kind === 'aggregate') return isAggregateNodeShape(value);
   if (kind === 'lookup') return isLookupNodeShape(value);
-  if (kind === 'source') {
-    const sourceKind = Reflect.get(value, 'sourceKind');
-    const config = Reflect.get(value, 'config');
-    return isConnectorKind(sourceKind) && typeof config === 'object' && config !== null;
-  }
+  if (kind === 'source') return isSourceNodeShape(value);
   return isWorkflowNodeKindUnhandled(kind);
+}
+
+/**
+ * Everything a `source` node carries.
+ *
+ * Its own function beside the four kinds that already have one, and for the
+ * reason those have one: {@link isWorkflowNode} is a narrowing dispatcher, and a
+ * dispatcher that also carries its cases inline stops being readable at exactly
+ * the point a new kind is added to it.
+ */
+function isSourceNodeShape(value: object): boolean {
+  const sourceKind = Reflect.get(value, 'sourceKind');
+  const config = Reflect.get(value, 'config');
+  return isConnectorKind(sourceKind) && typeof config === 'object' && config !== null;
 }
 
 /**
