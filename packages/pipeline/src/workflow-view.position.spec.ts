@@ -55,6 +55,19 @@ const MINIMAL: Record<WorkflowNodeKind, Record<string, unknown>> = {
     groupBy: ['workOrderId'],
     aggregates: [{ as: 'lines', fn: 'count' }],
   },
+  // And the ninth. Five for five — and two of the five arrived on the same
+  // afternoon from two people who could not see each other's work, which is the
+  // case the compile-forced Record was actually written for. This one is also
+  // the first whose minimal body names *another node* — `reference` is a node id
+  // — and `toGraph` accepts it, because whether that node exists is a fact about
+  // the graph and `validateWorkflow` is what answers it.
+  lookup: {
+    kind: 'lookup',
+    reference: 'plans',
+    key: 'planId',
+    referenceKey: 'Plan ID',
+    fields: { 'Plan Name': 'planName' },
+  },
 };
 
 const KINDS = Object.keys(MINIMAL) as WorkflowNodeKind[];

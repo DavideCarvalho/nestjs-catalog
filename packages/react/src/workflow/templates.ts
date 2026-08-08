@@ -399,6 +399,17 @@ const NODE_FACTORIES: NodeFactories = {
   // does not error — it commits a plausible number. A prefilled aggregate would
   // be a summary of somebody else's data, shipped with an air of authority.
   aggregate: (id, name, init) => ({ id, name, kind: 'aggregate', ...init }),
+  // `lookup` arrived sixth, and the map stopped the build a sixth time.
+  //
+  // Unused by every template below, and the reason is not the one the five above
+  // give. A lookup's content is not only facts about somebody's data — it is a
+  // `reference` that names *a node id in the graph being built*, so a template
+  // that prefilled one would be writing down the id of a node it also has to
+  // create, in an order nothing enforces. When that goes wrong the graph does not
+  // fail to save: `validateWorkflow` refuses it, which is the good case, and the
+  // bad case is a template that happens to name a node that exists and quietly
+  // holds the wrong side of the join in memory.
+  lookup: (id, name, init) => ({ id, name, kind: 'lookup', ...init }),
 };
 
 /* -------------------------------------------------------------------------- */

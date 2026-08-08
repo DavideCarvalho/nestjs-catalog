@@ -131,6 +131,31 @@ export function newNodeOfKind(
       position,
     };
   }
+  if (kind === 'lookup') {
+    // Every field blank, and the validator refuses it by name from the moment the
+    // node is dropped — the stance `filter` and `rename` take, and for the same
+    // reason one step sharper. A lookup has *four* things to fill in and three of
+    // them have a plausible-looking wrong default: a `reference` guessed from the
+    // first inbound edge would decide which side is held in memory, and a
+    // `key`/`referenceKey` pair guessed from a column both sides happen to share
+    // would author a join nobody chose. All three are silent when wrong.
+    //
+    // `unmatched` is left absent, which means null. That is the only one of the
+    // three dispositions that changes neither which rows exist nor whether the run
+    // finishes, so it is the one a node can start on before anybody has thought
+    // about it — and the run log reports the count either way, which is the part
+    // that stops it being a guess with consequences.
+    return {
+      id,
+      name,
+      kind: 'lookup',
+      reference: '',
+      key: '',
+      referenceKey: '',
+      fields: { '': '' },
+      position,
+    };
+  }
   if (kind === 'sink') {
     return { id, name, kind: 'sink', targetType: '', position };
   }

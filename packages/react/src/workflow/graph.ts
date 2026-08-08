@@ -18,6 +18,7 @@ import {
   type WorkflowFilterValue,
   type WorkflowIfNode,
   type WorkflowIfPredicate,
+  type WorkflowLookupNode,
   type WorkflowNode,
   type WorkflowNodeKind,
   type WorkflowRenameNode,
@@ -29,6 +30,7 @@ import {
   unreachableNodeKind,
   unreachablePredicateKind,
   workflowCallMode,
+  workflowLookupUnmatched,
   workflowRenameUnnamed,
 } from './model';
 import { type WorkflowProblem, edgeId } from './validate';
@@ -116,6 +118,7 @@ function subtitleFor(node: WorkflowNode, describe: NodeDescriptions): string {
   if (node.kind === 'filter') return filterSubtitle(node);
   if (node.kind === 'rename') return renameSubtitle(node);
   if (node.kind === 'aggregate') return aggregateSubtitle(node);
+  if (node.kind === 'lookup') return lookupSubtitle(node);
   if (node.kind === 'transform') {
     return describe.transformName(node.transformId) ?? 'no transform chosen';
   }
@@ -202,6 +205,35 @@ function aggregateSubtitle(node: WorkflowAggregateNode): string {
   if (groupBy.length === 0) return 'no columns to group on';
   if (aggregates.length === 0) return `by ${groupBy.join(', ')}, computing nothing`;
   return `by ${groupBy.join(', ')} \u2192 ${aggregates.length} ${aggregates.length === 1 ? 'value' : 'values'}`;
+}
+
+/**
+ * A lookup's face: what it matches on, and how many fields it brings across.
+ *
+ * The **key pair** is what gets the room, not the field list, and that is the
+ * decision. A lookup that is wrong is almost never wrong about which columns it
+ * wanted — it is wrong about the two columns it matches on, because those are the
+ * ones that have to agree between two systems that have never met. `planId =
+ * Plan ID` readable off the canvas is the difference between spotting that and
+ * opening every node in the graph.
+ *
+ * The disposition is on the face too, and only when it is not the default, for
+ * the reason a rename says "drops the rest": `drop` means this node also removes
+ * rows, which is a thing that should never require opening a box to discover.
+ */
+function lookupSubtitle(node: WorkflowLookupNode): string {
+  const key = typeof node.key === 'string' ? node.key : '';
+  const referenceKey = typeof node.referenceKey === 'string' ? node.referenceKey : '';
+  if (key.length === 0 || referenceKey.length === 0) return 'no key chosen';
+  const fields = Object.entries(node.fields ?? {}).filter(
+    ([from, to]) => from.length > 0 && to.length > 0,
+  );
+  if (fields.length === 0) return `${key} = ${referenceKey}, no fields`;
+  const brings = fields.length === 1 ? `+${fields[0]?.[1]}` : `+${fields.length} fields`;
+  const unmatched = workflowLookupUnmatched(node);
+  const tail =
+    unmatched === 'drop' ? ', drops misses' : unmatched === 'fail' ? ', fails on a miss' : '';
+  return `${key} = ${referenceKey} ${brings}${tail}`;
 }
 
 /** How many comparisons a predicate is made of, groups not counted. */
@@ -462,6 +494,7 @@ export function defaultLabel(kind: WorkflowNodeKind): string {
   if (kind === 'filter') return 'Filter';
   if (kind === 'rename') return 'Rename';
   if (kind === 'aggregate') return 'Aggregate';
+  if (kind === 'lookup') return 'Lookup';
   if (kind === 'transform') return 'Transform';
   return unreachableNodeKind(kind, 'defaultLabel');
 }
