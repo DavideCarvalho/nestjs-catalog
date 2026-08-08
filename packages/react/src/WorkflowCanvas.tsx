@@ -50,6 +50,7 @@ import {
   Plus,
   Repeat,
   Save,
+  Sigma,
   TextCursorInput,
   Trash2,
   TriangleAlert,
@@ -150,6 +151,9 @@ import {
   type CallableWorkflowRef,
   type CatalogWorkflow,
   type StorageAvailability,
+  WORKFLOW_AGGREGATE_FUNCTIONS,
+  WORKFLOW_AGGREGATE_MAX_AGGREGATES,
+  WORKFLOW_AGGREGATE_MAX_GROUP_BY,
   WORKFLOW_BRANCH_LABELS,
   WORKFLOW_CALL_MODES,
   WORKFLOW_FILTER_MAX_DEPTH,
@@ -157,6 +161,9 @@ import {
   WORKFLOW_FILTER_OPERATORS,
   WORKFLOW_NODE_KINDS,
   WORKFLOW_RENAME_MAX_COLUMNS,
+  type WorkflowAggregate,
+  type WorkflowAggregateFunction,
+  type WorkflowAggregateNode,
   type WorkflowBranchLabel,
   type WorkflowCallMode,
   type WorkflowCallNode,
@@ -179,8 +186,10 @@ import {
   type WorkflowSinkNode,
   type WorkflowSourceNode,
   type WorkflowTransformNode,
+  aggregateRefusals,
   callableWorkflowBlock,
   describeDurability,
+  isWorkflowAggregateFunction,
   isWorkflowBranchLabel,
   isWorkflowFilterOperator,
   isWorkflowFilterPredicateKind,
@@ -195,6 +204,9 @@ import {
   unreachableFilterPredicateKind,
   unreachableNodeKind,
   unreachablePredicateKind,
+  workflowAggregateMaxGroups,
+  workflowAggregateNeedsColumn,
+  workflowAggregateOutputColumns,
   workflowCallMode,
   workflowKnownColumns,
   workflowNarrowedTypes,
@@ -680,6 +692,11 @@ const ADD_NODE: Record<WorkflowNodeKind, { icon: typeof Plug; label: string; hin
     icon: TextCursorInput,
     label: 'Rename',
     hint: 'Renames columns, and nothing else. No code, no child process — a pure rename rewrites the staged column list and leaves every row exactly where it is. It can also drop the columns you do not name, which does cost a pass over the rows.',
+  },
+  aggregate: {
+    icon: Sigma,
+    label: 'Aggregate',
+    hint: 'Groups the rows and summarises each group — count, sum, average, min, max, or the values joined together. No code, and it holds only the groups rather than the rows, so a 44,720-row grouping into 16,119 groups never has more than one batch of records in memory. It refuses loudly if the grouping turns out to hold nearly everything.',
   },
 };
 
@@ -1386,6 +1403,11 @@ function miniMapColor(data: { kind?: unknown } | undefined): string {
   // gets: a rename is the node that is *provably* cheap, and an overview where
   // it reads as another piece of user code hides the one thing worth seeing.
   if (kind === 'rename') return '#14b8a6';
+  // Amber-500. The one node where the number of rows changes shape rather than
+  // merely shrinking, and the one worth spotting from the overview: a grouping
+  // that holds nearly every row it read is the failure this node exists to
+  // avoid, and the box on the map is where somebody notices there is one.
+  if (kind === 'aggregate') return '#f59e0b';
   return '#8b5cf6';
 }
 
@@ -5965,6 +5987,353 @@ function RenameInspector({
   );
 }
 
+/**
+ * The aggregate node's form: what defines a group, and what to compute per group.
+ *
+ * ## Why the two lists are local state and the node is not
+ *
+ * The same argument {@link RenameInspector} makes, arrived at from the other
+ * direction. A rename's model is a `Record` and has to be edited as a list; an
+ * aggregate's model is already a list, and the reason it is one is here in the
+ * form: two aggregates reading the same column — `min(closedDate)` and
+ * `max(closedDate)` — are the normal case rather than the mistake, so the
+ * output name is the key and a half-typed one is still a row somebody is in the
+ * middle of writing.
+ *
+ * Rows are held here, in order, and the node is derived from them. What can
+ * diverge is two rows sharing an output name, and that is said out loud below
+ * rather than silently resolved, because resolving it means deciding which of
+ * somebody's numbers survives.
+ *
+ * ## What this panel can say that no other inspector can
+ *
+ * **Exactly** which columns leave the node. Every other kind's answer is an
+ * upper bound at best and `undefined` at worst; an aggregate's output set is
+ * closed by its own config — the group keys plus the named aggregates, on every
+ * record, always. So the panel prints the list rather than hedging it, and the
+ * hedge is reserved for the columns coming *in*, where `workflowKnownColumns`
+ * genuinely may not know.
+ *
+ * ## And the one number it puts in front of somebody before they run it
+ *
+ * The group ceiling. A hash aggregate is cheap only while the groups are far
+ * fewer than the rows, and the moment somebody groups on a near-unique column
+ * the node holds the whole load. That is a decision made in this form, so the
+ * bound belongs in this form and not only in the run that refuses.
+ */
+function AggregateInspector({
+  node,
+  graph,
+  canEdit,
+  onChange,
+}: {
+  node: WorkflowAggregateNode;
+  graph: WorkflowGraph;
+  canEdit: boolean;
+  onChange: (node: WorkflowNode) => void;
+}) {
+  const [groupBy, setGroupBy] = useState<string[]>(() =>
+    node.groupBy.length > 0 ? [...node.groupBy] : [''],
+  );
+  const [rows, setRows] = useState<WorkflowAggregate[]>(() =>
+    node.aggregates.length > 0 ? [...node.aggregates] : [{ as: '', fn: 'count' }],
+  );
+
+  const commitGroupBy = (next: string[]) => {
+    setGroupBy(next);
+    onChange({ ...node, groupBy: next });
+  };
+
+  const commitRows = (next: WorkflowAggregate[]) => {
+    setRows(next);
+    onChange({ ...node, aggregates: next });
+  };
+
+  const setFunction = (index: number, value: string) => {
+    if (!isWorkflowAggregateFunction(value)) return;
+    commitRows(rows.map((each, at) => (at === index ? refunction(each, value) : each)));
+  };
+
+  const known = workflowKnownColumns(graph, node.id);
+  const refusals = aggregateRefusals(node);
+  const produces = workflowAggregateOutputColumns(node);
+  const duplicated = rows
+    .map((row) => row.as)
+    .filter((as, at, all) => as.length > 0 && all.indexOf(as) !== at);
+
+  return (
+    <div className="space-y-3">
+      <FieldGroup
+        title="Group by"
+        hint={
+          <>
+            What makes two records the same group. These come out under the names they went in
+            under, so each has to be a name a column can have — letters, digits and underscore,
+            starting with a letter or an underscore. If the source spells its headers{' '}
+            <code>Work Order Id</code>, put a Rename node above this one.
+          </>
+        }
+      >
+        {groupBy.map((column, index) => (
+          <div
+            // Positional keys. Rows have no id, the only edits are
+            // replace-in-place, append and remove, and there is no draft state
+            // below this point to preserve.
+            // biome-ignore lint/suspicious/noArrayIndexKey: see above
+            key={index}
+            className="flex items-end gap-2"
+          >
+            <div className="min-w-0 flex-1">
+              <TextField
+                label={index === 0 ? 'Column' : ''}
+                value={column}
+                placeholder="workOrderId"
+                disabled={!canEdit}
+                onChange={(next) =>
+                  commitGroupBy(groupBy.map((each, at) => (at === index ? next : each)))
+                }
+              />
+            </div>
+            {canEdit && groupBy.length > 1 && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="shrink-0"
+                onClick={() => commitGroupBy(groupBy.filter((_, at) => at !== index))}
+              >
+                Remove
+              </Button>
+            )}
+          </div>
+        ))}
+        {canEdit && (
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => commitGroupBy([...groupBy, ''])}
+            disabled={groupBy.length >= WORKFLOW_AGGREGATE_MAX_GROUP_BY}
+          >
+            Add column
+          </Button>
+        )}
+      </FieldGroup>
+
+      <FieldGroup
+        title="Compute"
+        hint={
+          <>
+            One column out per row. <code>count</code> with no column counts the records in the
+            group; with a column it counts the ones that are not null. Anything more than these is a
+            Transform — there is no conditional here on purpose.
+          </>
+        }
+      >
+        {rows.map((row, index) => (
+          <div
+            // Positional keys, for the reason the group-by list above gives.
+            // biome-ignore lint/suspicious/noArrayIndexKey: see above
+            key={index}
+            className="space-y-2 rounded-md border border-zinc-200 p-2 dark:border-zinc-800"
+          >
+            <div className="flex items-end gap-2">
+              <div className="min-w-0 flex-1">
+                <SelectField
+                  label={index === 0 ? 'Function' : ''}
+                  ariaLabel="Aggregate function"
+                  value={row.fn}
+                  onValueChange={(value) => setFunction(index, value)}
+                  disabled={!canEdit}
+                  options={WORKFLOW_AGGREGATE_FUNCTIONS.map((fn) => ({
+                    value: fn,
+                    label: fn,
+                    hint: AGGREGATE_HINTS[fn],
+                  }))}
+                />
+              </div>
+              <div className="min-w-0 flex-1">
+                <TextField
+                  label={index === 0 ? 'Of column' : ''}
+                  value={row.column ?? ''}
+                  placeholder={
+                    workflowAggregateNeedsColumn(row.fn) ? 'actualLaborCost' : 'every record'
+                  }
+                  disabled={!canEdit}
+                  onChange={(column) =>
+                    commitRows(
+                      rows.map((each, at) =>
+                        at === index
+                          ? column.length === 0
+                            ? { ...each, column: undefined }
+                            : { ...each, column }
+                          : each,
+                      ),
+                    )
+                  }
+                />
+              </div>
+              <div className="min-w-0 flex-1">
+                <TextField
+                  label={index === 0 ? 'Called' : ''}
+                  value={row.as}
+                  placeholder="totalLaborCost"
+                  disabled={!canEdit}
+                  onChange={(as) =>
+                    commitRows(rows.map((each, at) => (at === index ? { ...each, as } : each)))
+                  }
+                />
+              </div>
+              {canEdit && rows.length > 1 && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="shrink-0"
+                  onClick={() => commitRows(rows.filter((_, at) => at !== index))}
+                >
+                  Remove
+                </Button>
+              )}
+            </div>
+            {row.fn === 'join' && (
+              <div className="flex items-end gap-2">
+                <div className="min-w-0 flex-1">
+                  <TextField
+                    label="Separator"
+                    value={row.separator ?? ''}
+                    placeholder=", "
+                    disabled={!canEdit}
+                    onChange={(separator) =>
+                      commitRows(
+                        rows.map((each, at) =>
+                          at === index
+                            ? separator.length === 0
+                              ? { ...each, separator: undefined }
+                              : { ...each, separator }
+                            : each,
+                        ),
+                      )
+                    }
+                  />
+                </div>
+                <div className="min-w-0 flex-1">
+                  <TextField
+                    label="Refuse past"
+                    value={row.maxLength === undefined ? '' : String(row.maxLength)}
+                    placeholder="65535 characters"
+                    inputMode="numeric"
+                    disabled={!canEdit}
+                    hint="Refused, not truncated."
+                    onChange={(text) => {
+                      const parsed = Number(text.trim());
+                      const maxLength =
+                        text.trim().length === 0 || !Number.isInteger(parsed) ? undefined : parsed;
+                      commitRows(
+                        rows.map((each, at) => (at === index ? { ...each, maxLength } : each)),
+                      );
+                    }}
+                  />
+                </div>
+              </div>
+            )}
+          </div>
+        ))}
+        {canEdit && (
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => commitRows([...rows, { as: '', fn: 'count' }])}
+            disabled={rows.length >= WORKFLOW_AGGREGATE_MAX_AGGREGATES}
+          >
+            Add aggregate
+          </Button>
+        )}
+      </FieldGroup>
+
+      {/* The bound, said before the run says it. This is the one node whose cost
+          is chosen in the form rather than discovered afterwards: a grouping
+          holds one accumulator row per group, so the whole question is whether
+          the group-by columns above are coarse enough. */}
+      <p className={cn('text-[11px] leading-relaxed', MUTED)}>
+        This node holds <strong>one row per group</strong> and reads the records one staged batch at
+        a time, so its memory is the number of groups and not the number of records. If the grouping
+        turns out to be nearly one-to-one it holds the whole load, so the run{' '}
+        <strong>refuses</strong> past {workflowAggregateMaxGroups(node).toLocaleString()} groups
+        rather than quietly filling the machine.
+      </p>
+
+      {refusals.length > 0 && (
+        <p className="text-[11px] leading-relaxed text-amber-600 dark:text-amber-400">
+          {refusals.join(' ')}
+        </p>
+      )}
+
+      {duplicated.length > 0 && (
+        <p className="text-[11px] leading-relaxed text-amber-600 dark:text-amber-400">
+          {duplicated.map((as) => `“${as}”`).join(', ')} is used by more than one row. Two columns
+          cannot share one name, and picking a winner would be a rule about which of your numbers
+          survives.
+        </p>
+      )}
+
+      {produces.length > 0 && (
+        <p className={cn('text-[11px] leading-relaxed', MUTED)}>
+          What leaves this node is exactly <span className="font-mono">{produces.join(', ')}</span>,
+          on every record — including where the answer is null. Every other column of every record
+          stops here. That set is <strong>exact</strong> rather than a best guess, which is what
+          lets a filter or a sink below this node be checked when the graph is saved.
+        </p>
+      )}
+
+      {known ? (
+        <p className={cn('text-[11px] leading-relaxed', MUTED)}>
+          The graph knows exactly what arrives here:{' '}
+          <span className="font-mono">{[...known].join(', ') || 'nothing at all'}</span>. A column
+          named above that is not in that list is refused when this graph is saved, rather than
+          found out when sixteen thousand rows come back as one.
+        </p>
+      ) : (
+        <p className={cn('text-[11px] leading-relaxed', MUTED)}>
+          The graph cannot say which columns reach this node — a source discovers its shape against
+          the live system, and a transform is code. So the column names above are taken on trust,
+          and the run says out loud if one of them was in no record at all.
+        </p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * One aggregate, with its function changed and the fields that no longer apply
+ * dropped.
+ *
+ * Dropped rather than left behind, because a stored separator on a `sum` is a
+ * node the server refuses — and a form that can reach a refused state by
+ * changing a dropdown is a form that fails after Save with nothing visibly
+ * wrong on the screen.
+ */
+function refunction(
+  aggregate: WorkflowAggregate,
+  fn: WorkflowAggregateFunction,
+): WorkflowAggregate {
+  const kept: WorkflowAggregate = { as: aggregate.as, fn };
+  if (workflowAggregateNeedsColumn(fn) && aggregate.column !== undefined) {
+    kept.column = aggregate.column;
+  }
+  if (fn !== 'join') return kept;
+  if (aggregate.separator !== undefined) kept.separator = aggregate.separator;
+  if (aggregate.maxLength !== undefined) kept.maxLength = aggregate.maxLength;
+  return kept;
+}
+
+/** One line per function, for the picker. What it does, and what it costs. */
+const AGGREGATE_HINTS: Record<WorkflowAggregateFunction, string> = {
+  count: 'records in the group, or non-null values of a column',
+  sum: 'the total, with the low-order bits kept',
+  avg: 'the mean of the non-null values',
+  min: 'the least value — text compares by code point, not by database collation',
+  max: 'the greatest value — same comparison',
+  join: 'the values run together, refusing past a length rather than truncating',
+};
+
 function FilterInspector({
   node,
   graph,
@@ -6759,6 +7128,9 @@ function KindInspector({
         onChange={onChange}
       />
     );
+  }
+  if (node.kind === 'aggregate') {
+    return <AggregateInspector node={node} graph={graph} canEdit={canEdit} onChange={onChange} />;
   }
   if (node.kind === 'sink') {
     return (

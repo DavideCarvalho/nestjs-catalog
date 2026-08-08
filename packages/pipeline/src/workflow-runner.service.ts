@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import {
+  AggregateTable,
+  type AggregateTableStats,
   CATALOG_PIPELINE_STORE,
   CATALOG_REVISION_LIMIT,
   CATALOG_STORE,
@@ -13,6 +15,8 @@ import {
   type ConnectorRun,
   type StageRenamePlan,
   SubprocessTransformRunner,
+  WorkflowAggregateError,
+  type WorkflowAggregateNode,
   type WorkflowBranchLabel,
   type WorkflowCallMode,
   type WorkflowCallOutput,
@@ -47,6 +51,7 @@ import {
   unreachableCallMode,
   unreachableNodeKind,
   unreachablePredicateKind,
+  workflowAggregateMaxGroups,
   workflowCallMode,
   workflowFilterMatches,
   workflowNodeRuns,
@@ -560,6 +565,9 @@ export class WorkflowRunnerService {
     }
     if (node.kind === 'rename') {
       return this.runRename(node, input, startedAt);
+    }
+    if (node.kind === 'aggregate') {
+      return this.runAggregate(node, input, startedAt);
     }
     if (node.kind === 'call') {
       // Not executable from here, and refused rather than approximated.
@@ -1805,6 +1813,129 @@ export class WorkflowRunnerService {
   }
 
   /**
+   * Group the rows and summarise each group — **one staged batch in, groups
+   * held, one pass out.**
+   *
+   * ## The shape of the loop is the whole feature
+   *
+   * The obvious implementation is `readInputs()` and then a `reduce`, and it is
+   * the thing this node exists to stop doing. `readInputs` materialises the
+   * whole of a node's input in this process's heap, which is the transform
+   * contract and is what flip's `wo` derivation has to use today: 44,720
+   * records in memory, handed to a child process as 65.51 MiB of stdin, which
+   * answers with a single 25.01 MiB JSON line — **78.2% of the hard 32 MiB
+   * output cap**, buffered by the parent as one string. At 1.28× that file it is
+   * killed at the cap.
+   *
+   * So this reads one staged batch, folds it into {@link AggregateTable}, and
+   * drops it. What is held between batches is the **group table** and nothing
+   * else: 16,119 accumulator rows for that same derivation, against 44,720
+   * records. The input side of this node does not scale with the size of the
+   * load at all.
+   *
+   * ## It is not a stream on the way out, and that is arithmetic
+   *
+   * No aggregate can emit its first group before it has read its last record —
+   * the next record might belong to that group. This is the one node in the
+   * graph that is a genuine barrier, and pretending otherwise would mean
+   * emitting groups that are later revised, which the stage cannot express. What
+   * it can promise, and does, is that the barrier costs **groups** rather than
+   * **rows**.
+   *
+   * The output is coalesced into full batches, the rule {@link runFilter} states
+   * and for the same reason: an aggregate that produces three rows per input
+   * batch would otherwise write a stage row per batch.
+   *
+   * ## Numbering, and what a retry does
+   *
+   * Batch numbering is a running count of the batches actually written, which is
+   * a pure function of `input.inputs` and the node's config — both checkpointed
+   * — so a retried aggregate writes the same numbers over the same stage and
+   * each one replaces itself. The stale tail is cleared through the same helper
+   * {@link stage} uses. The fold is deterministic given the same staged input,
+   * so "the same numbers" is a claim about the values too and not only the
+   * count.
+   *
+   * ## Refusals come out as 400s with the sentence intact
+   *
+   * `WorkflowAggregateError` is the fold saying the data cannot be summarised
+   * the way the node says — a mixed-type `min`, text in a `sum`, a `join` past
+   * its bound, more groups than the ceiling. Every one of those has a message
+   * naming the column, the group and the values, and every one of them is a case
+   * where MySQL would have answered something plausible and wrong. Rethrown as a
+   * `BadRequestException` so the run records the sentence rather than a stack.
+   */
+  private async runAggregate(
+    node: WorkflowAggregateNode,
+    input: WorkflowNodeStepInput,
+    startedAt: number,
+  ): Promise<WorkflowNodeStepOutput> {
+    const store = this.requireStore();
+    const logs: string[] = [];
+    const table = this.buildAggregateTable(node);
+
+    let batches = 0;
+    const carry: Array<Record<string, unknown>> = [];
+    const flush = async (rows: Array<Record<string, unknown>>) => {
+      batches += 1;
+      await store.writeStage({ runId: input.runId, nodeId: node.id, batch: batches, rows });
+    };
+
+    try {
+      for (const ref of input.inputs) {
+        for (let batch = 1; batch <= ref.batches; batch += 1) {
+          const rows = await store.readStage({ runId: ref.runId, nodeId: ref.nodeId, batch });
+          for (const row of rows) table.push(row);
+        }
+      }
+
+      for (const row of table.emit()) {
+        carry.push(row);
+        // Awaited inside the emit loop rather than after it, so the groups are
+        // handed off as they are read and the heap never holds the table *and*
+        // a full copy of its output.
+        while (carry.length >= BATCH_SIZE) await flush(carry.splice(0, BATCH_SIZE));
+      }
+      if (carry.length > 0) await flush(carry.splice(0, carry.length));
+    } catch (error) {
+      // Narrowed rather than asserted: anything else is a bug and keeps its own
+      // stack, which is the difference between "this data cannot be aggregated"
+      // and "this code is broken".
+      if (error instanceof WorkflowAggregateError) throw new BadRequestException(error.message);
+      throw error;
+    }
+
+    const stats = table.stats();
+    logs.push(...aggregateLogLines(node, stats));
+    await this.clearStaleTail(input.runId, node.id, batches, logs);
+
+    return {
+      nodeId: node.id,
+      output: { runId: input.runId, nodeId: node.id, batches, rowCount: stats.groups },
+      rows: stats.groups,
+      rowsIn: stats.rowsIn,
+      elapsedMs: Date.now() - startedAt,
+      logs: safeLogLines(logs, LOG_LINES_PER_NODE),
+    };
+  }
+
+  /**
+   * The fold, built before a row is read.
+   *
+   * Separate so the refusal a *configuration* earns is told apart from the
+   * refusal the *data* earns: a node that could never have been stored fails
+   * here, before any staged batch is opened, and says so.
+   */
+  private buildAggregateTable(node: WorkflowAggregateNode): AggregateTable {
+    try {
+      return new AggregateTable(node);
+    } catch (error) {
+      if (error instanceof WorkflowAggregateError) throw new BadRequestException(error.message);
+      throw error;
+    }
+  }
+
+  /**
    * The only node that writes, and the only node that commits.
    *
    * It publishes through `appendRowsAsSystem` and `commitAsSystem` — the same
@@ -2598,6 +2729,62 @@ function renameLogLines(
   if (unmatched.length > 0 && outcome.rows > 0) {
     lines.push(
       `${unmatched.map((column) => JSON.stringify(column)).join(', ')} ${unmatched.length === 1 ? 'was' : 'were'} not found in any row, so ${unmatched.length === 1 ? 'the column it renames to is' : 'the columns they rename to are'} absent from everything this node passed on. Check the spelling against the source's own headers — a sink writing a column that is not in the record commits NULL into every row and reports success.`,
+    );
+  }
+
+  return lines;
+}
+
+/**
+ * What an aggregate says about the pass it just made.
+ *
+ * The first line is the number that decides whether the node was a good idea:
+ * rows in, groups out, and the ratio between them. A hash aggregate is cheap
+ * exactly to the extent that ratio is large, so it is the first thing on the
+ * run and not something to work out from two other numbers.
+ *
+ * Every line after it is a case where the answer is *plausible and possibly
+ * wrong*, which is the only kind of thing worth spending a log line on.
+ */
+function aggregateLogLines(node: WorkflowAggregateNode, stats: AggregateTableStats): string[] {
+  const { rowsIn, groups, unseenColumns, coercedFromString, longestJoin } = stats;
+  const ratio = groups > 0 ? (rowsIn / groups).toFixed(1) : '0';
+  const lines = [
+    `"${node.name}" read ${rowsIn} records and held ${groups} groups (${ratio} records per group), grouping on ${node.groupBy.map((column) => JSON.stringify(column)).join(', ')} and computing ${node.aggregates.length} ${node.aggregates.length === 1 ? 'aggregate' : 'aggregates'}. The memory this node used is the ${groups} groups, not the ${rowsIn} records.`,
+  ];
+
+  // Said out loud whenever the grouping is not actually buying anything, and
+  // said as a warning rather than a refusal because it is legal and sometimes
+  // meant. What it usually is, is the wrong group-by column: a hash aggregate
+  // that holds one group per record has silently become the whole-batch
+  // behaviour this node replaces.
+  if (groups > 0 && rowsIn > 0 && groups > rowsIn * 0.9) {
+    lines.push(
+      `${groups} groups out of ${rowsIn} records means this grouping is nearly one-to-one, so the node held essentially the whole load in memory rather than a summary of it. That is legal and it is usually the wrong group-by column; the ceiling that would have refused it is ${workflowAggregateMaxGroups(node)}.`,
+    );
+  }
+
+  if (unseenColumns.length > 0 && rowsIn > 0) {
+    lines.push(
+      `${unseenColumns.map((column) => JSON.stringify(column)).join(', ')} ${unseenColumns.length === 1 ? 'was' : 'were'} not found in any record, so anything grouped on ${unseenColumns.length === 1 ? 'it' : 'them'} collapsed into one null key and anything aggregating ${unseenColumns.length === 1 ? 'it' : 'them'} answered null for every group. Check the spelling against the source's own headers — a sink writing a column that is not in the record commits NULL into every row and reports success.`,
+    );
+  }
+
+  if (coercedFromString > 0) {
+    lines.push(
+      `${coercedFromString} values were read out of text to be summed or averaged. That is normal for a CSV, where every number arrives as text; it is worth a look if this source is a database, because a numeric column arriving as text usually means the column is not the one anybody thinks it is.`,
+    );
+  }
+
+  if (longestJoin > 0) {
+    lines.push(
+      `The longest joined value was ${longestJoin} characters. This node refuses at its bound rather than truncating: MySQL's GROUP_CONCAT stops at group_concat_max_len — 1024 by default — and raises a warning most drivers never surface, which is how a committed column ends up quietly missing its tail.`,
+    );
+  }
+
+  if (rowsIn === 0) {
+    lines.push(
+      `"${node.name}" was given nothing, so it produced no groups — which is what GROUP BY over an empty table produces, and not one row of nulls. A full sink downstream will refuse to commit an empty snapshot rather than replace what is live.`,
     );
   }
 

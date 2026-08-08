@@ -8,6 +8,7 @@ import {
 import type { Edge, Node } from '@xyflow/react';
 import { MarkerType } from '@xyflow/react';
 import {
+  type WorkflowAggregateNode,
   type WorkflowBranchLabel,
   type WorkflowCallNode,
   type WorkflowEdge,
@@ -114,6 +115,7 @@ function subtitleFor(node: WorkflowNode, describe: NodeDescriptions): string {
   if (node.kind === 'if') return ifSubtitle(node);
   if (node.kind === 'filter') return filterSubtitle(node);
   if (node.kind === 'rename') return renameSubtitle(node);
+  if (node.kind === 'aggregate') return aggregateSubtitle(node);
   if (node.kind === 'transform') {
     return describe.transformName(node.transformId) ?? 'no transform chosen';
   }
@@ -178,6 +180,28 @@ function renameSubtitle(node: WorkflowRenameNode): string {
       ? `${first[0]} \u2192 ${first[1]}`
       : `renames ${entries.length} columns`;
   return dropped ? `${what}, drops the rest` : what;
+}
+
+/**
+ * An aggregate's face: what defines a group, and how many numbers come out.
+ *
+ * The group-by columns are spelled out rather than counted, because they are the
+ * whole meaning of the node — `by workOrderId, assetId` says what one output row
+ * *is*, and "groups on 2 columns" says nothing anybody can check. The aggregate
+ * count is a count, because forty-nine function names do not fit on a box and
+ * the inspector is one click away.
+ *
+ * This is also the only node face that has to make a person suspicious of a
+ * grouping before they run it, which is why the columns come first: an aggregate
+ * grouped on something near-unique holds the whole load, and the name of the
+ * column is the only thing on the canvas that can give that away.
+ */
+function aggregateSubtitle(node: WorkflowAggregateNode): string {
+  const groupBy = (node.groupBy ?? []).filter((column) => column.length > 0);
+  const aggregates = (node.aggregates ?? []).filter((each) => each.as.length > 0);
+  if (groupBy.length === 0) return 'no columns to group on';
+  if (aggregates.length === 0) return `by ${groupBy.join(', ')}, computing nothing`;
+  return `by ${groupBy.join(', ')} \u2192 ${aggregates.length} ${aggregates.length === 1 ? 'value' : 'values'}`;
 }
 
 /** How many comparisons a predicate is made of, groups not counted. */
@@ -437,6 +461,7 @@ export function defaultLabel(kind: WorkflowNodeKind): string {
   if (kind === 'if') return 'If';
   if (kind === 'filter') return 'Filter';
   if (kind === 'rename') return 'Rename';
+  if (kind === 'aggregate') return 'Aggregate';
   if (kind === 'transform') return 'Transform';
   return unreachableNodeKind(kind, 'defaultLabel');
 }

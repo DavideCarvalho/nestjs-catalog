@@ -78,6 +78,10 @@ describe('what may be saved as a reusable node', () => {
     // A rename map names one source's own spelling of its own headers, so a
     // shared one renames nothing in a graph reading anything else.
     expect(nodeKindIsReusable('rename')).toBe(false);
+    // An aggregate names one type's columns on both sides, so a shared one
+    // groups a graph it was not written for on a column that is not there —
+    // which collapses everything into one null-keyed group rather than failing.
+    expect(nodeKindIsReusable('aggregate')).toBe(false);
   });
 });
 

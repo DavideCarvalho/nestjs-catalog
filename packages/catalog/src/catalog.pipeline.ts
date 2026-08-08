@@ -1454,6 +1454,8 @@ export const WORKFLOW_NODE_KINDS = [
   'filter',
   /** Renames columns, declaratively. See {@link WorkflowRenameNode}. */
   'rename',
+  /** Groups records and summarises each group. See {@link WorkflowAggregateNode}. */
+  'aggregate',
 ] as const;
 
 export type WorkflowNodeKind = (typeof WORKFLOW_NODE_KINDS)[number];
@@ -3060,6 +3062,665 @@ export function isWorkflowRenameColumns(value: unknown): value is Record<string,
   return false;
 }
 
+/* --- aggregate ----------------------------------------------------------- */
+
+/**
+ * The aggregate functions this node computes, and the rule that closes the list.
+ *
+ * A closed list with an exhaustiveness guard, for the reason every other list in
+ * this file is one. What is different here is that the list has a **stated
+ * admission rule**, because "we will keep it narrow" is a promise nobody can
+ * check and a rule is:
+ *
+ * > A function is in if it can be computed from a **fixed-size accumulator**,
+ * > and if its answer does not depend on a decision the config would have to
+ * > carry.
+ *
+ * The first half is the node's whole reason to exist. A hash aggregate is cheap
+ * because it holds one entry per group; an accumulator whose size grows with the
+ * number of *rows* in a group puts the rows back in memory and gives up the
+ * property. The second half is what keeps the config from becoming a small
+ * language: a function that needs an extra field to say what it means is a
+ * function whose meaning was not decided.
+ *
+ * What the rule excludes, so the omissions are on the record rather than
+ * implied:
+ *
+ * - **`countDistinct`** — the sharpest one. It needs a set of the distinct
+ *   values *per group per column*, so its accumulator is O(distinct values) and
+ *   a high-cardinality column inside a group holds the load. It is the exact
+ *   thing this node was built to stop doing, wearing an aggregate's name. A
+ *   sketch (HyperLogLog) is fixed-size and is a different function — an
+ *   estimate — which is not something to ship under the word `distinct`.
+ * - **`median`, percentiles, `stddev` of a stream** — all need the values, or a
+ *   digest that is an approximation with an error bound the config would have to
+ *   carry.
+ * - **`first` / `last`** — fixed-size, and excluded on the other half of the
+ *   rule: they mean "in input order", and this node's input order is a
+ *   `SELECT` without an `ORDER BY`. An aggregate that returns a different value
+ *   on a rerun is a load nobody can diff. `min`/`max` are the order-independent
+ *   version and are what somebody reaching for `first` usually wants.
+ * - **Conditional aggregation — `MAX(CASE WHEN … THEN … END)`** — deliberately
+ *   out of scope, and it is the one omission a reader of flip's `wo` query will
+ *   go looking for, because that query has a three-branch status ladder in it.
+ *   Admitting it means admitting a predicate *inside* an aggregate, which is a
+ *   second expression language nested in the first, evaluated per row per
+ *   aggregate. That is transform territory and the generic
+ *   {@link WorkflowTransformNode} still exists. What the ladder actually is, is
+ *   a priority ordering over a closed set of codes, and it composes: map the
+ *   code to a rank in a transform above this node, `min` the rank, map it back
+ *   below. Two cheap per-record steps instead of a language.
+ * - **`avg` is in**, and it is in *because* of the rule rather than despite it.
+ *   It is `sum` and `count` in one accumulator, both of which are already here,
+ *   and SQL has exactly one answer for it. Excluding it would have made the list
+ *   an arbitrary set that happened to cover one query, which is the thing the
+ *   rule is for.
+ */
+export const WORKFLOW_AGGREGATE_FUNCTIONS = [
+  /** Rows in the group, or non-null values of a column. `COUNT(*)` / `COUNT(c)`. */
+  'count',
+  /** The total. See `addToSum` for the summation error and what is done about it. */
+  'sum',
+  /** The mean of the non-null values. `sum` and `count` in one accumulator. */
+  'avg',
+  /** The least value. See `compareValues` for the order, which is not MySQL's. */
+  'min',
+  /** The greatest value. Same comparison, same docblock. */
+  'max',
+  /** The values, concatenated. `GROUP_CONCAT`, with a bound that refuses. */
+  'join',
+] as const;
+
+export type WorkflowAggregateFunction = (typeof WORKFLOW_AGGREGATE_FUNCTIONS)[number];
+
+/** Same reason as {@link isConnectorKind}: one list, no second copy to drift. */
+export function isWorkflowAggregateFunction(value: unknown): value is WorkflowAggregateFunction {
+  return WORKFLOW_AGGREGATE_FUNCTIONS.some((fn) => fn === value);
+}
+
+/**
+ * {@link unreachableNodeKind}, one level down, and for the identical reason.
+ *
+ * Every branch over {@link WorkflowAggregateFunction} ends here, so a seventh
+ * function added to the list without an accumulator, a finisher, a canonical
+ * form and a sentence is a type error naming the file rather than a node that
+ * saves, draws and then computes nothing. It throws as well, because a function
+ * name arrives as JSON out of a column and a build older than the data is a
+ * thing that happens.
+ */
+export function unreachableAggregateFunction(fn: never, where: string): never {
+  throw new Error(
+    `${where} has no rule for the aggregate function ${JSON.stringify(fn)}. It was added to WORKFLOW_AGGREGATE_FUNCTIONS without teaching this code how to compute it, and guessing would commit a number nobody derived.`,
+  );
+}
+
+/**
+ * How many columns one node may group on.
+ *
+ * The same argument {@link WORKFLOW_RENAME_MAX_COLUMNS} makes, plus one specific
+ * to this node: every extra group-by column can only ever *increase* the number
+ * of groups, so a long list is the shape a high-cardinality grouping arrives in.
+ * flip's real derivation groups on two.
+ */
+export const WORKFLOW_AGGREGATE_MAX_GROUP_BY = 16;
+
+/**
+ * How many aggregates one node may compute.
+ *
+ * flip's `wo` derivation has 49, so the bound has to be comfortably above that
+ * or the node does not do the job it was written for. Past a few hundred the
+ * thing being expressed is a table definition rather than a summary, and the
+ * cost is real: every aggregate is an accumulator held **per group**, so this
+ * number multiplies {@link WORKFLOW_AGGREGATE_MAX_GROUPS} in the heap.
+ */
+export const WORKFLOW_AGGREGATE_MAX_AGGREGATES = 256;
+
+/**
+ * The default ceiling on distinct groups, and the loud refusal that goes with
+ * it.
+ *
+ * A hash aggregate is cheap **only while the groups are far fewer than the
+ * rows**. Group on a near-unique column and it holds one accumulator row per
+ * input row, which is the whole-batch behaviour this node replaces, arrived at
+ * by a different route and with nothing on the canvas to point at. So the
+ * ceiling exists, it is crossed loudly, and the message names the columns being
+ * grouped on — because a bound that is merely reported is a bound that is
+ * discovered by the machine running out of memory.
+ *
+ * A million is chosen against the measurement rather than as a round number:
+ * flip's derivation holds 16,119, so the default is 62× the real case and no
+ * author of a sane grouping ever meets it. What it catches is `groupBy:
+ * ['combinedId']` on a 44,720-row type — a grouping that is *legal*, produces
+ * one group per row, and is somebody having picked the wrong column.
+ *
+ * The number is a proxy and it is worth saying which part it cannot see: what a
+ * group costs in bytes depends on how many aggregates the node has and how long
+ * a `join` grows. The first is bounded by
+ * {@link WORKFLOW_AGGREGATE_MAX_AGGREGATES}; the second has its own bound on the
+ * aggregate, because it is the one accumulator whose size is not fixed by the
+ * group count.
+ */
+export const WORKFLOW_AGGREGATE_MAX_GROUPS = 1_000_000;
+
+/**
+ * The highest ceiling an author may ask for.
+ *
+ * Configurable because "how many groups is too many" genuinely depends on the
+ * machine and on how wide the node is, and a hard-coded limit would make the
+ * node unusable for the one legitimate large grouping. Bounded because past this
+ * the answer is not a bigger number — it is that the grouping belongs in the
+ * source query, where the database already has spill-to-disk and this process
+ * does not.
+ */
+export const WORKFLOW_AGGREGATE_GROUPS_CEILING = 20_000_000;
+
+/**
+ * The default bound on one joined value, in characters.
+ *
+ * 65,535 because that is what a MySQL `TEXT` column holds, and a value the
+ * target column cannot store is the same defect one layer further down. See
+ * `appendJoin` for the full argument, including the five groups per column that
+ * are silently truncated in production today under a limit of 1,024.
+ */
+export const WORKFLOW_AGGREGATE_JOIN_MAX_LENGTH = 65_535;
+
+/** The highest an author may raise a `join` bound to. One `MEDIUMTEXT`. */
+export const WORKFLOW_AGGREGATE_JOIN_LENGTH_CEILING = 16_777_215;
+
+/** The longest separator a `join` may use. Long enough for `" | "`, short enough not to be data. */
+export const WORKFLOW_AGGREGATE_MAX_SEPARATOR = 16;
+
+/** The separator a `join` uses when the aggregate does not name one. */
+export const WORKFLOW_AGGREGATE_DEFAULT_SEPARATOR = ', ';
+
+/**
+ * One computed column: a function, what it reads, and what it is called.
+ *
+ * A list of these rather than a `Record<name, spec>`, which is the opposite of
+ * the shape {@link WorkflowRenameNode.columns} takes, and the reason is that the
+ * two nodes are keyed by different things. A rename is keyed by its **source**
+ * column and a source column can only be renamed once, so an object gets that
+ * refusal for free. An aggregate is keyed by its **output** name, and the same
+ * source column being read by several aggregates — `min(closedDate)` and
+ * `max(closedDate)` — is the normal case rather than the mistake. A list also
+ * keeps the author's order, which is the order the output columns come out in.
+ *
+ * Two aggregates sharing one `as` is the mistake, it is representable, and
+ * {@link aggregateRefusals} names both of them.
+ */
+export interface WorkflowAggregate {
+  /**
+   * The output column name. Matches {@link WORKFLOW_FILTER_COLUMN_PATTERN}.
+   *
+   * Constrained for the reason {@link WorkflowRenameNode.columns}' targets are,
+   * and it is the same trap: `property-names.ts` refuses a published property
+   * whose name cannot become a column, a load looks every field up as
+   * `row[name]`, and a name this service cannot carry downstream loads NULL into
+   * every row and reports success.
+   */
+  as: string;
+  /** Which function. See {@link WORKFLOW_AGGREGATE_FUNCTIONS}. */
+  fn: WorkflowAggregateFunction;
+  /**
+   * The column it reads. Absent is allowed **only** for `count`, where it means
+   * `COUNT(*)` — how many records landed in the group.
+   *
+   * Also matches {@link WORKFLOW_FILTER_COLUMN_PATTERN}, and that is a rule
+   * about *input* rather than output, which the rename node deliberately does
+   * not have. It is here because the filter node already draws the line in the
+   * same place and for the same forward-looking reason: an aggregate that reads
+   * a column no `GROUP BY` could name is one that could never be pushed into the
+   * query the source already runs. A source whose own headers are `Work Order
+   * Id` is what the `rename` node is for, one node upstream.
+   */
+  column?: string;
+  /**
+   * `join` only. What goes between the values. Absent means
+   * {@link WORKFLOW_AGGREGATE_DEFAULT_SEPARATOR}.
+   */
+  separator?: string;
+  /**
+   * `join` only. The bound, in characters, that this aggregate refuses at.
+   * Absent means {@link WORKFLOW_AGGREGATE_JOIN_MAX_LENGTH}.
+   */
+  maxLength?: number;
+}
+
+/**
+ * Groups records and computes a summary of each group. No author code.
+ *
+ * ## Why this is a node kind, and why it stays small
+ *
+ * The argument the `rename` node made, and it holds unchanged: the generic
+ * {@link WorkflowTransformNode} continues to exist, and **that is what lets this
+ * node stay deliberately narrow forever**. "I need more than this" is answered
+ * with *use a transform*, never with *add a field here*. The refusals in this
+ * docblock are the point of it, not an apology.
+ *
+ * What is different from `rename` is that the payoff is not speed, it is a
+ * **memory bound**, and it is the difference between working and being killed.
+ *
+ * ## The measurement
+ *
+ * flip's `wo` table is a `GROUP BY` over 44,720 SUBWO rows producing 16,119
+ * groups with 49 aggregates. Reproduced as a whole-batch transform — which is
+ * the only way this graph can express it today — it works, and only just:
+ *
+ * - the child process is handed **65.51 MiB** on stdin;
+ * - it answers with a single JSON line of **25.01 MiB, which is 78.2% of the
+ *   hard 32 MiB output cap**, buffered by the parent as one string;
+ * - and `readInputs` materialises all 44,720 records before the child starts. A
+ *   standalone equivalent peaked at 237 MiB heap and 406 MiB RSS.
+ *
+ * **It fails at 1.28× that file** — one more summed column, or one more month of
+ * work orders — and it fails by being killed at the cap rather than by
+ * degrading. SUBWO is already the largest file in the drop it comes from. So the
+ * commonest aggregation in the system is one column away from dying at a
+ * ceiling.
+ *
+ * A hash aggregate consumes its input as a stream and **holds only the groups**:
+ * 44,720 rows in, 16,119 accumulator rows held, one staged batch decoded at a
+ * time. For most real aggregations the group count is far smaller than the row
+ * count, and that gap is the entire feature.
+ *
+ * ## Which is why the bound is loud rather than absent
+ *
+ * "Holds only the groups" stops being cheap the moment the groups approach the
+ * rows. So {@link maxGroups} is a ceiling that **refuses**, naming the columns
+ * being grouped on. Peaking silently is the failure being fixed, and a node that
+ * fixed it by peaking somewhere else would not have fixed anything.
+ *
+ * ## What comes out
+ *
+ * The group-by columns, then one column per aggregate, in the node's order —
+ * **on every record, always, including where the answer is null**. That makes an
+ * aggregate the only node kind whose output column set is *exact* rather than an
+ * upper bound; see `producedColumns`.
+ *
+ * ## Every edge case, decided rather than discovered
+ *
+ * - **A group-by column not present in a record** — that record groups with the
+ *   records whose column is null, and the output carries `null`. SQL groups all
+ *   NULLs together, and the stage encoding makes absent-versus-null a difference
+ *   in physical layout rather than in meaning, so splitting them would make the
+ *   answer depend on which shape a row landed in.
+ * - **A null group key** — a group like any other, exactly as `GROUP BY`
+ *   produces.
+ * - **`1` and `"1"` as group keys** — *different* groups. SQL would coerce them
+ *   together; merging two things the source considered distinct on a rule nobody
+ *   chose is the worse error, and within one load a column is one type. See
+ *   `groupKeyOf`.
+ * - **Empty input** — no groups, so no rows staged, which is what `GROUP BY`
+ *   over an empty table produces. The sink already refuses to commit an empty
+ *   full snapshot, so nothing new is needed and nothing is silently green.
+ * - **An empty {@link groupBy}** — *refused*, and it is worth saying why rather
+ *   than leaving it as a bound. With no grouping, SQL returns exactly one row
+ *   whether the input had a billion rows or none, and a run that commits one row
+ *   of nulls looks identical to a run that summarised everything. A grand total
+ *   is genuinely wanted sometimes; the way to ask for it is a constant column
+ *   from a transform, which makes the one row visible in the graph.
+ * - **Two aggregates writing the same output name** — refused, naming both, from
+ *   the config alone with nothing to run.
+ * - **An aggregate whose `as` collides with a group-by column** — refused, same
+ *   sentence, same reason: one name, two values, and every rule for picking a
+ *   winner is arbitrary.
+ * - **Aggregating a column that does not exist upstream** — refused at *save*
+ *   wherever `workflowKnownColumns` can prove it (below a `rename` that drops
+ *   what it does not name, or below a `catalog` source when the caller supplied
+ *   a column lookup). Where the graph cannot prove it, the run says so out loud:
+ *   a column present in **no** record of the whole run is reported, and `sum`,
+ *   `min`, `max` and `join` over nothing answer `null` rather than `0` or `""`,
+ *   which is visibly different from a real answer.
+ * - **Mixed types in a `min`/`max`, or non-numeric text in a `sum`** — refused
+ *   at run time, naming the column, the group and the values. MySQL coerces;
+ *   coercing here would make the answer depend on which record arrived first and
+ *   the run would still be green.
+ *
+ * ## Ordering, and what is actually promised
+ *
+ * `GROUP_CONCAT` without an `ORDER BY` is unordered, which is why a comparison
+ * against flip found identical-length, different-order strings. This node joins
+ * in **input order** and emits groups in **first-seen order**, both of which are
+ * functions of the numbered list of staged batches it reads. So two runs over
+ * the same staged input produce the same bytes. What is *not* promised is
+ * stability across a source that returns its own rows in a different order — a
+ * `SELECT` without an `ORDER BY` promises nothing, and this node cannot promise
+ * more than it was handed.
+ */
+export interface WorkflowAggregateNode extends WorkflowNodeBase {
+  kind: 'aggregate';
+  /**
+   * The columns that define a group. Never empty; at most
+   * {@link WORKFLOW_AGGREGATE_MAX_GROUP_BY}; each matches
+   * {@link WORKFLOW_FILTER_COLUMN_PATTERN}; no duplicates.
+   *
+   * These are output column names as well as input ones — the group key comes
+   * out under the name it went in under — which is why they carry the target
+   * name rule and not only the input one.
+   */
+  groupBy: string[];
+  /**
+   * What to compute per group. Never empty; at most
+   * {@link WORKFLOW_AGGREGATE_MAX_AGGREGATES}; no two share an `as`.
+   *
+   * Empty is refused rather than treated as "just deduplicate", which is what it
+   * would silently be: a node emitting the distinct combinations of its group-by
+   * columns and dropping every other column of every row. That is a real
+   * operation and a completely different one, and reaching it by deleting the
+   * last row of a form is how a published type loses forty columns.
+   */
+  aggregates: WorkflowAggregate[];
+  /**
+   * The ceiling on distinct groups. Absent means
+   * {@link WORKFLOW_AGGREGATE_MAX_GROUPS}; at most
+   * {@link WORKFLOW_AGGREGATE_GROUPS_CEILING}.
+   */
+  maxGroups?: number;
+}
+
+/** {@link WorkflowAggregateNode.maxGroups}, resolved. One reader of the default. */
+export function workflowAggregateMaxGroups(node: WorkflowAggregateNode): number {
+  const asked = node.maxGroups;
+  if (typeof asked !== 'number' || !Number.isInteger(asked) || asked < 1) {
+    return WORKFLOW_AGGREGATE_MAX_GROUPS;
+  }
+  return Math.min(asked, WORKFLOW_AGGREGATE_GROUPS_CEILING);
+}
+
+/** {@link WorkflowAggregate.separator}, resolved. One reader of the default. */
+export function workflowAggregateSeparator(aggregate: WorkflowAggregate): string {
+  const asked = aggregate.separator;
+  return typeof asked === 'string' ? asked : WORKFLOW_AGGREGATE_DEFAULT_SEPARATOR;
+}
+
+/** {@link WorkflowAggregate.maxLength}, resolved. One reader of the default. */
+export function workflowAggregateJoinMaxLength(aggregate: WorkflowAggregate): number {
+  const asked = aggregate.maxLength;
+  if (typeof asked !== 'number' || !Number.isInteger(asked) || asked < 1) {
+    return WORKFLOW_AGGREGATE_JOIN_MAX_LENGTH;
+  }
+  return Math.min(asked, WORKFLOW_AGGREGATE_JOIN_LENGTH_CEILING);
+}
+
+/** Whether this function reads a column. Only `count` may go without one. */
+export function workflowAggregateNeedsColumn(fn: WorkflowAggregateFunction): boolean {
+  return fn !== 'count';
+}
+
+/**
+ * The columns an aggregate node **reads**: its group keys and its inputs.
+ *
+ * What `checkColumnsProduced` tests against what the graph can prove is there,
+ * and what the run log reports as never-seen. Deduplicated and in a stable
+ * order, because it goes into a sentence.
+ */
+export function workflowAggregateColumns(node: WorkflowAggregateNode): string[] {
+  const columns = new Set<string>();
+  for (const column of node.groupBy ?? []) {
+    if (typeof column === 'string' && column.length > 0) columns.add(column);
+  }
+  for (const aggregate of node.aggregates ?? []) {
+    const column = aggregate?.column;
+    if (typeof column === 'string' && column.length > 0) columns.add(column);
+  }
+  return [...columns];
+}
+
+/**
+ * The columns an aggregate node **produces**, which is all of them and nothing
+ * else.
+ *
+ * Closed by the config, and closed *exactly* rather than as an upper bound —
+ * every emitted record carries every one of these keys, whatever was upstream
+ * and whatever the values turned out to be. That is a stronger claim than the
+ * one `rename` introduced, and it is stronger for a structural reason: a rename
+ * only produces a target where the input actually held the source column,
+ * whereas an aggregate writes a group's answer whether or not anything in the
+ * group had a value for it.
+ *
+ * The one thing it does not claim is that the values are useful. An aggregate
+ * over a column that no record carried produces the column, holding `null`.
+ */
+export function workflowAggregateOutputColumns(node: WorkflowAggregateNode): string[] {
+  const columns: string[] = [];
+  for (const column of node.groupBy ?? []) {
+    if (typeof column === 'string' && column.length > 0 && !columns.includes(column)) {
+      columns.push(column);
+    }
+  }
+  for (const aggregate of node.aggregates ?? []) {
+    const as = aggregate?.as;
+    if (typeof as === 'string' && as.length > 0 && !columns.includes(as)) columns.push(as);
+  }
+  return columns;
+}
+
+/**
+ * Every reason an aggregate cannot be stored, as sentences, or empty.
+ *
+ * One function, called by {@link validateWorkflow}, by the HTTP boundary, by the
+ * canvas and by the fold itself, for the reason {@link renameColumnRefusals} is
+ * shared: a screen with its own copy of the identifier pattern is a screen that
+ * accepts something the server refuses, halfway through a save.
+ *
+ * All of them rather than the first, exactly as
+ * {@link refuseUnpublishablePropertyNames} argues: a node with forty aggregates
+ * typed in one sitting is usually wrong about several in the same way.
+ */
+export function aggregateRefusals(node: {
+  groupBy?: unknown;
+  aggregates?: unknown;
+  maxGroups?: unknown;
+}): string[] {
+  const groupBy = Array.isArray(node.groupBy) ? node.groupBy : [];
+  const aggregates = Array.isArray(node.aggregates) ? node.aggregates : [];
+  const named = new Set<string>();
+  const refusals = [
+    ...groupByRefusals(groupBy, named),
+    ...aggregatesRefusals(aggregates, named),
+    ...ceilingRefusals(node.maxGroups),
+  ];
+  return refusals;
+}
+
+/**
+ * What the grouping half can be wrong about, and the names it accepted.
+ *
+ * The accepted set is threaded out rather than recomputed, because the sharpest
+ * refusal in the file needs both halves: an aggregate writing into a column the
+ * node also groups on is one name holding two values, and only a reader that has
+ * seen the group-by list can see it.
+ */
+function groupByRefusals(groupBy: readonly unknown[], accepted: Set<string>): string[] {
+  const refusals: string[] = [];
+  if (groupBy.length === 0) {
+    refusals.push(
+      'It groups on nothing. With no group-by columns an aggregate returns exactly one row whether it read a billion records or none, so a run that summarised everything and a run that read an empty source commit the same thing. If a grand total is wanted, add a constant column in a transform above this node and group on it, so the one row is visible in the graph.',
+    );
+  }
+  if (groupBy.length > WORKFLOW_AGGREGATE_MAX_GROUP_BY) {
+    refusals.push(
+      `It groups on ${groupBy.length} columns, and at most ${WORKFLOW_AGGREGATE_MAX_GROUP_BY} may be named. Every extra column can only increase the number of groups, and a long list is the shape a grouping that holds the whole load arrives in.`,
+    );
+  }
+  for (const column of groupBy) {
+    if (typeof column !== 'string' || !WORKFLOW_FILTER_COLUMN_PATTERN.test(column)) {
+      refusals.push(
+        `It groups on ${JSON.stringify(column)}, which is not a name a column can have: letters, digits and underscore, starting with a letter or an underscore. A group key comes out under the name it went in under, so a name this service cannot carry downstream is one that loads NULL into every row and reports success. A source whose own headers are spelled like ${JSON.stringify('Work Order Id')} is what a rename node above this one is for.`,
+      );
+      continue;
+    }
+    if (accepted.has(column)) {
+      refusals.push(
+        `It groups on ${JSON.stringify(column)} twice. The second one changes no group and produces no second column, so it is either a typo or a column somebody meant to name instead.`,
+      );
+      continue;
+    }
+    accepted.add(column);
+  }
+  return refusals;
+}
+
+/** What the computing half can be wrong about, given the group keys already accepted. */
+function aggregatesRefusals(
+  aggregates: readonly unknown[],
+  groupedOn: ReadonlySet<string>,
+): string[] {
+  const refusals: string[] = [];
+  if (aggregates.length === 0) {
+    refusals.push(
+      'It computes nothing. An aggregate with no functions is a node that emits the distinct combinations of its group-by columns and drops every other column of every row — which is a real operation and a completely different one. Reaching it by deleting the last row of a form is how a published type loses forty columns.',
+    );
+  }
+  if (aggregates.length > WORKFLOW_AGGREGATE_MAX_AGGREGATES) {
+    refusals.push(
+      `It computes ${aggregates.length} aggregates, and at most ${WORKFLOW_AGGREGATE_MAX_AGGREGATES} may be named in one node. Every one of them is an accumulator held per group, so this number multiplies the group ceiling in memory.`,
+    );
+  }
+
+  const names = new Map<string, number>();
+  for (const entry of aggregates) {
+    if (typeof entry !== 'object' || entry === null) {
+      refusals.push(
+        `One aggregate is ${JSON.stringify(entry)} rather than a function, a column and a name.`,
+      );
+      continue;
+    }
+    refusals.push(...oneAggregateRefusals(entry, groupedOn, names));
+  }
+
+  for (const [as, count] of names) {
+    if (count < 2) continue;
+    refusals.push(
+      `${count} aggregates are written out as ${JSON.stringify(as)}. Two columns cannot share one name, and picking a winner would be a rule about which of somebody's numbers survives.`,
+    );
+  }
+  return refusals;
+}
+
+/** One entry of the list: its name, its function, its column, and its two optional fields. */
+function oneAggregateRefusals(
+  entry: object,
+  groupedOn: ReadonlySet<string>,
+  names: Map<string, number>,
+): string[] {
+  const refusals: string[] = [];
+  const as = Reflect.get(entry, 'as');
+  const fn = Reflect.get(entry, 'fn');
+  const column = Reflect.get(entry, 'column');
+  const label = typeof as === 'string' && as.length > 0 ? JSON.stringify(as) : 'One aggregate';
+
+  if (typeof as !== 'string' || !WORKFLOW_FILTER_COLUMN_PATTERN.test(as)) {
+    refusals.push(
+      `${label} is written out as ${JSON.stringify(as)}, which is not a name a column can have: letters, digits and underscore, starting with a letter or an underscore. A load looks every field up as \`row[name]\`, so a column this service cannot name downstream is one that loads NULL into every row and reports success.`,
+    );
+  } else {
+    names.set(as, (names.get(as) ?? 0) + 1);
+    if (groupedOn.has(as)) {
+      refusals.push(
+        `${label} writes into a column this node also groups on. One name cannot hold both the group key and a summary of the group, and picking a winner would be a rule about which of somebody's data survives.`,
+      );
+    }
+  }
+
+  if (!isWorkflowAggregateFunction(fn)) {
+    refusals.push(
+      `${label} uses the function ${JSON.stringify(fn)}, which this service cannot compute. The functions are ${WORKFLOW_AGGREGATE_FUNCTIONS.join(', ')}; anything else is a transform.`,
+    );
+    return refusals;
+  }
+
+  if (workflowAggregateNeedsColumn(fn)) {
+    if (typeof column !== 'string' || !WORKFLOW_FILTER_COLUMN_PATTERN.test(column)) {
+      refusals.push(
+        `${label} reads ${JSON.stringify(column)} with ${fn}, and that is not a column name: letters, digits and underscore, starting with a letter or an underscore. Only \`count\` may go without a column, where it means how many records landed in the group.`,
+      );
+    }
+  } else if (column !== undefined && !WORKFLOW_FILTER_COLUMN_PATTERN.test(String(column))) {
+    refusals.push(
+      `${label} counts ${JSON.stringify(column)}, and that is not a column name. Leave the column out to count the records in the group, or name one to count its non-null values.`,
+    );
+  }
+
+  refusals.push(...joinFieldRefusals(entry, fn, label));
+  return refusals;
+}
+
+/**
+ * The two fields only `join` reads.
+ *
+ * Refused on any other function rather than ignored, which is the rule the whole
+ * config follows: a field that only some functions read is a field somebody sets
+ * on the wrong one and never finds out.
+ */
+function joinFieldRefusals(entry: object, fn: WorkflowAggregateFunction, label: string): string[] {
+  const refusals: string[] = [];
+  const separator = Reflect.get(entry, 'separator');
+  if (separator !== undefined) {
+    if (fn !== 'join') {
+      refusals.push(
+        `${label} carries a separator and computes ${fn}, which has nothing to separate. A field that only some functions read is a field somebody will set on the wrong one and never find out.`,
+      );
+    } else if (
+      typeof separator !== 'string' ||
+      separator.length > WORKFLOW_AGGREGATE_MAX_SEPARATOR
+    ) {
+      refusals.push(
+        `${label} joins with ${JSON.stringify(separator)}, and a separator has to be text of at most ${WORKFLOW_AGGREGATE_MAX_SEPARATOR} characters. Past that it is data rather than punctuation, and it is data repeated once per record.`,
+      );
+    }
+  }
+
+  const maxLength = Reflect.get(entry, 'maxLength');
+  if (maxLength === undefined) return refusals;
+  if (fn !== 'join') {
+    refusals.push(
+      `${label} carries a maximum length and computes ${fn}, which produces no text to bound.`,
+    );
+    return refusals;
+  }
+  if (
+    typeof maxLength !== 'number' ||
+    !Number.isInteger(maxLength) ||
+    maxLength < 1 ||
+    maxLength > WORKFLOW_AGGREGATE_JOIN_LENGTH_CEILING
+  ) {
+    refusals.push(
+      `${label} bounds its joined value at ${JSON.stringify(maxLength)}, and the bound has to be a whole number of characters between 1 and ${WORKFLOW_AGGREGATE_JOIN_LENGTH_CEILING}. Past that the value cannot be stored in the column it is going into, which is the same failure one layer further down.`,
+    );
+  }
+  return refusals;
+}
+
+/** The group ceiling, when the node set one. See {@link WORKFLOW_AGGREGATE_MAX_GROUPS}. */
+function ceilingRefusals(maxGroups: unknown): string[] {
+  if (maxGroups === undefined) return [];
+  if (
+    typeof maxGroups === 'number' &&
+    Number.isInteger(maxGroups) &&
+    maxGroups >= 1 &&
+    maxGroups <= WORKFLOW_AGGREGATE_GROUPS_CEILING
+  ) {
+    return [];
+  }
+  return [
+    `It caps itself at ${JSON.stringify(maxGroups)} groups, and the cap has to be a whole number between 1 and ${WORKFLOW_AGGREGATE_GROUPS_CEILING}. Past that the answer is not a bigger number — it is that the grouping belongs in the source query, where the database has spill-to-disk and this process does not.`,
+  ];
+}
+
+/**
+ * Whether a stored aggregate list is one this build can run.
+ *
+ * Refused rather than repaired, the stance {@link isWorkflowRenameColumns} takes
+ * and for the same reason one step further along: an aggregate list read back
+ * with one entry silently dropped is a graph that commits a column of nulls
+ * under a name somebody put in an object type on purpose.
+ */
+export function isWorkflowAggregates(value: unknown): value is WorkflowAggregate[] {
+  if (!Array.isArray(value)) return false;
+  return aggregateRefusals({ groupBy: ['x'], aggregates: value }).length === 0;
+}
+
 /**
  * A discriminated union, so narrowing a node is `node.kind === "sink"` and
  * never a type assertion. This is why the kind list is not simply a string on
@@ -3073,7 +3734,8 @@ export type WorkflowNode =
   | WorkflowCallNode
   | WorkflowIfNode
   | WorkflowFilterNode
-  | WorkflowRenameNode;
+  | WorkflowRenameNode
+  | WorkflowAggregateNode;
 
 /* --- reusable nodes ------------------------------------------------------ */
 
@@ -3138,6 +3800,13 @@ export function isReusableNodeKind(value: unknown): value is ReusableNodeKind {
  *   *about* one drop of one file. `Mgmt Cd → mgmtCd` saved under a name and
  *   dropped into a graph reading a different system renames nothing at all, and
  *   the symptom is a column of NULLs rather than a failure.
+ * - `aggregate` — the same again, and it fails in both directions at once. Its
+ *   group-by columns and its inputs name one type's columns, so a shared one
+ *   groups a graph it was not written for on a column that is not there — which
+ *   collapses every record into one null-keyed group rather than erroring. And
+ *   its *output* column set is the thing downstream nodes are validated against,
+ *   so a shared node editable from elsewhere would silently change what another
+ *   graph's sink is allowed to write.
  */
 export const NODE_KIND_IS_REUSABLE = {
   source: true,
@@ -3147,6 +3816,7 @@ export const NODE_KIND_IS_REUSABLE = {
   if: false,
   filter: false,
   rename: false,
+  aggregate: false,
 } as const satisfies Record<WorkflowNodeKind, boolean> & Record<ReusableNodeKind, true>;
 
 /** Whether this kind can be saved as a reusable node. Reads {@link NODE_KIND_IS_REUSABLE}. */
@@ -4198,6 +4868,19 @@ export const WORKFLOW_ISSUE_CODES = [
    */
   'rename-invalid',
   /**
+   * An aggregate this service will not store: grouping on nothing or on a name
+   * a column cannot have, computing nothing, two aggregates sharing an output
+   * name, a function this build cannot compute, a separator on something that
+   * does not join.
+   *
+   * Every one of those is decidable from the node alone, and every one of them
+   * is silent if it is let through — the two worst being an empty `groupBy`,
+   * which commits exactly one row whether the source held everything or nothing,
+   * and an empty `aggregates`, which drops every column the node does not group
+   * on. See {@link aggregateRefusals} for the sentences.
+   */
+  'aggregate-invalid',
+  /**
    * A node naming a column that nothing upstream can produce.
    *
    * The one thing a declarative rename buys the *validator*, and it is the whole
@@ -4726,7 +5409,29 @@ function nodeIsUnconfigured(node: WorkflowNode): WorkflowValidationIssue | undef
   if (node.kind === 'if') return ifIsUnconfigured(node);
   if (node.kind === 'filter') return filterIsUnconfigured(node);
   if (node.kind === 'rename') return renameIsUnconfigured(node);
+  if (node.kind === 'aggregate') return aggregateIsUnconfigured(node);
   return undefined;
+}
+
+/**
+ * An aggregate this service will not store.
+ *
+ * The refusals come from {@link aggregateRefusals} rather than being restated
+ * here, so the canvas, the HTTP boundary, the validator and the fold itself say
+ * the same sentence about the same node. Every one of them is a *silent* failure
+ * if it were let through, and the two most dangerous point in opposite
+ * directions: no group-by columns commits exactly one row whatever the source
+ * held, and no aggregates commits the distinct group keys with every other
+ * column of every row gone.
+ */
+function aggregateIsUnconfigured(node: WorkflowAggregateNode): WorkflowValidationIssue | undefined {
+  const refusals = aggregateRefusals(node);
+  if (refusals.length === 0) return undefined;
+  return {
+    code: 'aggregate-invalid',
+    nodeIds: [node.id],
+    message: `Aggregate "${node.name}" (${node.id}) cannot be stored as it is. ${refusals.join(' ')}`,
+  };
 }
 
 /**
@@ -5428,6 +6133,7 @@ function canonicalNode(node: WorkflowNode): string {
     ]);
   }
   if (node.kind === 'rename') return canonicalRename(node);
+  if (node.kind === 'aggregate') return canonicalAggregate(node);
   if (node.kind === 'sink') {
     return JSON.stringify([
       node.id,
@@ -5460,6 +6166,48 @@ function canonicalRename(node: WorkflowRenameNode): string {
     node.kind,
     sortedEntries(node.columns),
     ...(workflowRenameUnnamed(node) === 'drop' ? ['drop'] : []),
+  ]);
+}
+
+/**
+ * An aggregate, canonicalised.
+ *
+ * **`groupBy` is sorted and the aggregates are sorted by output name**, because
+ * neither order changes what the node computes: a set of group-by columns
+ * defines the same groups whatever order they are listed in, and two aggregates
+ * are independent of each other. Order *is* what the output columns come out in,
+ * and a record's key order is not something anything downstream reads — the sink
+ * looks every property up by name. So reordering rows in the inspector is not an
+ * edit and does not bump a version.
+ *
+ * Each aggregate's optional fields are appended **only when set**, exactly as
+ * `edge.branch` and a rename's `unnamed` are, so the default has one spelling.
+ * The point of that rule is the same one every time: adding a node kind to this
+ * file must not renumber a graph that did not change. Here it holds for a
+ * stronger reason as well — no stored graph contains an aggregate node at all,
+ * because this release is the first one in which such a node can be saved, so
+ * every existing graph's canonical string is byte-identical to what it was.
+ */
+function canonicalAggregate(node: WorkflowAggregateNode): string {
+  const groupBy = [...(node.groupBy ?? [])].sort();
+  const aggregates = [...(node.aggregates ?? [])]
+    .sort((left, right) => (left.as < right.as ? -1 : left.as > right.as ? 1 : 0))
+    .map((each) => [
+      each.as,
+      each.fn,
+      each.column ?? '',
+      ...(each.separator === undefined ? [] : [each.separator]),
+      ...(each.maxLength === undefined ? [] : [each.maxLength]),
+    ]);
+  return JSON.stringify([
+    node.id,
+    node.kind,
+    groupBy,
+    aggregates,
+    // In the fingerprint because it decides whether a run finishes or refuses,
+    // which is a difference between two runs of "the same" graph worth being
+    // able to point at. Appended only when set, so the default has one spelling.
+    ...(node.maxGroups === undefined ? [] : [node.maxGroups]),
   ]);
 }
 
@@ -5734,6 +6482,12 @@ function producedColumns(
     for (const column of known) renamed.add(node.columns?.[column] ?? column);
     return renamed;
   }
+  // The one kind whose output set is *exact* rather than an upper bound, and it
+  // is exact without looking upstream at all: an aggregate emits its group-by
+  // columns and its named aggregates on every record it produces, whatever it
+  // was handed and whatever the values turned out to be. See
+  // {@link workflowAggregateOutputColumns} for the one thing it does not claim.
+  if (node.kind === 'aggregate') return new Set(workflowAggregateOutputColumns(node));
   // Neither of these touches a column: a filter decides which *rows* survive and
   // an `if` decides which *nodes* run. Both hand on exactly the shape they were
   // given, which is what makes a closed set survive one.
@@ -5826,11 +6580,8 @@ function checkColumnsProduced(
     // Narrowed off the union rather than tested with a property check, so a kind
     // that starts naming columns without being answered for here is a type error
     // at `missingColumnMessage` and not a check that silently passes.
-    if (node.kind !== 'filter' && node.kind !== 'rename') continue;
-    const named =
-      node.kind === 'filter'
-        ? workflowFilterColumns(node.predicate)
-        : Object.keys(node.columns ?? {});
+    if (node.kind !== 'filter' && node.kind !== 'rename' && node.kind !== 'aggregate') continue;
+    const named = columnsNamedBy(node);
     if (named.length === 0) continue;
     const known = workflowKnownColumns(graph, node.id, knowledge);
     if (known === undefined) continue;
@@ -5844,9 +6595,25 @@ function checkColumnsProduced(
   }
 }
 
+/**
+ * The columns a node names, per kind that names any.
+ *
+ * Its own function so the union it takes and the union
+ * {@link missingColumnMessage} takes are the same three kinds written down
+ * twice — which is what makes a fourth kind that starts naming columns a type
+ * error in both places rather than a check that silently passes.
+ */
+function columnsNamedBy(
+  node: WorkflowFilterNode | WorkflowRenameNode | WorkflowAggregateNode,
+): string[] {
+  if (node.kind === 'filter') return workflowFilterColumns(node.predicate);
+  if (node.kind === 'rename') return Object.keys(node.columns ?? {});
+  return workflowAggregateColumns(node);
+}
+
 /** The sentence {@link checkColumnsProduced} says, per kind. */
 function missingColumnMessage(
-  node: WorkflowFilterNode | WorkflowRenameNode,
+  node: WorkflowFilterNode | WorkflowRenameNode | WorkflowAggregateNode,
   missing: readonly string[],
   known: ReadonlySet<string>,
 ): string {
@@ -5855,8 +6622,13 @@ function missingColumnMessage(
   const consequence =
     node.kind === 'filter'
       ? 'A test on a column that is not there matches no row — not even a "does not equal" test — so this load would come out empty and every node would report success.'
-      : 'A rename of a column that is not there does nothing, so the column it was meant to produce is absent and a sink writing it commits NULL into every row.';
-  return `${node.kind === 'filter' ? 'Filter' : 'Rename'} "${node.name}" (${node.id}) names ${quoted(missing)}, and nothing upstream produces ${missing.length === 1 ? 'that column' : 'those columns'}. Something above this node closes the column set — a rename that drops what it does not name, or a source reading a published object type — so what reaches here is exactly ${quoted(known)}. ${consequence}`;
+      : node.kind === 'rename'
+        ? 'A rename of a column that is not there does nothing, so the column it was meant to produce is absent and a sink writing it commits NULL into every row.'
+        : // Both halves of an aggregate fail silently, and they fail differently,
+          // which is why this sentence names both rather than picking one.
+          'Grouping on a column that is not there puts every record into one null-keyed group, so a summary of sixteen thousand work orders comes out as a single row. Aggregating one that is not there answers null for every group, which a sink commits as a column of NULLs. Neither reports an error.';
+  const label = node.kind === 'filter' ? 'Filter' : node.kind === 'rename' ? 'Rename' : 'Aggregate';
+  return `${label} "${node.name}" (${node.id}) names ${quoted(missing)}, and nothing upstream produces ${missing.length === 1 ? 'that column' : 'those columns'}. Something above this node closes the column set — a rename that drops what it does not name, an aggregate, or a source reading a published object type — so what reaches here is exactly ${quoted(known)}. ${consequence}`;
 }
 
 function sortedEntries(config: Record<string, unknown>): Array<[string, unknown]> {
@@ -5913,6 +6685,7 @@ export function isWorkflowNode(value: unknown): value is WorkflowNode {
       : false;
   }
   if (kind === 'rename') return isRenameNodeShape(value);
+  if (kind === 'aggregate') return isAggregateNodeShape(value);
   if (kind === 'source') {
     const sourceKind = Reflect.get(value, 'sourceKind');
     const config = Reflect.get(value, 'config');
@@ -5935,6 +6708,26 @@ function isRenameNodeShape(value: object): boolean {
   const unnamed = Reflect.get(value, 'unnamed');
   if (unnamed !== undefined && !isWorkflowRenameUnnamed(unnamed)) return false;
   return isWorkflowRenameColumns(Reflect.get(value, 'columns'));
+}
+
+/**
+ * Everything an `aggregate` node carries, through the one refusal list.
+ *
+ * The whole node rather than field by field, so a stored aggregate is read back
+ * under exactly the rule that would have refused to store it. Refused rather
+ * than repaired, the stance every guard in this file takes: an aggregate read
+ * back with one entry silently dropped is a load that commits a column of nulls
+ * under a name somebody put in an object type on purpose, and one read back with
+ * its `groupBy` dropped is a load that commits a single row.
+ */
+function isAggregateNodeShape(value: object): boolean {
+  return (
+    aggregateRefusals({
+      groupBy: Reflect.get(value, 'groupBy'),
+      aggregates: Reflect.get(value, 'aggregates'),
+      maxGroups: Reflect.get(value, 'maxGroups'),
+    }).length === 0
+  );
 }
 
 /**
