@@ -308,11 +308,10 @@ const PROVENANCE_SCALARS: Record<CatalogProvenanceColumn, ScalarType> = {
  *
  * ## Which system columns are here, and the question that decided it
  *
- * "Which reserved columns does something read off a snapshot that has already
- * committed?" — asked of all five, because a copy has to carry exactly those and
- * a copy that carries more is a cost with no buyer. The catalog package holds
- * the answer, since it is a fact about `carryForward` rather than about parquet;
- * this is what it comes to here:
+ * **Which columns does a later load consult, such that an archive without them
+ * changes what that load produces?** Asked of all five. The catalog package
+ * holds the reasoning in full, since it is a fact about `carryForward` rather
+ * than about parquet; this is what it comes to here:
  *
  * - **`_principal_id` and `_loaded_at` are archived.** A merge copies both off
  *   the snapshot it merges against, untouched and on purpose, so a restore that
@@ -320,16 +319,24 @@ const PROVENANCE_SCALARS: Record<CatalogProvenanceColumn, ScalarType> = {
  *   and every later incremental snapshot inherits that, forever. They are the
  *   only two whose loss compounds.
  * - **`_batch` is not, and that reverses what this file used to say.** It said
- *   `_batch` was "a real loss" and "a prerequisite for anything that deletes",
- *   which was wrong on the second half and overstated on the first. Nothing
- *   reads a committed snapshot's `_batch`: the merge joins on the primary key
- *   and its own `_batch` predicate applies only to the snapshot being built, so
- *   the `-1` marker records that a merge happened and is never an input to the
- *   next one. It could not be restored in any case — `write` refuses a negative
- *   batch by name, which is the only seam a restore has. What is genuinely lost
- *   is one line of provenance in an ad-hoc query, and `_loaded_at` carries most
- *   of it anyway: a carried row keeps the older stamp, a loaded one gets the
- *   run's.
+ *   `_batch` was "a real loss" and "a prerequisite for anything that deletes".
+ *   The second half is wrong: no merge reads it. `carryForward` joins the
+ *   previous snapshot on its primary key and copies its properties, and its own
+ *   `_batch` predicate applies only to the snapshot being built, so the `-1`
+ *   marker records that a merge happened and is never an input to the next one.
+ *   It could not be restored in any case — `write` refuses a negative batch by
+ *   name, which is the only seam a restore has.
+ *
+ *   The first half is overstated rather than wrong, and the correction is worth
+ *   having: a committed snapshot's `_batch` *is* read, twice, both in the
+ *   ClickHouse adapter — as the default `(_batch, _row)` row order of a page, and
+ *   as the list of partitions `dropSnapshot` unlinks. Neither is a reason to
+ *   copy it. The first is a natural order the store interface does not promise
+ *   (the shared contract sorts explicitly and says why), and the second is
+ *   documented as assuming nothing about which values are present. What is
+ *   genuinely lost is a line of provenance in an ad-hoc query, and `_loaded_at`
+ *   carries most of that anyway: a carried row keeps the older stamp, a loaded
+ *   one gets the run's.
  * - **`_snapshot_id` is not**, being one value for the whole archive — it is in
  *   the manifest and in the parquet key-value metadata already.
  * - **`_row` is not**, being the order rather than a value. The stream is in

@@ -21,15 +21,20 @@ the run that committed it. An archive without them makes a restored snapshot
 answer "whoever ran the restore" for every row, and the next incremental load
 carries that forward, and the one after it.
 
-**`_batch` is not archived, and the previous note claiming it was "a prerequisite
-for anything that deletes" is withdrawn.** Nothing reads a committed snapshot's
-`_batch`: the batch-replace predicate and the merge's self-feed guard both scope
-to the snapshot being built, and `carryForward` joins the previous snapshot on
-its primary key without looking at its `_batch` at all. The `-1` marker records
-that a merge happened; it is never an input to the next one. It could not be
-restored in any case — `write` refuses a negative batch by name, and that is the
-only seam a restore has. `_snapshot_id` stays in the manifest, being one value
-per archive, and `_row` stays implicit in the file's order.
+**`_batch` is not archived, and the previous note calling it "a prerequisite for
+anything that deletes" is withdrawn.** No merge reads it: the batch-replace
+predicate and the merge's self-feed guard both scope to the snapshot being built,
+and `carryForward` joins the previous snapshot on its primary key without looking
+at its `_batch` at all. The `-1` marker records that a merge happened; it is never
+an input to the next one. It could not be restored in any case — `write` refuses a
+negative batch by name, and that is the only seam a restore has.
+
+A committed snapshot's `_batch` *is* read, twice, both in the ClickHouse adapter:
+as a page's default `(_batch, _row)` order, and as the partition list
+`dropSnapshot` unlinks. Neither is a reason to copy it — the ordering is a natural
+order the interface does not promise, and the partition enumeration assumes nothing
+about which values are present. `_snapshot_id` stays in the manifest, being one
+value per archive, and `_row` stays implicit in the file's order.
 
 The two columns cost **0.028 bytes per row**, +0.02%, measured over 200,000 rows
 of a 24-column type. `_batch` would have cost 0.029 B/row, so size decided

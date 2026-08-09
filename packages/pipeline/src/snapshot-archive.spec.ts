@@ -165,17 +165,23 @@ describe('archiveColumns', () => {
    * **`_batch` is not archived, and that is a decision rather than a gap.**
    *
    * This file used to assert the opposite reading — that `_batch` was "a real
-   * loss" and "a prerequisite for anything that deletes". The first half is
-   * overstated and the second is wrong. Nothing reads a *committed* snapshot's
-   * `_batch`: the batch-replace predicate and the merge's self-feed guard both
-   * scope to the snapshot being built, and `carryForward` joins the previous
-   * snapshot on its primary key without ever looking at its `_batch`. The `-1`
-   * marker records that a merge happened; it is never an input to the next one.
+   * loss" and "a prerequisite for anything that deletes". The second half is
+   * wrong: **no merge reads it.** The batch-replace predicate and the merge's
+   * self-feed guard both scope to the snapshot being built, and `carryForward`
+   * joins the previous snapshot on its primary key without ever looking at its
+   * `_batch`. The `-1` marker records that a merge happened; it is never an input
+   * to the next one.
    *
    * It could not be restored in any case. `write` refuses a negative batch by
    * name — negative batches are reserved for rows the store writes on your
    * behalf — so the only value in the column that carries any information is the
    * one value the only write seam will not accept back.
+   *
+   * The first half is overstated rather than wrong. A committed snapshot's
+   * `_batch` is read twice in the ClickHouse adapter — as a page's default
+   * `(_batch, _row)` order, which the store interface does not promise, and as
+   * the partition list `dropSnapshot` unlinks, which assumes nothing about the
+   * values. Neither is a reason to carry it into every archived file.
    *
    * `_snapshot_id` and `_row` are absent for their own reasons: one value for
    * the whole archive, and the order rather than a value.
