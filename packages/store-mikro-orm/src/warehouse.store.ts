@@ -20,11 +20,13 @@ import type {
   CatalogReadQuery,
   CatalogReadResult,
   CatalogResolvedFilter,
+  CatalogSnapshotArchiveStore,
   CatalogSnapshotLocation,
   CatalogSnapshotLookupStore,
   CatalogSnapshotStreamStore,
   CatalogStoreCapabilities,
   ScalarType,
+  SnapshotArchiveRef,
   SnapshotRef,
   SnapshotStreamOptions,
 } from '@dudousxd/nestjs-catalog';
@@ -33,6 +35,7 @@ import type {
 // class, not two structurally similar ones. This import used to name the MySQL
 // package, and that single line was the whole of what bound this file to one
 // engine at the type level.
+import { LockMode } from '@mikro-orm/core';
 import type { EntityManager } from '@mikro-orm/sql';
 import { BadRequestException, Inject, Injectable, Logger } from '@nestjs/common';
 import { CATALOG_STORE_ENTITY_MANAGER } from './context';
@@ -127,7 +130,8 @@ export class MikroOrmWarehouseStore
     CatalogQueryStore,
     CatalogFilteringReadStore,
     CatalogSnapshotStreamStore,
-    CatalogSnapshotLookupStore
+    CatalogSnapshotLookupStore,
+    CatalogSnapshotArchiveStore
 {
   private readonly logger = new Logger(this.constructor.name);
 
@@ -856,10 +860,42 @@ export class MikroOrmWarehouseStore
       }
     }
 
-    snapshot.committed = true;
-    snapshot.committedAt = new Date();
-    if (typeRow) typeRow.currentSnapshotId = snapshotId;
-    await em.flush();
+    // The publish itself, under the same two locks {@link dropSnapshot} takes
+    // and in the same order — snapshot record, then type row.
+    //
+    // The `droppedAt` refusal above is re-asked here, and the repetition is the
+    // whole of the fix. That check reads a row nothing was holding, so a drop
+    // landing between it and this flush would publish a snapshot whose rows were
+    // being deleted as it was published. Re-asking it inside the transaction
+    // that moves the pointer makes the answer one nothing can change underneath:
+    // a drop either finished before this lock was taken, in which case
+    // `droppedAt` is set and this refuses, or it has not started, in which case
+    // it will find the pointer naming this snapshot and refuse instead.
+    //
+    // `refresh: true` because the identity map is already holding the row read
+    // above, and a re-read served from memory would re-ask the question of the
+    // same stale answer.
+    await em.begin();
+    let published = false;
+    try {
+      const fresh = await em.findOne(
+        SnapshotRow,
+        { id },
+        { lockMode: LockMode.PESSIMISTIC_WRITE, refresh: true },
+      );
+      if (fresh?.droppedAt) {
+        throw new BadRequestException(
+          `${droppedMessage(type.name, fresh, fresh.droppedAt)} Committing it would point ${type.name} at a snapshot holding nothing. Commit a snapshot that still has its rows, or load ${type.name} again.`,
+        );
+      }
+      snapshot.committed = true;
+      snapshot.committedAt = new Date();
+      if (typeRow) typeRow.currentSnapshotId = snapshotId;
+      await em.commit();
+      published = true;
+    } finally {
+      if (!published && em.isInTransaction()) await em.rollback();
+    }
 
     // The view is what queries select from, so it moves with the commit.
     await refreshView(em, type, snapshotId, this.dialect);
@@ -912,37 +948,136 @@ export class MikroOrmWarehouseStore
    * And a second call is a no-op rather than a re-drop: `droppedAt` keeps the
    * time of the first, so a durable step that replays does not rewrite the date
    * to the moment of its retry.
+   *
+   * ## The lock, and what it is for
+   *
+   * All of it runs inside one transaction that takes a write lock on the
+   * snapshot's own record first and on the type's row second — and {@link commit}
+   * takes the same two in the same order, which is what makes the pair safe
+   * rather than merely careful.
+   *
+   * The check that "this is not the served snapshot" and the delete used to be
+   * two unlocked statements with a gap between them, and the gap is reachable:
+   * rolling a bad load back means committing an *older* snapshot, which is
+   * exactly the kind that a retention sweep is picking to drop. A commit landing
+   * in that gap leaves the type pointing at a snapshot whose rows are being
+   * deleted underneath it — every reader sees an empty dataset, and
+   * {@link currentSnapshot} calls that state unreachable through this adapter.
+   * It was, while dropping was something a person did by hand. An eviction that
+   * runs on a schedule is what turns "narrow" into "eventually".
+   *
+   * Under the lock the two orders are the only two outcomes, and both are
+   * correct: the commit goes first and this refuses because the pointer now names
+   * the snapshot, or this goes first and the commit refuses on the tombstone.
+   *
+   * The lock is held for the length of the `DELETE`, which for a large snapshot
+   * is not short, and a `commit` of the same type waits behind it. That is the
+   * price and it is the right way round — those two operations disagree about
+   * what the type is serving, so one of them has to wait. Loads of *other* types
+   * are untouched: the lock is one row of `catalog_object_type`.
    */
   async dropSnapshot(type: CatalogObjectTypeDef, snapshotId: string): Promise<void> {
     const em = this.em.fork();
-    const typeRow = await em.findOne(ObjectTypeRow, { name: type.name });
-    if (typeRow?.currentSnapshotId === snapshotId) {
-      throw new BadRequestException(
-        `Snapshot ${snapshotId} is the one being served for ${type.name}. Commit another one first.`,
+    const id = `${type.name}:${snapshotId}`;
+    let dropped = false;
+
+    await em.begin();
+    try {
+      // Snapshot first, type second, and the order is shared with `commit` —
+      // two paths taking the same two locks in opposite orders is a deadlock
+      // that only shows up under the load this is meant to survive.
+      //
+      // A locking read rather than a plain one, and not only for the lock: on
+      // MySQL's default REPEATABLE READ a plain read inside a transaction can be
+      // answered from a snapshot taken earlier in it, and re-reading a value we
+      // are about to act on from a stale view is precisely the bug being closed.
+      // `FOR UPDATE` always reads the latest committed row.
+      const snapshot = await em.findOne(
+        SnapshotRow,
+        { id },
+        { lockMode: LockMode.PESSIMISTIC_WRITE, refresh: true },
       );
-    }
-
-    const snapshot = await em.findOne(SnapshotRow, { id: `${type.name}:${snapshotId}` });
-    if (snapshot?.droppedAt) return;
-
-    // Before the delete, and only when there is a record to write it to: a
-    // snapshot with no row has nowhere to keep the number and the scan would be
-    // paid for nothing.
-    const held = snapshot ? await this.countRows(em, tableFor(type.name), snapshotId) : 0;
-
-    await em
-      .getConnection()
-      .execute(
-        `DELETE FROM ${this.ident(tableFor(type.name))} WHERE ${this.ident(SNAPSHOT_COLUMN)} = ?`,
-        [snapshotId],
+      const typeRow = await em.findOne(
+        ObjectTypeRow,
+        { name: type.name },
+        { lockMode: LockMode.PESSIMISTIC_WRITE, refresh: true },
       );
+      if (typeRow?.currentSnapshotId === snapshotId) {
+        throw new BadRequestException(
+          `Snapshot ${snapshotId} is the one being served for ${type.name}. Commit another one first.`,
+        );
+      }
 
-    if (snapshot) {
-      snapshot.rowCount = held;
-      snapshot.droppedAt = new Date();
-      await em.flush();
+      if (snapshot?.droppedAt) {
+        await em.rollback();
+        return;
+      }
+
+      // Before the delete, and only when there is a record to write it to: a
+      // snapshot with no row has nowhere to keep the number and the scan would be
+      // paid for nothing.
+      const held = snapshot ? await this.countRows(em, tableFor(type.name), snapshotId) : 0;
+
+      // Through the transaction's own context. `connection.execute` with no
+      // context runs on a pooled connection *outside* the transaction, which
+      // would put the delete beyond the lock that is protecting it — and it
+      // would look identical from here.
+      await em
+        .getConnection()
+        .execute(
+          `DELETE FROM ${this.ident(tableFor(type.name))} WHERE ${this.ident(SNAPSHOT_COLUMN)} = ?`,
+          [snapshotId],
+          'run',
+          em.getTransactionContext(),
+        );
+
+      if (snapshot) {
+        snapshot.rowCount = held;
+        snapshot.droppedAt = new Date();
+      }
+      // Flushes what is above and releases both locks.
+      await em.commit();
+      dropped = true;
+    } finally {
+      if (!dropped && em.isInTransaction()) await em.rollback();
     }
     emitCatalog('snapshot.dropped', { typeName: type.name, snapshotId });
+  }
+
+  /**
+   * Write down where a snapshot's rows were copied to.
+   *
+   * The other half of a tombstone. `droppedAt` says the rows are gone; this says
+   * they are also *somewhere*, and the difference is what a reader of an evicted
+   * snapshot is told — see the `catalog` source's refusal, which reads this ref
+   * and names the path when it is here. Without it that refusal says "no copy of
+   * it was recorded anywhere", which for an evicted snapshot is false and sends
+   * somebody to re-run a load they did not need to re-run.
+   *
+   * Recorded independently of the drop, and callable before it, because the two
+   * facts are independent: a copy can exist while the rows are still here. An
+   * eviction uses exactly that ordering — record, then delete — so that the only
+   * state a crash can leave is one with an archive and its rows, which is the
+   * recoverable one.
+   *
+   * Refuses a snapshot with no record. Creating one here would invent a load out
+   * of an archive, and the id in hand came from a caller that may have mistyped
+   * it or be holding another type's.
+   */
+  async recordSnapshotArchive(
+    type: CatalogObjectTypeDef,
+    snapshotId: string,
+    archive: SnapshotArchiveRef,
+  ): Promise<void> {
+    const em = this.em.fork();
+    const snapshot = await em.findOne(SnapshotRow, { id: `${type.name}:${snapshotId}` });
+    if (!snapshot) {
+      throw new BadRequestException(
+        `There is no snapshot ${snapshotId} of ${type.name} to record an archive against. An archive names a load, and a load this store has no record of is one it cannot vouch for — so the record is refused rather than created, which would turn a mistyped id into a snapshot that appears to have existed.`,
+      );
+    }
+    snapshot.archive = archive;
+    await em.flush();
   }
 
   /**
@@ -1514,6 +1649,13 @@ export class MikroOrmWarehouseStore
           WHERE ${this.ident(SNAPSHOT_COLUMN)} IN (${snapshotIds.map(() => '?').join(',')})
           GROUP BY ${this.ident(SNAPSHOT_COLUMN)}`,
       [...snapshotIds],
+      'all',
+      // `undefined` for every caller outside a transaction, which is all of them
+      // but one. `dropSnapshot` counts from inside the transaction that is about
+      // to delete what it counted, and a count taken on a *different* pooled
+      // connection would be answering about a different point in time — the one
+      // number a tombstone can never re-derive.
+      em.getTransactionContext(),
     );
 
     const counts = new Map<string, number>();
@@ -1880,6 +2022,11 @@ function toScalar(value: string): ScalarType {
  * deleted the rows, which is `row.rowCount` for the same reason a committed
  * snapshot's is — it was written by the operation that made it final, and no
  * later scan can rediscover it.
+ *
+ * The archive rides on every ref rather than only on tombstones, because a
+ * snapshot can be copied without being dropped and a caller that only ever saw
+ * an archive beside a `droppedAt` would read the two as one ladder. They are a
+ * grid; `SnapshotArchiveRef` sets out all four squares.
  */
 function toRef(row: SnapshotRow, rowCount: number): SnapshotRef {
   return {
@@ -1888,6 +2035,7 @@ function toRef(row: SnapshotRow, rowCount: number): SnapshotRef {
     rowCount,
     principalId: row.principalId,
     labels: row.labels,
+    ...(row.archive ? { archive: row.archive } : {}),
     ...(row.droppedAt ? { droppedAt: row.droppedAt.toISOString() } : {}),
   };
 }

@@ -647,6 +647,65 @@ export interface CatalogWriteStore extends CatalogReadStore {
   currentSnapshot?(type: CatalogObjectTypeDef): Promise<SnapshotRef | undefined>;
 }
 
+/**
+ * A store that can write down where a snapshot's bytes went.
+ *
+ * ## Why this is a separate capability and not a third argument to `dropSnapshot`
+ *
+ * Because an adapter that cannot do it must be able to *say so*, and an ignored
+ * optional argument says nothing. {@link SnapshotArchiveRef} was declared with
+ * nothing writing it — the field exists on {@link SnapshotRef}, and the only
+ * consumer of it today is a source refusing a dropped snapshot with the sentence
+ * "a verified copy of it was written to …". That sentence is either true or it
+ * is the most misleading thing in the codebase, and which one it is depends
+ * entirely on whether the drop that made the tombstone also recorded the
+ * archive.
+ *
+ * So an eviction — verify an archive, then delete the rows — must refuse to run
+ * against a store that cannot hold the ref, rather than deleting rows and
+ * leaving a tombstone that reports *no copy of it was recorded anywhere*. A
+ * `dropSnapshot(type, id, { archive })` whose third argument an older adapter
+ * silently drops produces exactly that lie; a capability the caller can test for
+ * produces a refusal.
+ *
+ * ## The ordering this exists to make possible
+ *
+ * Recorded **before** the rows go, never after. A crash between the two leaves a
+ * snapshot that has an archive and still has its rows, which is a legal state
+ * (see {@link SnapshotArchiveRef}: "`archive` only — copied, not moved") and is
+ * repaired by running the eviction again. The reverse ordering leaves rows
+ * deleted and nothing saying where they went, which is the one state in this
+ * design that no later operation can repair.
+ */
+export interface CatalogSnapshotArchiveStore extends CatalogWriteStore {
+  /**
+   * Attach `archive` to a snapshot's record, replacing any previous one.
+   *
+   * Idempotent, so a retried eviction re-records rather than duplicating. It
+   * must refuse a snapshot it has no record of: attaching an archive to nothing
+   * would report a verified copy of a load this store never saw.
+   *
+   * It says nothing about whether the rows are still here — that is
+   * {@link SnapshotRef.droppedAt}, and the two are deliberately independent.
+   */
+  recordSnapshotArchive(
+    type: CatalogObjectTypeDef,
+    snapshotId: string,
+    archive: SnapshotArchiveRef,
+  ): Promise<void>;
+}
+
+/** A store that can record an archive on a snapshot. See {@link CatalogSnapshotArchiveStore}. */
+export function supportsSnapshotArchiveRecords(
+  store: unknown,
+): store is CatalogSnapshotArchiveStore {
+  return (
+    typeof store === 'object' &&
+    store !== null &&
+    typeof Reflect.get(store, 'recordSnapshotArchive') === 'function'
+  );
+}
+
 /** What a carry-forward did. */
 export interface CarryForwardResult {
   /**

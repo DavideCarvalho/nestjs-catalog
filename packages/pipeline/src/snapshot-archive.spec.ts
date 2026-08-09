@@ -59,28 +59,7 @@ function typeOf(properties: Array<{ name: string; type: ScalarType }>): CatalogO
   };
 }
 
-/**
- * What a store stamps on every row it streams with `{ provenance: true }`.
- *
- * Stamped by {@link streamOf} rather than written into each fixture, because it
- * is on every row of every real stream and repeating it would bury the values
- * each case is actually about. The archiver refuses a row without it — see the
- * case that pins that — so a fixture that omitted it would fail for a reason
- * that has nothing to do with what it tests.
- */
-const PROVENANCE = {
-  _principal_id: 'a-loader',
-  _loaded_at: '2026-08-08T00:00:00.000Z',
-} as const;
-
 async function* streamOf(
-  rows: Array<Record<string, unknown>>,
-): AsyncGenerator<Record<string, unknown>> {
-  for (const row of rows) yield { ...PROVENANCE, ...row };
-}
-
-/** A stream with no provenance on it, for the cases that are about its absence. */
-async function* streamWithoutProvenance(
   rows: Array<Record<string, unknown>>,
 ): AsyncGenerator<Record<string, unknown>> {
   for (const row of rows) yield row;
@@ -130,67 +109,36 @@ describe('parquetTypeFor', () => {
 });
 
 describe('archiveColumns', () => {
-  it("takes every property in the type's order, then the provenance columns", () => {
+  it("takes every property, in the type's order, and none of the system columns", () => {
     const columns = archiveColumns(
       typeOf([
         { name: 'Work Order', type: 'string' },
         { name: 'hours', type: 'number' },
       ]),
     );
-    expect(columns.map((column) => column.name)).toEqual([
-      'Work Order',
-      'hours',
-      '_principal_id',
-      '_loaded_at',
-    ]);
+    expect(columns.map((column) => column.name)).toEqual(['Work Order', 'hours']);
     expect(columns.every((column) => column.nullable)).toBe(true);
   });
 
   /**
-   * The reserved columns a merge reads off the snapshot it merges against.
+   * None of the reserved columns is archived, and this was written down as a
+   * prerequisite for eviction. It is not — see {@link archiveColumns} for the
+   * reading of every site that touches them. The short form: `_batch` is a
+   * within-load mechanism whose readers all live inside an uncommitted load, so
+   * a restore that writes an archive back under one batch is indistinguishable
+   * through every catalog API; `_loaded_at` and `_principal_id` are the two that
+   * really are per-row and unrecoverable, which is the reverse of where the
+   * worry pointed.
    *
-   * `carryForward` copies both onto every row it carries, untouched, so a
-   * snapshot that came out of an incremental run holds two answers to "who
-   * loaded this row and when" — and a restore that could not supply them would
-   * make every carried row claim it was loaded whenever the restore ran, then
-   * hand that answer to the next incremental load, and the one after it.
+   * The case stays, because the columns still are not there and something should
+   * fail if that silently changes.
    */
-  it('preserves the two columns an incremental merge copies forward', () => {
+  it('takes none of the reserved columns, not even _batch', () => {
     const columns = archiveColumns(typeOf([{ name: 'hours', type: 'number' }]));
-    expect(columns.map((column) => column.name)).toContain('_principal_id');
-    expect(columns.map((column) => column.name)).toContain('_loaded_at');
-  });
-
-  /**
-   * **`_batch` is not archived, and that is a decision rather than a gap.**
-   *
-   * This file used to assert the opposite reading — that `_batch` was "a real
-   * loss" and "a prerequisite for anything that deletes". The second half is
-   * wrong: **no merge reads it.** The batch-replace predicate and the merge's
-   * self-feed guard both scope to the snapshot being built, and `carryForward`
-   * joins the previous snapshot on its primary key without ever looking at its
-   * `_batch`. The `-1` marker records that a merge happened; it is never an input
-   * to the next one.
-   *
-   * It could not be restored in any case. `write` refuses a negative batch by
-   * name — negative batches are reserved for rows the store writes on your
-   * behalf — so the only value in the column that carries any information is the
-   * one value the only write seam will not accept back.
-   *
-   * The first half is overstated rather than wrong. A committed snapshot's
-   * `_batch` is read twice in the ClickHouse adapter — as a page's default
-   * `(_batch, _row)` order, which the store interface does not promise, and as
-   * the partition list `dropSnapshot` unlinks, which assumes nothing about the
-   * values. Neither is a reason to carry it into every archived file.
-   *
-   * `_snapshot_id` and `_row` are absent for their own reasons: one value for
-   * the whole archive, and the order rather than a value.
-   */
-  it('does not archive _batch, _snapshot_id or _row', () => {
-    const names = archiveColumns(typeOf([{ name: 'hours', type: 'number' }])).map(
-      (column) => column.name,
-    );
+    const names = columns.map((column) => column.name);
     expect(names).not.toContain('_batch');
+    expect(names).not.toContain('_loaded_at');
+    expect(names).not.toContain('_principal_id');
     expect(names).not.toContain('_snapshot_id');
     expect(names).not.toContain('_row');
   });
@@ -304,11 +252,6 @@ describe('archiveSnapshot', () => {
         ...row,
         detail: row.detail === null ? null : JSON.stringify(row.detail),
         extra: row.extra === null ? null : JSON.stringify(row.extra),
-        // Beside the properties and read back as themselves, which is the whole
-        // of what archiving them costs at the encoder: both are STRING, the same
-        // as a `date` property, and neither goes through the text encoding the
-        // JSON columns need.
-        ...PROVENANCE,
       })),
     );
   });
@@ -372,89 +315,7 @@ describe('archiveSnapshot', () => {
     expect(manifest.columns).toEqual([
       { name: 'name', type: 'string', parquetType: 'STRING' },
       { name: 'openedAt', type: 'date', parquetType: 'STRING' },
-      // Last, always, and named in the manifest rather than left for a reader to
-      // recognise — they are exactly the columns a restore has to route
-      // somewhere other than the property values.
-      { name: '_principal_id', type: 'string', parquetType: 'STRING' },
-      { name: '_loaded_at', type: 'date', parquetType: 'STRING' },
     ]);
-  });
-
-  /**
-   * The refusal the other three checks cannot make.
-   *
-   * Row count, checksum and read-back all ask whether the file matches what was
-   * streamed. A caller that streamed without asking for provenance streams rows
-   * with no such key, the absence encodes as a null, the null hashes and reads
-   * back as a null, and **every check passes** — leaving a complete, verified
-   * archive silently missing the two columns a restore cannot reconstruct. So it
-   * is caught on the way in instead.
-   */
-  it('refuses a stream that carries no provenance, which verification could not catch', async () => {
-    const store = localArchiveStore(root);
-    const type = typeOf([{ name: 'name', type: 'string' }]);
-    const path = archivePathFor('bare', type.name, 'snap-9');
-
-    await expect(
-      archiveSnapshot({
-        type,
-        snapshotId: 'snap-9',
-        rows: streamWithoutProvenance([{ name: 'no provenance on me' }]),
-        expectedRowCount: 1,
-        store,
-        path,
-      }),
-    ).rejects.toThrow(/streamed a row with no _principal_id/);
-
-    // And nothing left behind, like every other refusal here.
-    await expect(stat(join(root, path, ARCHIVE_PART_NAME))).rejects.toThrow();
-    await expect(stat(join(root, `${path}/${ARCHIVE_PART_NAME}.partial`))).rejects.toThrow();
-  });
-
-  /**
-   * And once it is in the file, it is under the same verification as everything
-   * else — which is the standard anything added to the archived shape has to
-   * meet, rather than merely being written.
-   *
-   * The bytes served back hold the same row count and the same property values
-   * and differ in one provenance value. `canonicalRow` hashes every archive
-   * column, so the checksum sees it; a shape that was written but left out of the
-   * hash would pass this.
-   */
-  it('puts the provenance columns under the same checksum as the values', async () => {
-    const type = typeOf([{ name: 'name', type: 'string' }]);
-    const path = archivePathFor('prov-tamper', type.name, 'snap-10');
-    const backing = localArchiveStore(root);
-    const tampering: ArchiveStore = {
-      open: (at) => backing.open(at),
-      put: (at, bytes) => backing.put(at, bytes),
-      async read(at) {
-        const other = archivePathFor('prov-tamper', type.name, 'snap-10-other');
-        await archiveSnapshot({
-          type,
-          snapshotId: 'snap-10-other',
-          // Same value, same count. Only who loaded it differs.
-          rows: streamWithoutProvenance([
-            { ...PROVENANCE, _principal_id: 'somebody-else', name: 'what was written' },
-          ]),
-          expectedRowCount: 1,
-          store: backing,
-          path: other,
-        });
-        return backing.read(`${other}/${ARCHIVE_PART_NAME}`);
-      },
-    };
-
-    await expect(
-      archiveSnapshot({
-        type,
-        snapshotId: 'snap-10',
-        rows: streamOf([{ name: 'what was written' }]),
-        expectedRowCount: 1,
-        store: tampering,
-        path,
-      }),
-    ).rejects.toThrow(/right number, and they do not hash to what was written/);
   });
 
   /**
@@ -490,7 +351,7 @@ describe('archiveSnapshot', () => {
     const path = archivePathFor('boom', type.name, 'snap-4');
 
     async function* explodes(): AsyncGenerator<Record<string, unknown>> {
-      yield { ...PROVENANCE, name: 'first' };
+      yield { name: 'first' };
       throw new Error('the connection went away');
     }
 
