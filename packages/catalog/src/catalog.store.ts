@@ -11,6 +11,73 @@ import type { CatalogObjectQuery, CatalogObjectTypeDef } from './catalog.types';
  * without the screens above it changing.
  */
 
+/**
+ * Where a snapshot's rows have been copied to, outside the database.
+ *
+ * **Vocabulary only — this package writes none of these and reads none of them.**
+ * It is declared here because it belongs on {@link SnapshotRef}, and a
+ * `SnapshotRef` is what every screen and every caller already holds. The
+ * machinery that produces an archive lives in
+ * `@dudousxd/nestjs-catalog-pipeline`, which is the package already allowed to
+ * know what a bucket is; the catalog itself stays unable to name one.
+ *
+ * ## What its presence means, and what it does not
+ *
+ * Present means *a verified copy of this snapshot exists at `path`*. It says
+ * nothing about whether the rows are still in the database — those are two
+ * independent facts and a caller that conflates them gets the dangerous reading
+ * in both directions. The three states a console has to tell apart are:
+ *
+ * - **no `archive`** — the snapshot is in the database and nowhere else.
+ * - **`archive` present, rows still in the table** — copied, not moved. Reads
+ *   are unchanged and cost what they always did.
+ * - **`archive` present, rows gone** — the snapshot lives in object storage.
+ *   Still readable, still identified, and **not** the same price as a read of a
+ *   hot snapshot. {@link bytes} is here so a screen can say which it is about
+ *   to do rather than presenting the two as one click.
+ *
+ * A snapshot with no `SnapshotRef` at all is the fourth state, and it is the
+ * only one that means *gone*.
+ */
+export interface SnapshotArchiveRef {
+  /** The only format written today. Named rather than assumed, so a second one can arrive. */
+  format: 'parquet';
+  /**
+   * The disk the bytes went to, when a host named one.
+   *
+   * Absent means `path` is resolved by whatever wrote it — a filesystem path in
+   * a test, a bucket a host configured. The disk is recorded rather than
+   * inferred because a deployment may mount several and "which one" is not
+   * recoverable from the path.
+   */
+  disk?: string;
+  /** The directory holding this snapshot's parts and its manifest, without a trailing slash. */
+  path: string;
+  /** Rows in the archive. Compared against the snapshot's own count when it was written. */
+  rowCount: number;
+  /** Size on the far end, for a screen that has to say what a read will cost. */
+  bytes: number;
+  /**
+   * SHA-256 over the row stream in `_row` order, as the manifest records it.
+   *
+   * A row count catches a truncated archive and nothing else: an archive with
+   * every row present and one value corrupted has exactly the right count. This
+   * is the check that fails for that, and it is only meaningful because the
+   * stream is ordered — see the store's `streamSnapshot`.
+   */
+  checksum: string;
+  writtenAt: string;
+  /**
+   * When the archive was last read back and found to match.
+   *
+   * Separate from {@link writtenAt} because they answer different questions and
+   * a caller about to delete rows needs the second one. Absent means written but
+   * not confirmed readable, which is exactly the state in which nothing may be
+   * deleted.
+   */
+  verifiedAt?: string;
+}
+
 /** A point-in-time view of one object type. */
 export interface SnapshotRef {
   /**
@@ -29,6 +96,14 @@ export interface SnapshotRef {
   principalId: string;
   /** Free-form provenance: which base, which file, which workflow run. */
   labels?: Record<string, string>;
+  /**
+   * Where this snapshot's rows have been copied to, if anywhere.
+   *
+   * Optional, and absent is the answer for every snapshot in every deployment
+   * that archives nothing — which is all of them until a host asks. See
+   * {@link SnapshotArchiveRef} for the three states its presence distinguishes.
+   */
+  archive?: SnapshotArchiveRef;
 }
 
 /**

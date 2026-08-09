@@ -446,6 +446,7 @@ export {
   isWriteStore,
   outputAlias,
   physicalColumn,
+  type SnapshotArchiveRef,
   type SnapshotRef,
   supportsCarryForward,
   supportsSnapshotStreams,

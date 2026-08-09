@@ -101,6 +101,20 @@ export {
   type CatalogPipelineScope,
 } from './seams';
 export {
+  ARCHIVE_MANIFEST_NAME,
+  ARCHIVE_PART_NAME,
+  ARCHIVE_ROW_GROUP_ROWS,
+  archiveColumns,
+  archivePathFor,
+  archiveSnapshot,
+  isTextEncodedScalar,
+  localArchiveStore,
+  parquetTypeFor,
+  type ArchiveSink,
+  type ArchiveStore,
+  type SnapshotArchiveManifest,
+} from './snapshot-archive';
+export {
   SOURCES,
   applyConnection,
   describeSql,
