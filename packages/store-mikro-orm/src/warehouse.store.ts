@@ -19,6 +19,8 @@ import type {
   CatalogReadQuery,
   CatalogReadResult,
   CatalogResolvedFilter,
+  CatalogSnapshotLocation,
+  CatalogSnapshotLookupStore,
   CatalogSnapshotStreamStore,
   CatalogStoreCapabilities,
   ScalarType,
@@ -122,7 +124,8 @@ export class MikroOrmWarehouseStore
     CatalogMergeStore,
     CatalogQueryStore,
     CatalogFilteringReadStore,
-    CatalogSnapshotStreamStore
+    CatalogSnapshotStreamStore,
+    CatalogSnapshotLookupStore
 {
   private readonly logger = new Logger(this.constructor.name);
 
@@ -1051,6 +1054,54 @@ export class MikroOrmWarehouseStore
     return rows.map((row) =>
       toRef(row, row.committed || row.droppedAt ? row.rowCount : (counts.get(row.snapshotId) ?? 0)),
     );
+  }
+
+  /**
+   * What one snapshot id refers to, across every type in this store.
+   *
+   * ## Why it is not scoped to a type, and why it is not `read`
+   *
+   * The caller is a workflow whose graph names a snapshot, and it is holding a
+   * string. Every wrong answer about that string is silent unless something goes
+   * and looks: {@link read} given an id that no row carries answers `{ rows: [],
+   * total: 0 }`, which is also what it answers for a snapshot that is genuinely
+   * empty. Existence is a different question from emptiness and it needs a
+   * different statement.
+   *
+   * Unscoped because the case worth telling apart is an id belonging to *another
+   * type* — pasted from the wrong history, or off a run that loaded something
+   * else. A per-type lookup can only say "not here", and "not here" sends a
+   * person to look for a snapshot that is sitting in the next type along.
+   *
+   * One statement answers both, and it carries no index of its own: this table
+   * holds one row per load rather than one per row of data, and this runs once
+   * per run of a graph that names a snapshot — and then only to decide what to
+   * refuse. Adding an index would be an ALTER on every deployment to speed up a
+   * scan of a few thousand rows on a path that ends in an error message.
+   *
+   * A list rather than an option because the id is the caller's: a durable run
+   * that loads two types passes its run id to both, so two rows legitimately
+   * share an id, and returning one of them would be returning a coin toss.
+   *
+   * ## The count it reports
+   *
+   * `row.rowCount` verbatim, which is final for a committed snapshot and for a
+   * tombstone — both were written by the operation that made them final — and is
+   * **not maintained** for a load still in flight, where it reads 0. That is the
+   * honest shape of a one-statement locator: {@link listSnapshots} is what
+   * recounts, and it costs a statement per uncommitted snapshot to do it. Nobody
+   * resolving an identity needs a live count.
+   *
+   * A tombstone is reported exactly as a live snapshot is, which is the whole
+   * point of the method: a caller that could not see the tombstone would report
+   * a dropped snapshot as one that never existed, and those two send a reader to
+   * entirely different places.
+   */
+  async locateSnapshot(snapshotId: string): Promise<CatalogSnapshotLocation[]> {
+    const rows = await this.em
+      .fork()
+      .find(SnapshotRow, { snapshotId }, { orderBy: { createdAt: 'desc' } });
+    return rows.map((row) => ({ typeName: row.typeName, snapshot: toRef(row, row.rowCount) }));
   }
 
   /**

@@ -454,6 +454,68 @@ export function supportsSnapshotStreams(store: unknown): store is CatalogSnapsho
   );
 }
 
+/** Where one snapshot id turned out to live. */
+export interface CatalogSnapshotLocation {
+  /** The object type the snapshot belongs to. */
+  typeName: string;
+  /** The snapshot itself, tombstone and archive included. */
+  snapshot: SnapshotRef;
+}
+
+/**
+ * A store that can say what a snapshot id refers to, without being told the type.
+ *
+ * ## Why this is a question and not an inference
+ *
+ * Because a caller naming a snapshot has exactly one thing — a string — and
+ * every wrong answer about it is silent. {@link CatalogReadStore.read} given an
+ * id that does not exist returns `{ rows: [], total: 0 }`, which is the same
+ * answer it gives for a snapshot that is genuinely empty, for a filter that
+ * excluded everything, and for a load that collapsed. Existence cannot be
+ * inferred from a count.
+ *
+ * {@link CatalogReadStore.listSnapshots} answers *most* of it: the snapshot is
+ * in the type's list or it is not, and the ref carries {@link
+ * SnapshotRef.droppedAt} and {@link SnapshotRef.archive}. What it cannot answer
+ * is the third case, and the third case is the one somebody actually hits — an
+ * id copied off the wrong type's history, or off a run that loaded something
+ * else. "There is no such snapshot" and "that snapshot belongs to
+ * AfFleetReplica" send a person to two different places, and only a lookup that
+ * is not scoped to one type can tell them apart.
+ *
+ * A list rather than an option, because ids are caller-supplied: a run that
+ * loads two types under one durable run id gives both snapshots the same id, and
+ * reporting one of them would be reporting a coin toss.
+ *
+ * ## Optional, like every other capability here
+ *
+ * The caller degrades rather than refuses when it is absent — `listSnapshots`
+ * still separates missing from tombstoned, and the refusal simply stops claiming
+ * to have checked the other types. Adapters are free to skip it; today the only
+ * store that implements {@link CatalogSnapshotStreamStore} is the only one that
+ * can serve a `catalog` source at all, and it is the one that implements this.
+ */
+export interface CatalogSnapshotLookupStore extends CatalogReadStore {
+  /**
+   * Every snapshot in this store carrying `snapshotId`, whatever its type.
+   *
+   * Empty means no type has one. This is an **identity** question and not a
+   * read: it must answer for a tombstoned snapshot exactly as it answers for a
+   * live one, because a caller that cannot see the tombstone is a caller that
+   * reports it as missing.
+   */
+  locateSnapshot(snapshotId: string): Promise<CatalogSnapshotLocation[]>;
+}
+
+/** A store that can resolve a snapshot id. See {@link CatalogSnapshotLookupStore}. */
+export function supportsSnapshotLookup(store: unknown): store is CatalogSnapshotLookupStore {
+  return (
+    typeof store === 'object' &&
+    store !== null &&
+    typeof Reflect.get(store, 'locateSnapshot') === 'function'
+  );
+}
+
 /** A store that owns its copy of the data and can be loaded into. */
 export interface CatalogWriteStore extends CatalogReadStore {
   /**

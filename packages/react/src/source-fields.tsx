@@ -1,8 +1,10 @@
-import type { ConnectorKind, SourceFormat } from '@dudousxd/nestjs-catalog/client';
+import type { ConnectorKind, SnapshotRef, SourceFormat } from '@dudousxd/nestjs-catalog/client';
 import {
+  CATALOG_SOURCE_SNAPSHOT_KEY,
   CATALOG_SOURCE_TYPE_KEY,
   CONNECTOR_KINDS,
   SOURCE_FORMATS,
+  catalogSnapshotRefusal,
 } from '@dudousxd/nestjs-catalog/client';
 import { cn } from './cn';
 import { CONNECTION_KINDS, type ConnectableKind } from './connection-form';
@@ -151,8 +153,16 @@ export interface SourceDraft {
   forcePathStyle: boolean;
   maxObjectsPerRun: string;
   watermarkColumn: string;
-  /** The object type a `catalog` source reads. Its whole configuration. */
+  /** The object type a `catalog` source reads. */
   objectType: string;
+  /**
+   * Which snapshot of it, when the node names one.
+   *
+   * Blank is the ordinary case and means the snapshot the type is currently
+   * serving — see {@link CATALOG_SOURCE_SNAPSHOT_KEY} for why that default has
+   * no spelling of its own.
+   */
+  objectSnapshot: string;
 }
 
 export function sourceDraftFrom(config: Record<string, unknown> | undefined): SourceDraft {
@@ -179,6 +189,7 @@ export function sourceDraftFrom(config: Record<string, unknown> | undefined): So
       typeof source.maxObjectsPerRun === 'number' ? String(source.maxObjectsPerRun) : '',
     watermarkColumn: text('watermarkColumn'),
     objectType: text(CATALOG_SOURCE_TYPE_KEY),
+    objectSnapshot: text(CATALOG_SOURCE_SNAPSHOT_KEY),
   };
 }
 
@@ -282,6 +293,24 @@ function s3Config(draft: SourceDraft, viaConnection: boolean): Record<string, un
 }
 
 /**
+ * The type, and the snapshot of it only when one was named.
+ *
+ * **Omitted rather than sent empty**, which is the entire reason this is a
+ * function and not an object literal at the call site. A blank field stored as
+ * `objectSnapshot: ""` would mean the current snapshot and read as one — and it
+ * would also be a config key that was not there before, so `workflowGraphHash`
+ * would fingerprint the node differently and present every graph somebody merely
+ * opened as a new version of itself. Absent is how "the current one" is spelled.
+ */
+function catalogConfig(draft: SourceDraft): Record<string, unknown> {
+  const snapshot = draft.objectSnapshot.trim();
+  return {
+    [CATALOG_SOURCE_TYPE_KEY]: draft.objectType.trim(),
+    ...(snapshot.length === 0 ? {} : { [CATALOG_SOURCE_SNAPSHOT_KEY]: snapshot }),
+  };
+}
+
+/**
  * The pasted records, or none when the text will not parse.
  *
  * Unparseable text keeps the previous records rather than wiping them: the
@@ -308,7 +337,7 @@ export function sourceConfigFrom(
   if (kind === 'sql') return sqlConfig(draft, viaConnection, incremental);
   if (kind === 'file') return fileConfig(draft);
   if (kind === 's3') return s3Config(draft, viaConnection);
-  if (kind === 'catalog') return { [CATALOG_SOURCE_TYPE_KEY]: draft.objectType.trim() };
+  if (kind === 'catalog') return catalogConfig(draft);
   return inlineConfig(draft);
 }
 
@@ -344,6 +373,128 @@ export function sourceConfigFrom(
  */
 const NO_DISK = '__no_disk__';
 
+/** The value of the "read whatever is being served" choice, for the same reason. */
+const CURRENT_SNAPSHOT = '__current_snapshot__';
+
+/**
+ * A snapshot's date, for a row in the picker.
+ *
+ * The id is what gets stored and it is a run id — `wf-9ff572d8` — which nobody
+ * can order in their head. The date is what somebody is actually choosing by, so
+ * it leads and the id follows on the hint line.
+ */
+function snapshotLabel(snapshot: SnapshotRef): string {
+  const at = new Date(snapshot.createdAt);
+  if (Number.isNaN(at.getTime())) return snapshot.id;
+  return at.toLocaleString(undefined, {
+    year: 'numeric',
+    month: 'short',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
+
+/**
+ * Which snapshot of the type this source reads.
+ *
+ * ## A list where there is one, a text field where there is not
+ *
+ * The list is the reason relative references are not supported. "The one before
+ * current" is a real thing to want and the objection to it is that it resolves
+ * differently on every run — but the friction it was going to relieve was
+ * *having to look an id up*, and that friction is this control's whole job. An
+ * id chosen from a list of dates is not looked up at all.
+ *
+ * The text field is the fallback rather than the primary, and it stays for two
+ * cases the list cannot cover: a type whose name has been typed but not yet
+ * published, and a graph being edited on a console that cannot see this
+ * catalog's history.
+ *
+ * ## A dropped snapshot is shown, and cannot be chosen
+ *
+ * Shown because the record is kept on purpose and hiding it would make a load
+ * that visibly happened look like one that never did. Unchoosable because its
+ * rows are gone and every read of it is refused — offering it and then refusing
+ * is a worse screen than one that says so up front. The same rule the object
+ * explorer's history picker follows, for the same reason.
+ */
+function SnapshotField({
+  value,
+  onChange,
+  snapshots,
+  disabled,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  snapshots?: SnapshotRef[];
+  disabled?: boolean;
+}) {
+  const refusal = catalogSnapshotRefusal(value);
+  const listed = snapshots ?? [];
+  // A named snapshot that is not in the list — an id typed by hand, or one older
+  // than the window the list covers. Carried as its own row so choosing anything
+  // else and changing one's mind is not a one-way door.
+  const orphan = value.trim().length > 0 && !listed.some((each) => each.id === value.trim());
+
+  if (listed.length === 0) {
+    return (
+      <TextField
+        label="Snapshot (optional)"
+        value={value}
+        onChange={onChange}
+        placeholder="Blank reads the current load"
+        disabled={disabled}
+        hint={
+          refusal ? (
+            <span className="text-red-600 dark:text-red-400">{refusal}</span>
+          ) : (
+            'Blank reads the snapshot the catalog is currently serving, resolved when the run starts. Name one snapshot id to read that load instead — an id, never "latest" or "previous", because a name that resolves at run time reads different data on different days without the graph changing.'
+          )
+        }
+      />
+    );
+  }
+
+  return (
+    <div className="space-y-1">
+      <SelectField
+        label="Snapshot"
+        ariaLabel="Which snapshot to read"
+        value={value.trim().length === 0 ? CURRENT_SNAPSHOT : value.trim()}
+        onValueChange={(next) => onChange(next === CURRENT_SNAPSHOT ? '' : next)}
+        options={[
+          {
+            value: CURRENT_SNAPSHOT,
+            label: 'Current load',
+            hint: 'Resolved when the run starts',
+          },
+          ...(orphan
+            ? [{ value: value.trim(), label: value.trim(), hint: 'Not in this history' }]
+            : []),
+          ...listed.map((snapshot) => ({
+            value: snapshot.id,
+            label: snapshot.droppedAt
+              ? `${snapshotLabel(snapshot)} — dropped`
+              : snapshotLabel(snapshot),
+            hint: snapshot.droppedAt
+              ? `${snapshot.rowCount.toLocaleString()} rows, dropped · ${snapshot.id}`
+              : `${snapshot.rowCount.toLocaleString()} rows · ${snapshot.id}`,
+            // The rows are gone. Offering it and refusing the run is the screen
+            // this avoids.
+            disabled: Boolean(snapshot.droppedAt),
+          })),
+        ]}
+        disabled={disabled}
+        hint="A named snapshot is pinned by the name itself, so every run of this graph reads the same load. Leave it on the current load and the run resolves what the catalog is serving when it starts."
+      />
+      {refusal && (
+        <p className="text-[11px] leading-relaxed text-red-600 dark:text-red-400">{refusal}</p>
+      )}
+    </div>
+  );
+}
+
 export function SourceFields({
   kind,
   draft,
@@ -351,6 +502,7 @@ export function SourceFields({
   viaConnection,
   disabled,
   storage,
+  snapshots,
 }: {
   kind: ConnectorKind;
   draft: SourceDraft;
@@ -364,19 +516,37 @@ export function SourceFields({
    * {@link describeStorage}, which is what renders it.
    */
   storage?: StorageAvailability;
+  /**
+   * The history of the type a `catalog` source names, when the caller has it.
+   *
+   * Handed in rather than fetched here, exactly as `storage` is: this module is
+   * shared by two screens and has no transport of its own, and a component that
+   * reached for one would make the source form unusable anywhere the catalog
+   * client is not mounted. Absent falls back to a text field — see
+   * {@link SnapshotField}.
+   */
+  snapshots?: SnapshotRef[];
 }) {
   const set = (patch: Partial<SourceDraft>) => onChange({ ...draft, ...patch });
 
   if (kind === 'catalog') {
     return (
-      <TextField
-        label="Object type"
-        value={draft.objectType}
-        onChange={(objectType) => set({ objectType })}
-        placeholder="e.g. SubwoReplica"
-        disabled={disabled}
-        hint="The type, not a table. This reads the snapshot the catalog is currently serving, resolved when the run starts — the physical table keeps every load that has ever run, so naming it directly reads them all."
-      />
+      <div className="space-y-3">
+        <TextField
+          label="Object type"
+          value={draft.objectType}
+          onChange={(objectType) => set({ objectType })}
+          placeholder="e.g. SubwoReplica"
+          disabled={disabled}
+          hint="The type, not a table. The physical table keeps every load that has ever run, so naming it directly reads them all."
+        />
+        <SnapshotField
+          value={draft.objectSnapshot}
+          onChange={(objectSnapshot) => set({ objectSnapshot })}
+          snapshots={snapshots}
+          disabled={disabled}
+        />
+      </div>
     );
   }
 

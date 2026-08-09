@@ -3,8 +3,11 @@ import type {
   CatalogReadQuery,
   CatalogReadResult,
   CatalogReadStore,
+  CatalogSnapshotLocation,
+  CatalogSnapshotLookupStore,
   CatalogSnapshotStreamStore,
   CatalogStoreCapabilities,
+  SnapshotRef,
 } from '@dudousxd/nestjs-catalog';
 import { CONNECTOR_KINDS } from '@dudousxd/nestjs-catalog';
 import { describe, expect, it } from 'vitest';
@@ -88,6 +91,43 @@ function store(
     },
   };
   return streaming;
+}
+
+/** One snapshot, as the locator reports it. */
+function at(
+  typeName: string,
+  id: string,
+  overrides: Partial<SnapshotRef> = {},
+): CatalogSnapshotLocation {
+  return {
+    typeName,
+    snapshot: {
+      id,
+      createdAt: '2026-08-07T23:14:44.000Z',
+      rowCount: 44_720,
+      principalId: 'spec',
+      ...overrides,
+    },
+  };
+}
+
+/**
+ * The same store, able to say what a snapshot id refers to.
+ *
+ * A separate wrapper rather than a flag on {@link store}, so the tests that
+ * assert the *degraded* path — a store that cannot resolve an id — get a store
+ * that genuinely cannot rather than one that has been told to pretend.
+ */
+function locating(
+  underlying: CatalogReadStore,
+  known: CatalogSnapshotLocation[],
+): CatalogSnapshotLookupStore {
+  return {
+    ...underlying,
+    async locateSnapshot(snapshotId: string) {
+      return known.filter((each) => each.snapshot.id === snapshotId);
+    },
+  };
 }
 
 /** `null` rather than an omitted argument, so "the catalog knows no type" is expressible. */
@@ -177,6 +217,138 @@ describe('a catalog source that cannot read', () => {
   });
 });
 
+describe('a catalog source that names a snapshot it cannot read', () => {
+  const rows = [{ workOrderId: 'a', actualLaborCost: 1 }];
+  const serving = { rows: [], total: 1, snapshot: { id: 'load-2', current: true } };
+
+  it('refuses an id that no type in the catalog has', async () => {
+    // The first of the three, and the one that would otherwise be silent: a
+    // pinned read of an id nothing carries returns zero rows, which is
+    // indistinguishable from a snapshot that is genuinely empty. Existence
+    // cannot be read off a count, so it is asked.
+    await expect(
+      read(
+        { objectType: 'SubwoReplica', objectSnapshot: 'load-nope' },
+        reader(locating(store(serving, rows), [at('SubwoReplica', 'load-1')])),
+      ),
+    ).rejects.toThrow(/Snapshot load-nope of "SubwoReplica" cannot be found/);
+  });
+
+  it('refuses an id that belongs to another type, and says which', async () => {
+    // The second, and the mistake somebody actually makes: an id copied out of
+    // one type's history and pasted under another. "Not found" would send them
+    // looking for a snapshot that is sitting one type along.
+    await expect(
+      read(
+        { objectType: 'SubwoReplica', objectSnapshot: 'wf-02a60bd6' },
+        reader(locating(store(serving, rows), [at('AfFleetReplica', 'wf-02a60bd6')])),
+      ),
+    ).rejects.toThrow(/is not a snapshot of "SubwoReplica" — it belongs to "AfFleetReplica"/);
+  });
+
+  it('refuses a tombstoned snapshot with its date, rather than reading nothing', async () => {
+    // The third. The rows are gone and the record is kept on purpose, which is
+    // exactly what makes this reachable — and an empty read here would be
+    // indistinguishable from a load that collapsed.
+    await expect(
+      read(
+        { objectType: 'SubwoReplica', objectSnapshot: 'load-1' },
+        reader(
+          locating(store(serving, rows), [
+            at('SubwoReplica', 'load-1', { droppedAt: '2026-08-08T02:00:00.000Z' }),
+          ]),
+        ),
+      ),
+    ).rejects.toThrow(/dropped on 2026-08-08T02:00:00.000Z/);
+  });
+
+  it('says where an evicted snapshot went, rather than only that it is gone', async () => {
+    // Not in this release's scope to read one back — and that is precisely why
+    // the refusal has to name the archive. "The rows are gone" would send
+    // somebody to re-run a load whose data is sitting in a bucket.
+    await expect(
+      read(
+        { objectType: 'SubwoReplica', objectSnapshot: 'load-1' },
+        reader(
+          locating(store(serving, rows), [
+            at('SubwoReplica', 'load-1', {
+              droppedAt: '2026-08-08T02:00:00.000Z',
+              archive: {
+                format: 'parquet',
+                disk: 'cold',
+                path: 's3://catalog-archive/SubwoReplica/load-1',
+                rowCount: 44_720,
+                bytes: 12_000_000,
+                checksum: 'sha256:abc',
+                writtenAt: '2026-08-08T01:00:00.000Z',
+                verifiedAt: '2026-08-08T01:05:00.000Z',
+              },
+            }),
+          ]),
+        ),
+      ),
+    ).rejects.toThrow(/s3:\/\/catalog-archive\/SubwoReplica\/load-1.*"cold" disk/s);
+  });
+
+  it('refuses a relative reference at the moment of the read, not only on the canvas', async () => {
+    // A connector config is a JSON column: a row can be written by curl, by an
+    // older build, or by a newer one. The validator refusing it is not the same
+    // thing as it being impossible.
+    await expect(
+      read(
+        { objectType: 'SubwoReplica', objectSnapshot: 'previous' },
+        reader(locating(store(serving, rows), [at('SubwoReplica', 'load-1')])),
+      ),
+    ).rejects.toThrow(/not a snapshot id, it is a way of describing one/);
+  });
+
+  it('refuses a store that would silently ignore the snapshot it was given', async () => {
+    // `CatalogReadQuery.snapshot` is documented as ignored where `timeTravel` is
+    // false, and "ignored" is the dangerous word: the read succeeds against the
+    // current load and reports the id it was asked for.
+    const flat = store({ rows: [], total: 1 }, rows, {
+      snapshots: 'none',
+      writable: true,
+      timeTravel: false,
+    });
+    await expect(
+      read({ objectType: 'SubwoReplica', objectSnapshot: 'load-1' }, reader(flat)),
+    ).rejects.toThrow(/cannot read a snapshot other than the one it is serving/);
+  });
+
+  it('refuses a store that cannot say what the id refers to at all', async () => {
+    // No locator and no snapshot list. Reading anyway would be reading an id
+    // nothing has vouched for, and a wrong one comes back as zero rows.
+    await expect(
+      read({ objectType: 'SubwoReplica', objectSnapshot: 'load-1' }, reader(store(serving, rows))),
+    ).rejects.toThrow(/cannot say what that id refers to/);
+  });
+
+  it('falls back to the type’s own history when the store cannot look across types', async () => {
+    // The degraded path, and the refusal admits what it did not check rather
+    // than implying it looked everywhere.
+    const listing: CatalogReadStore = {
+      ...store(serving, rows),
+      async listSnapshots() {
+        return [at('SubwoReplica', 'load-1').snapshot];
+      },
+    };
+    await expect(
+      read({ objectType: 'SubwoReplica', objectSnapshot: 'load-9' }, reader(listing)),
+    ).rejects.toThrow(/only be asked about one type at a time/);
+    // …and it still separates a tombstone from a missing id on that path.
+    const tombstoned: CatalogReadStore = {
+      ...store(serving, rows),
+      async listSnapshots() {
+        return [at('SubwoReplica', 'load-1', { droppedAt: '2026-08-08T02:00:00.000Z' }).snapshot];
+      },
+    };
+    await expect(
+      read({ objectType: 'SubwoReplica', objectSnapshot: 'load-1' }, reader(tombstoned)),
+    ).rejects.toThrow(/dropped on 2026-08-08T02:00:00.000Z/);
+  });
+});
+
 describe('a catalog source that can read', () => {
   const rows = [
     { workOrderId: 'a', actualLaborCost: 1 },
@@ -212,6 +384,37 @@ describe('a catalog source that can read', () => {
       reader(store({ rows: [], total: 9, snapshot: { id: 'load-2', current: true } }, rows)),
     );
     expect(answered.notes.join(' ')).toMatch(/reported 9 rows and 2 were read/);
+  });
+
+  it('reads the snapshot the node names, and says it is not the one being served', async () => {
+    const answered = await read(
+      { objectType: 'SubwoReplica', objectSnapshot: 'load-1' },
+      reader(
+        locating(store({ rows: [], total: 2, snapshot: { id: 'load-1', current: false } }, rows), [
+          at('SubwoReplica', 'load-1'),
+          at('SubwoReplica', 'load-2'),
+        ]),
+      ),
+    );
+    expect(answered.records).toEqual(rows);
+    expect(answered.notes[0]).toMatch(/Read snapshot load-1 of "SubwoReplica"/);
+    expect(answered.notes[0]).toMatch(/named on this node/);
+    expect(answered.notes[0]).toMatch(/NOT the one the catalog is currently serving/);
+    // The pin is the name. Said out loud because the whole objection to a
+    // relative reference is that it would not be.
+    expect(answered.notes[0]).toMatch(/the id is the pin/);
+  });
+
+  it('says when the snapshot named happens to be the one being served', async () => {
+    const answered = await read(
+      { objectType: 'SubwoReplica', objectSnapshot: 'load-2' },
+      reader(
+        locating(store({ rows: [], total: 2, snapshot: { id: 'load-2', current: true } }, rows), [
+          at('SubwoReplica', 'load-2'),
+        ]),
+      ),
+    );
+    expect(answered.notes[0]).toMatch(/it is also the one the catalog is currently serving/);
   });
 
   it('reads a store that keeps no history without pinning, and says it could not', async () => {

@@ -1,15 +1,19 @@
 import { describe, expect, it } from 'vitest';
 import {
+  CATALOG_SNAPSHOT_RESERVED_NAMES,
+  CATALOG_SOURCE_SNAPSHOT_KEY,
   CATALOG_SOURCE_TYPE_KEY,
   CONNECTOR_KINDS,
   type WorkflowColumnKnowledge,
   type WorkflowGraph,
   type WorkflowNode,
+  catalogSnapshotRefusal,
   isConnectorKind,
   validateWorkflow,
   workflowGraphHash,
   workflowKnownColumns,
   workflowSourceObjectType,
+  workflowSourceSnapshot,
 } from './catalog.pipeline';
 
 /**
@@ -36,13 +40,16 @@ function source(id: string): WorkflowNode {
   return { id, name: id, kind: 'source', sourceKind: 'inline', config: {} };
 }
 
-function catalogSource(id: string, objectType?: string): WorkflowNode {
+function catalogSource(id: string, objectType?: string, snapshot?: string): WorkflowNode {
   return {
     id,
     name: id,
     kind: 'source',
     sourceKind: 'catalog',
-    config: objectType === undefined ? {} : { [CATALOG_SOURCE_TYPE_KEY]: objectType },
+    config: {
+      ...(objectType === undefined ? {} : { [CATALOG_SOURCE_TYPE_KEY]: objectType }),
+      ...(snapshot === undefined ? {} : { [CATALOG_SOURCE_SNAPSHOT_KEY]: snapshot }),
+    },
   };
 }
 
@@ -249,5 +256,157 @@ describe('workflowGraphHash, once a source kind has been added', () => {
     expect(workflowGraphHash(before)).not.toBe(
       workflowGraphHash(graph([after.nodes[0], sink('out')], [['src', 'out']])),
     );
+  });
+
+  it('renumbers no catalog source that names only a type', () => {
+    // Recorded off the build immediately before a snapshot could be named, and
+    // this is the assertion the whole "append only when present" rule exists to
+    // make true. A catalog source needs no special handling to satisfy it — the
+    // snapshot lives in `config`, and a config key that is absent contributes
+    // nothing to the canonical string — but "needs no handling" is a claim, and
+    // a pinned value is what turns it into a fact. Every stored graph in every
+    // deployment carries exactly this shape.
+    expect(
+      workflowGraphHash(
+        graph([catalogSource('src', 'SubwoReplica'), sink('out')], [['src', 'out']]),
+      ),
+    ).toBe('ba2f25db493d3a41');
+  });
+
+  it('moves when a snapshot is named, because the graph now reads a different load', () => {
+    const current = graph([catalogSource('src', 'SubwoReplica'), sink('out')], [['src', 'out']]);
+    const pinned = graph(
+      [catalogSource('src', 'SubwoReplica', 'wf-9ff572d8'), sink('out')],
+      [['src', 'out']],
+    );
+    expect(workflowGraphHash(pinned)).not.toBe(workflowGraphHash(current));
+  });
+
+  it('is moved by a blank snapshot, which is why a form must omit the key', () => {
+    // The trap, asserted so nobody removes the omission in `sourceConfigFrom`.
+    // `objectSnapshot: ""` means the current snapshot and reads as one — and it
+    // hashes differently from the node that says nothing, so a console that
+    // stored it would present every graph somebody merely opened as edited.
+    const empty = graph(
+      [
+        {
+          id: 'src',
+          name: 'src',
+          kind: 'source',
+          sourceKind: 'catalog',
+          config: { [CATALOG_SOURCE_TYPE_KEY]: 'SubwoReplica', [CATALOG_SOURCE_SNAPSHOT_KEY]: '' },
+        },
+        sink('out'),
+      ],
+      [['src', 'out']],
+    );
+    expect(workflowGraphHash(empty)).not.toBe('ba2f25db493d3a41');
+  });
+});
+
+describe('naming which snapshot a catalog source reads', () => {
+  it('reads the id off the node, trimmed', () => {
+    expect(workflowSourceSnapshot(catalogSource('src', 'SubwoReplica', ' wf-9ff572d8 '))).toBe(
+      'wf-9ff572d8',
+    );
+  });
+
+  it('answers nothing when none is named, which is how "the current one" is spelled', () => {
+    expect(workflowSourceSnapshot(catalogSource('src', 'SubwoReplica'))).toBeUndefined();
+    expect(workflowSourceSnapshot(catalogSource('src', 'SubwoReplica', '   '))).toBeUndefined();
+    expect(workflowSourceSnapshot(source('src'))).toBeUndefined();
+  });
+
+  it('accepts an ordinary id', () => {
+    expect(catalogSnapshotRefusal('wf-9ff572d8')).toBeUndefined();
+    expect(catalogSnapshotRefusal('')).toBeUndefined();
+  });
+
+  it('refuses every relative reference, in any case', () => {
+    for (const reserved of CATALOG_SNAPSHOT_RESERVED_NAMES) {
+      expect(catalogSnapshotRefusal(reserved)).toBeDefined();
+      expect(catalogSnapshotRefusal(reserved.toUpperCase())).toBeDefined();
+    }
+    // The reason, said in the message: a name resolved at run time reads
+    // different data on different days with nothing about the graph changing.
+    expect(catalogSnapshotRefusal('previous')).toMatch(
+      /resolve against whatever had been committed/,
+    );
+    expect(catalogSnapshotRefusal('previous')).toMatch(/empty diff as success/);
+  });
+
+  it('refuses anything that could mean several loads at once', () => {
+    // The failure this whole source kind exists to prevent, wearing punctuation.
+    for (const shape of ['*', 'wf-%', 'wf-9ff?', '-1', '~1', '^2']) {
+      expect(catalogSnapshotRefusal(shape)).toMatch(/wildcard or an offset|not a snapshot id/);
+    }
+  });
+
+  it('is refused on the canvas rather than inside a durable step', () => {
+    const issues = validateWorkflow(
+      graph([catalogSource('src', 'SubwoReplica', 'previous'), sink('out')], [['src', 'out']]),
+    );
+    expect(issues.map((issue) => issue.code)).toEqual(['source-snapshot-not-an-id']);
+    expect(issues[0].message).toMatch(/not a snapshot id/);
+  });
+
+  it('accepts a graph that names a real-looking id', () => {
+    expect(
+      validateWorkflow(
+        graph([catalogSource('src', 'SubwoReplica', 'wf-9ff572d8'), sink('out')], [['src', 'out']]),
+      ),
+    ).toEqual([]);
+  });
+});
+
+describe('the columns below a catalog source that names a snapshot', () => {
+  const withFilterOn = (column: string, snapshot?: string): WorkflowGraph =>
+    graph(
+      [
+        catalogSource('src', 'SubwoReplica', snapshot),
+        {
+          id: 'keep',
+          name: 'keep',
+          kind: 'filter',
+          predicate: { kind: 'compare', column, operator: 'equals', value: 'x' },
+          narrows: ['Mvr'],
+        },
+        sink('out'),
+      ],
+      [
+        ['src', 'keep'],
+        ['keep', 'out'],
+      ],
+    );
+
+  it('are unknown, because the published schema describes the type and not the load', () => {
+    // The subtle one. A property added, removed or renamed since the snapshot
+    // was written makes the published list wrong in BOTH directions: a filter on
+    // a name the type has now would be allowed and match nothing, and a filter
+    // on the name the load actually carries would be refused. Where a set cannot
+    // be proved this file says nothing, which is what it already does for every
+    // source that reaches an outside system.
+    expect(
+      workflowKnownColumns(withFilterOn('baseCode', 'wf-9ff572d8'), 'keep', knows),
+    ).toBeUndefined();
+  });
+
+  it('are still the published type’s when nothing is pinned', () => {
+    // The control: the claim is only withdrawn for a named snapshot. A source
+    // reading whatever is being served is reading the load the published schema
+    // was declared against.
+    const known = workflowKnownColumns(withFilterOn('baseCode'), 'keep', knows);
+    expect(known && [...known].sort()).toEqual(['actualLaborCost', 'baseCode', 'workOrderId']);
+  });
+
+  it('adds no column refusal below a pinned source', () => {
+    // And the consequence, which is the whole point of withdrawing the claim: a
+    // filter naming a column the type no longer declares is a graph that may be
+    // exactly right about the load it named, so it is not refused.
+    expect(validateWorkflow(withFilterOn('actual_labor_cost', 'wf-9ff572d8'), knows)).toEqual([]);
+    // …while the same filter under an unpinned source is refused, as it always was.
+    expect(
+      validateWorkflow(withFilterOn('actual_labor_cost'), knows).map((issue) => issue.code),
+    ).toEqual(['column-not-produced']);
   });
 });
