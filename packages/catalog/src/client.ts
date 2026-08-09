@@ -344,6 +344,12 @@ export {
   // The config key a `catalog` source names its object type in, so the
   // inspector writing it and the fetcher reading it cannot spell it differently.
   CATALOG_SOURCE_TYPE_KEY,
+  // …and the key it names one snapshot of that type in, plus the one rule about
+  // what may go in it. The inspector refuses a relative reference with the same
+  // sentence the validator and the fetcher do, because it is the same function.
+  CATALOG_SNAPSHOT_RESERVED_NAMES,
+  CATALOG_SOURCE_SNAPSHOT_KEY,
+  catalogSnapshotRefusal,
   CONNECTOR_KINDS,
   isConnectorKind,
   isSourceFormat,
@@ -559,6 +565,9 @@ export {
   // Which object type a `catalog` source reads, read off the node by the one
   // function the validator and the fetcher also use.
   workflowSourceObjectType,
+  // …and which snapshot of it, when the node names one rather than reading
+  // whatever is being served.
+  workflowSourceSnapshot,
   // Which published types a filter stands in front of. The console has to offer
   // the same acknowledgements the validator requires, and a canvas computing its
   // own answer would offer a set the server then refuses.

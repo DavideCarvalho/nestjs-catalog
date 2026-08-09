@@ -72,6 +72,12 @@ export const CONNECTOR_KINDS = [
    *   snapshot it serves, and a type with nothing committed is refused rather
    *   than read as zero rows. See `fetchCatalog` in the pipeline package.
    *
+   * A node may instead name **one snapshot by id** — see
+   * {@link CATALOG_SOURCE_SNAPSHOT_KEY}, which is how a graph diffs two versions
+   * of a type or reprocesses an old one without leaving the model. It is an id
+   * and only an id: nothing relative, and nothing that could mean "all of them",
+   * which is the reading that produced the measurement above.
+   *
    * Not connectable — see `CONNECTION_KINDS` in the react package. A connection
    * is an address and a credential shared by several loads, and this kind has
    * neither.
@@ -146,6 +152,132 @@ export function workflowSourceObjectType(
   const config = Reflect.get(node, 'config');
   if (typeof config !== 'object' || config === null) return undefined;
   const named = Reflect.get(config, CATALOG_SOURCE_TYPE_KEY);
+  if (typeof named !== 'string') return undefined;
+  const trimmed = named.trim();
+  return trimmed.length === 0 ? undefined : trimmed;
+}
+
+/**
+ * The config key a `catalog` source names **one snapshot** in.
+ *
+ * ## Why the key is not called `snapshotId`
+ *
+ * Because `snapshotId` is already taken, by something that is not this, in a
+ * place a person reads on the same afternoon. A run body carries a `snapshotId`
+ * and it is the **durable run id** — reusing one that already succeeded replays
+ * that run and returns its old counts as a fresh success. The two are especially
+ * confusable because they are frequently the *same string*: a snapshot's id is
+ * caller-supplied and a durable pipeline passes its run id (see
+ * {@link SnapshotRef.id}), so `snapshotId` in one field means "run this again"
+ * and in the other means "read that load", and nothing about the spelling says
+ * which. `objectSnapshot` pairs with {@link CATALOG_SOURCE_TYPE_KEY} instead —
+ * the two fields of this kind read as one sentence, *this object type, this
+ * snapshot of it* — and cannot be pasted into each other's place by accident.
+ *
+ * Absent is the ordinary case and means the snapshot the type is **currently
+ * serving**, resolved when the node runs. That default is not spelled: there is
+ * no `objectSnapshot: "current"`, because a second spelling of the default is a
+ * second thing to keep in step, and because the words it would be spelled with
+ * are exactly the ones {@link catalogSnapshotRefusal} refuses.
+ */
+export const CATALOG_SOURCE_SNAPSHOT_KEY = 'objectSnapshot';
+
+/**
+ * The words a snapshot may not be named by, whatever a store's ids look like.
+ *
+ * Two different mistakes, refused together because they are refused for one
+ * reason — that a name here has to mean the same load on every run:
+ *
+ * - **Relative references.** `previous`, `last`, `newest`. The thing somebody
+ *   actually wants when diffing, and the property a graph must not have: it
+ *   resolves against whatever has been committed by the time the node runs, so
+ *   the same stored graph reads different data on Tuesday than it did on Monday
+ *   while its {@link workflowGraphHash} says nothing changed. And it is not
+ *   merely unstable, it is unstable *per node*: a diff graph with one source on
+ *   `current` and one on `previous` resolves them at two different instants, so
+ *   a commit landing between the two probes leaves both pointing at the same
+ *   load — an empty diff, reported as success, which is the exact green-and-
+ *   silent failure this kind was built to end. The friction they would have
+ *   saved is answered by the picker instead: the inspector lists the snapshots,
+ *   so an id is chosen from a list rather than looked up.
+ * - **Anything that could mean "all of them".** `all`, `*`, `%`. The measurement
+ *   in {@link CONNECTOR_KINDS} is what a read of every retained snapshot at once
+ *   looks like — 89,440 rows where 44,720 were current, `succeeded`, every `SUM`
+ *   doubled — and the whole reason this kind names a type rather than a table is
+ *   that a type cannot be named that way. A snapshot must not reintroduce it.
+ *
+ * Folded to lower case before comparison, so `Latest` is refused too. An id that
+ * genuinely *is* one of these words cannot be named here, and that is the trade:
+ * a handful of unusable ids against a name whose meaning a reader cannot get
+ * wrong.
+ */
+export const CATALOG_SNAPSHOT_RESERVED_NAMES = [
+  'current',
+  'latest',
+  'newest',
+  'head',
+  'previous',
+  'prior',
+  'last',
+  'oldest',
+  'first',
+  'all',
+  'any',
+  'none',
+] as const;
+
+/**
+ * Why a snapshot name cannot be used, or `undefined` when it can.
+ *
+ * A sentence rather than a boolean because three callers say it — the canvas,
+ * `validateWorkflow`, and `fetchCatalog` at the moment of the read — and three
+ * hand-written phrasings of one rule is how a refusal on the canvas stops
+ * matching the refusal on the run.
+ *
+ * A blank name is not a refusal: absent means the current snapshot, which is the
+ * default and the overwhelmingly common case.
+ */
+export function catalogSnapshotRefusal(named: string): string | undefined {
+  const trimmed = named.trim();
+  if (trimmed.length === 0) return undefined;
+  const folded = trimmed.toLowerCase();
+
+  if (CATALOG_SNAPSHOT_RESERVED_NAMES.some((reserved) => reserved === folded)) {
+    return `"${trimmed}" is not a snapshot id, it is a way of describing one. A source reads the snapshot with the id it names, and nothing else: a relative reference would resolve against whatever had been committed by the time the node ran, so the same graph would read different data on different days with no version change to show for it — and two nodes resolving "current" and "previous" a second apart can end up on the same load and report an empty diff as success. Leave this blank for the snapshot the type is currently serving, or name one id from the list. The reserved words are ${CATALOG_SNAPSHOT_RESERVED_NAMES.join(', ')}.`;
+  }
+
+  // A wildcard is the "all of them" reading wearing punctuation, and a leading
+  // `-`, `~` or `^` is how every version-control system in the world spells "one
+  // before". Both are refused by shape rather than by membership, because there
+  // is no end to the list of ways to write them.
+  if (/[*%?]/.test(trimmed) || /^[-~^+]/.test(trimmed)) {
+    return `"${trimmed}" cannot name a snapshot. A wildcard or an offset would either match several loads at once — which is the read this source kind exists to make impossible, because the physical table holds every load ever committed — or resolve to a different one on every run. Name one snapshot id, or leave this blank for the one the type is currently serving.`;
+  }
+
+  return undefined;
+}
+
+/**
+ * Which snapshot a `catalog` source reads, when it names one rather than taking
+ * the current one.
+ *
+ * `undefined` covers "not that kind", "no snapshot named", and "named as blank
+ * space", and every caller wants the same thing from all three: read whatever
+ * the type is serving. Trimmed for the reason {@link workflowSourceObjectType}
+ * trims — an id differing from a real one by a trailing space resolves nothing,
+ * and the refusal it earns names a string that looks correct.
+ *
+ * Deliberately **not** validating: a name this returns may still be one
+ * {@link catalogSnapshotRefusal} refuses. Splitting the two is what lets the
+ * canvas show the field's contents while telling somebody why it will not run.
+ */
+export function workflowSourceSnapshot(
+  node: WorkflowNode | Record<string, unknown>,
+): string | undefined {
+  if (Reflect.get(node, 'sourceKind') !== 'catalog') return undefined;
+  const config = Reflect.get(node, 'config');
+  if (typeof config !== 'object' || config === null) return undefined;
+  const named = Reflect.get(config, CATALOG_SOURCE_SNAPSHOT_KEY);
   if (typeof named !== 'string') return undefined;
   const trimmed = named.trim();
   return trimmed.length === 0 ? undefined : trimmed;
@@ -5373,6 +5505,16 @@ export const WORKFLOW_ISSUE_CODES = [
    * type to guess, and guessing would read somebody else's data.
    */
   'source-type-not-named',
+  /**
+   * A `catalog` source whose named snapshot is not a name — a relative
+   * reference, or something that could match several loads.
+   *
+   * Its own code rather than part of `source-type-not-named`, because the node
+   * is not missing anything: it names a type and it names a snapshot, and the
+   * snapshot is the wrong *kind* of thing. See {@link catalogSnapshotRefusal}
+   * for both mistakes and why one graph must not be able to make either.
+   */
+  'source-snapshot-not-an-id',
   'call-not-named',
   /**
    * A plain call wired into something. See {@link WORKFLOW_CALL_MODES}: a plain
@@ -5947,26 +6089,55 @@ function nodeIsUnconfigured(node: WorkflowNode): WorkflowValidationIssue | undef
       message: `Transform node "${node.name}" (${node.id}) names no transform, so there is no code for it to run.`,
     };
   }
-  if (node.kind === 'source' && node.sourceKind === 'catalog') {
-    // Only this kind, and only from the config: every other kind's address is
-    // allowed to arrive from a named connection, so a blank field on the node is
-    // not evidence of anything. A `catalog` source has no connection to borrow
-    // from — the type name is the whole configuration — so a blank one is
-    // decidable here.
-    if (workflowSourceObjectType(node) === undefined) {
-      return {
-        code: 'source-type-not-named',
-        nodeIds: [node.id],
-        message: `Source "${node.name}" (${node.id}) reads from the catalog but does not say which object type, so there is nothing for it to read. Name the type on the node; there is no default, because a default would read somebody else's data.`,
-      };
-    }
-  }
+  if (node.kind === 'source') return sourceIsUnconfigured(node);
   if (node.kind === 'call') return callIsUnnamed(node);
   if (node.kind === 'if') return ifIsUnconfigured(node);
   if (node.kind === 'filter') return filterIsUnconfigured(node);
   if (node.kind === 'rename') return renameIsUnconfigured(node);
   if (node.kind === 'aggregate') return aggregateIsUnconfigured(node);
   if (node.kind === 'lookup') return lookupIsUnconfigured(node);
+  return undefined;
+}
+
+/**
+ * A source whose own config cannot be run, which is only ever a `catalog` one.
+ *
+ * Every other kind's address is allowed to arrive from a named connection, so a
+ * blank field on the node is not evidence of anything — a `sql` source with no
+ * url is the normal shape of one reading through a connection. A `catalog`
+ * source has no connection to borrow from, so both of its fields are decidable
+ * from the node alone.
+ *
+ * Its own function beside the ones every other configured kind has, rather than
+ * inline in the dispatcher, for the reason `canonicalSource` is one: a
+ * dispatcher that carries one case inline is where the next case gets written
+ * inline too.
+ */
+function sourceIsUnconfigured(node: WorkflowSourceNode): WorkflowValidationIssue | undefined {
+  if (node.sourceKind !== 'catalog') return undefined;
+
+  if (workflowSourceObjectType(node) === undefined) {
+    return {
+      code: 'source-type-not-named',
+      nodeIds: [node.id],
+      message: `Source "${node.name}" (${node.id}) reads from the catalog but does not say which object type, so there is nothing for it to read. Name the type on the node; there is no default, because a default would read somebody else's data.`,
+    };
+  }
+
+  // A named snapshot, when there is one. Refused here rather than only at the
+  // moment of the read for the reason the type name is: a source that cannot
+  // resolve what it names fails inside a durable step halfway through a load,
+  // and the graph it fails on is one somebody was allowed to save.
+  const snapshot = workflowSourceSnapshot(node);
+  const refusal = snapshot === undefined ? undefined : catalogSnapshotRefusal(snapshot);
+  if (refusal !== undefined) {
+    return {
+      code: 'source-snapshot-not-an-id',
+      nodeIds: [node.id],
+      message: `Source "${node.name}" (${node.id}) cannot read the snapshot it names. ${refusal}`,
+    };
+  }
+
   return undefined;
 }
 
@@ -6801,6 +6972,18 @@ function canonicalSource(node: WorkflowSourceNode): string {
     node.mode ?? 'full',
     // Sorted keys, so a canvas that rewrites the object in a different order
     // does not look like an edit.
+    //
+    // This is also where `objectSnapshot` enters the fingerprint, and it needs
+    // no line of its own to do it: a config key that is absent contributes
+    // nothing, so every source drawn before a snapshot could be named hashes to
+    // exactly the string it always did, and a node repointed from the current
+    // load to a named one is a new version of the graph — which it is, as surely
+    // as repointing a SQL source at another query. The rule the rest of this
+    // file applies by appending optional components only when set, this case
+    // gets for free. What it does NOT get for free is the empty string: a form
+    // that stored `objectSnapshot: ""` for a blank field would renumber every
+    // graph it touched while meaning "the current one", which is why
+    // `sourceConfigFrom` in the react package omits the key instead.
     sortedEntries(node.config),
     // Appended only when there is a reference, exactly as `edge.branch` above
     // is appended only when there is a label, and for the same reason: adding
@@ -7316,6 +7499,34 @@ function lookupProducedColumns(
  * names — `fetchCatalog` asks for exactly those and the store returns exactly
  * those — so the set is closed in the sense {@link workflowKnownColumns}
  * requires: an upper bound that holds whatever is upstream, since nothing is.
+ *
+ * ## …and it stops answering the moment the node names a snapshot
+ *
+ * This is the subtle one, and the answer went the other way at first. The
+ * argument for keeping the published set is that the store selects the type's
+ * *declared* properties whatever snapshot is being read, so the record keys come
+ * back the same either way — a property added after the old load simply arrives
+ * null. On that reading the set is still an upper bound and still closed.
+ *
+ * It is wrong, and it is wrong in **both** directions, which is what settles it.
+ * The published properties describe the type as it is declared *now*; the
+ * snapshot was written under whatever was declared *then*, and nothing in the
+ * graph, the registry or this function can say whether those are the same
+ * declaration. Rename a property — publish `unit_mel`, load, republish as
+ * `unitMel` — and reading the old snapshot gives:
+ *
+ * - a filter on `unitMel` **allowed**, because the published set has it, that
+ *   matches no row, because that column is null for every row of that load. The
+ *   graph comes out empty and green: the failure this whole check exists to
+ *   catch, waved through by the check itself.
+ * - a filter on `unit_mel` **refused**, because the published set no longer has
+ *   it — a wrong refusal of a graph that is right about the load it named.
+ *
+ * So the published schema is a claim about the type and not about the snapshot,
+ * and the two are the same claim only for the snapshot the type is serving.
+ * Where a claim cannot be proved this file says `undefined` and stays silent
+ * — the answer it already gives for four kinds — rather than a set that is
+ * confidently the wrong shape.
  */
 function sourceProducedColumns(
   node: WorkflowSourceNode,
@@ -7326,6 +7537,9 @@ function sourceProducedColumns(
     return undefined;
   }
   if (kind === 'catalog') {
+    // A named snapshot is a load whose shape the published type does not
+    // describe. See the docblock: silence, not the current property set.
+    if (workflowSourceSnapshot(node) !== undefined) return undefined;
     const named = workflowSourceObjectType(node);
     if (named === undefined || knowledge === undefined) return undefined;
     const columns = knowledge.columnsOfType(named);

@@ -61,7 +61,7 @@ function reader(): CatalogTypeReader {
 }
 
 /** Everything the fetcher yields, as records. */
-async function drain(type: string): Promise<Array<Record<string, unknown>>> {
+async function drain(type: string, snapshot?: string): Promise<Array<Record<string, unknown>>> {
   const stream = toRecordStream(
     await fetchCatalog({
       connector: {
@@ -69,7 +69,10 @@ async function drain(type: string): Promise<Array<Record<string, unknown>>> {
         name: 'Read the type',
         kind: 'catalog',
         targetType: '',
-        config: { objectType: type },
+        config: {
+          objectType: type,
+          ...(snapshot === undefined ? {} : { objectSnapshot: snapshot }),
+        },
         enabled: true,
         createdBy: 'spec',
         createdAt: new Date().toISOString(),
@@ -146,5 +149,86 @@ describe('a catalog source, over a type with history behind it', () => {
 
   it('refuses a type the catalog has never heard of', async () => {
     await expect(drain('NotAType')).rejects.toThrow(/NotAType/);
+  });
+});
+
+/**
+ * Reading a load that is not the current one, against a table holding several.
+ *
+ * The same `WHERE _snapshot_id = ?` the current-snapshot read uses, with the id
+ * coming off the node instead of off the pointer — so what this file has to
+ * prove is not that a filter filters, it is that naming an *older* id reads that
+ * load and nothing else while three other loads sit in the same table. A fake
+ * store filtering an array would assert that the fake filters.
+ */
+describe('a catalog source that names a snapshot', () => {
+  /** Four committed loads of one type, the shape the dev deployment is in. */
+  async function fourLoads(name: string): Promise<{ type: CatalogObjectTypeDef; ids: string[] }> {
+    const type = contractType(name);
+    await db.publish(type);
+    const ids = ['load-1', 'load-2', 'load-3', 'load-4'];
+    for (const [index, id] of ids.entries()) {
+      await db.store.write(
+        type,
+        [contractRow('a', id, index + 1), contractRow('b', id, (index + 1) * 10)],
+        { snapshotId: id, principalId: 'spec', batch: 0 },
+      );
+      await db.store.commit(type, id);
+    }
+    return { type, ids };
+  }
+
+  it('reads the load it names and not the one being served', async () => {
+    const { type } = await fourLoads('PinnedRead');
+
+    // The control: every load is still in the table. Without it, a fetcher that
+    // read two rows because only one snapshot existed would look identical to
+    // one that pinned correctly.
+    expect(await physicalRows(type)).toBe(8);
+
+    const current = await drain('PinnedRead');
+    expect(current.map((row) => row.label)).toEqual(['load-4', 'load-4']);
+
+    // Two loads back, named. Two rows out of eight, and they are that load's.
+    const older = await drain('PinnedRead', 'load-2');
+    expect(older).toHaveLength(2);
+    expect(older.map((row) => row.label)).toEqual(['load-2', 'load-2']);
+    expect(older.map((row) => row.score).sort((a, b) => Number(a) - Number(b))).toEqual([2, 20]);
+
+    // …and the oldest, so this is not "reads the second one" by accident.
+    expect((await drain('PinnedRead', 'load-1')).map((row) => row.score)).toEqual([1, 10]);
+  });
+
+  it('refuses a snapshot whose rows were dropped, with the date', async () => {
+    const { type } = await fourLoads('PinnedDropped');
+    await db.store.dropSnapshot(type, 'load-1');
+
+    // The record survives the drop — that is the whole of the tombstone — so
+    // this id resolves to something, and what it resolves to has no rows. An
+    // empty read here is indistinguishable from a load that collapsed.
+    await expect(drain('PinnedDropped', 'load-1')).rejects.toThrow(/dropped on /);
+    // And the loads beside it are untouched.
+    expect(await drain('PinnedDropped', 'load-2')).toHaveLength(2);
+  });
+
+  it('refuses an id that belongs to another type, and names that type', async () => {
+    await fourLoads('PinnedOwnerA');
+    const other = contractType('PinnedOwnerB');
+    await db.publish(other);
+    await db.store.write(other, [contractRow('a', 'elsewhere', 1)], {
+      snapshotId: 'only-on-b',
+      principalId: 'spec',
+      batch: 0,
+    });
+    await db.store.commit(other, 'only-on-b');
+
+    await expect(drain('PinnedOwnerA', 'only-on-b')).rejects.toThrow(
+      /is not a snapshot of "PinnedOwnerA" — it belongs to "PinnedOwnerB"/,
+    );
+  });
+
+  it('refuses an id nothing has ever carried', async () => {
+    await fourLoads('PinnedMissing');
+    await expect(drain('PinnedMissing', 'load-99')).rejects.toThrow(/cannot be found/);
   });
 });

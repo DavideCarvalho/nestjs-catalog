@@ -7,10 +7,14 @@ import {
   type CatalogReadStore,
   type ConnectorKind,
   SOURCE_FORMATS,
+  type SnapshotRef,
   type SourceFormat,
+  catalogSnapshotRefusal,
   isSourceFormat,
+  supportsSnapshotLookup,
   supportsSnapshotStreams,
   unreachableSourceFormat,
+  workflowSourceSnapshot,
 } from '@dudousxd/nestjs-catalog';
 import { Logger } from '@nestjs/common';
 import { importOptional } from './optional-modules';
@@ -754,7 +758,189 @@ export const fetchSql: SourceFetcher = async ({ connector, secret, state, mode }
 };
 
 /**
- * The catalog's own data: the current snapshot of one object type.
+ * What a `catalog` source was told to read: a type, and which snapshot of it.
+ *
+ * A pair, resolved once at the top of {@link fetchCatalog}, because the two
+ * fields are one decision. Absent `snapshot` is the ordinary case and means the
+ * one the type is currently serving.
+ */
+interface CatalogSourceTarget {
+  type: string;
+  snapshot?: string;
+}
+
+/**
+ * What the store found when it was asked what a named snapshot id refers to.
+ *
+ * Three answers, and they are three rather than one because a caller acts
+ * differently on each — see {@link namedSnapshotRefusal}, which turns each of
+ * them into a sentence.
+ */
+type NamedSnapshotResolution =
+  | { kind: 'usable'; snapshot: SnapshotRef }
+  /** A record exists for this type and its rows are gone. */
+  | { kind: 'dropped'; snapshot: SnapshotRef }
+  /** No record for this type; `elsewhere` names the types that do have one. */
+  | { kind: 'missing'; elsewhere: string[]; searched: 'everywhere' | 'this type only' };
+
+/**
+ * Which type and which snapshot a source node named.
+ *
+ * Read off the config through the catalog package's own accessors rather than
+ * off the keys, so the form that writes them, the validator that refuses them
+ * and this — the thing that acts on them — cannot spell either key differently.
+ */
+function catalogTarget(config: Record<string, unknown>): CatalogSourceTarget {
+  const node = { sourceKind: 'catalog', config };
+  const snapshot = workflowSourceSnapshot(node);
+  return {
+    type: String(config[CATALOG_SOURCE_TYPE_KEY] ?? '').trim(),
+    ...(snapshot === undefined ? {} : { snapshot }),
+  };
+}
+
+/**
+ * What the named snapshot turned out to be, asked of the store.
+ *
+ * ## Why existence is asked and not inferred
+ *
+ * Because there is nothing to infer it from. A read pinned to an id no row
+ * carries comes back `{ rows: [], total: 0 }`, and so does a read of a snapshot
+ * that is genuinely empty — a load that legitimately committed nothing is a real
+ * state, so the count cannot be the test. Streaming it yields nothing, reports
+ * success, and commits an empty load over whatever the sink points at, which is
+ * the entire failure this source kind exists to prevent arriving through the new
+ * field.
+ *
+ * ## Two ways to ask, and what is lost by the second
+ *
+ * {@link CatalogSnapshotLookupStore} answers across types, which is what
+ * separates "there is no such snapshot" from "that one belongs to
+ * AfFleetReplica" — the mistake somebody actually makes, since ids are copied
+ * out of one history and pasted under another type. Failing that,
+ * `listSnapshots` answers for this type alone: still enough to tell missing from
+ * tombstoned, and the refusal then says it did not look further rather than
+ * implying it did.
+ *
+ * A store offering neither cannot answer the question at all, and this returns
+ * `undefined` for that — {@link fetchCatalog} refuses, because the alternative
+ * is reading an id nothing has vouched for.
+ */
+async function resolveNamedSnapshot(
+  store: CatalogReadStore,
+  type: CatalogObjectTypeDef,
+  snapshotId: string,
+): Promise<NamedSnapshotResolution | undefined> {
+  if (supportsSnapshotLookup(store)) {
+    const found = await store.locateSnapshot(snapshotId);
+    const here = found.find((each) => each.typeName === type.name);
+    if (here === undefined) {
+      return {
+        kind: 'missing',
+        elsewhere: found.map((each) => each.typeName),
+        searched: 'everywhere',
+      };
+    }
+    return here.snapshot.droppedAt
+      ? { kind: 'dropped', snapshot: here.snapshot }
+      : { kind: 'usable', snapshot: here.snapshot };
+  }
+
+  if (typeof store.listSnapshots !== 'function') return undefined;
+  const known = await store.listSnapshots(type);
+  const here = known.find((each) => each.id === snapshotId);
+  if (here === undefined) {
+    return { kind: 'missing', elsewhere: [], searched: 'this type only' };
+  }
+  return here.droppedAt ? { kind: 'dropped', snapshot: here } : { kind: 'usable', snapshot: here };
+}
+
+/**
+ * The sentence for a named snapshot that cannot be read, or nothing when it can.
+ *
+ * Three refusals, each naming a different repair, because they are three
+ * different mistakes and the one thing they must never share is a generic
+ * message that leaves a reader guessing which of the three they made.
+ *
+ * The tombstone case says where the rows went when the record knows: an evicted
+ * snapshot has been copied to object storage and *reading it back from there is
+ * not offered here*. Saying so is the difference between somebody restoring an
+ * archive and somebody re-running a load they did not need to re-run.
+ */
+function namedSnapshotRefusal(
+  typeName: string,
+  snapshotId: string,
+  resolution: NamedSnapshotResolution,
+): string | undefined {
+  if (resolution.kind === 'usable') return undefined;
+
+  if (resolution.kind === 'dropped') {
+    const { archive, droppedAt, rowCount } = resolution.snapshot;
+    const where = archive
+      ? ` A verified copy of it was written to ${archive.path}${archive.disk ? ` on the "${archive.disk}" disk` : ''} as ${archive.format}, so the data still exists — but reading an archived snapshot back is not something this source can do, so the copy has to be restored before a graph can read it.`
+      : ' No copy of it was recorded anywhere, so those rows are gone.';
+    return `Snapshot ${snapshotId} of "${typeName}" held ${rowCount} row(s) and they were dropped on ${droppedAt}. The record of the load is kept so the runs that produced it stay resolvable, and that is why this node could name it at all — but there is nothing left to read.${where} This is refused rather than read as zero rows, because an empty load committed over a downstream type is indistinguishable from one that collapsed.`;
+  }
+
+  if (resolution.elsewhere.length > 0) {
+    const owners = resolution.elsewhere.map((name) => `"${name}"`).join(', ');
+    return `Snapshot ${snapshotId} is not a snapshot of "${typeName}" — it belongs to ${owners}. A snapshot id identifies a load of one type, and the same id under a different type is a different load or no load at all, so this is refused rather than read: pointing this node at ${owners} would read the data that id names, and naming a snapshot of "${typeName}" would read this type's.`;
+  }
+
+  const looked =
+    resolution.searched === 'everywhere'
+      ? 'No type in this catalog has a snapshot with that id'
+      : `This store can only be asked about one type at a time, and "${typeName}" has no snapshot with that id — it may belong to another type`;
+  return `Snapshot ${snapshotId} of "${typeName}" cannot be found. ${looked}. A snapshot id is not something that can be guessed at, and reading an id nothing carries would come back as zero rows and commit an empty load — so nothing is read. Check the id against the type's load history; if the snapshot was dropped, its record would still be here, so an id that resolves to nothing at all was never written under this name.`;
+}
+
+/**
+ * Everything that has to be true before a named snapshot is read, in order.
+ *
+ * Its own function rather than a block inside {@link fetchCatalog} because it is
+ * a complete decision with four ways of coming out no, and because the ordinary
+ * read — the one every existing graph does — should stay readable as the three
+ * steps it always was.
+ *
+ * Nothing here reads a row. It establishes that the id means something, that
+ * this store can honour it, and that what it means still has data; the read
+ * below is then the same read the current-snapshot path performs.
+ */
+async function assertNamedSnapshotIsReadable(
+  store: CatalogReadStore,
+  type: CatalogObjectTypeDef,
+  pinned: string,
+): Promise<void> {
+  // The same function the canvas and `validateWorkflow` refuse on. Repeated here
+  // rather than trusted, because a connector's config is a JSON column and a row
+  // can be written by curl, by an older build, or by a newer one.
+  const notAnId = catalogSnapshotRefusal(pinned);
+  if (notAnId !== undefined) {
+    throw new Error(`This source reads a named snapshot of "${type.name}". ${notAnId}`);
+  }
+
+  // `CatalogReadQuery.snapshot` is documented as ignored where this is false,
+  // and "ignored" is the dangerous word: the read would succeed, return the
+  // current load, and be reported as the snapshot that was asked for.
+  if (!store.capabilities.timeTravel) {
+    throw new Error(
+      `This source names snapshot ${pinned} of "${type.name}", and this deployment's catalog store cannot read a snapshot other than the one it is serving. A snapshot named where it cannot be honoured is worse than one that is refused: the read would succeed against the current load and nothing would say the graph had not read what it named. Remove the snapshot to read whatever is current.`,
+    );
+  }
+
+  const resolution = await resolveNamedSnapshot(store, type, pinned);
+  if (resolution === undefined) {
+    throw new Error(
+      `This source names snapshot ${pinned} of "${type.name}", and this deployment's catalog store cannot say what that id refers to — it lists no snapshots and cannot resolve one. Reading it anyway would be reading an id nothing has vouched for, and an id that refers to nothing comes back as zero rows rather than as an error.`,
+    );
+  }
+
+  const refused = namedSnapshotRefusal(type.name, pinned, resolution);
+  if (refused !== undefined) throw new Error(refused);
+}
+
+/**
+ * The catalog's own data: one snapshot of one object type.
  *
  * ## The failure this replaces
  *
@@ -785,6 +971,33 @@ export const fetchSql: SourceFetcher = async ({ connector, secret, state, mode }
  *    holds the dataset — see {@link CatalogSnapshotStreamStore} for why a paged
  *    read is not the fallback it looks like.
  *
+ * ## Naming a snapshot instead
+ *
+ * A node may carry {@link CATALOG_SOURCE_SNAPSHOT_KEY}, and then step 2 is
+ * skipped: the id is the one on the node, and the pin that step 3 relies on is
+ * already there by construction. There is no second mechanism, and that is the
+ * point — the run reads exactly one `_snapshot_id` either way, and the only
+ * difference is who chose it. What replaces the resolution step is an
+ * **identity** check, {@link resolveNamedSnapshot}, because an id that was
+ * typed rather than resolved can be three kinds of wrong and every one of them
+ * reads back as zero rows.
+ *
+ * The other three things it changes are all consequences of the id no longer
+ * coming from the pointer:
+ *
+ * - **The store has to have time travel.** `CatalogReadQuery.snapshot` is
+ *   documented as *ignored* where `timeTravel` is false, so naming one there
+ *   would silently read the current load instead — a graph that says it reads
+ *   March and reads today, reporting success.
+ * - **A tombstone becomes reachable.** The store's invariant is that the
+ *   snapshot a type is *serving* can never be dropped, which is what keeps the
+ *   ordinary path free of the question. A named one has no such protection, so
+ *   this is the one place a `catalog` source can meet one — and it refuses out
+ *   loud, in the store and again here.
+ * - **The columns stop being known.** See `sourceProducedColumns` in the
+ *   catalog package: the published property list describes the type as declared
+ *   now, and an older snapshot was written under whatever was declared then.
+ *
  * ## Nothing committed yet is a refusal
  *
  * Not an empty read. A type that exists and has never been loaded has no current
@@ -807,7 +1020,8 @@ export const fetchSql: SourceFetcher = async ({ connector, secret, state, mode }
  * rather than half-honoured.
  */
 export const fetchCatalog: SourceFetcher = async ({ connector, catalog }) => {
-  const named = String(connector.config[CATALOG_SOURCE_TYPE_KEY] ?? '').trim();
+  const target = catalogTarget(connector.config);
+  const named = target.type;
   if (named.length === 0) {
     throw new Error(
       `This source reads from the catalog but names no object type. Set \`${CATALOG_SOURCE_TYPE_KEY}\` to the type it should read; there is no default, because a default would read somebody else's data.`,
@@ -831,11 +1045,29 @@ export const fetchCatalog: SourceFetcher = async ({ connector, catalog }) => {
   // would silently drop a column somebody's graph reads.
   const fields = type.properties.map((property) => property.name);
 
+  // The whole of what naming a snapshot adds, before anything is read: is this
+  // an id at all, can this store answer for it, and does it refer to a load of
+  // this type that still has its rows. Everything below is then the same code
+  // the current-snapshot read has always run, with the id coming from the node
+  // instead of from the pointer.
+  const pinned = target.snapshot;
+  if (pinned !== undefined) await assertNamedSnapshotIsReadable(catalog.store, type, pinned);
+
   // One page of one row, for its `snapshot` and its `total` rather than for its
-  // rows. This is the resolution step: the store answers with the id its pointer
-  // names, which is the only place that answer exists.
-  const probe = await catalog.store.read(type, fields, { page: 1, size: 1 });
-  const snapshotId = probe.snapshot?.id;
+  // rows. With nothing pinned this is the resolution step: the store answers with
+  // the id its pointer names, which is the only place that answer exists. With a
+  // snapshot named it is no longer resolving anything — the id is already
+  // decided — and it is still worth the statement for two things it alone
+  // returns: `total`, the independent count the note below cross-checks, and
+  // `current`, which is how the run says whether the load it read is also the
+  // one being served. It is also the second gate a tombstone hits, since `read`
+  // refuses a dropped snapshot on the history path.
+  const probe = await catalog.store.read(
+    type,
+    fields,
+    pinned === undefined ? { page: 1, size: 1 } : { page: 1, size: 1, snapshot: pinned },
+  );
+  const snapshotId = pinned ?? probe.snapshot?.id;
 
   if (snapshotId === undefined) {
     // A store that keeps no history has no snapshot to name and its rows *are*
@@ -868,7 +1100,15 @@ export const fetchCatalog: SourceFetcher = async ({ connector, catalog }) => {
     }),
     notes: () => {
       const said = [
-        `Read snapshot ${snapshotId} of "${type.name}" — the one the catalog is currently serving, resolved when this node ran.`,
+        pinned === undefined
+          ? `Read snapshot ${snapshotId} of "${type.name}" — the one the catalog is currently serving, resolved when this node ran.`
+          : probe.snapshot?.current === true
+            ? `Read snapshot ${snapshotId} of "${type.name}" — named on this node, and it is also the one the catalog is currently serving.`
+            : // The line the whole feature is for. It says *which* load was read
+              // and that it is not the live one, on the run rather than on the
+              // canvas, because the run is what somebody reads six months later
+              // when the numbers do not match the dashboard.
+              `Read snapshot ${snapshotId} of "${type.name}" — named on this node, and NOT the one the catalog is currently serving. Nothing resolved it at run time: the id is the pin, so this run read the same load any other run of this graph would.`,
       ];
       // Two counts of one snapshot, from two statements. A committed snapshot is
       // immutable, so they agree; saying so when they do not is cheap and is the

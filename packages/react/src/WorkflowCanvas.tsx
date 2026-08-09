@@ -7835,6 +7835,29 @@ function SourceInspector({
 }) {
   const [source, setSource] = useState<SourceDraft>(() => sourceDraftFrom(node.config));
   const kind: ConnectorKind = toConnectorKind(node.sourceKind ?? 'http');
+
+  /**
+   * The history of the type a `catalog` source names, so the snapshot can be
+   * chosen instead of looked up.
+   *
+   * The whole answer to the objection that naming a snapshot by id is friction —
+   * see `SnapshotField`. Keyed on the type the field currently holds and asked
+   * only for that kind, so no other source node makes a request; the same query
+   * key the object explorer's picker uses, so opening both costs one fetch.
+   *
+   * A failure is not surfaced: the field falls back to accepting a typed id,
+   * which is exactly what it does on a store with no history. A console that
+   * cannot list snapshots must not be a console that cannot edit a graph.
+   */
+  const client = useCatalogClient();
+  const namedType = kind === 'catalog' ? source.objectType.trim() : '';
+  const { data: snapshots } = useQuery({
+    queryKey: catalogQueryKeys.objectSnapshots(namedType),
+    queryFn: () => client.snapshots(namedType),
+    enabled: namedType.length > 0,
+    staleTime: 30_000,
+    retry: false,
+  });
   const options = connectionOptionsFor(kind, connections);
   // A connection chosen for one kind is meaningless for another, so switching
   // the kind drops it rather than keeping an id the server would reject.
@@ -7951,6 +7974,7 @@ function SourceInspector({
         viaConnection={viaConnection}
         disabled={!canEdit}
         storage={storage}
+        snapshots={snapshots}
       />
 
       <ReadModeFields

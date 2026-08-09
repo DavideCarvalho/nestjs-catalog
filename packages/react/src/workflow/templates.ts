@@ -1,4 +1,5 @@
 import {
+  CATALOG_SOURCE_SNAPSHOT_KEY,
   CATALOG_SOURCE_TYPE_KEY,
   CONNECTOR_KINDS,
   type ConnectorKind,
@@ -304,7 +305,10 @@ export const SOURCE_KINDS: Record<ConnectorKind, SourceKindProfile> = {
   catalog: {
     label: "this catalog's own data",
     required: [CATALOG_SOURCE_TYPE_KEY],
-    optional: [],
+    // Naming a snapshot is the one optional thing this kind has, and no template
+    // ships one: a template describes a load that runs on a schedule, and a
+    // schedule pinned to one historical snapshot reads the same rows forever.
+    optional: [CATALOG_SOURCE_SNAPSHOT_KEY],
     // False, and it is the strongest `false` in this record. The rows come out
     // of the store keyed by the *property names of the type they were read
     // from* — that is what `read` and `streamSnapshot` both hand back — so there
