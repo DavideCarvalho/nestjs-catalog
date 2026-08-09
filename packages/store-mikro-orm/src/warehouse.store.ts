@@ -36,6 +36,7 @@ import type {
 // package, and that single line was the whole of what bound this file to one
 // engine at the type level.
 import { LockMode } from '@mikro-orm/core';
+import type { Transaction } from '@mikro-orm/core';
 import type { EntityManager } from '@mikro-orm/sql';
 import { BadRequestException, Inject, Injectable, Logger } from '@nestjs/common';
 import { CATALOG_STORE_ENTITY_MANAGER } from './context';
@@ -830,7 +831,15 @@ export class MikroOrmWarehouseStore
     //
     // After the stale-carry-forward refusal above rather than before it: a
     // snapshot that cannot be committed should not pay for a scan to be told so.
-    snapshot.rowCount = await this.countRows(em, tableFor(type.name), snapshotId);
+    //
+    // Held in a local as well as on the entity, because the locking re-read
+    // below passes `refresh: true` and a refresh overwrites the entity from the
+    // row — including this, which has not been flushed yet. Assigning it once and
+    // trusting it to survive left every committed snapshot recorded as holding
+    // zero rows, which is the number `listSnapshots` then reports and a tombstone
+    // then keeps forever.
+    const counted = await this.countRows(em, tableFor(type.name), snapshotId);
+    snapshot.rowCount = counted;
 
     // An empty snapshot is committed, not refused — and said out loud when it
     // replaces something.
@@ -888,6 +897,9 @@ export class MikroOrmWarehouseStore
           `${droppedMessage(type.name, fresh, fresh.droppedAt)} Committing it would point ${type.name} at a snapshot holding nothing. Commit a snapshot that still has its rows, or load ${type.name} again.`,
         );
       }
+      // After the refresh, all three, because the refresh put the row's stored
+      // values back over the unflushed ones.
+      snapshot.rowCount = counted;
       snapshot.committed = true;
       snapshot.committedAt = new Date();
       if (typeRow) typeRow.currentSnapshotId = snapshotId;
@@ -1016,7 +1028,9 @@ export class MikroOrmWarehouseStore
       // Before the delete, and only when there is a record to write it to: a
       // snapshot with no row has nowhere to keep the number and the scan would be
       // paid for nothing.
-      const held = snapshot ? await this.countRows(em, tableFor(type.name), snapshotId) : 0;
+      const held = snapshot
+        ? await this.countRows(em, tableFor(type.name), snapshotId, em.getTransactionContext())
+        : 0;
 
       // Through the transaction's own context. `connection.execute` with no
       // context runs on a pooled connection *outside* the transaction, which
@@ -1638,6 +1652,7 @@ export class MikroOrmWarehouseStore
     em: EntityManager,
     table: string,
     snapshotIds: readonly string[],
+    ctx?: Transaction,
   ): Promise<Map<string, number>> {
     // `IN ()` is a syntax error on MySQL, and "no uncommitted snapshots" is the
     // ordinary state of a type nobody is loading.
@@ -1650,12 +1665,16 @@ export class MikroOrmWarehouseStore
           GROUP BY ${this.ident(SNAPSHOT_COLUMN)}`,
       [...snapshotIds],
       'all',
-      // `undefined` for every caller outside a transaction, which is all of them
-      // but one. `dropSnapshot` counts from inside the transaction that is about
-      // to delete what it counted, and a count taken on a *different* pooled
-      // connection would be answering about a different point in time — the one
-      // number a tombstone can never re-derive.
-      em.getTransactionContext(),
+      // Absent for every caller but one. `dropSnapshot` counts from inside the
+      // transaction that is about to delete what it counted, and passing its
+      // context is what keeps the two on one connection — a count issued on a
+      // different pooled connection would be answering about a different point
+      // in time, and this is the one number a tombstone can never re-derive.
+      //
+      // Threaded as a parameter rather than read off the `em`, so that a caller
+      // outside a transaction passes nothing and the statement is issued exactly
+      // as it always was.
+      ctx,
     );
 
     const counts = new Map<string, number>();
@@ -1664,8 +1683,13 @@ export class MikroOrmWarehouseStore
   }
 
   /** One snapshot's rows. Zero when it holds none — see {@link countBySnapshot}. */
-  private async countRows(em: EntityManager, table: string, snapshotId: string): Promise<number> {
-    return (await this.countBySnapshot(em, table, [snapshotId])).get(snapshotId) ?? 0;
+  private async countRows(
+    em: EntityManager,
+    table: string,
+    snapshotId: string,
+    ctx?: Transaction,
+  ): Promise<number> {
+    return (await this.countBySnapshot(em, table, [snapshotId], ctx)).get(snapshotId) ?? 0;
   }
 
   /**

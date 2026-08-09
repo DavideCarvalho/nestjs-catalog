@@ -179,19 +179,25 @@ export interface SnapshotRetention {
  *
  * ## Three rules, and each of them is a state somebody reached
  *
- * - **The served snapshot is never a candidate**, whatever its age. It may not
- *   even be the newest: rolling a bad load back means committing an *older*
- *   snapshot, so the served one can be sitting deep in the list, and a policy
- *   that only spared the newest would pick it. The store refuses the drop
- *   anyway — that refusal is load-bearing and is the last word — but a sweep
- *   that queued it up would spend a full archive verification to be told no.
- * - **The served snapshot does not consume a retention slot** when it is not
- *   among the newest `keep`. `keep` is a promise about how far back you can go,
- *   and a rolled-back type would otherwise silently get one fewer.
- * - **Tombstones do not consume a slot either.** Their rows are already gone, so
+ * - **The served snapshot is never a candidate**, whatever its age, and it
+ *   counts as one of the `keep`. It may not even be the newest: rolling a bad
+ *   load back means committing an *older* snapshot, so the served one can be
+ *   sitting deep in the list, and a policy that only spared the newest would
+ *   pick it. The store refuses the drop anyway — that refusal is load-bearing
+ *   and is the last word — but a sweep that queued it up would spend a full
+ *   archive verification to be told no.
+ * - **Tombstones do not consume a slot.** Their rows are already gone, so
  *   counting them would let `keep: 3` leave a type with one live snapshot and
  *   two records of loads that hold nothing — which reads on a screen exactly
  *   like three rollback targets.
+ *
+ * Between them those two make `keep` mean one thing in every state: *this many
+ * snapshots still have their rows*. A policy where the served snapshot were
+ * spared **in addition** to the `keep` newest — which is what ClickHouse's
+ * `pruneSnapshots` does — gives `keep` in the ordinary case and `keep + 1` after
+ * a rollback, and a number that changes meaning depending on whether somebody
+ * rolled back last week is the same class of answer this policy rejected age and
+ * size for.
  */
 export function selectSnapshotsToEvict(input: {
   snapshots: readonly SnapshotRef[];
@@ -219,7 +225,14 @@ export function selectSnapshotsToEvict(input: {
   });
 
   const evictable: SnapshotRef[] = [];
-  let retained = 0;
+  // The served snapshot fills the first slot before the walk begins, wherever it
+  // sits in the list. It keeps its rows by definition — the store will not let
+  // anything take them — so a policy that did not count it would be promising
+  // `keep` and delivering `keep + 1`.
+  const served = ordered.find(
+    (snapshot) => snapshot.id === input.currentSnapshotId && !snapshot.droppedAt,
+  );
+  let retained = served === undefined ? 0 : 1;
   for (const snapshot of ordered) {
     if (snapshot.id === input.currentSnapshotId) continue;
     if (snapshot.droppedAt) continue;
