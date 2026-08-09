@@ -75,7 +75,7 @@ async function archive(typeName: string, snapshotId: string) {
   const ref = await archiveSnapshot({
     type,
     snapshotId,
-    rows: db.store.streamSnapshot(type, FIELDS, snapshotId),
+    rows: db.store.streamSnapshot(type, FIELDS, snapshotId, { provenance: true }),
     expectedRowCount: snapshot.rowCount,
     store: archives,
     path,

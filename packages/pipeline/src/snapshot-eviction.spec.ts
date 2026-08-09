@@ -3,7 +3,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type {
   CatalogObjectTypeDef,
-  CatalogReadQuery,
   CatalogReadResult,
   CatalogSnapshotArchiveStore,
   CatalogStoreCapabilities,
@@ -81,10 +80,21 @@ const SUBWO = typeOf('Subwo', [
   { name: 'hours', type: 'number' },
 ]);
 
+/**
+ * Rows as `streamSnapshot(..., { provenance: true })` hands them over.
+ *
+ * The two reserved columns are on every row because the archiver refuses a
+ * stream without them — which is the point of that refusal: an absent key
+ * encodes as a null and verifies against a null, so a fixture that omitted them
+ * here would be building exactly the archive eviction has to refuse, and every
+ * case below would be testing that refusal by accident.
+ */
 function rowsOf(count: number): Array<Record<string, unknown>> {
   return Array.from({ length: count }, (_, index) => ({
     id: `wo-${index}`,
     hours: index + 0.5,
+    _principal_id: 'loader',
+    _loaded_at: '2026-08-01T00:00:00.000Z',
   }));
 }
 
@@ -373,7 +383,12 @@ describe('evicting a snapshot', () => {
     // Rewritten with the right number of rows and one value different, through
     // the same writer — so the file is a valid archive of the wrong data.
     const changed = rowsOf(20);
-    changed[7] = { id: 'wo-7', hours: 999 };
+    changed[7] = {
+      id: 'wo-7',
+      hours: 999,
+      _principal_id: 'loader',
+      _loaded_at: '2026-08-01T00:00:00.000Z',
+    };
     await archiveSnapshot({
       type: SUBWO,
       snapshotId: 'altered',
@@ -413,6 +428,57 @@ describe('evicting a snapshot', () => {
     ).rejects.toThrow(/hours (is|are) not in it/i);
 
     expect(store.rows.get('narrow')).toHaveLength(10);
+  });
+
+  /**
+   * The defect the archiver's three checks structurally cannot see.
+   *
+   * A snapshot streamed without `{ provenance: true }` hands over rows with no
+   * `_principal_id` and no `_loaded_at`. The absent key encodes as a null, the
+   * null reads back as a null, and the row count and the checksum are both
+   * correct — so the archive is complete, verified, and holds none of the two
+   * values a later merge copies forward. `archiveSnapshot` refuses that on the
+   * way in now, per row; an archive written before it did is in the bucket with
+   * a `verifiedAt` on it and nothing in its history that could have noticed.
+   *
+   * The manifest is the only thing that tells the two apart, which is why the
+   * fixture rewrites the manifest rather than the data: an older writer's
+   * manifest listed the type's properties and nothing else, and that list is
+   * exactly what eviction has to refuse to delete rows on the strength of.
+   */
+  it('refuses an archive whose manifest does not carry the provenance columns', async () => {
+    const archives = localArchiveStore(root);
+    const store = new FakeStore();
+    const rows = rowsOf(8);
+    store.seed('preprovenance', rows, '2026-08-01T00:00:00.000Z');
+    store.seed('live', rowsOf(1), '2026-08-02T00:00:00.000Z');
+    store.currentId = 'live';
+
+    const { ref, path } = await archiveInto(archives, SUBWO, 'preprovenance', rows);
+
+    // The manifest an older writer produced: the type's properties, and no
+    // `_principal_id` or `_loaded_at` beside them.
+    const manifest = JSON.parse(
+      new TextDecoder().decode(
+        await (await archives.read(`${path}/${ARCHIVE_MANIFEST_NAME}`)).slice(0),
+      ),
+    );
+    manifest.columns = SUBWO.properties.map((property) => ({
+      name: property.name,
+      type: property.type,
+      parquetType: 'STRING',
+    }));
+    await archives.put(
+      `${path}/${ARCHIVE_MANIFEST_NAME}`,
+      new TextEncoder().encode(JSON.stringify(manifest, null, 2)),
+    );
+
+    await expect(
+      evictSnapshot({ type: SUBWO, snapshotId: 'preprovenance', store, archives, archive: ref }),
+    ).rejects.toThrow(/does not carry _principal_id or _loaded_at/i);
+
+    expect(store.rows.get('preprovenance')).toHaveLength(8);
+    expect(store.snapshots.get('preprovenance')?.droppedAt).toBeUndefined();
   });
 
   /** A verified archive of the wrong load is still an authorisation to delete. */
@@ -651,6 +717,3 @@ describe('a sweep', () => {
     expect(sweep.skipped).toEqual([]);
   });
 });
-
-/** Only referenced to keep the read query type imported where the fake implements it. */
-export type _Unused = CatalogReadQuery;

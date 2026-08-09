@@ -5,7 +5,10 @@ import type {
   SnapshotArchiveRef,
   SnapshotRef,
 } from '@dudousxd/nestjs-catalog';
-import { supportsSnapshotArchiveRecords } from '@dudousxd/nestjs-catalog';
+import {
+  CATALOG_PROVENANCE_COLUMNS,
+  supportsSnapshotArchiveRecords,
+} from '@dudousxd/nestjs-catalog';
 import {
   ARCHIVE_PART_NAME,
   type ArchiveStore,
@@ -48,16 +51,25 @@ import {
  *
  * ## What is checked that the writer could not check
  *
- * Two things, and they are the reason this is not merely `archiveSnapshot`'s
- * verification run twice:
+ * Three things, and they are the reason this is not merely `archiveSnapshot`'s
+ * verification run twice. All three share a shape: the writer compares its
+ * output against *its own input*, so anything wrong with the input is invisible
+ * to it and stays invisible for as long as nobody outside the write asks.
  *
- * - **The archive covers the type.** `archiveSnapshot` verifies its output
- *   against its own input, so an archiver handed a narrowed field list writes a
- *   file that is short of columns and passes every check it makes. The manifest
- *   records the catalog's own column names and types precisely so somebody else
- *   can ask this question, and eviction is the somebody: a property of the type
- *   that the manifest does not name means the archive cannot answer for it, and
- *   deleting on that basis loses a column for good.
+ * - **The archive covers the type.** An archiver handed a narrowed field list
+ *   writes a file that is short of columns and passes every check it makes. The
+ *   manifest records the catalog's own column names and types precisely so
+ *   somebody else can ask this question, and eviction is the somebody: a
+ *   property of the type that the manifest does not name means the archive
+ *   cannot answer for it, and deleting on that basis loses a column for good.
+ * - **The archive carries the provenance columns.** The same shape and the
+ *   worst instance of it: a snapshot streamed without `{ provenance: true }`
+ *   hands over rows with no `_principal_id` and no `_loaded_at`, and a missing
+ *   key encodes as a null which reads back as a null — so the row count is
+ *   right, the checksum is right, and the archive holds none of the two values a
+ *   later merge copies forward. `archiveSnapshot` refuses that on the way in
+ *   now; archives written before it did are in the bucket already, carrying a
+ *   `verifiedAt` earned against a check that could not see it.
  * - **The archive is of this snapshot.** The manifest carries the object type
  *   and the snapshot id, and both are compared against what is being deleted. A
  *   caller holding the wrong ref — a path copied off another type's history — is
@@ -72,14 +84,24 @@ import {
  * fan-out, because it has no honest failure answer: a commit that cannot reach a
  * bucket has already published.
  *
- * ## What is deliberately not here
+ * ## Restoring is not offered, and today it is not possible
  *
- * Reading an archive back as data. The `catalog` source refuses an evicted
- * snapshot and says the copy has to be restored first, and that sentence stays
- * true after this file exists — what changes is that it can now name where the
- * copy went, because {@link CatalogSnapshotArchiveStore.recordSnapshotArchive}
- * puts the ref on the tombstone before the rows go. Restoring is a later
- * operation with its own decisions.
+ * Worth stating plainly, because everything above is arranged so that a restore
+ * *could* work and it would be easy to read that as a restore existing. It does
+ * not, and the obstacle is not effort: `write` stamps `_principal_id` and
+ * `_loaded_at` itself — one principal per call, `now` per call — so there is no
+ * seam through which the archived per-row values could be written back, and it
+ * refuses a negative batch by name so a carry-forward marker could not go back
+ * either. The bytes are preserved and this operation proves them whole; putting
+ * them back needs a write path that does not exist.
+ *
+ * So the `catalog` source's refusal of an evicted snapshot stays exactly as
+ * true as it was — *reading an archived snapshot back is not something this
+ * source can do, so the copy has to be restored before a graph can read it*.
+ * What changes is that it can now name **where** the copy went, because
+ * {@link CatalogSnapshotArchiveStore.recordSnapshotArchive} puts the ref on the
+ * tombstone before the rows go; before this file, that branch could never run
+ * and every tombstone said no copy existed.
  */
 
 /** What one snapshot's eviction did. */
@@ -475,7 +497,7 @@ export async function evictSnapshots(input: {
  * Read the archive back and prove it is this snapshot, whole, before anything
  * is deleted.
  *
- * Five checks. Each one exists because it catches something the others cannot:
+ * Six checks. Each one exists because it catches something the others cannot:
  *
  * - **The manifest parses and is version 1.** A manifest that cannot be read is
  *   an archive whose own description is gone, and the rest of the checks would
@@ -488,6 +510,18 @@ export async function evictSnapshots(input: {
  *   Neither is visible to the writer's own verification, which compares its
  *   output against its own input, and both mean the archive cannot answer for a
  *   column the snapshot had.
+ * - **It carries `CATALOG_PROVENANCE_COLUMNS`.** This is the class of defect the
+ *   archiver's three checks structurally cannot see, and it is the reason this
+ *   check is here rather than assumed: a snapshot streamed *without*
+ *   `{ provenance: true }` hands over rows with no `_principal_id` and no
+ *   `_loaded_at`, the absent key encodes as a null, the null reads back as a
+ *   null, and the archive is complete, correctly counted and correctly
+ *   checksummed while holding none of the two values a restore cannot
+ *   reconstruct. `archiveSnapshot` now refuses that on the way in, per row —
+ *   but an archive written by an earlier build sits in the bucket with a
+ *   `verifiedAt` on it and no such refusal in its history. That is exactly the
+ *   archive this operation must not delete rows on the strength of, and the
+ *   manifest's column list is what tells the two apart.
  * - **The row count agrees three ways** — the file, the manifest, and the
  *   snapshot's own record. The third is the one that matters most here and only
  *   this side can ask it: an archive taken before the last batch landed is
@@ -496,6 +530,17 @@ export async function evictSnapshots(input: {
  *   catches a truncated archive; only the hash catches a complete one with a
  *   value changed, which is the shape `hyparquet-writer` 0.16.5 produced from a
  *   nullable JSON column and the reason the read-back check exists at all.
+ *
+ * ## What none of this promises
+ *
+ * That the archive can be put back. It cannot, today, and this operation must
+ * not imply otherwise: the write path stamps `_principal_id` and `_loaded_at`
+ * itself — one principal per call, `now` per call — so there is no seam through
+ * which per-row provenance can be written back, and `write` refuses a negative
+ * batch by name. The bytes are preserved and complete; restoring them is a
+ * capability that does not exist yet. What is being checked here is that the
+ * copy is whole and readable, which is the most that can be true before there
+ * is a restore, and the least that may be true before rows are deleted.
  *
  * Every failure throws, and the message says that nothing was deleted, because
  * a caller reading it needs to know whether they are looking at a bad archive or
@@ -535,6 +580,20 @@ export async function verifyArchiveForEviction(input: {
   if (missing.length > 0) {
     throw new Error(
       `The archive at ${where} holds ${manifest.columns.length} column(s) and "${type.name}" has ${type.properties.length}: ${missing.join(', ')} ${missing.length === 1 ? 'is' : 'are'} not in it. An archive that does not cover the type cannot answer for the rows it would replace, whether the writer was given a narrowed field list or the type gained a column afterwards. Archive it again. ${nothingWasDeleted}`,
+    );
+  }
+
+  // Separately, and with its own sentence, because it is a different mistake
+  // with a different repair — and because it is the one an archive can carry a
+  // `verifiedAt` for while being wrong. A stream taken without
+  // `{ provenance: true }` produces a file that is complete, counted and hashed
+  // and holds a null in both of these columns for every row; the archiver
+  // refuses that now, on the way in, but an archive written before it did is
+  // sitting in the bucket looking verified.
+  const withoutProvenance = CATALOG_PROVENANCE_COLUMNS.filter((column) => !archived.has(column));
+  if (withoutProvenance.length > 0) {
+    throw new Error(
+      `The archive at ${where} does not carry ${withoutProvenance.join(' or ')}. An incremental load copies ${CATALOG_PROVENANCE_COLUMNS.join(' and ')} off the snapshot it merges against, so a copy without them makes every future carried row claim it was loaded whenever a restore ran — and every later snapshot inherits that. This is refused rather than warned about, because the archive is otherwise complete and its checksum is correct: nothing later would notice. Archive the snapshot again, streaming it with { provenance: true }. ${nothingWasDeleted}`,
     );
   }
 
