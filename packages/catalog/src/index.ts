@@ -425,6 +425,7 @@ export * from './catalog.filters';
 export {
   assertNoColumnCollisions,
   assertSafeIdentifier,
+  CATALOG_PROVENANCE_COLUMNS,
   CATALOG_RESERVED_COLUMNS,
   CATALOG_SNAPSHOT_MODES,
   CATALOG_STORE,
@@ -437,6 +438,7 @@ export {
   type CatalogReadQuery,
   type CatalogReadResult,
   type CatalogReadStore,
+  type CatalogProvenanceColumn,
   type CatalogReservedColumn,
   type CatalogSnapshotLocation,
   type CatalogSnapshotLookupStore,
@@ -454,6 +456,7 @@ export {
   physicalColumn,
   type SnapshotArchiveRef,
   type SnapshotRef,
+  type SnapshotStreamOptions,
   supportsCarryForward,
   supportsSnapshotLookup,
   supportsSnapshotStreams,

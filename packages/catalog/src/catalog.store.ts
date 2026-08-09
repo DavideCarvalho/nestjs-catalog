@@ -442,7 +442,24 @@ export interface CatalogSnapshotStreamStore extends CatalogReadStore {
     type: CatalogObjectTypeDef,
     fields: string[],
     snapshotId: string,
+    options?: SnapshotStreamOptions,
   ): AsyncIterable<Record<string, unknown>>;
+}
+
+/** What a snapshot stream may be asked for beside the properties. */
+export interface SnapshotStreamOptions {
+  /**
+   * Also key every row by {@link CATALOG_PROVENANCE_COLUMNS}.
+   *
+   * **A store that cannot supply them must throw rather than omit them.** The
+   * caller this exists for is the snapshot archiver, and it cannot tell a store
+   * that declined from a snapshot whose provenance happens to be absent: a
+   * missing key encodes as a null, a null verifies against a null, and the
+   * archive is complete, checksummed and silently stripped of the only columns a
+   * restore could not reconstruct. Silence is the one answer that is not
+   * available here.
+   */
+  provenance?: boolean;
 }
 
 /** A store that can stream a whole snapshot. See {@link CatalogSnapshotStreamStore}. */
@@ -734,6 +751,50 @@ export type CatalogReservedColumn = (typeof CATALOG_RESERVED_COLUMNS)[number];
 export function isReservedColumn(column: string): boolean {
   return CATALOG_RESERVED_COLUMNS.some((reserved) => reserved === column.toLowerCase());
 }
+
+/**
+ * The two reserved columns that outlive the load that wrote them.
+ *
+ * ## The question this answers, and it was asked of all five
+ *
+ * Which of {@link CATALOG_RESERVED_COLUMNS} does something *read* off a snapshot
+ * that is already committed? A copy of a snapshot — an archive, a replica, a
+ * restore — has to carry exactly those and nothing else, and the answer is not
+ * the one the names suggest.
+ *
+ * - **`_principal_id` and `_loaded_at` are read, by the merge, off the snapshot
+ *   it is merging against.** {@link CatalogMergeStore.carryForward} copies both
+ *   across untouched onto every row it carries, deliberately: a carried row is
+ *   not a new load of that row, so restamping them would erase the one thing
+ *   they are good for, which is saying when a value last actually moved and who
+ *   moved it. They are therefore the only two whose loss *propagates* — every
+ *   later incremental snapshot inherits whatever a restore put there, and it
+ *   inherits it forever.
+ * - **`_batch` is not.** It is read constantly *during* a load — a re-sent batch
+ *   replaces itself by `WHERE _snapshot_id = ? AND _batch = ?`, and a merge
+ *   excludes its own output by it — and once the snapshot commits nothing reads
+ *   it again. In particular `carryForward` does *not* read the previous
+ *   snapshot's `_batch`: it joins on the primary key and copies the properties,
+ *   and its own `_batch` predicate applies only to the snapshot being built. The
+ *   marker it leaves (`-1`, "carried forward") is a record that a merge happened,
+ *   never an input to the next one. A copy that drops it loses a line of
+ *   provenance in the SQL console and loses nothing a later load consults —
+ *   and the write path could not accept it back regardless, since
+ *   {@link CatalogWriteStore.write} refuses a negative batch by name.
+ * - **`_snapshot_id` is one value for the whole snapshot**, so a per-row copy of
+ *   it is N copies of a string the copy is already named after.
+ * - **`_row` is the order**, not a value. A copy that preserves the order
+ *   preserves everything the column carries; the numbers themselves are an
+ *   engine's auto-increment and are not stable across a rewrite anyway.
+ *
+ * Kept here rather than in the archiver that needed it, because it is a fact
+ * about the store interface — about which columns {@link
+ * CatalogMergeStore.carryForward} reads — and anything else that copies a
+ * snapshot needs the same answer.
+ */
+export const CATALOG_PROVENANCE_COLUMNS = ['_principal_id', '_loaded_at'] as const;
+
+export type CatalogProvenanceColumn = (typeof CATALOG_PROVENANCE_COLUMNS)[number];
 
 /**
  * The whole naming rule, which used to be written out here.
