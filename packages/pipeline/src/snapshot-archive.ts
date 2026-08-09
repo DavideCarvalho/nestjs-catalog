@@ -364,21 +364,25 @@ function trimSlashes(value: string): string {
  *
  * ## Why not a retention cap instead
  *
- * A cap is smaller, and it breaks something. `catalog_connector_run.snapshotId`
- * is "also the snapshot this run wrote, and the durable run id" — one identifier
- * across all three — and `dropSnapshot` deletes both the rows *and* the
- * `catalog_snapshot` row. So a cap leaves every run older than the window naming
- * a snapshot that has no record anywhere, and the store already treats that
- * state as a defect: `currentSnapshot` warns when a pointer names a snapshot
- * with no row, precisely because an id alone tells a caller nothing. The
- * repository had reached the same conclusion in prose before this existed —
- * `audit-recorder.service.ts` says `catalog_snapshot` is "not on a timer at
- * all", because "dropping one by age is how a published type comes to point at
- * nothing".
+ * A cap is smaller, and it used to break something. `catalog_connector_run.
+ * snapshotId` is "also the snapshot this run wrote, and the durable run id" —
+ * one identifier across all three — and `dropSnapshot` deleted both the rows
+ * *and* the `catalog_snapshot` row, so a cap would have left every run older
+ * than the window naming a snapshot that has no record anywhere.
  *
- * The distinction worth keeping hold of: what makes the history resolvable is
+ * The distinction that dissolved it: what makes the history resolvable is
  * *keeping the record*, and what makes it resolvable **to data** is keeping the
- * bytes. Those are separable, and this is the second one.
+ * bytes. Those are separable. `dropSnapshot` now keeps the record as a
+ * tombstone — see `SnapshotRef.droppedAt` — so a dropped snapshot is still
+ * named, still attributed, and still says how large it was; what it no longer
+ * has is the data, and every read of it refuses out loud rather than answering
+ * with an empty result.
+ *
+ * That fixes the correctness objection and none of the rest. A tombstone can
+ * say a snapshot was 27 million rows and cannot hand any of them back, which is
+ * what this file is for: an archive is what makes a drop *recoverable* rather
+ * than merely *honest*. Neither of them decides when anything should be
+ * dropped — there is still no timer here and none in the catalog.
  *
  * ## Called by a host, never by a commit
  *

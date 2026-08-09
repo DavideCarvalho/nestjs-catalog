@@ -642,10 +642,20 @@ function FilterBar({
             className="w-72"
             options={[
               { value: '', label: 'Current load' },
+              // A dropped load stays in the list — the record of it is kept on
+              // purpose — and says so in both lines rather than only in the
+              // error that picking it produces. `rowCount` is what it held when
+              // its rows went, so it is still worth showing: "1,204,880 rows,
+              // dropped" is the sentence somebody looking at disk needs, and it
+              // is not a claim that they can be read.
               ...snapshots.map((each) => ({
                 value: each.id,
-                label: describeSnapshot(each),
-                hint: `${each.rowCount.toLocaleString()} rows · ${each.principalId}`,
+                label: each.droppedAt
+                  ? `${describeSnapshot(each)} — dropped`
+                  : describeSnapshot(each),
+                hint: each.droppedAt
+                  ? `${each.rowCount.toLocaleString()} rows, dropped · ${each.principalId}`
+                  : `${each.rowCount.toLocaleString()} rows · ${each.principalId}`,
               })),
             ]}
           />

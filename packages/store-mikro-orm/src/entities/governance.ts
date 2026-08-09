@@ -46,6 +46,25 @@ export class SnapshotRow {
 
   @Property({ nullable: true })
   committedAt?: Date;
+
+  /**
+   * When this snapshot's rows were deleted from `obj_<type>`, if they have been.
+   *
+   * Set means this row is a **tombstone**: everything above it still describes a
+   * real load — who wrote it, when, under which labels, and how many rows it
+   * held at the moment it was dropped — and none of those rows exist any more.
+   *
+   * The row is kept rather than deleted with the data because
+   * `catalog_connector_run.snapshotId` names it, and a run log whose snapshot
+   * ids resolve to nothing is a run log that cannot answer the only question it
+   * is asked. Deleting the rows reclaims the disk; deleting this row reclaims a
+   * few hundred bytes and costs the history. See `SnapshotRef.droppedAt`.
+   *
+   * Nullable and absent on every row written before it existed, which is the
+   * correct reading for all of them: their rows are where they were left.
+   */
+  @Property({ nullable: true })
+  droppedAt?: Date;
 }
 
 /**

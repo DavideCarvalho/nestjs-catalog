@@ -175,10 +175,17 @@ const CLOCK_RESOLUTION_MS = 1;
 // - `catalog_connector_run` — the run log. Prune by **count per connector**,
 //   not by age: "the last 200 runs of this connector" stays useful on a
 //   connector that runs monthly, where an age window empties it.
-// - `catalog_snapshot` — **not on a timer at all.** A snapshot row names data
-//   a type may still be serving; `pruneSnapshots(type, keep)` in the ClickHouse
-//   store already argues this, and dropping one by age is how a published type
-//   comes to point at nothing.
+// - `catalog_snapshot` — **not on a timer at all, and still not.** A snapshot
+//   row names data a type may still be serving; `pruneSnapshots(type, keep)` in
+//   the ClickHouse store already argues this, and dropping one by age is how a
+//   published type comes to point at nothing.
+//
+//   What has changed is what a drop costs, not who decides one. `dropSnapshot`
+//   deletes a snapshot's rows and keeps its row here as a tombstone, so the run
+//   log's `snapshot_id` still resolves to a record after the data is gone and
+//   the serving snapshot cannot be dropped at all. That removes the objection
+//   to *ever* deleting rows; it does not supply a policy for when, and pruning
+//   this table itself is still the thing that would break the trail.
 //
 // Whatever runs it should be the host's, not this library's, and it should log
 // what it removed. A deployment that discovers its audit trail is shorter than
