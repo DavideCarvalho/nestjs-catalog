@@ -327,6 +327,70 @@ function skipping(context: { skip: () => void }, reason: string): void {
 }
 
 /**
+ * The store, if a tombstone is a thing it can have, and nothing otherwise.
+ *
+ * Two questions, and both have to be asked. A store that cannot time-travel has
+ * no older snapshot to drop in the first place. A store that implements no
+ * `listSnapshots` keeps no record a drop could leave behind — the interface says
+ * so in as many words, and it is a legitimate shape rather than a gap. It is
+ * also, and this is why the skip is printed rather than silent, exactly what an
+ * adapter looks like just before somebody notices its drops leave holes.
+ */
+function tombstoneSubject(context: { skip: () => void }): CatalogWriteStore | undefined {
+  if (!subject.store.capabilities.timeTravel) {
+    skipping(context, 'declares timeTravel: false, so it has no older snapshot to drop.');
+    return undefined;
+  }
+  if (!subject.store.listSnapshots) {
+    skipping(
+      context,
+      'implements no listSnapshots(), so it keeps no record a drop could leave behind.',
+    );
+    return undefined;
+  }
+  return subject.store;
+}
+
+/**
+ * A type with two committed loads, the older of which has been dropped.
+ *
+ * Two rows in the load that goes and one in the load that stays, so a count of 2
+ * on the tombstone can be confused neither with the size of what is being served
+ * nor with zero — and zero is the answer every one of these cases exists to
+ * refuse.
+ */
+async function droppedFixture(
+  store: CatalogWriteStore,
+  caseName: string,
+): Promise<CatalogObjectTypeDef> {
+  const def = await ready(caseName);
+  await store.write(def, [contractRow('a', 'alpha', 1), contractRow('b', 'bravo', 2)], {
+    snapshotId: 'load-a',
+    principalId: 'contract',
+    batch: 0,
+  });
+  await store.commit(def, 'load-a');
+  await store.write(def, [contractRow('c', 'charlie', 3)], {
+    snapshotId: 'load-b',
+    principalId: 'contract',
+    batch: 0,
+  });
+  await store.commit(def, 'load-b');
+
+  const list = store.listSnapshots;
+  if (list) {
+    // Asserted before the drop, so a store that reports `droppedAt` on
+    // everything — which would pass every assertion below — is caught here
+    // rather than mistaken for one that got this right.
+    const before = await list.call(store, def);
+    expect(before.find((ref) => ref.id === 'load-a')?.droppedAt).toBeUndefined();
+  }
+
+  await store.dropSnapshot(def, 'load-a');
+  return def;
+}
+
+/**
  * Both provenance columns arrived, without saying which instant `_loaded_at`
  * holds.
  *
@@ -912,6 +976,122 @@ export function describeCatalogStoreContract(boot: () => ContractStore): void {
       // being served.
       await subject.store.dropSnapshot(def, 'older');
       expect(idsOf(await readAll(subject.store, def))).toEqual(['a', 'b']);
+    });
+
+    it('keeps a dropped snapshot in its list, with the size it held and the date', async (context) => {
+      const store = tombstoneSubject(context);
+      if (!store) return;
+      const list = store.listSnapshots;
+      if (!list) return;
+      const def = await droppedFixture(store, 'ContractTombstoneRecord');
+
+      // The whole of the change: the record is still there, still attributable,
+      // and still says how large the load was. A store that deleted it would
+      // leave every connector run naming `load-a` pointing at nothing.
+      const tombstone = (await list.call(store, def)).find((ref) => ref.id === 'load-a');
+      expect(tombstone).toBeDefined();
+      expect(tombstone?.droppedAt).toBeDefined();
+      expect(tombstone?.principalId).toBe('contract');
+      // The count it held, taken before the rows went. Never a fresh one: a
+      // fresh count of a tombstone is zero, which reports a load that held
+      // millions of rows as one that held none.
+      expect(tombstone?.rowCount).toBe(2);
+
+      // And none of it disturbed what is being served.
+      expect(idsOf(await readAll(store, def))).toEqual(['c']);
+
+      // Idempotent. A durable step that replays must not rewrite the date to
+      // the moment of its retry — the drop happened once, and when it happened
+      // is the fact a run history is being kept for.
+      await store.dropSnapshot(def, 'load-a');
+      const replayed = (await list.call(store, def)).find((ref) => ref.id === 'load-a');
+      expect(replayed?.droppedAt).toBe(tombstone?.droppedAt);
+      expect(replayed?.rowCount).toBe(2);
+    });
+
+    it('refuses to read a dropped snapshot, and refuses to commit one', async (context) => {
+      const store = tombstoneSubject(context);
+      if (!store) return;
+      const list = store.listSnapshots;
+      if (!list) return;
+      const def = await droppedFixture(store, 'ContractTombstoneRefusal');
+      const tombstone = (await list.call(store, def)).find((ref) => ref.id === 'load-a');
+
+      // Refused with a sentence, not answered with an empty page. An empty page
+      // here is indistinguishable from a filter that matched nothing and from a
+      // load that collapsed, which is the confusion this whole field exists to
+      // prevent — so the message has to carry enough to act on: which snapshot,
+      // of which type, how large it was, and when somebody dropped it.
+      const refusal = await readAll(store, def, 'load-a').then(
+        () => undefined,
+        (error: unknown) => (error instanceof Error ? error.message : String(error)),
+      );
+      expect(refusal).toBeDefined();
+      expect(refusal).toContain('load-a');
+      expect(refusal).toContain(def.name);
+      expect(refusal).toContain('2 row');
+      expect(refusal).toContain(String(tombstone?.droppedAt));
+
+      // The refusal that matters most. `commit` is how a rollback names an
+      // older snapshot, and committing a tombstone points a published type at a
+      // load holding nothing — silently, because a store recounting the rows
+      // finds zero and an empty load is a thing that legitimately happens.
+      await expect(store.commit(def, 'load-a')).rejects.toThrow(/dropped on/i);
+      expect(idsOf(await readAll(store, def))).toEqual(['c']);
+    });
+
+    it('does not merge an incremental load onto a snapshot whose rows were dropped', async (context) => {
+      if (!supportsCarryForward(subject.store)) {
+        skipping(context, 'is not a CatalogMergeStore, so there is no merge to point anywhere.');
+        return;
+      }
+      if (!subject.store.capabilities.timeTravel) {
+        skipping(context, 'declares timeTravel: false, so there is no older snapshot to roll to.');
+        return;
+      }
+      const store = subject.store;
+      const def = await ready('ContractMergeOntoTombstone');
+
+      // The ordinary cleanup after a bad load: roll back to the good snapshot,
+      // then drop the bad one. Reachable only because the record now survives
+      // the drop — which is what makes "the newest committed snapshot" and "a
+      // snapshot that still has rows" two different things for the first time.
+      await store.write(def, [contractRow('a', 'alpha', 1), contractRow('b', 'bravo', 2)], {
+        snapshotId: 'load-a',
+        principalId: 'contract',
+        batch: 0,
+      });
+      await store.commit(def, 'load-a');
+      await store.write(def, [contractRow('a', 'wrong', 99)], {
+        snapshotId: 'load-b',
+        principalId: 'contract',
+        batch: 0,
+      });
+      await store.commit(def, 'load-b');
+      await store.commit(def, 'load-a');
+      await store.dropSnapshot(def, 'load-b');
+
+      // The ids are chosen so that a store ordering by `(createdAt, snapshotId)`
+      // descending would pick the tombstone on a tie: `load-b` sorts above
+      // `load-a`. A case whose two snapshots landed in the same millisecond
+      // would otherwise pass for the wrong reason.
+      await store.write(def, [contractRow('c', 'charlie', 3)], {
+        snapshotId: 'load-c',
+        principalId: 'contract',
+        batch: 0,
+      });
+      const merged = await store.carryForward(def, 'load-c', { principalId: 'contract' });
+
+      // Merged onto the newest committed snapshot that still holds rows, which
+      // is also the one being served. Merging onto the tombstone would have
+      // copied nothing and committed a full replacement wearing an incremental
+      // load's name — a dataset silently reduced to whatever this run fetched.
+      expect(merged.from).toBe('load-a');
+      expect(merged.carried).toBe(2);
+      expect(merged.total).toBe(3);
+
+      await store.commit(def, 'load-c');
+      expect(idsOf(await readAll(store, def))).toEqual(['a', 'b', 'c']);
     });
 
     it('names the snapshot it is actually serving, including after a rollback', async (context) => {
