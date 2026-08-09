@@ -141,8 +141,32 @@ function warehouse(
     throw new Error(`This spec answers no such statement: ${sql}`);
   };
 
+  // `commit` and `dropSnapshot` now decide and write inside one transaction,
+  // taking a row lock so that a drop and a rollback-commit of the same snapshot
+  // cannot interleave into a served snapshot with no rows. This fake models the
+  // transaction as what the real one is here — a boundary the flush happens on —
+  // because these cases are about which statements an empty load emits, and the
+  // lock's own behaviour is held against a real engine in
+  // `snapshot-archive-record.db.spec.ts`.
+  let inTransaction = false;
+
   const fake = {
     fork: () => fake,
+    begin: () => {
+      inTransaction = true;
+      return Promise.resolve();
+    },
+    commit: () => {
+      inTransaction = false;
+      return fake.flush();
+    },
+    rollback: () => {
+      inTransaction = false;
+      pending = [];
+      return Promise.resolve();
+    },
+    isInTransaction: () => inTransaction,
+    getTransactionContext: () => undefined,
     getConnection: () => ({ execute }),
     getPlatform: () => ({ quoteValue: (value: string) => `'${value}'` }),
     findOne: (entity: unknown, where: Record<string, string>) => {

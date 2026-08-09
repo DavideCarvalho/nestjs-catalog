@@ -100,7 +100,7 @@ interface ArchiveWriter {
  * back to check it. See {@link parquetTypeFor} for why the JSON logical type is
  * not used.
  */
-interface ArchiveColumn {
+export interface ArchiveColumn {
   name: string;
   type: string;
   nullable: boolean;
@@ -567,7 +567,7 @@ export async function archiveSnapshot(input: {
 }
 
 /** What one pass over the rows produced. */
-interface ArchiveTally {
+export interface ArchiveTally {
   rowCount: number;
   bytes: number;
   checksum: string;
@@ -741,20 +741,8 @@ async function verifyArchivePart(input: {
   columns: ArchiveColumn[];
   expected: ArchiveTally;
 }): Promise<string> {
-  const file = await input.store.read(input.path);
-  const hash = createHash('sha256');
-  let rowCount = 0;
-  for await (const record of parquetRecordsFrom(file, input.path)) {
-    if (record === null || typeof record !== 'object') {
-      throw new Error(
-        `Reading ${input.path} back produced a ${typeof record} where a row was expected. The archive is not recorded.`,
-      );
-    }
-    hash.update(canonicalRow(intoRecord(record), input.columns));
-    rowCount += 1;
-  }
+  const { rowCount, checksum } = await readArchivePart(input.store, input.path, input.columns);
 
-  const checksum = hash.digest('hex');
   if (rowCount !== input.expected.rowCount) {
     throw new Error(
       `${input.path} was written with ${input.expected.rowCount} rows and reads back as ${rowCount}. The archive is not recorded and nothing has been deleted.`,
@@ -766,6 +754,167 @@ async function verifyArchivePart(input: {
     );
   }
   return new Date().toISOString();
+}
+
+/**
+ * Read an archive's rows back and say how many there were and what they hash to.
+ *
+ * Exported because it is the *only* honest way to ask "is this archive still the
+ * thing it says it is", and something other than a write has to be able to ask
+ * it. {@link archiveSnapshot} asks it once, of bytes it wrote seconds ago;
+ * eviction asks it again, of bytes that may be a year old and were written by a
+ * version of a library that has since been found to lose a column. A flag saved
+ * by the first would sail past the second, which is the failure the third check
+ * in `archiveSnapshot` was added for in the first place.
+ *
+ * It goes through {@link parquetRecordsFrom} — the same reader every real read
+ * of the file would use, including its refusal of column types it cannot decode
+ * — and hashes through {@link canonicalRow} with the *same* column order the
+ * writer used. Both of those have to be shared rather than reimplemented: a
+ * second reader would answer a question nobody asks, and a second canonical form
+ * would make every archive with a `json` column look corrupt.
+ *
+ * `bytes` is what came back from the store, so a caller can compare it against
+ * the size the manifest recorded.
+ */
+export async function readArchivePart(
+  store: ArchiveStore,
+  path: string,
+  columns: ArchiveColumn[],
+): Promise<ArchiveTally> {
+  const file = await store.read(path);
+  const hash = createHash('sha256');
+  let rowCount = 0;
+  for await (const record of parquetRecordsFrom(file, path)) {
+    if (record === null || typeof record !== 'object') {
+      throw new Error(
+        `Reading ${path} back produced a ${typeof record} where a row was expected. The archive is not recorded.`,
+      );
+    }
+    hash.update(canonicalRow(intoRecord(record), columns));
+    rowCount += 1;
+  }
+  return { rowCount, bytes: file.byteLength, checksum: hash.digest('hex') };
+}
+
+/**
+ * The manifest beside an archive's data, parsed and checked to be one.
+ *
+ * Read through {@link ArchiveStore.read} rather than a `get`, because a
+ * random-access handle can serve a whole small object and adding a second
+ * read method to the interface would mean every implementation grows one for
+ * the sake of a file that is a few hundred bytes.
+ *
+ * `version` is the only field asserted here. It is the one that says whether the
+ * rest of the shape can be trusted at all, and a manifest from a future writer
+ * has to be refused by a reader that cannot know what changed rather than
+ * silently read with today's assumptions.
+ */
+export async function readArchiveManifest(
+  store: ArchiveStore,
+  path: string,
+): Promise<SnapshotArchiveManifest> {
+  const manifestPath = `${path}/${ARCHIVE_MANIFEST_NAME}`;
+  const file = await store.read(manifestPath);
+  const bytes = await file.slice(0, file.byteLength);
+  const parsed: unknown = JSON.parse(new TextDecoder().decode(bytes));
+  if (parsed === null || typeof parsed !== 'object') {
+    throw new Error(`${manifestPath} is not a JSON object, so this is not an archive we can read.`);
+  }
+  const version = Reflect.get(parsed, 'version');
+  if (version !== 1) {
+    throw new Error(
+      `${manifestPath} declares manifest version ${JSON.stringify(version)}, and this reader only knows version 1. Refusing to read it with assumptions that may no longer hold.`,
+    );
+  }
+  return manifestOf(parsed, manifestPath);
+}
+
+/**
+ * A parsed manifest narrowed to its declared shape, field by field.
+ *
+ * Written out rather than asserted, and the length is the point: this value
+ * arrives as bytes from object storage, and it is about to be the evidence on
+ * which rows are deleted. Every field a caller reads is checked to be the type
+ * it is read as, so a manifest truncated, hand-edited or written by something
+ * else fails here with the field named rather than three steps later as a
+ * comparison against `undefined` that quietly succeeds.
+ */
+function manifestOf(value: object, path: string): SnapshotArchiveManifest {
+  const text = (key: string): string => {
+    const held = Reflect.get(value, key);
+    if (typeof held !== 'string' || held.length === 0) {
+      throw new Error(`${path} has no usable "${key}", so the archive cannot be identified.`);
+    }
+    return held;
+  };
+  const count = (key: string): number => {
+    const held = Reflect.get(value, key);
+    if (typeof held !== 'number' || !Number.isFinite(held)) {
+      throw new Error(
+        `${path} has no usable "${key}", so the archive cannot be checked against it.`,
+      );
+    }
+    return held;
+  };
+  const format = Reflect.get(value, 'format');
+  if (format !== 'parquet') {
+    throw new Error(
+      `${path} says its format is ${JSON.stringify(format)}, and parquet is the only one this can read.`,
+    );
+  }
+  const columns = Reflect.get(value, 'columns');
+  if (!Array.isArray(columns)) {
+    throw new Error(
+      `${path} carries no column list, so there is no way to tell whether the archive covers the type it names.`,
+    );
+  }
+  return {
+    version: 1,
+    objectType: text('objectType'),
+    snapshotId: text('snapshotId'),
+    format: 'parquet',
+    rowCount: count('rowCount'),
+    bytes: count('bytes'),
+    checksum: text('checksum'),
+    writtenAt: text('writtenAt'),
+    columns: columns.map((column: unknown, index: number) => {
+      if (column === null || typeof column !== 'object') {
+        throw new Error(`${path} has a column at ${index} that is not an object.`);
+      }
+      const name = Reflect.get(column, 'name');
+      const type = Reflect.get(column, 'type');
+      const parquetType = Reflect.get(column, 'parquetType');
+      if (typeof name !== 'string' || typeof type !== 'string' || typeof parquetType !== 'string') {
+        throw new Error(
+          `${path} has a column at ${index} that does not name itself and its types.`,
+        );
+      }
+      return { name, type: scalarOf(type, name, path), parquetType };
+    }),
+    writer: text('writer'),
+  };
+}
+
+/** The catalog scalars, as a list something read off disk can be checked against. */
+const ARCHIVE_SCALARS: readonly ScalarType[] = [
+  'string',
+  'number',
+  'boolean',
+  'date',
+  'json',
+  'uuid',
+  'unknown',
+];
+
+function scalarOf(value: string, column: string, path: string): ScalarType {
+  const found = ARCHIVE_SCALARS.find((scalar) => scalar === value);
+  if (found === undefined) {
+    throw new Error(
+      `${path} calls column "${column}" a ${JSON.stringify(value)}, which is not one of the catalog's scalar types (${ARCHIVE_SCALARS.join(', ')}).`,
+    );
+  }
+  return found;
 }
 
 /** A read-back row as a record, without asserting it is one. */

@@ -1,3 +1,4 @@
+import type { SnapshotArchiveRef } from '@dudousxd/nestjs-catalog';
 import { Entity, Index, PrimaryKey, Property } from '@mikro-orm/decorators/legacy';
 
 /**
@@ -65,6 +66,30 @@ export class SnapshotRow {
    */
   @Property({ nullable: true })
   droppedAt?: Date;
+
+  /**
+   * Where this snapshot's rows were copied to, if anywhere.
+   *
+   * Independent of {@link droppedAt} rather than a sub-field of it, because the
+   * two facts really are independent: an archive can exist while the rows are
+   * still here (a copy taken ahead of time), and rows can be gone with no
+   * archive at all (a plain `dropSnapshot`). Storing it inside the tombstone
+   * would make the first state unrepresentable, and the first state is the one
+   * an eviction passes through on its way to the second — it records the
+   * archive, and only then deletes.
+   *
+   * JSON rather than a column per field, and that is the one place this table
+   * takes a shortcut on purpose. Nothing queries by checksum or by path; the ref
+   * is read whole, by a screen or by a refusal message, and seven columns would
+   * be seven migrations for a value that is written once per snapshot and never
+   * filtered on. The shape is `SnapshotArchiveRef`, which the catalog package
+   * owns.
+   *
+   * Nullable, and absent on every row written before it existed — the correct
+   * reading for all of them, since nothing was archiving anything.
+   */
+  @Property({ type: 'json', nullable: true })
+  archive?: SnapshotArchiveRef;
 }
 
 /**

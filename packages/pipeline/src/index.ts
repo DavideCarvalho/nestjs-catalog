@@ -110,10 +110,24 @@ export {
   isTextEncodedScalar,
   localArchiveStore,
   parquetTypeFor,
+  readArchiveManifest,
+  readArchivePart,
+  type ArchiveColumn,
   type ArchiveSink,
   type ArchiveStore,
+  type ArchiveTally,
   type SnapshotArchiveManifest,
 } from './snapshot-archive';
+export {
+  evictSnapshot,
+  evictSnapshots,
+  selectSnapshotsToEvict,
+  verifyArchiveForEviction,
+  type EvictSnapshotInput,
+  type EvictedSnapshot,
+  type EvictionSweep,
+  type SnapshotRetention,
+} from './snapshot-eviction';
 export {
   SOURCES,
   applyConnection,
