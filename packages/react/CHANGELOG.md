@@ -1,5 +1,163 @@
 # @dudousxd/nestjs-catalog-react
 
+## 0.34.0
+
+### Minor Changes
+
+- f0a6ce4: A `catalog` source can read a named snapshot, not only the current one
+
+  The `catalog` source kind exists because reading `obj_<type>` as a physical table
+  reads every retained snapshot at once — measured at 89,440 rows where 44,720 were
+  current, run status `succeeded`, the row count unchanged because a downstream
+  `GROUP BY` collapsed the duplicates, and every `SUM` doubled. Naming a _type_
+  respects the pointer; naming a table does not.
+
+  Which left one question unanswered: keeping history is only worth something if an
+  older version can be read. A snapshot could be kept, listed, archived and — since
+  the last release — dropped without losing its record, and there was still no way
+  for a graph to read one. So a source node can now carry `objectSnapshot`, and it
+  reads that load instead of whatever is being served.
+
+  Everything else about the read is unchanged, and deliberately so. The current-
+  snapshot path resolves an id and then streams _that_ id, so a commit landing
+  mid-read cannot splice two loads together; a named snapshot is already pinned by
+  construction, and the run reads exactly one `_snapshot_id` either way. There is no
+  second mechanism — only a different answer to "who chose the id".
+
+  **It is an id, and only an id.** Not `latest`, not `previous`, not `-1`, not `*`.
+  A relative reference is the thing somebody actually wants when diffing two
+  versions, and it is the one property a stored graph must not have: it resolves
+  against whatever has been committed by the time the node runs, so the same graph
+  reads different data on different days while `workflowGraphHash` reports no
+  change. It is also unstable _per node_ — a diff graph with one source on the
+  current load and one on "previous" resolves them at two different instants, so a
+  commit landing between the two probes leaves both on the same snapshot and the
+  diff comes out empty and green. And a name that could mean several loads at once
+  is exactly the failure the kind was built to end. The friction a relative
+  reference would have saved — having to look an id up — is answered by the
+  inspector instead, which lists the type's loads by date and stores the id behind
+  the one that gets picked.
+
+  **Three ways a named snapshot can be wrong, and three different sentences.**
+  Every one of them would otherwise be zero rows and a successful run, which is
+  indistinguishable from a load that collapsed:
+
+  - **No such snapshot anywhere.** Existence cannot be read off a count, because a
+    snapshot that legitimately committed nothing is a real state; the store is
+    asked instead, through a new optional `locateSnapshot`.
+  - **It belongs to another type.** The mistake people actually make, since ids are
+    copied out of one history and pasted under another. The refusal names the type
+    that has it, because "not found" sends somebody hunting for a snapshot that is
+    sitting one type along. This is why the lookup is not scoped to a type — and
+    why it returns a list: a durable run that loads two types gives both snapshots
+    its run id.
+  - **Its rows were dropped.** The tombstone from the last release is what makes
+    this reachable at all, and it refuses with the date. When the record carries an
+    archive it says where the copy went, because _reading an archived snapshot back
+    is not offered yet_ and "the rows are gone" would send somebody to re-run a load
+    whose data is sitting in a bucket.
+
+  Two more refusals follow from the id no longer coming from the pointer. A store
+  that reports `timeTravel: false` documents `snapshot` as _ignored_, so naming one
+  there would read the current load and report the id that was asked for — refused
+  instead. And a store that can neither locate nor list snapshots cannot vouch for
+  the id at all, so nothing is read.
+
+  **`producedColumns` goes quiet for a named snapshot, and that is the subtle
+  part.** A `catalog` source is the one kind whose column set the graph knows — the
+  named type's published properties — which is what lets a filter at the root of a
+  graph be refused for naming a column that cannot be there. That claim is about
+  the type _as declared now_, and an older snapshot was written under whatever was
+  declared _then_. Rename a property and the published list is wrong in both
+  directions: a filter on the current name is allowed and matches nothing (null for
+  every row of that load), and a filter on the name the load actually carries is
+  refused although the graph is right. So a pinned source answers `undefined` — the
+  same silence four other source kinds already give — rather than a set that is
+  confidently the wrong shape.
+
+  The field is `objectSnapshot` rather than `snapshotId` on purpose. A run body
+  already carries a `snapshotId` and it is the **durable run id**: reusing one that
+  succeeded replays that run and returns its old counts as a fresh success. The two
+  are frequently the same string, since a snapshot's id is caller-supplied and a
+  durable pipeline passes its run id — so one spelling for both would mean "run this
+  again" in one field and "read that load" in another with nothing to tell them
+  apart. `objectSnapshot` pairs with `objectType` instead.
+
+  No stored graph is renumbered. The snapshot lives in the source's `config`, which
+  the canonical form already sorts and hashes, so a config with no such key hashes
+  to exactly the string it always did — pinned by a test against a value recorded
+  off the previous build. The console omits the key rather than storing `""` for a
+  blank field, which is the one way this could have gone wrong.
+
+  No eviction, no reading a snapshot back out of parquet, and no retention policy.
+  An evicted snapshot is refused with a sentence saying where it went.
+
+### Patch Changes
+
+- 956f61a: Dropping a snapshot now keeps its record and only deletes its rows
+
+  A snapshot is a whole version of an object type's data: a load writes rows into
+  `obj_<type>` under a new `_snapshot_id` beside the live ones, and `commit` moves
+  the pointer. Nothing removed the old ones, which is how one deployment's catalog
+  reached 441 retained snapshots of a single type and 100 GB, and the database then
+  refused connections.
+
+  The obvious repair is a retention cap, and there wasn't one for a reason that was
+  written down in this repository: `catalog_connector_run.snapshotId` names the
+  snapshot each run produced, so deleting old snapshots turns the run history into
+  a list of pointers to nothing — and the store already treats an unresolvable
+  pointer as a defect.
+
+  **That objection is about the record. The disk is held by the rows, and the two
+  deletions were separable.** `dropSnapshot` deleted both; it now deletes the rows
+  and keeps the `catalog_snapshot` row, marked with the new
+  `SnapshotRef.droppedAt`. A dropped snapshot is still named, still attributed to
+  whoever loaded it, and still says how many rows it held — the count is taken
+  immediately before the delete, which is the last moment it exists — so every run
+  that produced it stays answerable. What it no longer has is the data.
+
+  `droppedAt` is orthogonal to the `archive` field added in 0.31.0 rather than a
+  second vocabulary for the same thing: `archive` says a copy exists somewhere,
+  `droppedAt` says the rows are no longer here, and the four combinations are the
+  four states a console has to tell apart — hot, copied, tombstoned, evicted.
+
+  **Every reader that could have presented a tombstone as data now refuses out
+  loud**, because the failure mode is an empty result and an empty result here is
+  indistinguishable from a load that collapsed:
+
+  - `read` refuses a `snapshot` whose rows were dropped, with the date. Only on the
+    history path — the served snapshot cannot be a tombstone, so an ordinary read
+    is the same two statements it was.
+  - `streamSnapshot` refuses always: it never resolves the pointer, so any snapshot
+    it is given may be one. A workflow reading a tombstone would otherwise iterate
+    zero rows and commit an empty load downstream.
+  - `commit` refuses a tombstone. This is the one that mattered: it recounts, would
+    have found zero, and its empty-snapshot branch only logs — so a rollback onto a
+    dropped snapshot would have pointed a published type at nothing.
+  - `dropSnapshot` still refuses the snapshot being served, which is what keeps the
+    hot read free of the question.
+  - `carryForward` no longer merges onto a tombstone. The row survives a drop now,
+    so the newest committed snapshot can be one whose rows are gone; carrying
+    forward from it would copy nothing and commit a full replacement wearing an
+    incremental load's name.
+  - `currentSnapshot`'s "points at a snapshot with no row" warning is no longer
+    what a deliberate drop looks like, and a served snapshot found tombstoned says
+    something different and specific.
+  - The object explorer's load picker labels a dropped load as dropped, with the
+    size it held, rather than offering it as an ordinary choice.
+
+  `listSnapshots`' window moves from 50 to `CATALOG_SNAPSHOT_LIST_LIMIT` (500). It
+  was a page size doing a bound's job — it is the only list of snapshots anything
+  has, so a console reading it was blind to 391 of those 441 — and tombstones make
+  it matter more, because a dropped snapshot used to leave the list and now stays
+  in it.
+
+  **No retention policy, and this does not imply one.** Nothing here runs on a
+  timer and nothing chooses a snapshot to drop. What changed is that dropping is
+  now safe to build a policy on; deciding when is a separate decision. The
+  ClickHouse store still removes its snapshot record along with the rows, so its
+  `pruneSnapshots` has the old behaviour and reports no `droppedAt`.
+
 ## 0.33.0
 
 ### Minor Changes
