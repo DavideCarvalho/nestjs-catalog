@@ -1,5 +1,6 @@
 import {
   CATALOG_FILTER_OPERATORS,
+  CATALOG_PROVENANCE_COLUMNS,
   assertNoColumnCollisions,
   emitCatalog,
 } from '@dudousxd/nestjs-catalog';
@@ -1288,11 +1289,17 @@ export class MikroOrmWarehouseStore
     await this.assertNotDropped(this.em.fork(), type.name, snapshotId);
 
     const table = tableFor(type.name);
+    // Named from the core package's list rather than from this adapter's own
+    // `PRINCIPAL_COLUMN` and `LOADED_AT_COLUMN`, for the reason `RESERVED_COLUMNS`
+    // is: the archiver checks its rows against that same list, so a copy here
+    // that drifted would produce a stream the archiver refuses — or worse, one it
+    // accepts under names nothing else uses.
+    //
     // Unaliased, unlike the properties. `outputAlias` exists to let a property
     // named `Asset Id` out under its own spelling; a reserved name is already an
     // identifier by the rule that reserves it, so aliasing it would only give the
     // driver a second name for the same column to disagree about.
-    const provenanceColumns = provenance ? [PRINCIPAL_COLUMN, LOADED_AT_COLUMN] : [];
+    const provenanceColumns = provenance ? CATALOG_PROVENANCE_COLUMNS : [];
     const statement = `SELECT ${[
       ...selected.map(
         (p) => `${this.ident(physicalColumn(p.name))} AS ${this.ident(outputAlias(p.name))}`,

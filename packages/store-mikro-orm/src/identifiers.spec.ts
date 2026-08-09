@@ -8,6 +8,7 @@
  * core's rather than merely to look like it.
  */
 import {
+  CATALOG_PROVENANCE_COLUMNS,
   CATALOG_RESERVED_COLUMNS,
   UnsafeIdentifierError as CatalogUnsafeIdentifierError,
   isSafeIdentifier,
@@ -86,5 +87,25 @@ describe('RESERVED_COLUMNS', () => {
     expect([...RESERVED_COLUMNS].sort()).toEqual(
       [SNAPSHOT_COLUMN, PRINCIPAL_COLUMN, LOADED_AT_COLUMN, BATCH_COLUMN, ROW_COLUMN].sort(),
     );
+  });
+
+  /**
+   * And the provenance subset, for the same reason one column deeper.
+   *
+   * `streamSnapshot` builds its SELECT from the core package's
+   * `CATALOG_PROVENANCE_COLUMNS`, and the snapshot archiver checks every row it
+   * is handed against the same list. That is what makes the two provably talk
+   * about the same columns — but it is only worth anything while those names are
+   * the ones this adapter's DDL actually creates. Drift here and the store emits
+   * `SELECT "_principal_id"` against a table that has no such column, which is a
+   * refusal at least; drift the other way and the archiver quietly accepts rows
+   * keyed by a name nothing else uses.
+   */
+  it('names the two provenance columns this adapter writes', () => {
+    expect([...CATALOG_PROVENANCE_COLUMNS].sort()).toEqual(
+      [PRINCIPAL_COLUMN, LOADED_AT_COLUMN].sort(),
+    );
+    // A subset of the reserved list rather than a second vocabulary beside it.
+    for (const column of CATALOG_PROVENANCE_COLUMNS) expect(RESERVED_COLUMNS).toContain(column);
   });
 });
