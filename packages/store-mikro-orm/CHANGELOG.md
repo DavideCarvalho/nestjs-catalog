@@ -1,5 +1,119 @@
 # @dudousxd/nestjs-catalog-store-mikro-orm
 
+## 0.21.0
+
+### Minor Changes
+
+- 500ee84: An archived snapshot carries the two reserved columns a merge reads, and not `_batch`
+
+  `streamSnapshot` takes an optional fourth argument, `{ provenance: true }`, which
+  adds `_principal_id` and `_loaded_at` to every row it hands over. The snapshot
+  archiver writes both into the parquet file and lists them in the manifest, and
+  refuses a stream that does not carry them.
+
+  **Which reserved columns a copy of a snapshot has to hold, asked of all five.**
+  `carryForward` copies `_principal_id` and `_loaded_at` off the snapshot it merges
+  against, untouched and deliberately — a carried row is not a new load of that
+  row, so restamping them would erase the one thing they are good for. A snapshot
+  produced by an incremental run therefore holds two answers to "who loaded this
+  and when", and nothing else records the difference: `catalog_snapshot` names only
+  the run that committed it. An archive without them makes a restored snapshot
+  answer "whoever ran the restore" for every row, and the next incremental load
+  carries that forward, and the one after it.
+
+  **`_batch` is not archived, and the previous note calling it "a prerequisite for
+  anything that deletes" is withdrawn.** No merge reads it: the batch-replace
+  predicate and the merge's self-feed guard both scope to the snapshot being built,
+  and `carryForward` joins the previous snapshot on its primary key without looking
+  at its `_batch` at all. The `-1` marker records that a merge happened; it is never
+  an input to the next one. It could not be restored in any case — `write` refuses a
+  negative batch by name, and that is the only seam a restore has.
+
+  A committed snapshot's `_batch` _is_ read, twice, both in the ClickHouse adapter:
+  as a page's default `(_batch, _row)` order, and as the partition list
+  `dropSnapshot` unlinks. Neither is a reason to copy it — the ordering is a natural
+  order the interface does not promise, and the partition enumeration assumes nothing
+  about which values are present. `_snapshot_id` stays in the manifest, being one
+  value per archive, and `_row` stays implicit in the file's order.
+
+  The two columns cost **0.028 bytes per row**, +0.02%, measured over 200,000 rows
+  of a 24-column type. `_batch` would have cost 0.029 B/row, so size decided
+  nothing either way.
+
+  The addition is under the archiver's existing verification — the checksum hashes
+  every archive column — plus one check the other three could not make: a stream
+  with no provenance on it is refused on the way in, because an absent key encodes
+  as a null, and a null verifies against a null.
+
+  The shared store contract gains two cases for `streamSnapshot`, skipped out loud
+  by an adapter that does not implement it.
+
+- 5b213d6: A snapshot whose archive still verifies can have its rows evicted
+
+  The third and irreversible piece. A tombstone keeps the record after the rows
+  go; an archive writes a verified copy out; this deletes the rows, and it is the
+  only one of the three that can lose anything permanently. So the ordering is the
+  whole safety property — **write, verify, then delete, never the other way** —
+  and every failure below is a refusal rather than a warning.
+
+  **`evictSnapshot` re-establishes verification at eviction time.** It does not
+  read `verifiedAt` off the ref. A flag is a memory of a measurement, and the
+  measurement it remembers may have been taken by a writer that was losing a
+  column: that is not hypothetical, it is what `hyparquet-writer` 0.16.5 did to a
+  nullable JSON column and the reason the read-back check exists at all. So the
+  bytes are re-read through this package's own parquet reader and both numbers are
+  re-derived, immediately before the delete.
+
+  Three of the six checks are ones `archiveSnapshot` structurally cannot make,
+  because it compares its output against its own input:
+
+  - **The archive covers every property the type has.** An archiver handed a
+    narrowed field list writes a short file that passes every check it makes.
+  - **The archive carries `_principal_id` and `_loaded_at`.** A snapshot streamed
+    without `{ provenance: true }` yields rows with no such key, the absent key
+    encodes as a null, the null reads back as a null — count right, checksum
+    right, and none of the two values a later merge copies forward. The archiver
+    refuses that on the way in now; archives written before it did are already in
+    the bucket carrying a `verifiedAt` earned against a check that could not see
+    it, and those are exactly the archives nothing may be deleted on.
+  - **The archive is of this snapshot**, by object type and snapshot id from the
+    manifest.
+
+  **Retention is a count, `keep`, and it is required.** Size makes retention depend
+  on type width, so the widest type — the one whose rollback you most want — keeps
+  fewest. Age makes it depend on load cadence, so 30 days gives an hourly type 720
+  snapshots and a monthly type one. A count is the only policy where "how far back
+  can I go" has an answer that does not move. `keep` means _this many snapshots
+  still have their rows_ in every state: the served snapshot is one of them
+  wherever it sits in the list, and tombstones do not consume a slot.
+
+  Host-called, never a commit hook, following `pruneSnapshots`' precedent. A sweep
+  collects failures rather than stopping at the first, so one unarchived snapshot
+  cannot wedge a type behind its oldest load.
+
+  **`CatalogSnapshotArchiveStore.recordSnapshotArchive`** puts the ref on the
+  snapshot, and eviction refuses a store that lacks it. Not an optional argument to
+  `dropSnapshot`, because an adapter that cannot record has to be able to refuse
+  and an ignored argument cannot: it would leave a tombstone reporting _no copy of
+  it was recorded anywhere_, which is the sentence somebody hunting for their data
+  reads. The mikro-orm store gains a nullable JSON `catalog_snapshot.archive`,
+  reported on every `SnapshotRef`, which makes the `catalog` source's
+  archive-naming refusal reachable for the first time.
+
+  **`dropSnapshot` and `commit` now take the same two row locks in the same
+  order** — the snapshot record, then the type row. The served-snapshot check and
+  the delete used to be unlocked statements with a gap between them, and rolling a
+  bad load back means committing an _older_ snapshot, which is exactly what a
+  retention sweep picks: a commit landing in that gap left a type serving rows
+  being deleted underneath it. Narrow while dropping was done by hand; a schedule
+  is what turns narrow into eventually.
+
+  **Restoring an archive is still not possible and this does not imply it is.**
+  `write` stamps `_principal_id` and `_loaded_at` itself, one value per call, so
+  there is no seam for per-row provenance to go back through. The bytes are
+  preserved and proved whole; putting them back needs a write path that does not
+  exist yet.
+
 ## 0.20.0
 
 ### Minor Changes
