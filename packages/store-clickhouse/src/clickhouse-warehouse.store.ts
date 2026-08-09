@@ -39,10 +39,11 @@ import { CATALOG_CLICKHOUSE_OPTIONS, type CatalogClickHouseStoreOptions } from '
 import { refreshView, relationsFor, runReadOnlyQuery } from './query';
 import {
   type SnapshotRecord,
-  deleteSnapshot,
+  droppedMessage,
   findPreviousCommitted,
   findSnapshot,
   listSnapshots,
+  listSnapshotsWithRows,
   putSnapshot,
   readCurrent,
   toRef,
@@ -112,6 +113,19 @@ const CARRIED_FROM_LABEL = '_carriedFrom';
 const CARRIED_FROM_NOTHING = 'none';
 /** Set when a batch landed after the carry-forward. `commit` refuses on it. */
 const CARRY_FORWARD_STALE_LABEL = '_carryForwardStale';
+
+/**
+ * How many live snapshots {@link ClickHouseWarehouseStore.pruneSnapshots} will
+ * look at in one pass.
+ *
+ * Larger than the list limit because this is not a list anyone reads — it is
+ * the working set of a policy, and a pass that saw fewer records than the cap
+ * allows would leave snapshots above `keep` un-pruned until a later pass
+ * happened to catch them. Tombstones are excluded before the limit applies, so
+ * this bounds live snapshots only and a type cannot accumulate its way out of
+ * being pruned.
+ */
+const PRUNE_SCAN_LIMIT = 1000;
 
 /** What the physical layout must be for anything below to mean what it says. */
 const REQUIRED_ENGINE = 'MergeTree';
@@ -528,6 +542,8 @@ export class ClickHouseWarehouseStore
     if (!this.ensured.has(table)) await this.ensureType(type);
 
     const own = await findSnapshot(this.client, type.name, snapshotId);
+    // Tombstones are excluded in there, and that clause is what keeps a drop
+    // from becoming a silent truncation one load later — see the function.
     const previous = await findPreviousCommitted(
       this.client,
       type.name,
@@ -713,6 +729,18 @@ export class ClickHouseWarehouseStore
       throw new BadRequestException(`No snapshot ${snapshotId} has been written for ${type.name}.`);
     }
 
+    // First, because it is the cheapest refusal and the most serious one.
+    // Committing a tombstone is exactly the failure that made a scheduled
+    // `pruneSnapshots` dangerous: the pointer moves to a snapshot with no rows,
+    // every reader of the type sees an empty dataset, and nothing here would
+    // have noticed — this method takes the record's own count and the record
+    // says what the load held, so not even a warning would have been logged.
+    if (record.droppedAt) {
+      throw new BadRequestException(
+        `${droppedMessage(type.name, record, record.droppedAt)} Committing it would point ${type.name} at a snapshot holding nothing. Commit a snapshot that still has its rows, or load ${type.name} again.`,
+      );
+    }
+
     // Refused, not repaired. The carry-forward could be re-run from here, but
     // then a commit would be quietly doing a merge, and the caller that wrote
     // the late batch would never learn that its ordering was wrong. What is on
@@ -745,7 +773,7 @@ export class ClickHouseWarehouseStore
   }
 
   /**
-   * Drop a snapshot's rows.
+   * Drop a snapshot's rows, and leave the record standing as a tombstone.
    *
    * A partition drop per batch, which is a metadata operation and a file
    * unlink. This is the only place the partition-per-batch layout costs
@@ -753,6 +781,37 @@ export class ClickHouseWarehouseStore
    * `DROP PARTITION` statements. The batch numbers are read from the data
    * rather than assumed to be contiguous, because a load that failed part-way
    * leaves gaps and a loop from 0 to N would stop at the first one.
+   *
+   * ## What this used to do, and why it was worse here than anywhere
+   *
+   * It dropped the partitions *and* wrote a `deleted` marker over the snapshot
+   * row, so the record went with the rows. `catalog_connector_run.snapshotId`
+   * names a snapshot, and a run log whose ids resolve to nothing cannot answer
+   * what it is asked — which is written down elsewhere in this library as the
+   * reason nothing may be dropped by age. This adapter dropped by age anyway:
+   * {@link pruneSnapshots} is a real policy with a real cap, so the dangling
+   * pointer was not a hazard here but a scheduled output.
+   *
+   * The objection is about the record. The disk is held by the rows. They are
+   * separable, and separating them is the whole of this change: the record
+   * stays with `droppedAt` set, so the run that produced it is still
+   * answerable, and every path to the data says so out loud rather than
+   * answering with an empty result.
+   *
+   * ## The three orderings that matter
+   *
+   * The count is taken **before** the partitions go, because that is the last
+   * moment the number exists; a tombstone that could not say how large the load
+   * was would lose the one fact that makes a run's history worth keeping.
+   * `droppedAt` is written **after**, so a crash in between leaves a snapshot
+   * whose partitions are partly gone and whose record still claims them —
+   * visible, and repaired by running this again. The reverse ordering would
+   * leave a tombstone over partitions nobody will ever unlink, which is the
+   * failure that cannot be seen.
+   *
+   * And a second call is a no-op rather than a re-drop: the first `droppedAt`
+   * stands, so a durable step that replays does not rewrite the date to the
+   * moment of its retry.
    */
   async dropSnapshot(type: CatalogObjectTypeDef, snapshotId: string): Promise<void> {
     const current = await readCurrent(this.client, type.name);
@@ -762,8 +821,16 @@ export class ClickHouseWarehouseStore
       );
     }
 
+    const record = await findSnapshot(this.client, type.name, snapshotId);
+    if (record?.droppedAt) return;
+
     const table = tableFor(type.name);
     const stage = stageFor(type.name);
+    // Before the partitions go, and only when there is a record to write it to:
+    // a snapshot with no row has nowhere to keep the number and the count would
+    // be paid for nothing.
+    const held = record ? await this.countSnapshot(table, snapshotId) : 0;
+
     for (const batch of await this.batchesIn(table, snapshotId)) {
       await this.dropPartition(table, snapshotId, batch);
     }
@@ -775,10 +842,24 @@ export class ClickHouseWarehouseStore
       await this.dropPartition(stage, snapshotId, batch);
     }
 
-    await deleteSnapshot(this.client, type.name, snapshotId);
+    if (record) {
+      record.rowCount = held;
+      record.droppedAt = new Date();
+      await putSnapshot(this.client, record);
+    }
     emitCatalog('snapshot.dropped', { typeName: type.name, snapshotId });
   }
 
+  /**
+   * Every snapshot of a type, tombstones among them and marked as such.
+   *
+   * The count on a live snapshot is the record's own, which this adapter keeps
+   * current on every write rather than deriving on demand; on a tombstone it is
+   * the number {@link dropSnapshot} took immediately before unlinking the
+   * partitions, and it is as final as a committed snapshot's. Neither is a
+   * fresh scan, so a tombstone cannot report a 27-million-row load as an empty
+   * one — which is what a recount would say about it.
+   */
   async listSnapshots(type: CatalogObjectTypeDef): Promise<SnapshotRef[]> {
     const records = await listSnapshots(this.client, type.name);
     return records.map(toRef);
@@ -796,6 +877,56 @@ export class ClickHouseWarehouseStore
    * cheaply.
    *
    * The currently-served snapshot is never dropped, whatever its age.
+   *
+   * ## What `keep` counts, now that a drop leaves something behind
+   *
+   * Snapshots that still hold rows, and only those. The list is asked for with
+   * the tombstones already excluded, so `keep = 7` means seven readable loads
+   * whether the type was pruned yesterday or has been pruned nightly for a
+   * year. Counting tombstones towards it would have been the quiet failure: a
+   * type with seven tombstones and one live snapshot would report itself at its
+   * cap and the next load would push the only readable snapshot out of it.
+   *
+   * A snapshot that is already a tombstone is therefore not visited at all, and
+   * so is not re-dropped and not reported in `dropped`. `dropSnapshot` would
+   * refuse to act on it anyway — it is idempotent — but "already dropped" is
+   * not something this method did, and a caller counting `dropped.length` per
+   * run to see whether a cap is biting deserves the truth.
+   *
+   * ## What it reclaims, and what it now does not
+   *
+   * The rows, in full: the partitions are unlinked exactly as before and that
+   * is where every byte of a snapshot's data is. What it no longer removes is
+   * the snapshot's *record* — and the honest measurement is that it never did.
+   * The old code did not delete that row either; it inserted a second one
+   * carrying `deleted = 1`, which `ReplacingMergeTree` collapses onto the first
+   * and which then stays in the table for good. So the record count under a
+   * daily load has always grown by one a day, and this change alters the width
+   * of those rows rather than their number: a tombstone keeps the principal,
+   * the labels and the count that the `deleted` marker blanked, and adds a
+   * nullable `DateTime64(3)`.
+   *
+   * Measured rather than asserted: 20,000 records of realistic width (a type
+   * name, a run id, a principal, four labels), merged with `OPTIMIZE FINAL` and
+   * read out of `system.parts`.
+   *
+   * | shape | on disk | uncompressed |
+   * |---|---|---|
+   * | live snapshot | 32.0 B/record | 214.9 B/record |
+   * | old `deleted = 1` marker | 15.6 B/record | 90.0 B/record |
+   * | tombstone | 38.0 B/record | 214.9 B/record |
+   *
+   * The row count is the same in all three. A dropped snapshot costs about **22
+   * more bytes on disk** than it used to, which is the labels and the principal
+   * the marker blanked. A deployment loading one type hourly for ten years
+   * accumulates ~88,000 records: 3.3 MB where it would have been 1.4 MB.
+   *
+   * So there is **no second bound, and none is needed for space**. There is one
+   * for the *list*: {@link listSnapshots} returns at most
+   * `CATALOG_SNAPSHOT_LIST_LIMIT` records, which bounds what a caller is handed
+   * rather than what is stored. The bound worth having on the storage is the
+   * one that does not exist yet and is not invented here — an archive, after
+   * which a tombstone could be retired to wherever run history is kept.
    */
   async pruneSnapshots(type: CatalogObjectTypeDef, keep: number): Promise<{ dropped: string[] }> {
     if (!Number.isInteger(keep) || keep < 1) {
@@ -804,21 +935,41 @@ export class ClickHouseWarehouseStore
       );
     }
     const current = await readCurrent(this.client, type.name);
-    const records = await listSnapshots(this.client, type.name, 1000);
+    const records = await listSnapshotsWithRows(this.client, type.name, PRUNE_SCAN_LIMIT);
     const dropped: string[] = [];
     for (const record of records.slice(keep)) {
+      // The served snapshot is skipped whatever its age, so a type whose
+      // current load is old — which is what a rollback leaves — keeps `keep`
+      // recent snapshots *and* the one being read. `dropSnapshot` refuses it as
+      // well, and that refusal is the load-bearing one: it is what makes "the
+      // snapshot a type is serving is never a tombstone" an invariant `read`
+      // can rely on rather than a convention this loop happens to observe.
       if (record.snapshotId === current) continue;
       await this.dropSnapshot(type, record.snapshotId);
       dropped.push(record.snapshotId);
     }
     if (dropped.length > 0) {
       this.logger.log(
-        `Pruned ${dropped.length} snapshot(s) of ${type.name}, keeping the newest ${keep}`,
+        `Pruned ${dropped.length} snapshot(s) of ${type.name}, keeping the newest ${keep}; their records are kept as tombstones so the runs that produced them stay resolvable`,
       );
     }
     return { dropped };
   }
 
+  /**
+   * ## Reading a snapshot whose rows were dropped
+   *
+   * Refused, with the date. A tombstoned snapshot's `_snapshot_id` predicate
+   * matches no partition, so without the check below this returns `{ rows: [],
+   * total: 0 }` — the same answer as a filter that excluded everything and as a
+   * load that collapsed, on a screen that has no way to tell those apart.
+   *
+   * The lookup that finds out costs a statement, so it is paid **only on the
+   * history path**. A read with no `snapshot` resolves the type's pointer, and
+   * {@link dropSnapshot} refuses to drop what that pointer names — so the
+   * ordinary read is the two statements it has always been, and the third
+   * arrives only when a caller has explicitly asked for an older load.
+   */
   async read(
     type: CatalogObjectTypeDef,
     fields: string[],
@@ -830,6 +981,9 @@ export class ClickHouseWarehouseStore
     // Nothing committed yet is an empty result, not an error: the type is real
     // and known, it simply has no load anyone has blessed.
     if (!snapshotId) return { rows: [], total: 0 };
+    // Only when the caller named one. See the docblock: the pointer's own
+    // snapshot cannot be a tombstone, so the ordinary read pays nothing.
+    if (query.snapshot) await this.assertNotDropped(type.name, query.snapshot);
 
     const selected = type.properties.filter((p) => fields.includes(p.name));
     if (selected.length === 0) return { rows: [], total: 0 };
@@ -1113,6 +1267,34 @@ export class ClickHouseWarehouseStore
       format: 'JSONEachRow',
     });
     return (await result.json<{ batch: string | number }>()).map((row) => Number(row.batch));
+  }
+
+  /**
+   * Refuse a read of a snapshot whose rows have been dropped.
+   *
+   * The only shared gate the refusal sites go through, so "what does a
+   * tombstone do to a reader" has one answer that can be changed in one place
+   * rather than several checks that agree until one of them is edited.
+   *
+   * A snapshot with no record at all passes: this is not an existence check,
+   * and making it one would change what {@link read} does with an unknown id
+   * from "no rows" to a refusal, which is a different decision with different
+   * callers.
+   *
+   * **There is no `streamSnapshot` here to guard, and that is the state of this
+   * adapter rather than an omission in this change.** The MikroORM store has
+   * one and it refuses always, because it never resolves the pointer and so any
+   * id it is handed may be a tombstone. This adapter offers neither
+   * `streamSnapshot` nor `streamQuery` — see {@link runQuery} — so the only way
+   * into a named snapshot is {@link read}, which is guarded above. A
+   * `streamSnapshot` added here later must call this first, for the reason the
+   * MikroORM one does: a workflow reading a tombstone would iterate zero rows,
+   * report success, and commit an empty load downstream.
+   */
+  private async assertNotDropped(typeName: string, snapshotId: string): Promise<void> {
+    const record = await findSnapshot(this.client, typeName, snapshotId);
+    if (!record?.droppedAt) return;
+    throw new BadRequestException(droppedMessage(typeName, record, record.droppedAt));
   }
 
   private async countSnapshot(table: string, snapshotId: string): Promise<number> {

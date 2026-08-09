@@ -46,6 +46,7 @@ export {
   runReadOnlyQuery,
 } from './query';
 export {
+  CATALOG_SNAPSHOT_LIST_LIMIT,
   catalogClickHouseManagedTables,
   CURRENT_TABLE,
   ensureCatalogClickHouseSchema,

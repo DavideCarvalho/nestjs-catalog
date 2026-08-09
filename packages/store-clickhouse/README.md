@@ -83,6 +83,16 @@ a retention window would be breaking the catalog's central promise on a schedule
 nobody chose. What ClickHouse changes is the price: dropping a snapshot is
 unlinking partitions.
 
+**A drop takes the rows and keeps the record.** The snapshot's row survives with
+`dropped_at` set, and `listSnapshots()` reports it as `SnapshotRef.droppedAt`
+along with the count it held — because `catalog_connector_run.snapshotId` names
+a snapshot, and a run log whose ids resolve to nothing cannot answer what it is
+asked. Reading such a snapshot is refused with a sentence naming the drop and
+its date rather than answered with an empty page, and committing one is refused
+outright: that is how a published type comes to serve nothing. `keep` counts
+snapshots that still hold rows, so a table of tombstones cannot push live
+snapshots out of the window.
+
 ## What is atomic and what is not
 
 Three things were checked against a live server rather than read off a docs page:
@@ -240,7 +250,7 @@ should point `queryConnection` at a user whose *profile* constrains
 | `obj_<type>__stage` | Where a batch is built before it is swapped in. Empty between writes. |
 | `<type>` | A view over the committed snapshot. What the SQL console selects from. |
 | `<type>__next` | The shadow the commit exchanges with. Holds the previously-served definition. |
-| `catalog_ch_snapshot` | One row per snapshot: row count, principal, labels, committed. |
+| `catalog_ch_snapshot` | One row per snapshot: row count, principal, labels, committed, and `dropped_at` once its rows have gone. |
 | `catalog_ch_current` | One row per type: which snapshot readers get. |
 
 `catalogClickHouseManagedTables()` names the last two, for a deployment that
