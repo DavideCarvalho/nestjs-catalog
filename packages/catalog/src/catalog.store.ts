@@ -26,18 +26,23 @@ import type { CatalogObjectQuery, CatalogObjectTypeDef } from './catalog.types';
  * Present means *a verified copy of this snapshot exists at `path`*. It says
  * nothing about whether the rows are still in the database — those are two
  * independent facts and a caller that conflates them gets the dangerous reading
- * in both directions. The three states a console has to tell apart are:
+ * in both directions. Which is why "are the rows still there" is a *different*
+ * field, {@link SnapshotRef.droppedAt}, and the two compose as a grid rather
+ * than as one ladder:
  *
- * - **no `archive`** — the snapshot is in the database and nowhere else.
- * - **`archive` present, rows still in the table** — copied, not moved. Reads
- *   are unchanged and cost what they always did.
- * - **`archive` present, rows gone** — the snapshot lives in object storage.
- *   Still readable, still identified, and **not** the same price as a read of a
- *   hot snapshot. {@link bytes} is here so a screen can say which it is about
- *   to do rather than presenting the two as one click.
+ * - **neither** — the snapshot is in the database and nowhere else.
+ * - **`archive` only** — copied, not moved. Reads are unchanged and cost what
+ *   they always did.
+ * - **`droppedAt` only** — a tombstone. The record survives so run history
+ *   stays resolvable; the data does not, and no read of it can succeed.
+ * - **both** — the snapshot lives in object storage. Still identified, still
+ *   recoverable, and **not** the same price as a read of a hot snapshot.
+ *   {@link bytes} is here so a screen can say which it is about to do rather
+ *   than presenting the two as one click.
  *
- * A snapshot with no `SnapshotRef` at all is the fourth state, and it is the
- * only one that means *gone*.
+ * A snapshot with no `SnapshotRef` at all is the fifth state, and it is the
+ * only one that means *gone*: nothing left to name it, and every
+ * `catalog_connector_run` that produced it now points at nothing.
  */
 export interface SnapshotArchiveRef {
   /** The only format written today. Named rather than assumed, so a second one can arrive. */
@@ -101,9 +106,46 @@ export interface SnapshotRef {
    *
    * Optional, and absent is the answer for every snapshot in every deployment
    * that archives nothing — which is all of them until a host asks. See
-   * {@link SnapshotArchiveRef} for the three states its presence distinguishes.
+   * {@link SnapshotArchiveRef} for the states it composes into.
    */
   archive?: SnapshotArchiveRef;
+  /**
+   * When this snapshot's rows were deleted, if they have been.
+   *
+   * Present makes this ref a **tombstone**: the record of the load survives —
+   * who wrote it, when, under which labels, and how many rows it held — while
+   * the rows themselves are gone. Absent is the answer for every snapshot that
+   * still has its data, which is every snapshot until something drops one.
+   *
+   * ## Why the record is kept rather than deleted with the rows
+   *
+   * A snapshot is a whole version of an object type, and committing a new one
+   * leaves the old rows in place beside the new ones. Nothing removed them, so
+   * a type loaded daily holds every day it has ever been loaded; one deployment
+   * reached 441 retained snapshots and 100 GB and the database then refused
+   * connections. The obvious repair — drop old snapshots — was blocked by a
+   * real objection, that `catalog_connector_run` records the snapshot each run
+   * produced, so deleting the snapshot turns the run history into a list of
+   * pointers to nothing.
+   *
+   * The objection is about the *record*, and the disk is held by the *rows*.
+   * They are separable, and separating them is the whole of this field: the
+   * bytes can go while the run that produced them stays answerable. It says
+   * nothing about *when* anything should be dropped — there is no retention
+   * policy anywhere in this package and this field does not imply one.
+   *
+   * ## What it obliges a reader to do
+   *
+   * Refuse, out loud. A read of a tombstoned snapshot must fail with a sentence
+   * naming the drop and its date; it must never come back as zero rows, which
+   * is indistinguishable from a load that collapsed and is the failure this
+   * codebase refuses everywhere else. The store enforces the one invariant that
+   * keeps ordinary reads free of the question: **the snapshot a type is serving
+   * can never be tombstoned**, so only an explicit read of history can meet one.
+   *
+   * ISO-8601, like {@link createdAt}.
+   */
+  droppedAt?: string;
 }
 
 /**
@@ -474,7 +516,25 @@ export interface CatalogWriteStore extends CatalogReadStore {
    */
   commit(type: CatalogObjectTypeDef, snapshotId: string): Promise<SnapshotRef>;
 
-  /** Drop a snapshot. Refuses the currently-committed one. */
+  /**
+   * Drop a snapshot's rows. Refuses the currently-committed one.
+   *
+   * **The rows, and not necessarily the record.** A store that keeps a snapshot
+   * list should keep the entry and mark it {@link SnapshotRef.droppedAt} rather
+   * than removing it, because the entry is what makes a connector run that
+   * names this snapshot still answerable — see that field for the argument in
+   * full. A store whose record and rows are the same object has nothing to
+   * keep, and reports no `droppedAt` because it has none to report.
+   *
+   * Idempotent: dropping a snapshot whose rows are already gone is a no-op that
+   * leaves the original drop time standing, so a retried step does not rewrite
+   * history to the moment of its retry.
+   *
+   * Two refusals follow from a tombstone existing, and both belong to the store
+   * because it is the only thing that can see the state: a tombstoned snapshot
+   * may not be {@link commit}ted — that is exactly how a published type comes to
+   * serve nothing — and a read of one must fail rather than return zero rows.
+   */
   dropSnapshot(type: CatalogObjectTypeDef, snapshotId: string): Promise<void>;
 
   /**

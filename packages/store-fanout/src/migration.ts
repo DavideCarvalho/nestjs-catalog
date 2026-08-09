@@ -701,7 +701,12 @@ export class CatalogFanoutMigration {
     const list = this.fanout.primary.store.listSnapshots;
     if (list) {
       const refs = await list.call(this.fanout.primary.store, type);
-      const newest = refs[0];
+      // The newest whose rows are still there. A tombstone is a snapshot the
+      // primary can still name and can no longer read, so picking one here would
+      // resolve to an id that every replay and every comparison below then reads
+      // as zero rows — and this branch is already the guess, so it is the last
+      // place that should be handing one on.
+      const newest = refs.find((ref) => ref.droppedAt === undefined);
       if (newest) return newest.id;
     }
     throw new BadRequestException(
