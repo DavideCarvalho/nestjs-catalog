@@ -91,7 +91,9 @@ describe('archiving a snapshot out of a real warehouse', () => {
     // method, same order — so what is asserted below is the archive's fidelity
     // and not a second opinion about what the snapshot contains.
     const expected: Array<Record<string, unknown>> = [];
-    for await (const row of db.store.streamSnapshot(type, fields, 'load-1')) {
+    for await (const row of db.store.streamSnapshot(type, fields, 'load-1', {
+      provenance: true,
+    })) {
       expected.push({ ...row });
     }
     expect(expected).toHaveLength(3);
@@ -101,7 +103,7 @@ describe('archiving a snapshot out of a real warehouse', () => {
     const ref = await archiveSnapshot({
       type,
       snapshotId: 'load-1',
-      rows: db.store.streamSnapshot(type, fields, 'load-1'),
+      rows: db.store.streamSnapshot(type, fields, 'load-1', { provenance: true }),
       expectedRowCount: written.rowCount,
       store,
       path,
@@ -140,6 +142,7 @@ describe('archiving a snapshot out of a real warehouse', () => {
         type,
         type.properties.map((property) => property.name),
         'empty-1',
+        { provenance: true },
       ),
       expectedRowCount: 0,
       store,
@@ -148,6 +151,84 @@ describe('archiving a snapshot out of a real warehouse', () => {
 
     expect(ref.rowCount).toBe(0);
     expect(ref.verifiedAt).toBeTruthy();
+  });
+
+  /**
+   * **The case that decides what an archive has to hold, end to end.**
+   *
+   * An incremental run produces a snapshot whose rows do not share a provenance:
+   * the ones it fetched carry its own principal and load time, and the ones it
+   * carried forward keep the *previous* snapshot's, because `carryForward` copies
+   * both across untouched on purpose — a carried row is not a new load of that
+   * row, and restamping it would erase the one thing those columns are good for.
+   *
+   * Nothing else in the snapshot records that. `catalog_snapshot` names only the
+   * run that committed it. So an archive that drops these two columns is one that
+   * cannot be restored to a state where "when did this value last actually move"
+   * has an answer — and the wrong answer it would get instead is inherited by the
+   * next incremental load, and the one after it.
+   *
+   * Asserted off the parquet bytes rather than off the stream, because the stream
+   * is only half the join: what this pins is that the values survive being
+   * written down and read back by this package's own reader.
+   */
+  it('keeps a carried-forward row pointing at the run that actually loaded it', async () => {
+    const type = contractType('ArchivedCarried');
+    await db.publish(type);
+
+    await db.store.write(type, [contractRow('a', 'alpha', 1), contractRow('b', 'bravo', 2)], {
+      snapshotId: 'base',
+      principalId: 'first-loader',
+      batch: 0,
+    });
+    await db.store.commit(type, 'base');
+
+    // An incremental run: `b` changed, `a` was not mentioned and is carried.
+    await db.store.write(type, [contractRow('b', 'bravo-updated', 20)], {
+      snapshotId: 'incremental',
+      principalId: 'second-loader',
+      batch: 0,
+    });
+    const merged = await db.store.carryForward(type, 'incremental', {
+      principalId: 'second-loader',
+    });
+    expect(merged.carried).toBe(1);
+    const committed = await db.store.commit(type, 'incremental');
+    expect(committed.rowCount).toBe(2);
+
+    const store = localArchiveStore(root);
+    const path = archivePathFor('archive', type.name, 'incremental');
+    const ref = await archiveSnapshot({
+      type,
+      snapshotId: 'incremental',
+      rows: db.store.streamSnapshot(
+        type,
+        type.properties.map((property) => property.name),
+        'incremental',
+        { provenance: true },
+      ),
+      expectedRowCount: committed.rowCount,
+      store,
+      path,
+    });
+    expect(ref.rowCount).toBe(2);
+
+    const file = await store.read(`${path}/${ARCHIVE_PART_NAME}`);
+    const back = new Map<string, Record<string, unknown>>();
+    for await (const record of parquetRecordsFrom(file, 'carried')) {
+      if (record === null || typeof record !== 'object') throw new Error('not a row');
+      const row: Record<string, unknown> = { ...record };
+      back.set(String(row.id), row);
+    }
+
+    expect([...back.keys()].sort()).toEqual(['a', 'b']);
+    // The whole point, out of the file: two rows of one snapshot, two loaders.
+    expect(back.get('a')?._principal_id).toBe('first-loader');
+    expect(back.get('b')?._principal_id).toBe('second-loader');
+    // And `_loaded_at` survived being written down — compared for presence
+    // rather than for an instant, because MySQL's `DATETIME` has no fractional
+    // part and two writes inside one second are genuinely indistinguishable.
+    for (const row of back.values()) expect(row._loaded_at).toBeTruthy();
   });
 
   /**
@@ -178,6 +259,7 @@ describe('archiving a snapshot out of a real warehouse', () => {
           type,
           type.properties.map((property) => property.name),
           'short-1',
+          { provenance: true },
         ),
         // A count nobody could satisfy, standing in for a snapshot that changed.
         expectedRowCount: 5,

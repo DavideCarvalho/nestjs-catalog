@@ -1,5 +1,6 @@
 import {
   CATALOG_FILTER_OPERATORS,
+  CATALOG_PROVENANCE_COLUMNS,
   assertNoColumnCollisions,
   emitCatalog,
 } from '@dudousxd/nestjs-catalog';
@@ -25,6 +26,7 @@ import type {
   CatalogStoreCapabilities,
   ScalarType,
   SnapshotRef,
+  SnapshotStreamOptions,
 } from '@dudousxd/nestjs-catalog';
 // From `@mikro-orm/sql`, which is where `@mikro-orm/mysql` and
 // `@mikro-orm/postgresql` both re-export it from — the *same* `SqlEntityManager`
@@ -1243,17 +1245,40 @@ export class MikroOrmWarehouseStore
    * repairs, arrived at from the other side. It also aliases its columns to
    * `outputAlias`, and rows are handed out keyed by property name here exactly as
    * `read` hands them out, so the caller sees one vocabulary.
+   *
+   * ## `provenance`, and why it is two columns rather than five
+   *
+   * With it, every row also carries `_principal_id` and `_loaded_at`. Those two
+   * and no others, because those two are the ones {@link carryForward} *reads*
+   * off the snapshot it merges against — see {@link CATALOG_PROVENANCE_COLUMNS}
+   * for the argument, which was asked of all five reserved columns and answered
+   * differently for each.
+   *
+   * The keys are the reserved names verbatim, which is safe rather than lucky: a
+   * property may not be *called* one, so `_loaded_at` cannot collide with a
+   * property's own key in the row this hands back.
+   *
+   * `_loaded_at` gets whatever the driver hands over, unconverted, exactly as a
+   * `date` property does — MikroORM's MySQL connection sets `dateStrings` and a
+   * `DATETIME` arrives as `2026-01-02 03:04:05`, where Postgres returns a `Date`
+   * that {@link normalise}'s rule turns into an ISO string. That divergence is
+   * real, is the shared store contract's already-recorded finding about `date`
+   * columns, and is deliberately not repaired here: inventing a zone for MySQL's
+   * naive string in this one method would make `_loaded_at` disagree with every
+   * `date` property beside it in the same row.
    */
   async *streamSnapshot(
     type: CatalogObjectTypeDef,
     fields: string[],
     snapshotId: string,
+    options?: SnapshotStreamOptions,
   ): AsyncGenerator<Record<string, unknown>> {
     const selected = type.properties.filter((p) => fields.includes(p.name));
     // Nothing asked for is nothing to read, and it is not an error: `read` says
     // the same thing about the same input. A `SELECT` with no columns is not a
     // statement.
     if (selected.length === 0) return;
+    const provenance = options?.provenance === true;
 
     // Always, unlike `read`, and the asymmetry is not an oversight: this method
     // takes the id from its caller and never resolves the pointer, so there is
@@ -1264,9 +1289,23 @@ export class MikroOrmWarehouseStore
     await this.assertNotDropped(this.em.fork(), type.name, snapshotId);
 
     const table = tableFor(type.name);
-    const statement = `SELECT ${selected
-      .map((p) => `${this.ident(physicalColumn(p.name))} AS ${this.ident(outputAlias(p.name))}`)
-      .join(',')}
+    // Named from the core package's list rather than from this adapter's own
+    // `PRINCIPAL_COLUMN` and `LOADED_AT_COLUMN`, for the reason `RESERVED_COLUMNS`
+    // is: the archiver checks its rows against that same list, so a copy here
+    // that drifted would produce a stream the archiver refuses — or worse, one it
+    // accepts under names nothing else uses.
+    //
+    // Unaliased, unlike the properties. `outputAlias` exists to let a property
+    // named `Asset Id` out under its own spelling; a reserved name is already an
+    // identifier by the rule that reserves it, so aliasing it would only give the
+    // driver a second name for the same column to disagree about.
+    const provenanceColumns = provenance ? CATALOG_PROVENANCE_COLUMNS : [];
+    const statement = `SELECT ${[
+      ...selected.map(
+        (p) => `${this.ident(physicalColumn(p.name))} AS ${this.ident(outputAlias(p.name))}`,
+      ),
+      ...provenanceColumns.map((column) => this.ident(column)),
+    ].join(',')}
        FROM ${this.ident(table)} WHERE ${this.ident(SNAPSHOT_COLUMN)} = ?
        ORDER BY ${this.ident(ROW_COLUMN)} ASC`;
 
@@ -1282,7 +1321,12 @@ export class MikroOrmWarehouseStore
         [snapshotId],
         trx,
       )) {
-        yield normalise(row, selected);
+        const out = normalise(row, selected);
+        for (const column of provenanceColumns) {
+          const value = row[column];
+          out[column] = value instanceof Date ? value.toISOString() : value;
+        }
+        yield out;
       }
     } finally {
       await connection.rollback(trx).catch(() => undefined);

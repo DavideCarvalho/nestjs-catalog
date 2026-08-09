@@ -442,7 +442,24 @@ export interface CatalogSnapshotStreamStore extends CatalogReadStore {
     type: CatalogObjectTypeDef,
     fields: string[],
     snapshotId: string,
+    options?: SnapshotStreamOptions,
   ): AsyncIterable<Record<string, unknown>>;
+}
+
+/** What a snapshot stream may be asked for beside the properties. */
+export interface SnapshotStreamOptions {
+  /**
+   * Also key every row by {@link CATALOG_PROVENANCE_COLUMNS}.
+   *
+   * **A store that cannot supply them must throw rather than omit them.** The
+   * caller this exists for is the snapshot archiver, and it cannot tell a store
+   * that declined from a snapshot whose provenance happens to be absent: a
+   * missing key encodes as a null, a null verifies against a null, and the
+   * archive is complete, checksummed and silently stripped of the only columns a
+   * restore could not reconstruct. Silence is the one answer that is not
+   * available here.
+   */
+  provenance?: boolean;
 }
 
 /** A store that can stream a whole snapshot. See {@link CatalogSnapshotStreamStore}. */
@@ -734,6 +751,60 @@ export type CatalogReservedColumn = (typeof CATALOG_RESERVED_COLUMNS)[number];
 export function isReservedColumn(column: string): boolean {
   return CATALOG_RESERVED_COLUMNS.some((reserved) => reserved === column.toLowerCase());
 }
+
+/**
+ * The two reserved columns that outlive the load that wrote them.
+ *
+ * ## The question this answers, and it was asked of all five
+ *
+ * Not "which columns are read after a commit" — that question has a longer
+ * answer than it looks and it is the wrong one. The question a copy of a
+ * snapshot has to answer is narrower: **which columns does a later load consult,
+ * such that a copy without them changes what that load produces?** A copy has to
+ * carry exactly those, and one that carries more is a cost with no buyer.
+ *
+ * - **`_principal_id` and `_loaded_at`, yes.** {@link CatalogMergeStore.carryForward}
+ *   reads both off the snapshot it merges against and copies them across
+ *   untouched, deliberately: a carried row is not a new load of that row, so
+ *   restamping them would erase the one thing they are good for, which is saying
+ *   when a value last actually moved and who moved it. They are the only two
+ *   whose loss *propagates* — every later incremental snapshot inherits whatever
+ *   a restore put there, and inherits it forever.
+ * - **`_batch`, no — though it is not true that nothing reads it after a
+ *   commit, and an earlier draft of this list said so.** Two adapters read a
+ *   committed snapshot's `_batch`, both in ClickHouse: its `read()` uses
+ *   `(_batch, _row)` as the default row order, and its `dropSnapshot` selects
+ *   the distinct batches present in order to drop one partition each. Neither
+ *   makes it worth copying. The ordering is a *natural* order the interface
+ *   explicitly does not promise — the shared store contract says so where it
+ *   sorts explicitly, precisely because the two engines disagree about it — and
+ *   the partition enumeration is documented as making no assumption about which
+ *   values are there, so it is correct for any set including a restore that
+ *   flattened everything to one batch.
+ *
+ *   What matters here is the narrower question, and the answer to that is clean:
+ *   **no merge reads it.** `carryForward` joins the previous snapshot on its
+ *   primary key and copies its properties; its own `_batch` predicate applies
+ *   only to the snapshot being built, where it stops the statement feeding on its
+ *   own output. The `-1` marker is a record that a merge happened, never an input
+ *   to the next one. And the write path could not take it back regardless:
+ *   {@link CatalogWriteStore.write} refuses a negative batch by name, so the one
+ *   value in the column that carries information is the one value the only
+ *   restore seam rejects.
+ * - **`_snapshot_id`, no.** One value for the whole snapshot, so a per-row copy
+ *   is N copies of a string the copy is already named after.
+ * - **`_row`, no.** The order, not a value. A copy that preserves the order
+ *   preserves everything the column carries; the numbers themselves are an
+ *   engine's auto-increment and are not stable across a rewrite anyway.
+ *
+ * Kept here rather than in the archiver that needed it, because it is a fact
+ * about the store interface — about which columns {@link
+ * CatalogMergeStore.carryForward} reads — and anything else that copies a
+ * snapshot needs the same answer.
+ */
+export const CATALOG_PROVENANCE_COLUMNS = ['_principal_id', '_loaded_at'] as const;
+
+export type CatalogProvenanceColumn = (typeof CATALOG_PROVENANCE_COLUMNS)[number];
 
 /**
  * The whole naming rule, which used to be written out here.

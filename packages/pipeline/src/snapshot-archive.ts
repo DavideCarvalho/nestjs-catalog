@@ -4,9 +4,11 @@ import { mkdir, open, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import type {
   CatalogObjectTypeDef,
+  CatalogProvenanceColumn,
   ScalarType,
   SnapshotArchiveRef,
 } from '@dudousxd/nestjs-catalog';
+import { CATALOG_PROVENANCE_COLUMNS } from '@dudousxd/nestjs-catalog';
 import { importOptional } from './optional-modules';
 import { type RandomAccessBytes, parquetRecordsFrom } from './source-parquet';
 
@@ -162,6 +164,12 @@ export interface SnapshotArchiveManifest {
    * {@link parquetTypeFor}. A reader holding this manifest can map an archive
    * back to an object type without the registry that produced it, which is the
    * difference between an archive and a pile of files.
+   *
+   * The last two entries are always `CATALOG_PROVENANCE_COLUMNS`, listed here
+   * rather than left implicit so that a reader can tell them from the type's own
+   * properties without knowing the rule — which matters because they are exactly
+   * the columns a restore has to route somewhere other than the property values.
+   * See {@link archiveColumns}.
    */
   columns: Array<{ name: string; type: ScalarType; parquetType: string }>;
   writer: string;
@@ -280,27 +288,103 @@ function archiveValue(value: unknown, column: ArchiveColumn): unknown {
 }
 
 /**
+ * The catalog's own type for each provenance column, for the manifest.
+ *
+ * `_loaded_at` is a `date` and `_principal_id` is a `string`, which is what they
+ * are declared as in every adapter's DDL and what the SQL console already lists
+ * them as. Both encode to STRING through {@link parquetTypeFor} — a `date`
+ * because the value in hand is already text, see that function — so this changes
+ * no bytes; it changes what a reader holding the manifest is told they mean.
+ */
+const PROVENANCE_SCALARS: Record<CatalogProvenanceColumn, ScalarType> = {
+  _principal_id: 'string',
+  _loaded_at: 'date',
+};
+
+/**
  * The columns of a type, in the order the archive fixes.
  *
- * Every property, in the type's own order, and nothing else. The system columns
- * are not here — `_snapshot_id` is constant across a snapshot and lives in the
- * manifest instead, and `_row` is the order rather than a value. `_batch` is a
- * real loss and is called out in this file's tests: it distinguishes rows a run
- * produced from rows it carried forward unchanged, which the SQL console offers
- * as a question people ask. Nothing is deleted here so the loss costs nothing
- * yet, and preserving it is a prerequisite for anything that does delete.
+ * Every property in the type's own order, then {@link CATALOG_PROVENANCE_COLUMNS}.
+ *
+ * ## Which system columns are here, and the question that decided it
+ *
+ * **Which columns does a later load consult, such that an archive without them
+ * changes what that load produces?** Asked of all five. The catalog package
+ * holds the reasoning in full, since it is a fact about `carryForward` rather
+ * than about parquet; this is what it comes to here:
+ *
+ * - **`_principal_id` and `_loaded_at` are archived.** A merge copies both off
+ *   the snapshot it merges against, untouched and on purpose, so a restore that
+ *   cannot supply them makes every carried row claim it moved at restore time —
+ *   and every later incremental snapshot inherits that, forever. They are the
+ *   only two whose loss compounds.
+ * - **`_batch` is not, and that reverses what this file used to say.** It said
+ *   `_batch` was "a real loss" and "a prerequisite for anything that deletes".
+ *   The second half is wrong: no merge reads it. `carryForward` joins the
+ *   previous snapshot on its primary key and copies its properties, and its own
+ *   `_batch` predicate applies only to the snapshot being built, so the `-1`
+ *   marker records that a merge happened and is never an input to the next one.
+ *   It could not be restored in any case — `write` refuses a negative batch by
+ *   name, which is the only seam a restore has.
+ *
+ *   The first half is overstated rather than wrong, and the correction is worth
+ *   having: a committed snapshot's `_batch` *is* read, twice, both in the
+ *   ClickHouse adapter — as the default `(_batch, _row)` row order of a page, and
+ *   as the list of partitions `dropSnapshot` unlinks. Neither is a reason to
+ *   copy it. The first is a natural order the store interface does not promise
+ *   (the shared contract sorts explicitly and says why), and the second is
+ *   documented as assuming nothing about which values are present. What is
+ *   genuinely lost is a line of provenance in an ad-hoc query, and `_loaded_at`
+ *   carries most of that anyway: a carried row keeps the older stamp, a loaded
+ *   one gets the run's.
+ * - **`_snapshot_id` is not**, being one value for the whole archive — it is in
+ *   the manifest and in the parquet key-value metadata already.
+ * - **`_row` is not**, being the order rather than a value. The stream is in
+ *   `_row` order and the file preserves it.
+ *
+ * ## What the two cost, measured
+ *
+ * **0.028 bytes per row**, which is +0.02%. Against 200,000 rows of a 24-column
+ * Sub WO-shaped type at this file's row-group size: 22,621,717 bytes for the
+ * properties alone and 22,627,350 with the two columns beside them — 5,633 bytes
+ * for 400,000 values.
+ *
+ * They cost nothing because of what they hold rather than because parquet is
+ * good: `_principal_id` is one value per load and two after a merge, and
+ * `_loaded_at` is one value per `write()` call — the store takes `now` once per
+ * call and stamps every row of the batch with it — so both are a handful of
+ * distinct strings run-length encoded across the whole file. Measured against
+ * the case that cannot occur, a distinct `_loaded_at` on every row, the same two
+ * columns cost 6.263 B/row, which is the bound on how wrong this gets if a store
+ * ever starts stamping per row.
+ *
+ * Worth recording that `_batch` measured at **0.029 B/row** on the same fixture,
+ * which is to say the same nothing. Size did not decide any of this and could
+ * not have: a per-row integer of low cardinality is free too. What decided it is
+ * that nothing reads it.
  */
 export function archiveColumns(type: CatalogObjectTypeDef): ArchiveColumn[] {
-  return type.properties.map((property) => ({
-    name: property.name,
-    type: parquetTypeFor(property.type),
-    text: isTextEncodedScalar(property.type),
-    // Every column, always. A property the type calls required can still be null
-    // in an old snapshot written before it was required, and a non-nullable
-    // parquet column holding a null is a write that fails halfway through a
-    // 27-million-row stream rather than one that refuses at the top.
-    nullable: true,
-  }));
+  return [
+    ...type.properties.map((property) => ({
+      name: property.name,
+      type: parquetTypeFor(property.type),
+      text: isTextEncodedScalar(property.type),
+      // Every column, always. A property the type calls required can still be null
+      // in an old snapshot written before it was required, and a non-nullable
+      // parquet column holding a null is a write that fails halfway through a
+      // 27-million-row stream rather than one that refuses at the top.
+      nullable: true,
+    })),
+    ...CATALOG_PROVENANCE_COLUMNS.map((column) => ({
+      name: column,
+      type: parquetTypeFor(PROVENANCE_SCALARS[column]),
+      text: isTextEncodedScalar(PROVENANCE_SCALARS[column]),
+      // Nullable for the same reason, and one more: a table created by an older
+      // version of an adapter may not have had the column when its oldest
+      // snapshots were written.
+      nullable: true,
+    })),
+  ];
 }
 
 /** Where a snapshot's archive goes. */
@@ -409,9 +493,13 @@ export async function archiveSnapshot(input: {
 }): Promise<SnapshotArchiveRef> {
   const { type, snapshotId, rows, expectedRowCount, store, path } = input;
   const columns = archiveColumns(type);
-  if (columns.length === 0) {
+  // Asked of the type's properties and not of `columns`, which is no longer the
+  // same question: `archiveColumns` appends the provenance columns, so a type
+  // with nothing of its own still produces a two-column file — a file that would
+  // write, read back, verify, and hold not one value anybody archived it for.
+  if (type.properties.length === 0) {
     throw new Error(
-      `"${type.name}" has no properties, so there is nothing of snapshot ${snapshotId} to archive. A parquet file with no columns is not a file this can write or read back.`,
+      `"${type.name}" has no properties, so there is nothing of snapshot ${snapshotId} to archive. A parquet file holding only the provenance columns is not a copy of anything.`,
     );
   }
 
@@ -447,11 +535,18 @@ export async function archiveSnapshot(input: {
     bytes: written.bytes,
     checksum: written.checksum,
     writtenAt,
-    columns: type.properties.map((property) => ({
-      name: property.name,
-      type: property.type,
-      parquetType: parquetTypeFor(property.type),
-    })),
+    columns: [
+      ...type.properties.map((property) => ({
+        name: property.name,
+        type: property.type,
+        parquetType: parquetTypeFor(property.type),
+      })),
+      ...CATALOG_PROVENANCE_COLUMNS.map((column) => ({
+        name: column,
+        type: PROVENANCE_SCALARS[column],
+        parquetType: parquetTypeFor(PROVENANCE_SCALARS[column]),
+      })),
+    ],
     writer: 'nestjs-catalog-pipeline/snapshot-archive@1',
   };
   await store.put(
@@ -518,6 +613,21 @@ async function writeArchivePart(input: {
    */
   const encoded = async function* (): AsyncGenerator<Record<string, unknown>> {
     for await (const row of input.rows) {
+      // Before anything is encoded. A caller that streamed without asking for
+      // provenance hands over rows with no such key, `archiveValue` turns the
+      // absence into a null, the null is hashed and read back as a null, and
+      // **verification passes** — the archive is complete, checksummed, and
+      // silently missing the two columns a restore cannot reconstruct. That is
+      // the one defect the three checks below cannot see, because all three ask
+      // whether the file matches what was streamed and it does. So it is caught
+      // here, on the way in, per row rather than on the first: a store that
+      // stopped supplying them halfway through fails the same way.
+      for (const column of CATALOG_PROVENANCE_COLUMNS) {
+        if (column in row) continue;
+        throw new Error(
+          `${input.describe} streamed a row with no ${column}. The archive carries ${CATALOG_PROVENANCE_COLUMNS.join(' and ')} because an incremental load copies them off the snapshot it merges against, so a copy without them makes every future carried row claim it was loaded whenever the restore ran. Stream the snapshot with { provenance: true }, or use a store that can supply it.`,
+        );
+      }
       const out: Record<string, unknown> = {};
       for (const column of input.columns) out[column.name] = archiveValue(row[column.name], column);
       hash.update(canonicalRow(out, input.columns));

@@ -7,11 +7,13 @@ import type {
   ScalarType,
 } from '@dudousxd/nestjs-catalog';
 import {
+  CATALOG_PROVENANCE_COLUMNS,
   isCatalogStoreCapabilities,
   isWriteStore,
   resolveObjectFilters,
   supportsCarryForward,
   supportsObjectFilters,
+  supportsSnapshotStreams,
 } from '@dudousxd/nestjs-catalog';
 import { beforeAll, describe, expect, it } from 'vitest';
 
@@ -293,6 +295,199 @@ async function filteredIds(
 }
 
 /**
+ * The adapter under test, assigned by the suite's `beforeAll`.
+ *
+ * Module scope rather than a closure inside {@link describeCatalogStoreContract},
+ * so that a group of cases split into its own function — see {@link
+ * describeSnapshotStreamCases} — reads the same variable rather than being handed
+ * a getter for it. One suite runs per module, so there is only ever one adapter
+ * for this to hold.
+ */
+let subject: ContractStore;
+
+/** Publish and hand back the def, so a case is two lines of setup. */
+async function ready(caseName: string): Promise<CatalogObjectTypeDef> {
+  const def = contractType(caseName);
+  await subject.publish(def);
+  return def;
+}
+
+/**
+ * Skip a case, out loud.
+ *
+ * Vitest's own report says only that something was skipped, which over three
+ * adapters is three silences that look identical whether the case does not
+ * apply, was never written, or was switched off to make a run green. The
+ * reason is printed beside the store's name so a reader of the output can
+ * tell those apart without opening this file.
+ */
+function skipping(context: { skip: () => void }, reason: string): void {
+  console.log(`[contract] ${subject.name}: ${reason}`);
+  context.skip();
+}
+
+/**
+ * Both provenance columns arrived, without saying which instant `_loaded_at`
+ * holds.
+ *
+ * The value is asserted present rather than compared, and the reason is the same
+ * second-boundary problem {@link SEEN_AT} is on: MySQL maps `_loaded_at` to
+ * `DATETIME`, which has no fractional part, so two writes inside one second are
+ * genuinely indistinguishable and a case that compared them would flake on a
+ * fast machine and pass on a slow one. That the column *arrives* is what a copy
+ * of a snapshot depends on; which instant it holds is the engine's business and
+ * is pinned by the adapters' own suites.
+ */
+function expectProvenance(row: Record<string, unknown>): void {
+  for (const column of CATALOG_PROVENANCE_COLUMNS) {
+    expect(row[column]).toBeDefined();
+    expect(row[column]).not.toBeNull();
+  }
+}
+
+/**
+ * And absent unless asked for.
+ *
+ * Every caller that existed before the option reads a snapshot in order to write
+ * it into another type, and would otherwise find two reserved names among the
+ * fields it is about to load — names a publisher is not allowed to give a
+ * property, so nothing downstream has anywhere to put them.
+ */
+function expectNoProvenance(row: Record<string, unknown>): void {
+  for (const column of CATALOG_PROVENANCE_COLUMNS) expect(column in row).toBe(false);
+}
+
+/**
+ * The snapshot-stream cases, declared from their own function.
+ *
+ * Split out of {@link describeCatalogStoreContract} for a mechanical reason
+ * worth stating so the next case does not get folded back in: the linter caps
+ * cognitive complexity per function, and every `it` in this file nests into
+ * whichever one declares it. The suite's one function was already near the cap,
+ * so a group of cases that each open with a capability guard is a group that has
+ * to be declared somewhere else. The seam is otherwise arbitrary — these cases
+ * are the contract exactly as much as the ones beside them.
+ *
+ * Reads `subject` and the two helpers from module scope, which is where they
+ * moved so that this split cost nothing at the call site. `subject` is assigned
+ * in the suite's `beforeAll`, so nothing here may touch it before a case runs.
+ */
+function describeSnapshotStreamCases(): void {
+  it('streams one whole snapshot, in order, and nothing from the loads beside it', async (context) => {
+    const store = subject.store;
+    if (!supportsSnapshotStreams(store)) {
+      // A real answer rather than a gap, and the interface says so at length:
+      // a store fronting an API, or one on a driver that buffers a result set
+      // before resolving, cannot stream honestly, and a shim that collected
+      // every row and yielded them back would satisfy the type while doing the
+      // one thing the type exists to avoid. The caller refuses out loud rather
+      // than falling back to a paged read.
+      skipping(
+        context,
+        'implements no streamSnapshot, so a workflow reading a whole snapshot out of it is refused rather than paged.',
+      );
+      return;
+    }
+    const def = await ready('ContractSnapshotStream');
+    const fields = [...FIELDS];
+
+    await store.write(def, [contractRow('a', 'first', 1), contractRow('b', 'second', 2)], {
+      snapshotId: 'streamed',
+      principalId: 'contract',
+      batch: 0,
+    });
+    await store.commit(def, 'streamed');
+
+    // A second load, so the physical table holds both. A stream that read the
+    // table instead of the snapshot returns three rows here and a plausible
+    // file everywhere else.
+    await store.write(def, [contractRow('c', 'later', 3)], {
+      snapshotId: 'streamed-2',
+      principalId: 'contract',
+      batch: 0,
+    });
+    await store.commit(def, 'streamed-2');
+
+    const streamed: Array<Record<string, unknown>> = [];
+    for await (const row of store.streamSnapshot(def, fields, 'streamed')) streamed.push(row);
+
+    expect(streamed.map((row) => row.id)).toEqual(['a', 'b']);
+    // Keyed by property name, the same vocabulary `read` hands out, so rows
+    // read out of one type can be written into another with no translation.
+    expect(streamed[0]?.label).toBe('first');
+    expect(streamed[0]?.score).toBe(1);
+  });
+
+  it('carries the loading principal on each streamed row, and a carried row keeps the older one', async (context) => {
+    const store = subject.store;
+    if (!supportsSnapshotStreams(store)) {
+      skipping(context, 'implements no streamSnapshot, so it has no stream to put provenance on.');
+      return;
+    }
+    if (!supportsCarryForward(store)) {
+      skipping(
+        context,
+        'is not a CatalogMergeStore, so no row is ever carried rather than loaded.',
+      );
+      return;
+    }
+    const def = await ready('ContractStreamProvenance');
+    const fields = [...FIELDS];
+
+    // **The case that decides what an archive has to hold.** `carryForward`
+    // copies `_principal_id` and `_loaded_at` off the previous snapshot
+    // untouched — deliberately, because a carried row is not a new load of that
+    // row and restamping it would erase the one thing those columns are good
+    // for. So a snapshot produced by an incremental run holds *two* answers to
+    // "who loaded this and when", and neither is recoverable from the snapshot
+    // row, which records only the run that committed it.
+    //
+    // That is the whole argument for a copy of a snapshot carrying these two
+    // columns: without them a restored snapshot answers "whoever ran the
+    // restore, whenever it ran" for every row, and the next incremental load
+    // carries *that* forward, and the one after it, indefinitely.
+    await store.write(def, [contractRow('a', 'alpha', 1), contractRow('b', 'bravo', 2)], {
+      snapshotId: 'base',
+      principalId: 'first-loader',
+      batch: 0,
+    });
+    await store.commit(def, 'base');
+
+    await store.write(def, [contractRow('b', 'bravo-updated', 20)], {
+      snapshotId: 'incremental',
+      principalId: 'second-loader',
+      batch: 0,
+    });
+    const merged = await store.carryForward(def, 'incremental', {
+      principalId: 'second-loader',
+    });
+    expect(merged.carried).toBe(1);
+    await store.commit(def, 'incremental');
+
+    const rows = new Map<string, Record<string, unknown>>();
+    for await (const row of store.streamSnapshot(def, fields, 'incremental', {
+      provenance: true,
+    })) {
+      rows.set(String(row.id), row);
+    }
+    expect([...rows.keys()].sort()).toEqual(['a', 'b']);
+
+    // `a` was not in the incremental run at all — it was carried — so it still
+    // names the run that actually loaded it. `b` was, so it names this one.
+    // The store that dropped these on the way through the stream would return
+    // two identical values here, or none.
+    expect(rows.get('a')?._principal_id).toBe('first-loader');
+    expect(rows.get('b')?._principal_id).toBe('second-loader');
+
+    for (const row of rows.values()) expectProvenance(row);
+
+    for await (const row of store.streamSnapshot(def, fields, 'incremental')) {
+      expectNoProvenance(row);
+    }
+  });
+}
+
+/**
  * Run the contract.
  *
  * `boot` is a getter rather than the store itself because the engine is started
@@ -301,29 +496,6 @@ async function filteredIds(
  * still declared at collection time where the reporter can see it.
  */
 export function describeCatalogStoreContract(boot: () => ContractStore): void {
-  let subject: ContractStore;
-
-  /** Publish and hand back the def, so a case is two lines of setup. */
-  async function ready(caseName: string): Promise<CatalogObjectTypeDef> {
-    const def = contractType(caseName);
-    await subject.publish(def);
-    return def;
-  }
-
-  /**
-   * Skip a case, out loud.
-   *
-   * Vitest's own report says only that something was skipped, which over three
-   * adapters is three silences that look identical whether the case does not
-   * apply, was never written, or was switched off to make a run green. The
-   * reason is printed beside the store's name so a reader of the output can
-   * tell those apart without opening this file.
-   */
-  function skipping(context: { skip: () => void }, reason: string): void {
-    console.log(`[contract] ${subject.name}: ${reason}`);
-    context.skip();
-  }
-
   describe('catalog store contract', () => {
     beforeAll(() => {
       subject = boot();
@@ -894,6 +1066,8 @@ export function describeCatalogStoreContract(boot: () => ContractStore): void {
       expect(idsOf(rows)).toEqual(['a', 'b']);
       expect(rows.rows.map((row) => row.label)).toEqual(['alpha-2', 'bravo-2']);
     });
+
+    describeSnapshotStreamCases();
 
     it('hands a published type and its properties back as they were written', async (context) => {
       const readBack = subject.readBackType;
