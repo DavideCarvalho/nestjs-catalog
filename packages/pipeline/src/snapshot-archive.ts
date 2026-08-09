@@ -334,6 +334,27 @@ const PROVENANCE_SCALARS: Record<CatalogProvenanceColumn, ScalarType> = {
  *   the manifest and in the parquet key-value metadata already.
  * - **`_row` is not**, being the order rather than a value. The stream is in
  *   `_row` order and the file preserves it.
+ *
+ * ## What the two cost, measured
+ *
+ * **0.028 bytes per row**, which is +0.02%. Against 200,000 rows of a 24-column
+ * Sub WO-shaped type at this file's row-group size: 22,621,717 bytes for the
+ * properties alone and 22,627,350 with the two columns beside them — 5,633 bytes
+ * for 400,000 values.
+ *
+ * They cost nothing because of what they hold rather than because parquet is
+ * good: `_principal_id` is one value per load and two after a merge, and
+ * `_loaded_at` is one value per `write()` call — the store takes `now` once per
+ * call and stamps every row of the batch with it — so both are a handful of
+ * distinct strings run-length encoded across the whole file. Measured against
+ * the case that cannot occur, a distinct `_loaded_at` on every row, the same two
+ * columns cost 6.263 B/row, which is the bound on how wrong this gets if a store
+ * ever starts stamping per row.
+ *
+ * Worth recording that `_batch` measured at **0.029 B/row** on the same fixture,
+ * which is to say the same nothing. Size did not decide any of this and could
+ * not have: a per-row integer of low cardinality is free too. What decided it is
+ * that nothing reads it.
  */
 export function archiveColumns(type: CatalogObjectTypeDef): ArchiveColumn[] {
   return [
