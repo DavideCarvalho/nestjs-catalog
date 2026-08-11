@@ -89,6 +89,14 @@ export {
   UnsafeIdentifierError,
 } from './identifiers';
 export {
+  // The window `listSnapshots` and `listSnapshotsWithRows` bound themselves by.
+  // Exported because a host reading a full list has to know whether it read all
+  // of them, and it was reachable only by deep-importing `dist/warehouse.store`
+  // — which flip does today, with a comment saying it should be raised upstream.
+  // This is that, raised: the alternative a host is left with is copying `500`
+  // into its own code, where it drifts silently, and a list quietly shorter than
+  // the truth is the failure this constant exists to make visible.
+  CATALOG_SNAPSHOT_LIST_LIMIT,
   MikroOrmWarehouseStore,
   MySqlWarehouseStore,
   PostgresWarehouseStore,

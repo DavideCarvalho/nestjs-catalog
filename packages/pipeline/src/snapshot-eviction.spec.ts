@@ -137,6 +137,20 @@ class FakeStore implements CatalogSnapshotArchiveStore {
     );
   }
 
+  /**
+   * Exact, and unaffected by any window — which is what a real adapter's is, and
+   * what lets the refusal below say "never a load of this type" and mean it. A
+   * store WITHOUT this can only scan its newest records, so the same id gets a
+   * different and more careful sentence; that path has its own cases in
+   * `snapshot-eviction.window.spec.ts`.
+   */
+  async findSnapshot(
+    _type: CatalogObjectTypeDef,
+    snapshotId: string,
+  ): Promise<SnapshotRef | undefined> {
+    return this.snapshots.get(snapshotId);
+  }
+
   async currentSnapshot(): Promise<SnapshotRef | undefined> {
     return this.currentId === undefined ? undefined : this.snapshots.get(this.currentId);
   }

@@ -254,6 +254,18 @@ class RichCatalogStore implements CatalogWriteStore {
   listSnapshots(type: CatalogObjectTypeDef): Promise<SnapshotRef[]> {
     return this.inner.listSnapshots(type);
   }
+  async listSnapshotsWithRows(type: CatalogObjectTypeDef, limit?: number): Promise<SnapshotRef[]> {
+    const live = (await this.inner.listSnapshots(type)).filter(
+      (snapshot) => snapshot.droppedAt === undefined,
+    );
+    return limit === undefined ? live : live.slice(0, limit);
+  }
+  async findSnapshot(
+    type: CatalogObjectTypeDef,
+    snapshotId: string,
+  ): Promise<SnapshotRef | undefined> {
+    return (await this.inner.listSnapshots(type)).find((snapshot) => snapshot.id === snapshotId);
+  }
   currentSnapshot(type: CatalogObjectTypeDef): Promise<SnapshotRef | undefined> {
     return this.inner.currentSnapshot(type);
   }

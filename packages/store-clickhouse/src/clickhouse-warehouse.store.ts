@@ -38,6 +38,7 @@ import {
 import { CATALOG_CLICKHOUSE_OPTIONS, type CatalogClickHouseStoreOptions } from './options';
 import { refreshView, relationsFor, runReadOnlyQuery } from './query';
 import {
+  CATALOG_SNAPSHOT_LIST_LIMIT,
   type SnapshotRecord,
   droppedMessage,
   findPreviousCommitted,
@@ -863,6 +864,40 @@ export class ClickHouseWarehouseStore
   async listSnapshots(type: CatalogObjectTypeDef): Promise<SnapshotRef[]> {
     const records = await listSnapshots(this.client, type.name);
     return records.map(toRef);
+  }
+
+  /**
+   * The type's snapshots that still hold rows, newest first.
+   *
+   * The store contract's name for the query this adapter has had internally
+   * since tombstones existed — see {@link listSnapshotsWithRows} in
+   * `snapshots.ts` for why the predicate is in the statement, and
+   * {@link pruneSnapshots}, which is the caller it was written for. Declaring it
+   * on the interface is what lets a caller that is NOT this class — a retention
+   * sweep in a host, reading through `CatalogWriteStore` — ask the same question
+   * instead of filtering a bounded list and quietly getting a prefix of it.
+   */
+  async listSnapshotsWithRows(
+    type: CatalogObjectTypeDef,
+    limit = CATALOG_SNAPSHOT_LIST_LIMIT,
+  ): Promise<SnapshotRef[]> {
+    const records = await listSnapshotsWithRows(this.client, type.name, limit);
+    return records.map(toRef);
+  }
+
+  /**
+   * One snapshot of this type, by id, tombstone included.
+   *
+   * Exact, so a caller holding an id off a checkpoint or a run row gets "no such
+   * load of this type" only when that is true, rather than whenever the load is
+   * older than the newest window.
+   */
+  async findSnapshot(
+    type: CatalogObjectTypeDef,
+    snapshotId: string,
+  ): Promise<SnapshotRef | undefined> {
+    const record = await findSnapshot(this.client, type.name, snapshotId);
+    return record === undefined ? undefined : toRef(record);
   }
 
   /**

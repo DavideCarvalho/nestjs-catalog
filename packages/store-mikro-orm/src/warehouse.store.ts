@@ -36,7 +36,7 @@ import type {
 // package, and that single line was the whole of what bound this file to one
 // engine at the type level.
 import { LockMode } from '@mikro-orm/core';
-import type { Transaction } from '@mikro-orm/core';
+import type { FilterQuery, Transaction } from '@mikro-orm/core';
 import type { EntityManager } from '@mikro-orm/sql';
 import { BadRequestException, Inject, Injectable, Logger } from '@nestjs/common';
 import { CATALOG_STORE_ENTITY_MANAGER } from './context';
@@ -1179,14 +1179,104 @@ export class MikroOrmWarehouseStore
    * invisible. {@link CATALOG_SNAPSHOT_LIST_LIMIT} is that number, and the
    * tombstones {@link dropSnapshot} now leaves behind make it matter more rather
    * than less: a dropped snapshot used to leave the list, and now it stays in it.
+   *
+   * That last sentence is the whole reason {@link listSnapshotsWithRows} exists
+   * beside this. **This window counts records, tombstones among them**, so a
+   * caller asking "which snapshots still hold rows" by filtering this result is
+   * asking about the live snapshots *of the newest 500 records*, which is not
+   * the same set and shrinks to nothing as tombstones accumulate. Ask the other
+   * method, which puts the predicate in the statement.
    */
   async listSnapshots(type: CatalogObjectTypeDef): Promise<SnapshotRef[]> {
+    return this.snapshotWindow(type, { typeName: type.name }, CATALOG_SNAPSHOT_LIST_LIMIT);
+  }
+
+  /**
+   * The type's snapshots that still hold rows, newest first.
+   *
+   * ## The predicate is in the statement, and that is the entire point
+   *
+   * `droppedAt: null` goes to the database, so the bound is applied to the live
+   * snapshots rather than to the records. Filtering {@link listSnapshots}'s
+   * result instead takes the newest 500 *records* and drops the tombstones among
+   * them — and a type that has been swept hourly for a few days has a window
+   * that is almost all tombstones, so the filtered list runs short and then runs
+   * empty while the type still has live snapshots to retire. Empty reads as
+   * "nothing to do" to every caller that asks this question, which is how a
+   * retention sweep goes blind while continuing to report that it ran.
+   *
+   * Measured on the deployment this was written for: one type accrued ~4.5
+   * snapshot records an hour against 6 live ones, so the 500-record window was
+   * ~4 days from being all tombstone. The ClickHouse adapter's
+   * `listSnapshotsWithRows` already had this clause for the same reason; this is
+   * the same fix on the adapter the sweep actually runs against.
+   *
+   * ## What a full result means
+   *
+   * That there may be more live snapshots than were returned — and that is a
+   * finding rather than an artefact, because `limit` bounds live snapshots here.
+   * A type at the window has hundreds of loads still holding their rows, which
+   * is a retention policy that is not keeping up, not a list that is too short.
+   *
+   * The index is `(type_name, created_at)`; `dropped_at` is not in it, so this
+   * filters rows the index range hands back rather than seeking on it. That is
+   * the right trade at this table's size — one row per load, thousands, not
+   * millions — and the alternative is an ALTER on every deployment to speed up a
+   * query that runs once an hour.
+   */
+  async listSnapshotsWithRows(
+    type: CatalogObjectTypeDef,
+    limit = CATALOG_SNAPSHOT_LIST_LIMIT,
+  ): Promise<SnapshotRef[]> {
+    return this.snapshotWindow(type, { typeName: type.name, droppedAt: null }, limit);
+  }
+
+  /**
+   * One snapshot of this type, by id, tombstone included.
+   *
+   * Exact rather than a scan of the newest window, and the difference is the
+   * difference between "this load is older than 500 others" and "there is no
+   * such load". An eviction reads its candidate's row count and archive ref
+   * through here, and it is holding an id that came off a checkpoint written
+   * before the sweep started — an id a window has no obligation to still
+   * contain.
+   *
+   * The count is recomputed for an uncommitted snapshot and taken from the
+   * record otherwise, exactly as {@link listSnapshots} does it, so the two
+   * cannot report a different size for the same load.
+   */
+  async findSnapshot(
+    type: CatalogObjectTypeDef,
+    snapshotId: string,
+  ): Promise<SnapshotRef | undefined> {
+    const [ref] = await this.snapshotWindow(type, { typeName: type.name, snapshotId }, 1);
+    return ref;
+  }
+
+  /**
+   * The shared body of the three reads above: a bounded, newest-first window of
+   * `catalog_snapshot`, with the uncommitted rows counted fresh.
+   *
+   * One function because the recount is the subtle half and three copies of it
+   * would be three chances to get it wrong in different ways — and because the
+   * only thing that legitimately differs between the three is the `where`, which
+   * is what the caller passes.
+   */
+  private async snapshotWindow(
+    type: CatalogObjectTypeDef,
+    where: FilterQuery<SnapshotRow>,
+    limit: number,
+  ): Promise<SnapshotRef[]> {
     const em = this.em.fork();
-    const rows = await em.find(
-      SnapshotRow,
-      { typeName: type.name },
-      { orderBy: { createdAt: 'desc' }, limit: CATALOG_SNAPSHOT_LIST_LIMIT },
-    );
+    const rows = await em.find(SnapshotRow, where, {
+      // `snapshotId` breaks the tie, so two loads committed in the same second
+      // cannot swap places between two calls. An unstable window is another way
+      // a bounded list quietly stops being an answer: the row at position 500
+      // would be a coin toss, and a caller comparing two runs would see a
+      // snapshot appear and disappear with nothing having changed.
+      orderBy: { createdAt: 'desc', snapshotId: 'desc' },
+      limit,
+    });
 
     // Tombstones are excluded from the fresh count and not merely absent from
     // the table: their rows are gone, so a count would come back zero and the
