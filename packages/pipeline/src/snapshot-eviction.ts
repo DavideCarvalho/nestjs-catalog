@@ -144,6 +144,152 @@ export interface EvictionSweep {
    * {@link evictSnapshots} for why it is not an exception.
    */
   skipped: Array<{ snapshotId: string; reason: string }>;
+  /**
+   * What the policy was applied to, and whether that was all of it.
+   *
+   * Carried out of the sweep because a caller cannot otherwise tell a sweep that
+   * had nothing to do from a sweep that could not see what it had to do, and
+   * those two look identical in every other field here: no candidates, nothing
+   * evicted, nothing skipped. See {@link SnapshotEvictionPlan.listTruncated}.
+   */
+  plan: SnapshotEvictionPlan;
+}
+
+/**
+ * Which snapshots a sweep is about to retire, and how good a view it had.
+ *
+ * The second half is the part worth having a type for. A retention sweep reads
+ * a bounded list, and a bounded list is a complete answer right up until the
+ * moment it is not — at which point it looks exactly like a complete answer with
+ * fewer things in it. Every field below exists so a caller can tell those apart
+ * without knowing which store it is talking to.
+ */
+export interface SnapshotEvictionPlan {
+  /** The snapshots to evict, oldest first. See {@link selectSnapshotsToEvict}. */
+  candidates: SnapshotRef[];
+  /** Snapshots that still hold rows, as many as the store was asked for. */
+  live: number;
+  /**
+   * Whether the store answered "which snapshots still hold rows" itself.
+   *
+   * False means it was asked for a mixed list of records and the tombstones were
+   * dropped from the result afterwards — a filter applied *after* a bound, which
+   * yields the live snapshots of a window rather than the newest live snapshots.
+   * The answer is still sound as far as it goes; what it cannot do is be sure it
+   * went far enough.
+   */
+  answeredLiveInStatement: boolean;
+  /**
+   * Whether the list came back full, so there may be more than was considered.
+   *
+   * **A caller must not treat this as a detail.** It is the difference between
+   * "this type has nothing left to retire" and "this type has more to retire
+   * than could be seen", and a sweep that reports the second as the first is a
+   * sweep that stops working while continuing to say it ran. What to do about it
+   * depends on the caller — refusing to sweep the very type that most needs it
+   * would be worse than sweeping a prefix of it — but reporting it quietly is
+   * not one of the options.
+   *
+   * When {@link answeredLiveInStatement} is false it is answered pessimistically
+   * unless the caller passed `listBound`: `listSnapshots` takes no bound
+   * argument, so there is no way from in here to tell a store that returned
+   * everything it has from one that returned everything it will show. The cure
+   * is an adapter that implements `listSnapshotsWithRows`.
+   */
+  listTruncated: boolean;
+  /** The bound that was applied, so a report can say what "full" meant. */
+  limit: number;
+}
+
+/**
+ * How many snapshots one planning query asks for.
+ *
+ * Deliberately larger than any adapter's console window. A sweep is not a page:
+ * a screen that shows 500 of 900 snapshots is merely paginated, while a sweep
+ * that sees 500 of 900 leaves 400 loads on disk and says nothing. The two want
+ * different numbers, and this is the one that belongs to the caller that deletes.
+ *
+ * It is still bounded, because an unbounded list is one query that can return a
+ * five-figure result set, and a sweep that dies inside its own SELECT reclaims
+ * nothing at all. 5,000 live snapshots of one type is far past any retention
+ * policy anybody would write; a deployment there gets the truncation signal and
+ * converges over a few runs, which is what a bound is for.
+ */
+export const SNAPSHOT_EVICTION_SCAN_LIMIT = 5_000;
+
+/**
+ * What a retention policy would retire for one type, and how complete the view
+ * behind that answer was.
+ *
+ * Split out of {@link evictSnapshots} so a host that checkpoints its plan — a
+ * durable workflow deciding once and walking the list across many steps — runs
+ * the same selection this package runs, rather than a reimplementation of it
+ * that agrees with it until one of them is edited.
+ *
+ * ## Why it prefers `listSnapshotsWithRows`
+ *
+ * Because the question a retention policy asks is "which snapshots still hold
+ * rows", and every store that keeps tombstones answers a *different* question in
+ * `listSnapshots`: the newest N records, dropped ones included. Filtering that
+ * result gives the live snapshots of the newest N records — a set that shrinks
+ * as tombstones accumulate and reaches empty while the type still has live loads
+ * to retire, at which point the sweep reports "nothing to do" forever.
+ *
+ * Measured, not theorised: on the deployment this was written for, one type
+ * accrued ~4.5 records an hour against 6 live snapshots, putting a 500-record
+ * window ~4 days from being all tombstone.
+ */
+export async function planSnapshotEviction(input: {
+  type: CatalogObjectTypeDef;
+  store: CatalogWriteStore;
+  retention: SnapshotRetention;
+  /** Defaults to {@link SNAPSHOT_EVICTION_SCAN_LIMIT}. */
+  limit?: number;
+  /**
+   * The bound the store's own `listSnapshots` applies, when the caller knows it.
+   *
+   * Only consulted on the degraded path, and only to answer
+   * {@link SnapshotEvictionPlan.listTruncated} precisely instead of
+   * pessimistically. A caller that knows its adapter — flip knows it is on the
+   * MikroORM store and can import that package's `CATALOG_SNAPSHOT_LIST_LIMIT` —
+   * gets "the window is full" on the day it fills; a caller that does not gets
+   * "this may be partial" from the first run, which is true but is the kind of
+   * true that everybody learns to scroll past.
+   */
+  listBound?: number;
+}): Promise<SnapshotEvictionPlan> {
+  const { type, store } = input;
+  const limit = input.limit ?? SNAPSHOT_EVICTION_SCAN_LIMIT;
+  const access = assertCanEvict(store, type);
+
+  // The mixed list ignores `limit`: `listSnapshots` takes no bound argument, so
+  // an adapter without the live query answers with its own window. That is the
+  // whole shape of the degradation — the caller cannot choose how much it sees,
+  // and cannot tell from the result whether it saw all of it.
+  const live = access.listLive;
+  const listed = live === undefined ? await access.listSnapshots() : await live(limit);
+  const stillHoldingRows = listed.filter((snapshot) => !snapshot.droppedAt);
+
+  const current =
+    typeof store.currentSnapshot === 'function' ? await store.currentSnapshot(type) : undefined;
+
+  return {
+    candidates: selectSnapshotsToEvict({
+      snapshots: listed,
+      ...(current === undefined ? {} : { currentSnapshotId: current.id }),
+      retention: input.retention,
+    }),
+    live: stillHoldingRows.length,
+    answeredLiveInStatement: live !== undefined,
+    listTruncated:
+      live !== undefined
+        ? stillHoldingRows.length >= limit
+        : // Against the RECORDS returned, never the live ones: a window full of
+          // records is exactly the state in which live snapshots can be sitting
+          // outside it, whatever the live count inside it happens to be.
+          input.listBound === undefined || listed.length >= input.listBound,
+    limit: live !== undefined ? limit : (input.listBound ?? listed.length),
+  };
 }
 
 /**
@@ -286,6 +432,22 @@ export function selectSnapshotsToEvict(input: {
 interface EvictionAccess {
   store: CatalogSnapshotArchiveStore;
   listSnapshots(): Promise<SnapshotRef[]>;
+  /**
+   * The live snapshots, answered by the store as its own question, when it can.
+   *
+   * Absent means the store has only the mixed, bounded {@link listSnapshots},
+   * and the caller must treat a full window as a possibly-partial answer rather
+   * than as the truth. See {@link planSnapshotEviction}.
+   */
+  listLive?(limit?: number): Promise<SnapshotRef[]>;
+  /**
+   * One snapshot by id, exactly, when the store can answer it.
+   *
+   * Absent means the only way to find a ref is to scan the newest window, which
+   * cannot tell "older than the window" from "never existed" — see
+   * {@link resolveSnapshot} for what that costs and what it does instead.
+   */
+  findSnapshot?(snapshotId: string): Promise<SnapshotRef | undefined>;
 }
 
 export interface EvictSnapshotInput {
@@ -369,15 +531,13 @@ export interface EvictSnapshotInput {
  */
 export async function evictSnapshot(input: EvictSnapshotInput): Promise<EvictedSnapshot> {
   const { type, snapshotId } = input;
-  const { store, listSnapshots } = assertCanEvict(input.store, type, snapshotId);
+  const access = assertCanEvict(input.store, type, snapshotId);
+  const { store } = access;
 
-  const known = await listSnapshots();
-  const snapshot = known.find((each) => each.id === snapshotId);
-  if (!snapshot) {
-    throw new Error(
-      `There is no snapshot ${snapshotId} of "${type.name}" to evict. Its record would still be here if it had been dropped — a tombstone survives — so an id that resolves to nothing was never a load of this type, and nothing is deleted on the strength of one.`,
-    );
-  }
+  // By id, not by scanning a window. The id came from a plan made before this
+  // call — often from a durable checkpoint written hours earlier — and a bounded
+  // list has no obligation to still contain it. See {@link resolveSnapshot}.
+  const snapshot = await resolveSnapshot(access, type, snapshotId);
 
   const archive = input.archive ?? snapshot.archive;
   if (!archive) {
@@ -456,23 +616,24 @@ export async function evictSnapshots(input: {
   store: CatalogWriteStore;
   archives: ArchiveStore;
   retention: SnapshotRetention;
+  /** Passed through to {@link planSnapshotEviction}. */
+  limit?: number;
+  /** Passed through to {@link planSnapshotEviction}. */
+  listBound?: number;
 }): Promise<EvictionSweep> {
   const { type } = input;
-  const { store, listSnapshots } = assertCanEvict(input.store, type);
 
-  const snapshots = await listSnapshots();
-  const current =
-    typeof store.currentSnapshot === 'function' ? await store.currentSnapshot(type) : undefined;
-
-  const candidates = selectSnapshotsToEvict({
-    snapshots,
-    ...(current === undefined ? {} : { currentSnapshotId: current.id }),
+  const plan = await planSnapshotEviction({
+    type,
+    store: input.store,
     retention: input.retention,
+    ...(input.limit === undefined ? {} : { limit: input.limit }),
+    ...(input.listBound === undefined ? {} : { listBound: input.listBound }),
   });
 
   const evicted: EvictedSnapshot[] = [];
   const skipped: Array<{ snapshotId: string; reason: string }> = [];
-  for (const candidate of candidates) {
+  for (const candidate of plan.candidates) {
     try {
       evicted.push(
         await evictSnapshot({
@@ -490,7 +651,7 @@ export async function evictSnapshots(input: {
     }
   }
 
-  return { typeName: type.name, evicted, skipped };
+  return { typeName: type.name, evicted, skipped, plan };
 }
 
 /**
@@ -662,7 +823,53 @@ function assertCanEvict(
       `This store cannot record an archive against a snapshot, so evicting ${what} would leave a tombstone reporting that no copy of it exists anywhere — which is exactly the sentence somebody looking for the data would read. Eviction is refused rather than performed with the record missing. Nothing has been deleted.`,
     );
   }
-  return { store, listSnapshots: () => list(type) };
+
+  // Optional, both of them, and both are the difference between an exact answer
+  // and a bounded one. A store without them still evicts — every path below
+  // degrades to `listSnapshots` — but it degrades to a *prefix* of the truth and
+  // the caller is told so, rather than reading a short list as a complete one.
+  const live = store.listSnapshotsWithRows?.bind(store);
+  const find = store.findSnapshot?.bind(store);
+  return {
+    store,
+    listSnapshots: () => list(type),
+    ...(live === undefined ? {} : { listLive: (limit?: number) => live(type, limit) }),
+    ...(find === undefined ? {} : { findSnapshot: (snapshotId: string) => find(type, snapshotId) }),
+  };
+}
+
+/**
+ * The snapshot a candidate id names, found exactly when the store can and by
+ * scanning the newest window when it cannot.
+ *
+ * The fallback is the old behaviour and it has a failure the exact read does
+ * not: `listSnapshots` is bounded by *records*, tombstones among them, so a
+ * snapshot older than that window comes back absent — and absent, here, produces
+ * the sentence "an id that resolves to nothing was never a load of this type",
+ * which would then be false. That is why the two cases raise different errors.
+ * Neither deletes anything, so the cost of the fallback is a candidate that is
+ * skipped every run with a misleading reason attached, forever; the cost of not
+ * saying which case it is would be somebody believing the reason.
+ */
+async function resolveSnapshot(
+  access: EvictionAccess,
+  type: CatalogObjectTypeDef,
+  snapshotId: string,
+): Promise<SnapshotRef> {
+  if (access.findSnapshot !== undefined) {
+    const found = await access.findSnapshot(snapshotId);
+    if (found) return found;
+    throw new Error(
+      `There is no snapshot ${snapshotId} of "${type.name}" to evict. Its record would still be here if it had been dropped — a tombstone survives — so an id that resolves to nothing was never a load of this type, and nothing is deleted on the strength of one.`,
+    );
+  }
+
+  const known = await access.listSnapshots();
+  const snapshot = known.find((each) => each.id === snapshotId);
+  if (snapshot) return snapshot;
+  throw new Error(
+    `Snapshot ${snapshotId} of "${type.name}" is not among the ${known.length} most recent snapshot record(s) this store will list, and this store cannot look one up by id, so there is no way to read the row count and archive an eviction checks before deleting. It may be a load older than that window rather than one that never existed — an adapter implementing findSnapshot would tell the two apart. Nothing has been deleted.`,
+  );
 }
 
 function describe(error: unknown): string {

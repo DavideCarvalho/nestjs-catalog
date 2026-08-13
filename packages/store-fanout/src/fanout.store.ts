@@ -159,6 +159,14 @@ export class FanoutCatalogStore implements CatalogWriteStore {
    * now stops this package compiling until somebody has decided what to do.
    */
   declare readonly listSnapshots?: (type: CatalogObjectTypeDef) => Promise<SnapshotRef[]>;
+  declare readonly listSnapshotsWithRows?: (
+    type: CatalogObjectTypeDef,
+    limit?: number,
+  ) => Promise<SnapshotRef[]>;
+  declare readonly findSnapshot?: (
+    type: CatalogObjectTypeDef,
+    snapshotId: string,
+  ) => Promise<SnapshotRef | undefined>;
   declare readonly currentSnapshot?: (
     type: CatalogObjectTypeDef,
   ) => Promise<SnapshotRef | undefined>;
@@ -224,6 +232,20 @@ export class FanoutCatalogStore implements CatalogWriteStore {
     if (primary.store.listSnapshots) {
       const listSnapshots = primary.store.listSnapshots.bind(primary.store);
       this.listSnapshots = listSnapshots;
+    }
+    // Bound to the primary for the same reason `listSnapshots` is: the primary's
+    // commit is what decides a load happened, and its drop is what makes a
+    // tombstone, so "which snapshots still hold rows" is its answer. Composing
+    // it would report a follower's backlog as the catalog's, and the caller
+    // asking this question is deciding what to DELETE — the one place where an
+    // answer assembled from stores that disagree is worse than no answer.
+    if (primary.store.listSnapshotsWithRows) {
+      const listSnapshotsWithRows = primary.store.listSnapshotsWithRows.bind(primary.store);
+      this.listSnapshotsWithRows = listSnapshotsWithRows;
+    }
+    if (primary.store.findSnapshot) {
+      const findSnapshot = primary.store.findSnapshot.bind(primary.store);
+      this.findSnapshot = findSnapshot;
     }
     if (primary.store.currentSnapshot) {
       // Bound to the primary and not composed, for the reason every read is: the
@@ -1097,6 +1119,8 @@ export class FanoutCatalogStore implements CatalogWriteStore {
  */
 export const PROBED_STORE_METHODS = [
   'listSnapshots',
+  'listSnapshotsWithRows',
+  'findSnapshot',
   'currentSnapshot',
   'carryForward',
   'runQuery',

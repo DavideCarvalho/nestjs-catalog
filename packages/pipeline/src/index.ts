@@ -119,13 +119,16 @@ export {
   type SnapshotArchiveManifest,
 } from './snapshot-archive';
 export {
+  SNAPSHOT_EVICTION_SCAN_LIMIT,
   evictSnapshot,
   evictSnapshots,
+  planSnapshotEviction,
   selectSnapshotsToEvict,
   verifyArchiveForEviction,
   type EvictSnapshotInput,
   type EvictedSnapshot,
   type EvictionSweep,
+  type SnapshotEvictionPlan,
   type SnapshotRetention,
 } from './snapshot-eviction';
 export {

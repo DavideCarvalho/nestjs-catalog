@@ -379,6 +379,72 @@ export interface CatalogReadStore {
   ): Promise<CatalogReadResult>;
 
   listSnapshots?(type: CatalogObjectTypeDef): Promise<SnapshotRef[]>;
+
+  /**
+   * The type's snapshots **that still hold rows**, newest first, with the
+   * tombstones excluded by the statement rather than by the caller.
+   *
+   * ## Why this is a method and not a `.filter()` on {@link listSnapshots}
+   *
+   * Because `listSnapshots` is bounded, and a bound applied before a predicate
+   * is a different question from a bound applied after it. A caller that lists
+   * the newest N *records* and then drops the tombstones among them is holding
+   * the live snapshots **of that window**, not the newest N live snapshots — and
+   * since a tombstone is what a dropped snapshot leaves behind, a type that has
+   * been swept for long enough has a window made almost entirely of them. Past
+   * N tombstones the filtered list is empty, and empty is indistinguishable from
+   * "nothing to do" to every caller that has ever asked this question.
+   *
+   * The ClickHouse adapter learned this first and put `dropped_at IS NULL`
+   * inside the statement for `pruneSnapshots`; this is that lesson given a name
+   * on the interface, so the next adapter inherits it instead of rediscovering
+   * it. See `listSnapshotsWithRows` in `@dudousxd/nestjs-catalog-store-clickhouse`.
+   *
+   * ## What the bound means here
+   *
+   * `limit` bounds the **live** snapshots, so a result shorter than it is the
+   * complete answer and a result exactly at it means there may be more — and,
+   * unlike the same signal on `listSnapshots`, that is a real finding rather
+   * than an artefact of how long the type has been retained: a type with more
+   * live snapshots than the window is a type whose retention is not keeping up.
+   * A caller that needs to act on completeness should read the length back
+   * against the `limit` it passed.
+   *
+   * ## Optional, and the fallback is worth stating
+   *
+   * A caller that finds it absent has `listSnapshots` and the filter-after-bound
+   * problem above. It should degrade to that — the answer is a *prefix* of the
+   * truth, never a wrong answer about what it did see — but it must say that the
+   * answer may be partial rather than reporting a short list as a complete one.
+   */
+  listSnapshotsWithRows?(type: CatalogObjectTypeDef, limit?: number): Promise<SnapshotRef[]>;
+
+  /**
+   * One snapshot of one type, by id, tombstone included — or `undefined` when
+   * this type never had a load by that name.
+   *
+   * ## Why a lookup, when a list already contains it
+   *
+   * Because every list here is bounded and this question is not about recency.
+   * A caller holding an id got it from somewhere that outlives a window — a
+   * `catalog_connector_run` row, a durable step's checkpoint, a person pasting
+   * from a screen — and answering it by scanning the newest N records turns
+   * "this snapshot is older than N loads" into "there is no such snapshot".
+   * Those two sentences send a reader to entirely different places, and the
+   * second one is a lie a scan cannot know it is telling.
+   *
+   * It is scoped to a type, which is what separates it from {@link
+   * CatalogSnapshotLookupStore.locateSnapshot}: that one exists to answer for an
+   * id whose type is *unknown*, and it costs a scan across every type to do it.
+   * This is the cheap, exact read a caller that already knows the type wants,
+   * and it is the one an eviction uses to find the row count and the archive ref
+   * it is about to check.
+   *
+   * A tombstone comes back rather than reading as absent, for the same reason it
+   * stays in `listSnapshots`: a caller that could not see it would report a
+   * dropped snapshot as one that never existed.
+   */
+  findSnapshot?(type: CatalogObjectTypeDef, snapshotId: string): Promise<SnapshotRef | undefined>;
 }
 
 /**

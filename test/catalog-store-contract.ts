@@ -1009,6 +1009,91 @@ export function describeCatalogStoreContract(boot: () => ContractStore): void {
       expect(replayed?.rowCount).toBe(2);
     });
 
+    it('bounds the snapshots that still hold rows by the live ones, not by the records', async (context) => {
+      const store = tombstoneSubject(context);
+      if (!store) return;
+      const live = store.listSnapshotsWithRows;
+      if (!live) {
+        skipping(
+          context,
+          'implements no listSnapshotsWithRows(), so a caller asking which snapshots still hold ' +
+            'rows has to filter a bounded list and gets the live ones OF THAT WINDOW.',
+        );
+        return;
+      }
+      const def = await ready('ContractLiveWindow');
+
+      // Five loads, and then the two in the MIDDLE are dropped — so the
+      // tombstones are newer than two live snapshots rather than older than all
+      // of them. That ordering is the whole case. A store that applies its bound
+      // to the records and filters afterwards answers a `limit: 3` here with
+      // `[load-5]`: the newest three records are 5, 4 and 3, and two of those
+      // are tombstones. A store with the predicate in the statement answers
+      // `[load-5, load-2, load-1]`.
+      //
+      // In production the tombstones are the OLD ones, which is why the defect
+      // hides: the live snapshots sit at the top of the window and the answer
+      // looks right for as long as the window is bigger than the history. It
+      // stops looking right when the tombstones outnumber the window, and by
+      // then it is a sweep reporting nothing to do while a disk fills.
+      for (const n of [1, 2, 3, 4, 5]) {
+        await store.write(def, [contractRow(`r${n}`, `row ${n}`, n)], {
+          snapshotId: `load-${n}`,
+          principalId: 'contract',
+          batch: 0,
+        });
+        await store.commit(def, `load-${n}`);
+      }
+      await store.dropSnapshot(def, 'load-3');
+      await store.dropSnapshot(def, 'load-4');
+
+      const bounded = await live.call(store, def, 3);
+      expect(bounded.map((ref) => ref.id)).toEqual(['load-5', 'load-2', 'load-1']);
+      // Nothing dropped comes back at all, at any bound. A caller that has to
+      // check `droppedAt` itself has not been given the answer it asked for.
+      expect(bounded.every((ref) => ref.droppedAt === undefined)).toBe(true);
+
+      const all = await live.call(store, def);
+      expect(all.map((ref) => ref.id)).toEqual(['load-5', 'load-2', 'load-1']);
+      // And a bound below the number of live snapshots still truncates, which is
+      // the signal a caller reads completeness off: short means complete, full
+      // means there may be more.
+      expect((await live.call(store, def, 2)).map((ref) => ref.id)).toEqual(['load-5', 'load-2']);
+    });
+
+    it('finds one snapshot by id whatever its age, tombstone included', async (context) => {
+      const store = tombstoneSubject(context);
+      if (!store) return;
+      const find = store.findSnapshot;
+      if (!find) {
+        skipping(
+          context,
+          'implements no findSnapshot(), so an id older than the newest window cannot be told ' +
+            'apart from an id that never named a load of this type.',
+        );
+        return;
+      }
+      const def = await droppedFixture(store, 'ContractFindSnapshot');
+
+      // The tombstone, by name. This is the read an eviction makes to learn the
+      // row count and the archive ref of a candidate it decided on hours ago,
+      // and the candidate's id came off a checkpoint rather than off a list — so
+      // it has to resolve without recency having anything to do with it.
+      const tombstone = await find.call(store, def, 'load-a');
+      expect(tombstone?.droppedAt).toBeDefined();
+      expect(tombstone?.rowCount).toBe(2);
+      expect(tombstone?.principalId).toBe('contract');
+
+      const live = await find.call(store, def, 'load-b');
+      expect(live?.droppedAt).toBeUndefined();
+      expect(live?.rowCount).toBe(1);
+
+      // Absent means absent, and it has to stay distinguishable from a tombstone:
+      // one of them says "that data was deleted on the 8th" and the other says
+      // "no load of this type was ever called that".
+      expect(await find.call(store, def, 'load-never')).toBeUndefined();
+    });
+
     it('refuses to read a dropped snapshot, and refuses to commit one', async (context) => {
       const store = tombstoneSubject(context);
       if (!store) return;
