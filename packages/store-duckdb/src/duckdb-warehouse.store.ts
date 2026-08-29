@@ -90,7 +90,7 @@ export class DuckDbWarehouseStore {
    * DuckDB keeps no history of its own. History here is a prefix per load and a pointer at
    * one of them, which is emulation in exactly the sense MySQL's `_snapshot_id` column is.
    *
-   * ## `atomicCutover: true` — measured, found false, fixed, measured again
+   * ## `atomicCutover: true` — measured, by an experiment that can fail
    *
    * `commit` repoints the served pointer with one `SnapshotCatalog.setCurrent` call, which is
    * one `ObjectStore.put` of a small JSON body (`{"snapshotId":"..."}`, a few dozen bytes) —
@@ -103,11 +103,11 @@ export class DuckDbWarehouseStore {
    *
    * The claim is a measurement. The db-spec's `measures whether a cutover is atomic under
    * concurrent reads` test runs sixteen readers in a loop for the lifetime of 200 cutovers,
-   * so pointer reads are still in flight while `setCurrent` fires, and six runs came back
-   * **0 torn out of 5,072-6,993 reads each**. The same experiment against a `writeFile`
-   * straight at the key — an `O_CREAT|O_TRUNC` open with the body written separately after
-   * it — tore 229-8,296 times per run, which is the half that matters most: it is what says
-   * this detector can fail, so a clean result is a result rather than a switched-off gauge.
+   * so pointer reads are still in flight while `setCurrent` fires, and seven runs came back
+   * **0 torn, out of 5,048-6,993 reads each and 38,558 in total**. Pointed instead at a `writeFile` straight at
+   * the key — an `O_CREAT|O_TRUNC` open with the body written separately after it — the same
+   * experiment tears 229-8,296 times per run. That control is the half that licenses this
+   * field: it is what makes a clean result a result rather than a switched-off gauge.
    *
    * Stated for this class, not only for the binding that was raced: the S3 binding moves the
    * same pointer with a single `PutObjectCommand`, which by S3's own contract never exposes a

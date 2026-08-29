@@ -46,35 +46,49 @@ function etagOf(body: string): string {
   return createHash('sha256').update(body).digest('hex');
 }
 
-/**
- * The suffix an object wears while it is being written but is not yet the key.
- *
- * A staging object lives in the destination's own directory (see {@link writeThenRename}), so
- * it is visible to `list` for as long as the write takes — and a listing that returned it
- * would hand its caller a key that stops existing a moment later. Worse for the one caller
- * that matters: `readSortedRefs` gets every key under `_snapshots/` and parses each, so a
- * visible staging object would put the same snapshot record in the history twice. `walk`
- * therefore skips anything wearing this suffix. No key this store derives ends in it — every
- * one is built by `identifiers.ts` and ends in `.json` or `.parquet`.
- */
+/** The suffix {@link writeThenRename} appends to a body it has not finished putting in place. */
 const STAGING_SUFFIX = '.staging';
+
+/**
+ * What `list` refuses to report: a file whose name is a destination plus a UUID plus
+ * {@link STAGING_SUFFIX}, which is exactly the shape {@link writeThenRename} builds.
+ *
+ * A staging object lives in its destination's own directory, so it is visible to a listing for
+ * as long as the write takes — and a listing that returned it would hand its caller a key that
+ * stops existing a moment later. The caller that would suffer is the snapshot history:
+ * `readSortedRefs` gets and parses every key under `_snapshots/`, so a visible staging object
+ * puts the same record in the history twice, once under each name.
+ *
+ * Matched by the whole shape rather than by a bare suffix, and applied to files only, because
+ * the hazard is in a path COMPONENT and not in a key. Keys are derived by `identifiers.ts` and
+ * end in `.json` or `.parquet`, but a snapshot id is a caller's string and becomes a directory
+ * component of `snapshotPrefix`, so a run called `nightly.staging` is a directory of that name.
+ * A bare-suffix test skips a directory and its whole subtree, so any listing that reached one
+ * from above would report the prefix as empty while the objects sit in it — and empty is the
+ * one wrong answer nothing downstream can tell apart from the truth. No listing this package
+ * takes today starts above a snapshot directory, but that is a fact about the current call
+ * sites rather than a property of this port, and the rule belongs to the port. Requiring the
+ * UUID makes the collision unconstructible instead of merely unlikely; the `isDirectory` check
+ * makes it impossible for a directory regardless. Neither guard is load-bearing alone.
+ */
+const STAGING_NAME = /\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.staging$/;
 
 /**
  * Put a body at a path in one step, so a concurrent reader sees the old object or the new one
  * and never a half-written key.
  *
- * `writeFile` straight at the destination cannot do that: the flag it opens with is
- * `O_CREAT|O_TRUNC`, and the body is written by a separate operation afterwards, so the key is
- * zero bytes on disk in between. That window is not theoretical. The db-spec's cutover race
- * measured 229-8,296 reads per run parsing an empty `_current.json` while `setCurrent` was
- * moving the pointer with the direct write this replaces; `rename` over the destination
- * brought the same race to zero.
+ * `writeFile` aimed straight at the destination cannot promise that: it opens with
+ * `O_CREAT|O_TRUNC` and writes the body in a separate operation afterwards, leaving the key
+ * zero bytes on disk in between. That window is wide enough to hit constantly — pointed at
+ * `_current.json`, the db-spec's cutover race reads an empty pointer 229-8,296 times per run —
+ * and the body's size does not shrink it, because the gap is ahead of the write rather than
+ * inside it. `rename` has no such gap: the destination is the old object until it is the new
+ * one.
  *
- * The staging object must be a SIBLING of the destination, which is why this takes a path
- * rather than building one under `tmpdir()`: `rename` is atomic only within one filesystem,
- * and a temp directory is a separate mount on most machines. Crossing one turns the rename
- * into a copy, which restores the exact window this exists to close — and reports nothing
- * while doing it.
+ * The staging object must be a SIBLING of the destination, which is why this takes a path and
+ * derives one rather than building it under `tmpdir()`: `rename` is atomic only within one
+ * filesystem, and a temp directory is a separate mount on most machines. Crossing one turns
+ * the rename into a copy, which puts the window back and reports nothing while doing it.
  *
  * A failure unlinks the staging object and rethrows the original error. The unlink is allowed
  * to fail silently precisely so it cannot displace that error: a caller must still see the
@@ -125,8 +139,9 @@ export function localObjectStore(root: string): ObjectStore {
   async function walk(directory: string, prefix: string, into: string[]): Promise<void> {
     const entries = await readdir(directory, { withFileTypes: true }).catch(() => []);
     for (const entry of entries) {
-      // A key being written right now is not a key yet — see STAGING_SUFFIX.
-      if (entry.name.endsWith(STAGING_SUFFIX)) continue;
+      // A body being written right now is not a key yet — see STAGING_NAME, which also says
+      // why a directory is never skipped no matter what it is called.
+      if (!entry.isDirectory() && STAGING_NAME.test(entry.name)) continue;
       const key = posix.join(prefix, entry.name);
       if (entry.isDirectory()) {
         await walk(join(directory, entry.name), key, into);
@@ -182,10 +197,10 @@ export function localObjectStore(root: string): ObjectStore {
      * externally, which is what this binding is for; the real multi-writer guarantee is S3's
      * `If-Match`, which Task 13 supplies.
      *
-     * The write itself goes through {@link writeThenRename} like `put`'s does. That closes a
-     * different hole from the one above and is worth separating: a lost update is two WRITERS
-     * disagreeing about who won, while a truncated destination is a READER seeing a key that
-     * momentarily holds nothing. This method used to have both. It still has the first.
+     * The write itself goes through {@link writeThenRename} like `put`'s does, which is a
+     * different guarantee from the one this method lacks and worth keeping apart: a lost update
+     * is two WRITERS disagreeing about who won, while a truncated destination is a READER
+     * seeing a key that momentarily holds nothing. Only the first of those is still true here.
      */
     async putIfMatch(key, body, etag) {
       const current = await this.get(key);

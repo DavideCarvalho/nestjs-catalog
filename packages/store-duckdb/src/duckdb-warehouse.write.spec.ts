@@ -80,10 +80,11 @@ describe('DuckDbWarehouseStore capabilities', () => {
   });
 
   it('declares only the atomicity it has measured', () => {
-    // Earned the long way. The db-spec's race (`duckdb-warehouse.db.spec.ts`) keeps
-    // pointer reads in flight across 200 cutovers; against the `writeFile` this binding
-    // used to do it saw hundreds of them parse a truncated pointer, and against the
-    // sibling-and-rename it does now it sees none, over five runs and ~28,000 reads.
+    // Measured, and by an experiment that can fail: the db-spec's race
+    // (`duckdb-warehouse.db.spec.ts`) keeps pointer reads in flight across 200 cutovers,
+    // and pointed at a `writeFile` aimed straight at the key it reads a truncated pointer
+    // 229-8,296 times per run. Against the sibling-and-rename `put` does, seven runs and
+    // 38,558 reads produced no torn read at all.
     expect(store.capabilities.atomicCutover).toBe(true);
     // `false`, not absent: there is no cross-statement transaction anywhere in this
     // file, so this is a measured "no" rather than an unmeasured silence.
@@ -108,6 +109,26 @@ describe('write', () => {
     expect(await localObjectStore(root).list('writeone/run-1')).toEqual([
       'writeone/run-1/part-000001.parquet',
     ]);
+  });
+
+  it('serves a snapshot whose id ends in the staging suffix like any other', async () => {
+    // A snapshot id is a caller's string, and it becomes a directory component of
+    // `snapshotPrefix` — the same namespace the object store names a body it has not finished
+    // writing in. The listing rule that keeps the two apart is pinned in `object-store.spec.ts`;
+    // this is the end-to-end statement that an id shaped like one stages, counts, commits and
+    // serves like any other.
+    const type = contractType('StagingNamedRun');
+    await store.ensureType(type);
+    await store.write(type, [contractRow('a', 'A', 1)], {
+      snapshotId: 'nightly.staging',
+      principalId: 'tester',
+      batch: 1,
+    });
+    expect(await store.countStaged(type, 'nightly.staging')).toBe(1);
+    await store.commit(type, 'nightly.staging');
+    const served = await store.read(type, ['id', 'label'], {});
+    expect(served.total).toBe(1);
+    expect(served.rows[0]?.label).toBe('A');
   });
 
   it('replaces a re-sent batch instead of appending it', async () => {

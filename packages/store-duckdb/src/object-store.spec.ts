@@ -89,8 +89,19 @@ describe('localObjectStore', () => {
     // `_snapshots/` — would read the same record twice, once under each name.
     mkdirSync(join(root, 'inflight'), { recursive: true });
     await writeFile(join(root, 'inflight', 'real.json'), '{"n":1}', 'utf8');
-    await writeFile(join(root, 'inflight', 'real.json.abc-123.staging'), '{"n":1}', 'utf8');
+    const staging = 'real.json.4f1a2b3c-5d6e-4f70-8a91-b2c3d4e5f607.staging';
+    await writeFile(join(root, 'inflight', staging), '{"n":1}', 'utf8');
     expect(await store.list('inflight')).toEqual(['inflight/real.json']);
+  });
+
+  it('lists through a directory whose own name ends in the staging suffix', async () => {
+    // The hiding rule is about a body mid-write, and a directory is never one. It matters
+    // because a path COMPONENT is not a derived key: a snapshot id is a caller's string and
+    // becomes a directory under `snapshotPrefix`, so a run called `nightly.staging` would
+    // otherwise have its whole row prefix skipped and every caller that asks whether the
+    // snapshot has objects would be told "empty" instead of being told the truth.
+    await store.put('sweep/nightly.staging/part-000001.parquet', 'rows');
+    expect(await store.list('sweep')).toEqual(['sweep/nightly.staging/part-000001.parquet']);
   });
 
   it('propagates a put failure rather than reporting a write that never landed', async () => {
