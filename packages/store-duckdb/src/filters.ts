@@ -1,5 +1,6 @@
 import type { CatalogResolvedFilter, ScalarType } from '@dudousxd/nestjs-catalog';
 import { physicalColumn } from '@dudousxd/nestjs-catalog';
+import { BadRequestException } from '@nestjs/common';
 import { quoteLiteral } from './duckdb';
 import { ident } from './identifiers';
 
@@ -15,14 +16,17 @@ import { ident } from './identifiers';
  * `CatalogResolvedFilter` exists, so this is unreachable through the documented path — it is
  * here for the same reason `resolvedPaging`'s checks are: a caller who builds
  * `CatalogResolvedFilter` by hand, bypassing the service, gets a named refusal rather than a
- * raw engine error that points at the wrong thing.
+ * raw engine error that points at the wrong thing. `BadRequestException`, like every other
+ * refusal this adapter raises over a caller's value and like both shipped siblings: the same
+ * bad filter must not be a 400 with a sentence on one store and a 500 with the message
+ * swallowed on this one, behind a fan-out, from the same console screen.
  */
 function literal(value: string | number | boolean | Date | undefined): string {
   if (value === undefined) return 'NULL';
   if (value instanceof Date) return quoteLiteral(value.toISOString());
   if (typeof value === 'number') {
     if (!Number.isFinite(value)) {
-      throw new Error(`filter value must be a finite number, got ${value}.`);
+      throw new BadRequestException(`filter value must be a finite number, got ${value}.`);
     }
     return String(value);
   }

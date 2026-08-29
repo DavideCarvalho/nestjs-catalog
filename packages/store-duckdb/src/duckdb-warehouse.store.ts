@@ -5,10 +5,13 @@ import { join } from 'node:path';
 import type {
   CarryForwardResult,
   CatalogFilterOperator,
+  CatalogFilteringReadStore,
+  CatalogMergeStore,
   CatalogObjectTypeDef,
   CatalogPropertyDef,
   CatalogReadQuery,
   CatalogReadResult,
+  CatalogSnapshotStreamStore,
   CatalogStoreCapabilities,
   SnapshotRef,
   SnapshotStreamOptions,
@@ -82,7 +85,14 @@ const CARRY_FORWARD_STALE_LABEL = '_carryForwardStale';
 const COMMITTED_LABEL = '_committed';
 
 @Injectable()
-export class DuckDbWarehouseStore {
+// Declared rather than left structural, matching both shipped adapters. The core package asks
+// `typeof Reflect.get(store, 'carryForward') === 'function'` and friends at runtime, which is a
+// question about presence and not about shape: a drifted signature passes every one of those
+// guards and fails at the call site, in a deployment, behind a fan-out. `implements` is where
+// that becomes a compile error instead.
+export class DuckDbWarehouseStore
+  implements CatalogMergeStore, CatalogFilteringReadStore, CatalogSnapshotStreamStore
+{
   /**
    * What this adapter can do, and what it has measured about atomicity.
    *
@@ -286,10 +296,11 @@ export class DuckDbWarehouseStore {
     // it. Refusing the batch outright keeps `batchNumberOf`'s fallback exhaustive rather than
     // merely true of every batch this file's own specs happened to try.
     if (!Number.isInteger(batch) || batch < 0 || batch > Number.MAX_SAFE_INTEGER) {
-      throw new Error(
+      throw new BadRequestException(
         `batch must be a non-negative integer no greater than Number.MAX_SAFE_INTEGER, got ${String(options.batch)}. The batch number is half of this store's object key, and a key it cannot derive — or cannot parse back out of a listing — is a batch a retry cannot replace and an ordered read cannot place.`,
       );
     }
+    assertNoReservedLabels(options.labels);
     // Records that match nothing are a misconfiguration, not a load.
     //
     // Every field is looked up by property name — `stageRow` reads `row[property.name]` — so
@@ -521,7 +532,7 @@ export class DuckDbWarehouseStore {
   async commit(type: CatalogObjectTypeDef, snapshotId: string): Promise<SnapshotRef> {
     const existing = await this.snapshots.find(type.name, snapshotId);
     if (existing?.droppedAt) {
-      throw new Error(
+      throw new BadRequestException(
         `snapshot ${snapshotId} of ${type.name} was dropped on ${existing.droppedAt} and cannot be committed. Its rows are gone; the record survives so run history stays resolvable.`,
       );
     }
@@ -738,7 +749,7 @@ export class DuckDbWarehouseStore {
     const existing = await this.snapshots.find(type.name, snapshotId);
     if (existing?.droppedAt) return;
     if ((await this.snapshots.current(type.name)) === snapshotId) {
-      throw new Error(
+      throw new BadRequestException(
         `snapshot ${snapshotId} is the one ${type.name} is currently serving and cannot be dropped. Commit another snapshot first — a served tombstone would make every ordinary read pay for the question.`,
       );
     }
@@ -845,7 +856,7 @@ export class DuckDbWarehouseStore {
     if (query.snapshot) {
       const ref = await this.snapshots.find(type.name, wanted);
       if (ref?.droppedAt) {
-        throw new Error(
+        throw new BadRequestException(
           `snapshot ${wanted} of ${type.name} held ${ref.rowCount} row(s) and was dropped on ${ref.droppedAt}. Its rows are gone; this read cannot be served and is refused rather than answered with none — an empty result here is indistinguishable from a load that collapsed.`,
         );
       }
@@ -1042,7 +1053,7 @@ export class DuckDbWarehouseStore {
   ): AsyncIterable<Record<string, unknown>> {
     const ref = await this.snapshots.find(type.name, snapshotId);
     if (ref?.droppedAt) {
-      throw new Error(
+      throw new BadRequestException(
         `snapshot ${snapshotId} of ${type.name} was dropped on ${ref.droppedAt} and cannot be streamed. Iterating zero rows here would let a workflow report success and commit an empty load downstream.`,
       );
     }
@@ -1240,7 +1251,7 @@ export class DuckDbWarehouseStore {
     snapshotId: string,
     carryKey: string,
   ): never {
-    throw new Error(
+    throw new BadRequestException(
       `${type.name}'s snapshot ${snapshotId} is currently served and already carries rows forward from an earlier snapshot, but this call found no committed snapshot to carry from (its predecessor may have been dropped). Refusing to overwrite ${carryKey} rather than silently deleting rows ${type.name} is currently serving.`,
     );
   }
@@ -1293,11 +1304,11 @@ export class DuckDbWarehouseStore {
     resolvedOrigin: string,
   ): never {
     if (recordedOrigin === undefined) {
-      throw new Error(
+      throw new BadRequestException(
         `${type.name}'s snapshot ${snapshotId} is the one currently being served and its record says it has never carried rows forward from anything, but this call resolved ${resolvedOrigin} as a source to merge in. Merging would put ${resolvedOrigin}'s rows straight into the dataset ${type.name} is serving, with no commit to make that visible or reversible. Carry forward into a new snapshot and commit that instead.`,
       );
     }
-    throw new Error(
+    throw new BadRequestException(
       `${type.name}'s snapshot ${snapshotId} is currently served and was carried forward from ${recordedOrigin}, but this call resolved a different source: ${resolvedOrigin}. That happens when ${recordedOrigin} is no longer a live, committed snapshot (most likely dropped) and a different one took its place as the newest live committed record. Refusing to substitute ${resolvedOrigin}'s survivors into a snapshot ${type.name} is already serving under ${recordedOrigin}'s name.`,
     );
   }
@@ -1549,6 +1560,7 @@ export class DuckDbWarehouseStore {
         `${type.name} declares no primary key, so an incremental load has no way to say which incoming row replaces which existing one. Publish the type with a primary key, or run this connector in "full" mode, which replaces the dataset outright and needs no key.`,
       );
     }
+    assertNoReservedLabels(options.labels);
     const keyColumns = type.primaryKey.map((name) => physicalColumn(name));
 
     const served = await this.currentSnapshot(type);
@@ -1873,6 +1885,79 @@ function labelsUnchanged(
   const keys = Object.keys(after);
   if (keys.length !== Object.keys(before ?? {}).length) return false;
   return keys.every((key) => before?.[key] === after[key]);
+}
+
+/**
+ * The three label keys this store writes and reads for its own correctness, and which a caller
+ * therefore may not supply.
+ *
+ * Listed rather than matched by their shared `_` prefix, and that is not a stylistic choice —
+ * a prefix rule is WRONG here and was measured to be. `_expectShrink` is an underscore-prefixed
+ * label the core package explicitly instructs a publisher to send through this exact path
+ * ("set it in the `labels` of any batch of the load", `EXPECT_SHRINK_LABEL` in
+ * `packages/pipeline/src/load-expectations.ts`), the publish controller passes a request body's
+ * labels straight to it, and {@link DuckDbWarehouseStore.recordWrittenBatch}'s own docblock
+ * cites that instruction as the reason it merges every batch's labels rather than only the
+ * first's. Refusing the prefix refuses that acknowledgement — on this adapter alone, at the
+ * moment a deliberate collapse is being declared, in a sentence about reserved names — and two
+ * of this package's own specs (`records a label only a LATER batch supplied`, `adds a key a
+ * later batch brought…`) fail on it, which is how this was found rather than shipped.
+ *
+ * So the underscore namespace is shared: the core owns some of it, this store owns these
+ * three. The cost of a list is that a fourth store-owned label has to be added here the day it
+ * is invented. Built from the three constants rather than restating their spellings, so at
+ * least the list cannot disagree with them.
+ */
+const STORE_OWNED_LABELS: readonly string[] = [
+  COMMITTED_LABEL,
+  CARRIED_FROM_LABEL,
+  CARRY_FORWARD_STALE_LABEL,
+];
+
+/**
+ * Refuse a caller's label that would forge one of this store's own bookkeeping facts.
+ *
+ * All three of {@link STORE_OWNED_LABELS} live in the same `Record<string, string>` a publisher
+ * fills in, and `options.labels` reaches that map twice — through {@link
+ * DuckDbWarehouseStore.write}, which hands it to `recordWrittenBatch`, and through {@link
+ * DuckDbWarehouseStore.carryForward} — with both merging it verbatim. It reaches `write` from an
+ * HTTP request body: the publish controller passes `body?.labels` straight through
+ * `PublishService.appendRows`. So without this, three of this file's invariants are settable by
+ * whoever can POST a batch.
+ *
+ * What each forged key buys, sharpest first:
+ *
+ * - **`_committed`** makes {@link hasFinalRowCount} true for a record `write` created carrying
+ *   the placeholder `rowCount: 0`. {@link DuckDbWarehouseStore.present} then stops recomputing
+ *   it, and the placeholder reaches `refuseRowCountDrift`'s `pending === 0` branch
+ *   (`packages/pipeline/src/load-expectations.ts`), which refuses under no bound and below any
+ *   floor — so every full-mode load onto a type already serving rows is refused at commit, in a
+ *   sentence saying the snapshot holds nothing while its rows sit staged on disk. It also makes
+ *   an abandoned, never-committed snapshot eligible as `carryForward`'s fallback merge source,
+ *   which is the single thing `COMMITTED_LABEL` exists to prevent.
+ * - **`_carryForwardStale`** is a permanent commit refusal a caller inflicts on itself: the only
+ *   way past that mark is a `carryForward` that clears it, and `commit`'s message sends the
+ *   caller to do exactly that, which will not help.
+ * - **`_carriedFrom`** forges the lineage {@link DuckDbWarehouseStore.refuseSubstitutedOrigin}
+ *   compares a resolved merge source against, which is what stands between an already-served
+ *   snapshot and a silent, uncommitted substitution of some other predecessor's rows.
+ *
+ * Refused rather than stripped, for the reason every other refusal in this file is a refusal: a
+ * request that asked for something impossible must not be answered with silent success. A
+ * publisher labelling its load and getting a 200 has no way to discover the label was dropped,
+ * and would find out from a provenance query months later.
+ *
+ * The better long-term home is a reserved-name rejection in the core's publish path, where every
+ * adapter would get it and where `_expectShrink` could be carved out once instead of per store —
+ * but the meaning of these three keys is this adapter's, so this adapter is what defends them.
+ */
+function assertNoReservedLabels(labels: Record<string, string> | undefined): void {
+  const reserved = Object.keys(labels ?? {}).filter((key) => STORE_OWNED_LABELS.includes(key));
+  if (reserved.length > 0) {
+    throw new BadRequestException(
+      `Refusing the label(s) ${reserved.join(', ')}: this store writes them itself to record whether a snapshot is committed, what it carried rows forward from, and whether that merge is still current. A caller setting one decides those facts about its own load. Name the label something else.`,
+    );
+  }
 }
 
 /**

@@ -695,6 +695,24 @@ describe('carryForward', () => {
     );
   });
 
+  it('refuses a caller label that would forge one of this store own bookkeeping facts', async () => {
+    // The second door into the same record. `carryForward` merges `options.labels` with the
+    // same spread `write` uses, and it is the call that writes `_carriedFrom` itself — so a
+    // caller supplying one here would be naming the merge source the store is about to record.
+    const type = contractType('CarryReservedLabels');
+    await store.ensureType(type);
+    await store.write(type, [contractRow('a', 'A', 1)], {
+      snapshotId: 'run-1',
+      principalId: 'tester',
+      batch: 0,
+    });
+    for (const key of ['_committed', '_carryForwardStale', '_carriedFrom']) {
+      await expect(
+        store.carryForward(type, 'run-1', { principalId: 'tester', labels: { [key]: 'forged' } }),
+      ).rejects.toThrow(new RegExp(key));
+    }
+  });
+
   it('refuses a NULL primary key among the rows already written for this load', async () => {
     const type = contractType('CarryNullIncoming');
     await store.ensureType(type);

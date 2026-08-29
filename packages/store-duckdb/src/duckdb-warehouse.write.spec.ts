@@ -425,6 +425,44 @@ describe('write', () => {
     expect(committed.labels).toEqual({ source: 'first-batch', _expectShrink: 'known' });
   });
 
+  it('refuses a caller label that would forge one of this store own bookkeeping facts', async () => {
+    // All three arrive on the same public surface: the publish controller passes a request
+    // body's `labels` straight to `appendRows`, which passes them to `write`, which merges them
+    // into the snapshot record verbatim.
+    //
+    // `_committed` is the sharpest — it makes `hasFinalRowCount` true for a record whose
+    // `rowCount` is still the `0` placeholder, so `present` stops recomputing it and the
+    // placeholder reaches the load bound's unconditional "collapsed to nothing" refusal.
+    // `_carryForwardStale` is a permanent commit refusal a caller inflicts on itself.
+    // `_carriedFrom` forges the lineage `refuseSubstitutedOrigin` compares against.
+    const type = contractType('WriteReservedLabels');
+    await store.ensureType(type);
+    for (const key of ['_committed', '_carryForwardStale', '_carriedFrom']) {
+      await expect(
+        store.write(type, [contractRow('a', 'A', 1)], {
+          snapshotId: 'run-1',
+          principalId: 'tester',
+          labels: { [key]: 'forged' },
+        }),
+      ).rejects.toThrow(new RegExp(key));
+    }
+  });
+
+  it('still accepts _expectShrink, which is the core own caller-supplied label', async () => {
+    // The reason the refusal above is a list of three names and not the `_` prefix. The core
+    // package tells a publisher to set `_expectShrink` "in the labels of any batch of the
+    // load"; a prefix rule would refuse that acknowledgement on this adapter alone.
+    const type = contractType('WriteExpectShrinkLabel');
+    await store.ensureType(type);
+    await store.write(type, [contractRow('a', 'A', 1)], {
+      snapshotId: 'run-1',
+      principalId: 'tester',
+      labels: { _expectShrink: 'migration to one base' },
+    });
+    const committed = await store.commit(type, 'run-1');
+    expect(committed.labels).toEqual({ _expectShrink: 'migration to one base' });
+  });
+
   it('refuses a batch above Number.MAX_SAFE_INTEGER', async () => {
     // batchKey renders a batch through String(batch); past MAX_SAFE_INTEGER that can render as
     // exponential notation ('1e+21'), which streamSnapshot's batchNumberOf cannot parse back
