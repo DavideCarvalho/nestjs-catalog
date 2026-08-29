@@ -72,6 +72,41 @@ describe('localObjectStore', () => {
     await writeFile(store.locate(key), 'ok', 'utf8');
   });
 
+  it('leaves nothing behind, at any depth, that a later list would report as a key', async () => {
+    // `put` writes a sibling of the destination and renames it into place, and the sibling
+    // lives in the destination's own directory rather than under `tmpdir()` — `rename` is
+    // atomic only within one filesystem. So the two things worth pinning are that the deep
+    // directory gets made for the staging object too, and that nothing survives the write.
+    await store.put('staged/deep/dir/object.json', '{"n":1}');
+    expect(await store.list('staged')).toEqual(['staged/deep/dir/object.json']);
+    expect((await store.get('staged/deep/dir/object.json'))?.body).toBe('{"n":1}');
+  });
+
+  it('hides an object still being written from a concurrent list', async () => {
+    // A staging object is visible on disk for as long as the write takes. `list` must not
+    // report it: its caller would get a key that stops existing a moment later, and the one
+    // caller that matters — the snapshot history, which gets and parses every key under
+    // `_snapshots/` — would read the same record twice, once under each name.
+    mkdirSync(join(root, 'inflight'), { recursive: true });
+    await writeFile(join(root, 'inflight', 'real.json'), '{"n":1}', 'utf8');
+    await writeFile(join(root, 'inflight', 'real.json.abc-123.staging'), '{"n":1}', 'utf8');
+    expect(await store.list('inflight')).toEqual(['inflight/real.json']);
+  });
+
+  it('propagates a put failure rather than reporting a write that never landed', async () => {
+    // The staging-and-rename dance must not swallow a real fault: EACCES under the target
+    // directory has to surface as itself, not as a cleanup error raised while unlinking the
+    // staging object, and not as a successful `put` that wrote nothing.
+    const lockedDir = join(root, 'locked-put');
+    mkdirSync(lockedDir);
+    chmodSync(lockedDir, 0o000);
+    try {
+      await expect(store.put('locked-put/object.json', 'x')).rejects.toThrow(/EACCES/);
+    } finally {
+      chmodSync(lockedDir, 0o700);
+    }
+  });
+
   it('propagates a get failure that is not "the key is absent"', async () => {
     // EISDIR is a cheap, reliable way to produce a non-ENOENT fault without filling a disk:
     // reading a directory as though it were a file. `get` must not report this as "never

@@ -29,7 +29,7 @@ import { DuckDbWarehouseStore } from './duckdb-warehouse.store';
  * needs is not a large number of reads but reads still being issued when `setCurrent` fires,
  * which only a looping reader supplies. Sixteen keeps the default four-thread libuv pool —
  * the one serving both the pointer reads and the pointer writes — busy for the whole race:
- * measured, the readers get through roughly 4,500-4,800 reads across the 200 cutovers.
+ * measured, the readers get through roughly 5,000-7,000 reads across the 200 cutovers.
  */
 const RACE_READERS = 16;
 const RACE_CUTOVERS = 200;
@@ -87,14 +87,22 @@ describe('DuckDbWarehouseStore', () => {
    * The window is one file. `read` touches the pointer exactly once, at its first await
    * (`snapshots.current`), and everything after that reads Parquet under the id it already
    * resolved, which no commit rewrites. `commit` moves that same pointer through
-   * `ObjectStore.put`, which the local binding spells as `writeFile` — an `O_TRUNC` open and
-   * then a separate write, with the file empty in between. So this experiment is sensitive
-   * only while a pointer read is in flight during a pointer write, and its whole design is
-   * about arranging that overlap: the readers loop for the lifetime of the commits, and the
-   * commits do not start until every reader has completed a read and is going round again.
-   * A fixed batch of reads fired once up front measures nothing — all of them resolve before
-   * the first `setCurrent` lands, since every commit clears `snapshots.find`, a `countStaged`
-   * scan and a `snapshots.put` first, so `failures` would be empty by construction.
+   * `ObjectStore.put`. So this experiment is sensitive only while a pointer read is in flight
+   * during a pointer write, and its whole design is about arranging that overlap: the readers
+   * loop for the lifetime of the commits, and the commits do not start until every reader has
+   * completed a read and is going round again. A fixed batch of reads fired once up front
+   * measures nothing — all of them resolve before the first `setCurrent` lands, since every
+   * commit clears `snapshots.find`, a `countStaged` scan and a `snapshots.put` first, so
+   * `failures` would be empty by construction. That was the shape this replaced, and it is
+   * why the shape matters more than the count.
+   *
+   * It found something. `put` used to write straight at the key with `writeFile`, whose
+   * `O_CREAT|O_TRUNC` open precedes the body by a whole separate operation, and this test read
+   * a zero-byte `_current.json` 229-8,296 times per run. `put` now stages a sibling and
+   * renames it into place (`object-store.ts`), and the same runs come back clean — so what
+   * this case guards now is that the rename stays. A regression to a direct write shows up
+   * here as a `Current-snapshot pointer … is not valid JSON` in the failure list, and the
+   * assertion below turns that into a red test rather than a silent capability lie.
    */
   it('measures whether a cutover is atomic under concurrent reads', async () => {
     // `atomicCutover` is a property of the statement the adapter chose, not of the engine —
@@ -160,8 +168,8 @@ describe('DuckDbWarehouseStore', () => {
     // Then what the capability object is allowed to say, bound to what this run observed.
     // Conditional on purpose, and the two directions are not symmetric: one torn read
     // disproves `atomicCutover` outright, while a clean run proves nothing beyond itself and
-    // so constrains nothing. Every run of this against the local binding has been dirty; a
-    // binding whose pointer swap is genuinely atomic passes this untouched.
+    // so constrains nothing. Since the store now states `true`, this is the regression gate —
+    // the day the pointer write stops being atomic, one torn read fails this case.
     if (failures.length > 0) expect(store.capabilities.atomicCutover).toBeUndefined();
   }, 300_000);
 });

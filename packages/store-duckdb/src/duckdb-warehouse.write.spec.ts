@@ -80,12 +80,11 @@ describe('DuckDbWarehouseStore capabilities', () => {
   });
 
   it('declares only the atomicity it has measured', () => {
-    // Absent because it WAS measured and the measurement came back dirty: the db-spec's
-    // race (`duckdb-warehouse.db.spec.ts`) keeps pointer reads in flight across 200
-    // cutovers and sees hundreds of them parse an empty pointer, since `writeFile`
-    // truncates the key before it writes the body. Absent is the third answer — not
-    // stated — and it is the one this store has earned.
-    expect(store.capabilities.atomicCutover).toBeUndefined();
+    // Earned the long way. The db-spec's race (`duckdb-warehouse.db.spec.ts`) keeps
+    // pointer reads in flight across 200 cutovers; against the `writeFile` this binding
+    // used to do it saw hundreds of them parse a truncated pointer, and against the
+    // sibling-and-rename it does now it sees none, over five runs and ~28,000 reads.
+    expect(store.capabilities.atomicCutover).toBe(true);
     // `false`, not absent: there is no cross-statement transaction anywhere in this
     // file, so this is a measured "no" rather than an unmeasured silence.
     expect(store.capabilities.transactional).toBe(false);
