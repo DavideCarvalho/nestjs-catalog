@@ -1,11 +1,59 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type { CatalogObjectTypeDef } from '@dudousxd/nestjs-catalog';
 import { isCatalogStoreCapabilities, isWriteStore } from '@dudousxd/nestjs-catalog';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { contractRow, contractType } from '../../../test/catalog-store-contract';
+import * as duckdbModule from './duckdb';
 import { DuckDbWarehouseStore } from './duckdb-warehouse.store';
 import { localObjectStore } from './object-store';
+
+/**
+ * A type with one property spelled the way a real source spells it, the same incident the
+ * core package's `physicalColumn` docblock records: a load matches a record to a property by
+ * property NAME, so a property called `Asset Id` has to clean to `Asset_Id` on the write path
+ * for `stageRow` to find it under a name DuckDB will also accept in a `SELECT` list — and
+ * nothing in this file's other fixtures exercises that cleaning, since `contractType`'s
+ * properties are already safe identifiers before `physicalColumn` ever touches them.
+ */
+function sourceSpelledType(name: string): CatalogObjectTypeDef {
+  return {
+    name,
+    displayName: name,
+    pluralDisplayName: `${name}s`,
+    description: 'Fixture for a property spelled the way a source spells it.',
+    tableName: `obj_${name.toLowerCase()}`,
+    group: 'Contract',
+    primaryKey: ['id'],
+    enriched: true,
+    properties: [
+      {
+        name: 'id',
+        displayName: 'id',
+        type: 'string',
+        columnName: 'id',
+        nullable: false,
+        primary: true,
+        hidden: false,
+        order: 0,
+        enriched: false,
+      },
+      {
+        name: 'Asset Id',
+        displayName: 'Asset Id',
+        type: 'string',
+        columnName: 'Asset Id',
+        nullable: true,
+        primary: false,
+        hidden: false,
+        order: 1,
+        enriched: false,
+      },
+    ],
+    relations: [],
+  };
+}
 
 let root: string;
 let store: DuckDbWarehouseStore;
@@ -112,10 +160,24 @@ describe('write', () => {
       batch: 1,
     });
     expect(result.written).toBe(0);
-    expect(await localObjectStore(root).list('writeempty/run-1')).toEqual([
-      'writeempty/run-1/part-000001.parquet',
-    ]);
+    const key = 'writeempty/run-1/part-000001.parquet';
+    expect(await localObjectStore(root).list('writeempty/run-1')).toEqual([key]);
     expect(await store.countStaged(type, 'run-1')).toBe(0);
+
+    // "Schema-carrying" is the claim under test, not just "exists": a zero-row Parquet
+    // object with no columns at all would also satisfy every assertion above. `DESCRIBE`
+    // over the object proves the declared columns are actually there.
+    const connection = await duckdbModule.openDuckDb({ root });
+    try {
+      const described = await connection.rows(
+        `DESCRIBE SELECT * FROM read_parquet(${duckdbModule.quoteLiteral(localObjectStore(root).locate(key))})`,
+      );
+      expect(described.map((column) => column.column_name)).toEqual(
+        expect.arrayContaining(['id', 'label', 'score', 'active', 'seenAt']),
+      );
+    } finally {
+      await connection.close();
+    }
   });
 
   it('defaults an unnumbered batch to 0, matching the sibling adapters', async () => {
@@ -158,5 +220,95 @@ describe('write', () => {
       'writedefaultbatch/run-1/part-000001.parquet',
     ]);
     expect(await store.countStaged(type, 'run-1')).toBe(2);
+  });
+
+  it('refuses a batch whose record keys match no property, and still accepts a zero-row batch', async () => {
+    // Every field is looked up by property name. A record set keyed under different headers —
+    // the exact shape of a CSV that arrived from a resource that renamed its columns — coerces
+    // to `null` for every property, and nothing about that fails on its own: `write` would
+    // report `{ written: N }`, the object would land, and a later `commit` would repoint the
+    // served pointer at N rows that say nothing. That is the "row count that looks plausible"
+    // failure the core interface's own `write` docblock names.
+    const type = contractType('WriteMismatched');
+    await store.ensureType(type);
+    await expect(
+      store.write(type, [{ unrelatedField: 'x', anotherField: 'y' }], {
+        snapshotId: 'run-1',
+        principalId: 'tester',
+        batch: 0,
+      }),
+    ).rejects.toThrow(/none of the incoming fields match/i);
+
+    // The guard is asked only of a batch that has rows: a zero-row batch carries no field
+    // names to disagree with the type, and must still succeed for Ruling 4's sake.
+    const result = await store.write(type, [], {
+      snapshotId: 'run-1',
+      principalId: 'tester',
+      batch: 0,
+    });
+    expect(result.written).toBe(0);
+  });
+
+  it('memoizes the connection, so concurrent first calls open only one', async () => {
+    // `ready()` is private, so this is checked the one way available from outside: spying on
+    // the module-level `openDuckDb` this store's `ready()` calls, and firing two writes at a
+    // fresh store — one that has never opened a connection — at the same time. An unmemoized
+    // `ready()` has an `await` between checking `this.connection` and setting it, so both
+    // calls would see it unset and each call `openDuckDb`, leaking a second DuckDB instance
+    // that runs under none of this store's configured memory or thread limits.
+    const concurrentRoot = mkdtempSync(join(tmpdir(), 'catalog-duckdb-concurrent-'));
+    const concurrentStore = new DuckDbWarehouseStore({ root: concurrentRoot });
+    const openSpy = vi.spyOn(duckdbModule, 'openDuckDb');
+    try {
+      const type = contractType('WriteConcurrent');
+      await concurrentStore.ensureType(type);
+      await Promise.all([
+        concurrentStore.write(type, [contractRow('a', 'A', 1)], {
+          snapshotId: 'run-1',
+          principalId: 'tester',
+          batch: 0,
+        }),
+        concurrentStore.write(type, [contractRow('b', 'B', 2)], {
+          snapshotId: 'run-1',
+          principalId: 'tester',
+          batch: 1,
+        }),
+      ]);
+      expect(openSpy).toHaveBeenCalledTimes(1);
+      expect(await concurrentStore.countStaged(type, 'run-1')).toBe(2);
+    } finally {
+      openSpy.mockRestore();
+      await concurrentStore.close();
+      rmSync(concurrentRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('writes a property spelled the way a source spells it under its cleaned physical name', async () => {
+    // The incident `physicalColumn`'s own docblock records: thirteen types loaded with a
+    // property renamed to dodge this exact problem, and six came back with most of their
+    // columns empty because nothing on the write path ever exercised the cleaning. `Asset Id`
+    // must clean to `Asset_Id` — a name `stageColumns` can declare and a later `SELECT` can
+    // name — and the row written under the source's own spelling must actually be staged
+    // there, not silently dropped for having no property that matches its exact key.
+    const type = sourceSpelledType('WriteSpelled');
+    await store.ensureType(type);
+    const result = await store.write(type, [{ id: 'a', 'Asset Id': 'A-71' }], {
+      snapshotId: 'run-1',
+      principalId: 'tester',
+      batch: 0,
+    });
+    expect(result.written).toBe(1);
+    expect(await store.countStaged(type, 'run-1')).toBe(1);
+
+    const key = 'writespelled/run-1/part-000000.parquet';
+    const connection = await duckdbModule.openDuckDb({ root });
+    try {
+      const rows = await connection.rows(
+        `SELECT Asset_Id FROM read_parquet(${duckdbModule.quoteLiteral(localObjectStore(root).locate(key))})`,
+      );
+      expect(rows).toEqual([{ Asset_Id: 'A-71' }]);
+    } finally {
+      await connection.close();
+    }
   });
 });
