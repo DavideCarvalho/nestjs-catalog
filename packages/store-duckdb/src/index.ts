@@ -19,5 +19,10 @@ export {
   type CatalogDuckDbStoreOptions,
   type DuckDbS3Options,
 } from './options';
+export {
+  objectSnapshotCatalog,
+  SNAPSHOT_LIST_LIMIT,
+  type SnapshotCatalog,
+} from './snapshots';
 export { CatalogDuckDbStoreModule } from './store.module';
 export { DuckDbWarehouseStore } from './duckdb-warehouse.store';

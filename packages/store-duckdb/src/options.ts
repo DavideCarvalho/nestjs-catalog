@@ -1,4 +1,5 @@
 import type { ObjectStore } from './object-store';
+import type { SnapshotCatalog } from './snapshots';
 
 export const CATALOG_DUCKDB_OPTIONS = Symbol('CATALOG_DUCKDB_OPTIONS');
 
@@ -35,4 +36,10 @@ export interface CatalogDuckDbStoreOptions {
    * with its own transport.
    */
   objectStore?: ObjectStore;
+  /**
+   * Overrides the object-backed default. A host that has a transactional database
+   * should bind one — the pointer that decides what readers see is the one piece of
+   * this store's state worth a transaction.
+   */
+  snapshotCatalog?: SnapshotCatalog;
 }
