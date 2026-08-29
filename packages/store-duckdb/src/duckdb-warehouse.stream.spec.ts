@@ -800,6 +800,22 @@ describe('carryForward on a snapshot that is already served', () => {
 
     const read = await store.read(type, ['id'], { size: 10 });
     expect(read.rows.map((row) => row.id)).toEqual(['a']);
+
+    // The rest of what this fall-through does, pinned rather than left implicit. It is NOT all
+    // harmless: a zero-row `carry.parquet` lands inside the prefix a committed, SERVED snapshot
+    // is read from, and the served record is rewritten -- gaining a `_carriedFrom` lineage for a
+    // merge that never happened, and a `rowCount` written outside any commit. Both are stated
+    // here so the contract change that removes this path has a test to change rather than a
+    // silent behaviour to rediscover. Not guarded here: a fourth refusal on `carryForward` is
+    // the wrong shape of fix, and the right one is a contract decision.
+    expect(await localObjectStore(root).list('carryneverwritten/run-1')).toEqual([
+      'carryneverwritten/run-1/carry.parquet',
+      'carryneverwritten/run-1/part-000000.parquet',
+    ]);
+    const served = await store.currentSnapshot(type);
+    expect(served?.id).toBe('run-1');
+    expect(served?.labels).toEqual({ _carriedFrom: 'none' });
+    expect(served?.rowCount).toBe(1);
   });
 
   it('refuses to merge a predecessor into a served snapshot whose record names no origin', async () => {

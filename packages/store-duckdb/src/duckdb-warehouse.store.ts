@@ -207,9 +207,10 @@ export class DuckDbWarehouseStore {
    * early instead would mean a batch whose key `countStaged` and `read` can never resolve,
    * for the one case a caller is guaranteed to hit on every empty source.
    *
-   * Creates the load's snapshot record on its first batch and never rewrites it on a later one
-   * — see the comment at the end of the body for what that record carries, why this call is
-   * what anchors its `createdAt`, and why its `rowCount` is a placeholder rather than a count.
+   * Every call touches the load's snapshot record, and the first one creates it: see {@link
+   * recordWrittenBatch} for what that record carries, why this call is what anchors its
+   * `createdAt`, why its `rowCount` is a placeholder rather than a count, and what a batch after
+   * the first can still change about it.
    */
   async write(
     type: CatalogObjectTypeDef,
@@ -318,8 +319,8 @@ export class DuckDbWarehouseStore {
   }
 
   /**
-   * The snapshot record `write` leaves behind, created on a load's first batch and marked when
-   * a batch lands after a merge.
+   * The snapshot record `write` leaves behind: created on a load's first batch, kept current
+   * with any labels a later batch brings, and marked when a batch lands after a merge.
    *
    * Split out of {@link write} rather than left inline for this file's complexity budget, which
    * the record's two jobs pushed that method past. They are separate jobs and both belong to a
@@ -336,20 +337,28 @@ export class DuckDbWarehouseStore {
    * ignored: `commit` refuses on this mark, so the only way past it is to run `carryForward`
    * again, which is exactly what a full retry of the load does anyway.
    *
-   * ## Creating the load's record on its first batch
+   * ## Creating the load's record, and keeping its labels current
    *
-   * Created once and never rewritten by a later batch, matching both siblings, whose `write`
-   * upserts the same row on every batch and leaves whatever it finds
-   * (`packages/store-mikro-orm/src/warehouse.store.ts`, "upserted rather than inserted so a
-   * retried batch does not create a second one"). It carries two things nothing else is in a
-   * position to record.
+   * Created by the FIRST batch, then upserted by any later batch that has something to add —
+   * matching both siblings, whose `write` upserts the same row on every batch and leaves
+   * whatever it finds (`packages/store-mikro-orm/src/warehouse.store.ts`, "upserted rather than
+   * inserted so a retried batch does not create a second one"). What a later batch can change is
+   * bounded: the stale mark above, and label keys the record does not already carry. `id`,
+   * `createdAt`, `principalId` and any label value already recorded are written once and left
+   * alone; a batch with nothing new to say writes nothing at all (see {@link labelsUnchanged}).
    *
-   * The first is `options.labels`: a caller's provenance — which base, which file, which
-   * workflow run — which used to be declared on `write` and never read, so a plain full load's
-   * labels were silently discarded, `commit` taking no `labels` parameter of its own and only
-   * ever seeing labels that arrived on a record something else had already written. A key
-   * recorded here is never overwritten later; see `carryForward`'s own merge of the same
-   * parameter for the other half of that rule.
+   * `options.labels` is a caller's provenance — which base, which file, which workflow run —
+   * and it used to be declared on `write` and never read, so a plain full load's labels were
+   * silently discarded, `commit` taking no `labels` parameter of its own and only ever seeing
+   * labels that arrived on a record something else had already written. Reading it only on the
+   * batch that creates the record was the same defect one batch over: the core package's own
+   * `EXPECT_SHRINK_LABEL` docblock (`packages/pipeline/src/load-expectations.ts`) tells a
+   * publisher to "set it in the `labels` of ANY batch of the load", `PublishService.appendRows`
+   * takes labels per call, and the publish controller passes them per request — so a publisher
+   * acknowledging a deliberate collapse on its second batch had the acknowledgement dropped and
+   * was then refused at commit for the collapse it had acknowledged. Merged under what is
+   * already recorded, so a key keeps the value the first batch to supply it gave it; see
+   * `carryForward`'s own merge of the same parameter for the third writer of the same rule.
    *
    * The second is `createdAt`, and it is why this runs whether or not any labels came with it.
    * `createdAt` is what `SnapshotCatalog`'s `list`/`listLive` sort on, so it is what "newest"
@@ -386,11 +395,18 @@ export class DuckDbWarehouseStore {
       );
       return;
     }
-    if (existingRef.labels?.[CARRIED_FROM_LABEL] === undefined) return;
-    await this.snapshots.put(type.name, {
-      ...existingRef,
-      labels: { ...existingRef.labels, [CARRY_FORWARD_STALE_LABEL]: 'true' },
-    });
+    // Under what is already recorded, never over it — the same spread, in the same order, as
+    // `carryForward`'s. A key a previous batch supplied keeps its value; a key only THIS batch
+    // supplies is added.
+    const labels: Record<string, string> = { ...options.labels, ...existingRef.labels };
+    if (existingRef.labels?.[CARRIED_FROM_LABEL] !== undefined) {
+      labels[CARRY_FORWARD_STALE_LABEL] = 'true';
+    }
+    // Nothing new to say: no label this batch brought is missing from the record, and no merge
+    // needs marking. Skipped rather than written, so an ordinary multi-batch load still pays one
+    // GET per batch and no PUT — the cost `write` has always had.
+    if (labelsUnchanged(existingRef.labels, labels)) return;
+    await this.snapshots.put(type.name, { ...existingRef, labels });
   }
 
   /** How many rows are staged under a snapshot. Present for this package's own specs. */
@@ -579,12 +595,17 @@ export class DuckDbWarehouseStore {
    * both are handed back verbatim. A **tombstone** carries what `dropSnapshot` recorded before
    * deleting the rows; recounting one would answer zero for a load that held millions. A
    * **committed** record carries what `commit` counted while blessing it, which is also the
-   * number the pipeline's bound compared against, and it stays that until another `commit`
-   * republishes it. Nothing in this store refuses a `write` into an already-committed snapshot,
-   * so that number can be overtaken on disk — but those rows are a load nobody has blessed, and
-   * recounting here would change what a committed snapshot claims with no commit having said
-   * so. Re-running `commit` is what makes such a number current, and that is the only thing
-   * that should.
+   * number the pipeline's bound compared against. Nothing in this store refuses a `write` into
+   * an already-committed snapshot, so that number can be overtaken on disk — but those rows are
+   * a load nobody has blessed, and recounting here would change what a committed snapshot claims
+   * with no commit having said so.
+   *
+   * One other writer reaches a committed record's `rowCount`: `carryForward` assigns
+   * `ref.rowCount = total` to whatever record it found, and on the served-replay path that
+   * record is committed and no commit follows. The two numbers agree in practice — `total` is
+   * the same `countStaged` over the same snapshot that `commit` ran — but that is an agreement
+   * rather than a rule this method enforces, and it is stated here rather than left as a claim
+   * that only a committed number is written by a commit.
    *
    * Every OTHER writer of a record writes a `rowCount` it has no way to maintain: `write`
    * creates one on a load's first batch, before the rest of the load exists, and `carryForward`
@@ -1555,14 +1576,13 @@ export class DuckDbWarehouseStore {
       rowCount: 0,
       principalId: options.principalId,
     };
-    // One rule for a caller's labels across all three writers of this record: **a key is
-    // recorded by the first call that supplies it and never overwritten by a later one.**
-    // `write` creates the record on the first batch and leaves it alone on the ones after;
-    // this merges whatever `options.labels` brings UNDER what is already recorded, so labels
-    // supplied only here (a caller that labels its merge and not its batches) are kept, and
-    // labels supplied to both do not flip value halfway through a load. Written as a spread in
-    // that order rather than as a branch on `existingRef`, because branching is how this
-    // parameter came to be read on one path and silently discarded on the other.
+    // One rule for a caller's labels across every writer of this record: **a key is recorded by
+    // the first call that supplies it and never overwritten by a later one.** `write` merges
+    // each batch's labels the same way, in the same spread order (see `recordWrittenBatch`), so
+    // labels supplied only here — a caller that labels its merge and not its batches — are kept,
+    // and labels supplied to both do not flip value halfway through a load. Written as a spread
+    // rather than as a branch on `existingRef`, because branching is how this parameter came to
+    // be read on one path and silently discarded on the other, twice.
     const labels = { ...options.labels, ...ref.labels };
     labels[CARRIED_FROM_LABEL] = previous?.id ?? CARRIED_FROM_NOTHING;
     // The merge is current as of now, whatever it was before this call.
@@ -1785,6 +1805,28 @@ function normaliseRow(
 function batchNumberOf(key: string): number {
   const match = /\/part-(\d+)\.parquet$/.exec(key);
   return match ? Number(match[1]) : CARRY_FORWARD_BATCH;
+}
+
+/**
+ * Whether a merged label map says anything the record does not already say.
+ *
+ * {@link DuckDbWarehouseStore.recordWrittenBatch} runs on every batch of a load, and the
+ * ordinary case is a load whose batches all carry the same labels: the merge then produces
+ * exactly what is already stored, and writing it back would be one object PUT per batch to
+ * record nothing.
+ *
+ * Size first, then values. The size test alone would in fact be enough today, because the merged
+ * map is built by spreading the stored one LAST: a key can only be added, never dropped, and no
+ * stored value is ever replaced. The value test costs one pass over a handful of keys and does
+ * not depend on that argument continuing to hold for whatever writes this map next.
+ */
+function labelsUnchanged(
+  before: Record<string, string> | undefined,
+  after: Record<string, string>,
+): boolean {
+  const keys = Object.keys(after);
+  if (keys.length !== Object.keys(before ?? {}).length) return false;
+  return keys.every((key) => before?.[key] === after[key]);
 }
 
 /**

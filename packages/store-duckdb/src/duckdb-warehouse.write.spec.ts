@@ -349,6 +349,52 @@ describe('write', () => {
     expect(committed.labels).toEqual({ source: 'first-batch' });
   });
 
+  it('records a label only a LATER batch supplied', async () => {
+    // The core package documents the contract this pins (`EXPECT_SHRINK_LABEL` in
+    // packages/pipeline/src/load-expectations.ts): "Set it in the `labels` of ANY batch of the
+    // load -- PublishService.appendRows passes them through to the snapshot." `appendRows` takes
+    // labels per call and the publish controller passes `body?.labels` per request, so a
+    // publisher acknowledging a deliberate shrink on its second batch is an ordinary use of a
+    // public surface. Creating the record on the first batch and then returning early whenever
+    // one already existed discarded every later batch's labels in silence -- and with the row
+    // count now recomputed, the bound that label stands down actually fires, so the load was
+    // refused at commit with a message telling it to set the label it had set.
+    const type = contractType('WriteLabelsLaterBatch');
+    await store.ensureType(type);
+    await store.write(type, [contractRow('a', 'A', 1)], {
+      snapshotId: 'run-1',
+      principalId: 'tester',
+      batch: 0,
+    });
+    await store.write(type, [contractRow('b', 'B', 2)], {
+      snapshotId: 'run-1',
+      principalId: 'tester',
+      batch: 1,
+      labels: { _expectShrink: 'migration to one base' },
+    });
+    const committed = await store.commit(type, 'run-1');
+    expect(committed.labels).toEqual({ _expectShrink: 'migration to one base' });
+  });
+
+  it('adds a key a later batch brought without disturbing one an earlier batch recorded', async () => {
+    const type = contractType('WriteLabelsMerged');
+    await store.ensureType(type);
+    await store.write(type, [contractRow('a', 'A', 1)], {
+      snapshotId: 'run-1',
+      principalId: 'tester',
+      batch: 0,
+      labels: { source: 'first-batch' },
+    });
+    await store.write(type, [contractRow('b', 'B', 2)], {
+      snapshotId: 'run-1',
+      principalId: 'tester',
+      batch: 1,
+      labels: { source: 'second-batch', _expectShrink: 'known' },
+    });
+    const committed = await store.commit(type, 'run-1');
+    expect(committed.labels).toEqual({ source: 'first-batch', _expectShrink: 'known' });
+  });
+
   it('refuses a batch above Number.MAX_SAFE_INTEGER', async () => {
     // batchKey renders a batch through String(batch); past MAX_SAFE_INTEGER that can render as
     // exponential notation ('1e+21'), which streamSnapshot's batchNumberOf cannot parse back
