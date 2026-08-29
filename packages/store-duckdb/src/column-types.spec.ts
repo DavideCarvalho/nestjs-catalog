@@ -1,3 +1,4 @@
+import { DuckDBTimestampTZValue } from '@duckdb/node-api';
 import { describe, expect, it } from 'vitest';
 import { coerce, duckDbType, normalise } from './column-types';
 
@@ -96,5 +97,15 @@ describe('normalise', () => {
 
   it('converts a bigint to a number, because JSON.stringify throws on one', () => {
     expect(normalise(42n, 'number')).toBe(42);
+  });
+
+  it('hands a real DuckDBTimestampTZValue back as an ISO string, not the opaque driver object', () => {
+    // Every TIMESTAMP WITH TIME ZONE column this store ever declares -- every `date` property
+    // and the reserved `_loaded_at` -- comes back off the real driver as this class, never a
+    // native `Date`. Before this case existed nothing asserted that; a filter test proved the
+    // right ROWS came back but never looked at what a date-typed VALUE actually was.
+    const micros = 1767323045_000_000n; // 2026-01-02T03:04:05.000Z
+    const value = new DuckDBTimestampTZValue(micros);
+    expect(normalise(value, 'date')).toBe('2026-01-02T03:04:05.000Z');
   });
 });

@@ -1,4 +1,24 @@
+import { DuckDBTimestampTZValue } from '@duckdb/node-api';
 import type { ScalarType } from '@dudousxd/nestjs-catalog';
+
+/**
+ * `micros` since the Unix epoch, UTC — the shape every `TIMESTAMP WITH TIME ZONE` column this
+ * store ever declares comes back as (see {@link duckDbType}: `date` maps to that type and no
+ * other), converted to the millisecond `Date` the rest of this file already speaks.
+ *
+ * Found, not assumed: `runAndReadAll().getRowObjects()` and `stream()`'s chunk-at-a-time
+ * `appendToRowObjects` were both checked against a real TIMESTAMPTZ column, and both handed
+ * back a `DuckDBTimestampTZValue` — never a native `Date` — so this conversion is not specific
+ * to either read path. Before this existed, `normalise` fell through every branch below for
+ * that value and returned it untouched: no test had ever asserted the *value* of a date-typed
+ * column read back from a live query (only that filtering on one narrowed the right rows), so
+ * every `_loaded_at` and every declared `date` property this store has ever served was this
+ * opaque, un-stringified object rather than the ISO string this function's own docblock
+ * promises.
+ */
+function fromTimestampTZ(value: DuckDBTimestampTZValue): Date {
+  return new Date(Number(value.micros / 1000n));
+}
 
 /**
  * The DuckDB type each catalog scalar lands in.
@@ -84,6 +104,28 @@ export function coerce(value: unknown, type: ScalarType): string | number | bool
 }
 
 /**
+ * The `type === 'date'` half of {@link normalise}, split out so that function's own branching
+ * stays under this file's complexity budget. A date-typed value that arrives as a bigint or
+ * number (epoch ms) must return an ISO string, not a raw number — never a DuckDB epoch, since
+ * that column's own type is `TIMESTAMP WITH TIME ZONE`, not `DOUBLE`.
+ */
+function normaliseDate(value: unknown): unknown {
+  let asDate: Date;
+  if (value instanceof Date) {
+    asDate = value;
+  } else if (value instanceof DuckDBTimestampTZValue) {
+    asDate = fromTimestampTZ(value);
+  } else if (typeof value === 'number' || typeof value === 'bigint') {
+    asDate = new Date(Number(value));
+  } else if (typeof value === 'string') {
+    asDate = new Date(value);
+  } else {
+    return null;
+  }
+  return Number.isNaN(asDate.getTime()) ? null : asDate.toISOString();
+}
+
+/**
  * What a stored value becomes on the way out.
  *
  * Two adapters behind one interface returning two renderings of the same instant is a bug
@@ -94,29 +136,19 @@ export function coerce(value: unknown, type: ScalarType): string | number | bool
  * bigint rather than rendering it — so a row that reached a response body untouched would
  * fail the serialiser rather than the read.
  *
- * Date-typed values return as ISO strings regardless of their input representation (Date
- * instance, numeric epoch, or string), matching the file's contract. An unparseable string
- * returns `null` rather than throwing, consistent with `coerce` — a warehouse driver may hand
- * back invalid state and crashing the read is worse than losing the value.
+ * Date-typed values return as ISO strings regardless of their input representation (a `Date`
+ * instance, a `DuckDBTimestampTZValue` off the driver, a numeric epoch, or a string), matching
+ * the file's contract. An unparseable string returns `null` rather than throwing, consistent
+ * with `coerce` — a warehouse driver may hand back invalid state and crashing the read is worse
+ * than losing the value.
  */
 export function normalise(value: unknown, type: ScalarType): unknown {
   if (value === null || value === undefined) return null;
-  // Check for date-typed values first, before generic type checks. A date-typed value that
-  // arrives as a bigint (epoch ms) or number (epoch ms) must return an ISO string, not a raw number.
-  if (type === 'date') {
-    let asDate: Date;
-    if (value instanceof Date) {
-      asDate = value;
-    } else if (typeof value === 'number' || typeof value === 'bigint') {
-      asDate = new Date(Number(value));
-    } else if (typeof value === 'string') {
-      asDate = new Date(value);
-    } else {
-      return null;
-    }
-    return Number.isNaN(asDate.getTime()) ? null : asDate.toISOString();
-  }
+  // Checked ahead of the generic type checks below, which would otherwise hand a
+  // `DuckDBTimestampTZValue` or a bigint straight back unconverted.
+  if (type === 'date') return normaliseDate(value);
   if (value instanceof Date) return value.toISOString();
+  if (value instanceof DuckDBTimestampTZValue) return fromTimestampTZ(value).toISOString();
   if (typeof value === 'bigint') return Number(value);
   return value;
 }

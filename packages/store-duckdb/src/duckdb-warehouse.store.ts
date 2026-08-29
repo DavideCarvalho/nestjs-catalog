@@ -3,6 +3,7 @@ import { rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type {
+  CarryForwardResult,
   CatalogFilterOperator,
   CatalogObjectTypeDef,
   CatalogPropertyDef,
@@ -10,9 +11,11 @@ import type {
   CatalogReadResult,
   CatalogStoreCapabilities,
   SnapshotRef,
+  SnapshotStreamOptions,
 } from '@dudousxd/nestjs-catalog';
 import {
   CATALOG_FILTER_OPERATORS,
+  CATALOG_PROVENANCE_COLUMNS,
   assertNoColumnCollisions,
   assertSafeIdentifier,
   outputAlias,
@@ -24,17 +27,36 @@ import { type DuckDbConnection, openDuckDb, quoteLiteral } from './duckdb';
 import { predicateFor } from './filters';
 import {
   BATCH_COLUMN,
+  CARRY_FORWARD_BATCH,
   LOADED_AT_COLUMN,
   PRINCIPAL_COLUMN,
   ROW_COLUMN,
   SNAPSHOT_COLUMN,
   batchKey,
+  carryForwardKey,
   ident,
   snapshotPrefix,
 } from './identifiers';
 import { type ObjectStore, isS3Root, localObjectStore } from './object-store';
 import { CATALOG_DUCKDB_OPTIONS, type CatalogDuckDbStoreOptions } from './options';
 import { SNAPSHOT_LIST_LIMIT, type SnapshotCatalog, objectSnapshotCatalog } from './snapshots';
+
+/**
+ * Provenance and flag at once, kept in the snapshot record's labels rather than as a column,
+ * matching the ClickHouse and MikroORM siblings' own choice (see `CARRIED_FROM_LABEL` in each
+ * of their `warehouse.store.ts`): "these rows came from there" is genuinely provenance, and a
+ * label needs no schema change, so an older reader of the record is unaffected by its presence.
+ */
+const CARRIED_FROM_LABEL = '_carriedFrom';
+/** Value of {@link CARRIED_FROM_LABEL} when the type had nothing committed to carry from. */
+const CARRIED_FROM_NOTHING = 'none';
+/**
+ * Set on the snapshot record by {@link DuckDbWarehouseStore.write} when a batch lands after
+ * {@link DuckDbWarehouseStore.carryForward} already ran for that snapshot, and cleared by
+ * `carryForward` itself when it runs again. `commit` refuses on it — see that method's own
+ * docblock for why refusal, and not a silent repair, is the only safe response.
+ */
+const CARRY_FORWARD_STALE_LABEL = '_carryForwardStale';
 
 @Injectable()
 export class DuckDbWarehouseStore {
@@ -253,6 +275,30 @@ export class DuckDbWarehouseStore {
     } finally {
       await rm(staging, { force: true });
     }
+
+    // A batch that lands after a carry-forward invalidates it.
+    //
+    // `carryForward` decides which of the previous snapshot's rows survive by looking at the
+    // batches present under `snapshotId` when it runs; a batch arriving afterwards has nothing
+    // to displace, so the previous version of every row it touches is still sitting there,
+    // carried, and the snapshot now holds both under one primary key. Marked here rather than
+    // repaired — repairing would mean re-running the merge from inside `write`, which turns an
+    // ordinary batch write into a scan of the previous snapshot on every call — and certainly
+    // rather than ignored: `commit` refuses on this mark, so the only way past it is to run
+    // `carryForward` again, which is exactly what a full retry of the load does anyway.
+    //
+    // Only reached when a snapshot record already exists: `carryForward` is the one thing that
+    // creates one before `commit` does (see its own docblock), so an ordinary write for a
+    // snapshot no `carryForward` has ever touched finds nothing here and this block is a no-op
+    // — the write path for a plain full load is unchanged bit for bit.
+    const existingRef = await this.snapshots.find(type.name, options.snapshotId);
+    if (existingRef?.labels?.[CARRIED_FROM_LABEL] !== undefined) {
+      await this.snapshots.put(type.name, {
+        ...existingRef,
+        labels: { ...existingRef.labels, [CARRY_FORWARD_STALE_LABEL]: 'true' },
+      });
+    }
+
     // Rows accepted by THIS call. Never the snapshot's running total: a caller sums these
     // across batches, and a fan-out compares its primary's answer with its follower's.
     return { written: rows.length };
@@ -299,12 +345,32 @@ export class DuckDbWarehouseStore {
    * committing an older snapshot is how a rollback is expressed, so `commit` must be able to
    * move the pointer backwards, and a guard here that only accepted a newer snapshot would
    * make a rollback impossible to express through this method at all.
+   *
+   * ## The fourth refusal: a merge a later batch invalidated
+   *
+   * `CatalogMergeStore.carryForward`'s own docblock (`packages/catalog/src/catalog.store.ts`)
+   * states the one legal order for an incremental load: write every batch, `carryForward` once,
+   * *after* the last batch, then `commit`. A batch written after the merge has nothing in the
+   * merge's anti-join to displace it — the previous version of every row it touches is still
+   * sitting there, carried — so the snapshot would hold two versions of the same primary key.
+   * Refused rather than repaired by re-running the merge here, for the reason `write`'s own
+   * marking comment gives: `commit` doing a merge on the caller's behalf would hide from that
+   * caller that its ordering was wrong, and the caller would never learn to fix the batch that
+   * produced the problem in the first place. The repair is stated in the message: carry forward
+   * again, then commit.
    */
   async commit(type: CatalogObjectTypeDef, snapshotId: string): Promise<SnapshotRef> {
     const existing = await this.snapshots.find(type.name, snapshotId);
     if (existing?.droppedAt) {
       throw new Error(
         `snapshot ${snapshotId} of ${type.name} was dropped on ${existing.droppedAt} and cannot be committed. Its rows are gone; the record survives so run history stays resolvable.`,
+      );
+    }
+    if (existing?.labels?.[CARRY_FORWARD_STALE_LABEL] !== undefined) {
+      throw new BadRequestException(
+        `Snapshot ${snapshotId} of ${type.name} carried rows forward from ${
+          existing.labels[CARRIED_FROM_LABEL] ?? 'an earlier snapshot'
+        } and then took more batches, so the merge no longer covers the whole load and every row those batches touched is in the snapshot twice. Carry forward again, then commit — in that order.`,
       );
     }
     const ref: SnapshotRef = {
@@ -603,6 +669,281 @@ export class DuckDbWarehouseStore {
     );
     const principal = rows[0]?.principal;
     return typeof principal === 'string' ? principal : 'unknown';
+  }
+
+  /**
+   * Every row of one snapshot, in `(_batch, _row)` order, pulled from the engine one chunk at a
+   * time rather than paged or read in full.
+   *
+   * ## Why not `read`, paged
+   *
+   * `read` resolves "current" correctly and can be paged, but a page is `LIMIT`/`OFFSET`, and
+   * the core package's own `CatalogSnapshotStreamStore` docblock explains why that is the wrong
+   * tool for a whole dataset: reading it in pages makes the engine walk the offset each time, a
+   * cost that is quadratic in exactly the row counts this feature exists for, and paging is only
+   * correct under a total order, which `read` does not promise. `(_batch, _row)` is that total
+   * order for the same reason `read`'s own docblock gives it one: {@link batchKey} derives a
+   * batch's key from `(type, snapshot, batch)`, so two objects staged under one snapshot can
+   * never share a `_batch` — and a carried object's `_batch` is {@link CARRY_FORWARD_BATCH}
+   * (`-1`), which sorts before every ordinary batch rather than colliding with one.
+   *
+   * ## Genuinely streamed
+   *
+   * Through `connection.stream` — see that method's own docblock in `duckdb.ts` for how this
+   * was checked against the running engine rather than assumed from the driver's types — which
+   * pulls DuckDB's own chunk-at-a-time result and yields from it as each chunk is fetched, so an
+   * abandoned `for await` (a `break`, an error thrown by the consumer) leaves the rest of the
+   * snapshot unfetched rather than sitting in a Node array nobody asked for.
+   *
+   * ## Refusals
+   *
+   * A dropped snapshot is refused outright, ahead of the empty-glob check below: iterating zero
+   * rows here would let a workflow report success and commit an empty load downstream, which is
+   * the exact failure `read`'s own tombstone check exists to prevent — see that method's
+   * docblock. `fields` is resolved to properties and refused by name exactly as `read` refuses
+   * it, so a caller cannot reach over the whitelist by calling this method instead of that one.
+   *
+   * `provenance: true` adds both of {@link CATALOG_PROVENANCE_COLUMNS} or throws — this store
+   * never has to choose the latter: `write`'s own `stageRow` puts `_principal_id` and
+   * `_loaded_at` on every row it ever stages, and this method's own `carryForward` copies both
+   * across untouched rather than dropping either, so there is no code path in this file that
+   * could produce a row with one and not the other.
+   */
+  async *streamSnapshot(
+    type: CatalogObjectTypeDef,
+    fields: string[],
+    snapshotId: string,
+    options?: SnapshotStreamOptions,
+  ): AsyncIterable<Record<string, unknown>> {
+    const ref = await this.snapshots.find(type.name, snapshotId);
+    if (ref?.droppedAt) {
+      throw new Error(
+        `snapshot ${snapshotId} of ${type.name} was dropped on ${ref.droppedAt} and cannot be streamed. Iterating zero rows here would let a workflow report success and commit an empty load downstream.`,
+      );
+    }
+    if ((await this.objects.list(snapshotPrefix(type.name, snapshotId))).length === 0) return;
+
+    const properties = fields.map((field) => {
+      const property = type.properties.find((each) => each.name === field);
+      if (!property) {
+        throw new BadRequestException(
+          `${type.name} has no property named ${field}; a store must never return a column outside the whitelist it was handed.`,
+        );
+      }
+      return property;
+    });
+
+    const selected = properties.map(
+      (property) =>
+        `${ident(physicalColumn(property.name))} AS ${ident(outputAlias(property.name))}`,
+    );
+    if (options?.provenance) {
+      for (const column of CATALOG_PROVENANCE_COLUMNS) {
+        selected.push(ident(column));
+      }
+    }
+
+    const connection = await this.ready();
+    const sql = `SELECT ${selected.join(', ')} FROM read_parquet(${quoteLiteral(this.globFor(type, snapshotId))}, union_by_name = true) ORDER BY ${ident(BATCH_COLUMN)}, ${ident(ROW_COLUMN)}`;
+    for await (const row of connection.stream(sql)) {
+      const out = normaliseRow(properties, row);
+      if (options?.provenance) {
+        for (const column of CATALOG_PROVENANCE_COLUMNS) {
+          out[column] = normalise(row[column], column === '_loaded_at' ? 'date' : 'string');
+        }
+      }
+      yield out;
+    }
+  }
+
+  /**
+   * Refuse to merge when either side's primary key holds a NULL.
+   *
+   * Matches the MikroORM and ClickHouse siblings' own `assertKeyed` (see each package's
+   * `warehouse.store.ts`/`clickhouse-warehouse.store.ts`), which check the same thing for the
+   * same reason: a declared primary key is not the same thing as a populated one. A transform
+   * that never produces the key column leaves a type that looks mergeable and data that is not
+   * — a NULL-keyed row matches nothing in the anti-join below, since SQL's `=` is never true of
+   * two NULLs, so it would be carried forward this run, carried forward again next run, and
+   * duplicate itself once per run forever while the row counts stay merely plausible. Checked on
+   * both sides: a NULL in the incoming batches means this run's rows can never replace anything,
+   * a NULL in the previous snapshot means rows that can never be replaced.
+   */
+  private async assertKeyed(glob: string, keyColumns: string[], described: string): Promise<void> {
+    const connection = await this.ready();
+    const nullTest = keyColumns.map((column) => `${ident(column)} IS NULL`).join(' OR ');
+    const rows = await connection.rows(
+      `SELECT count(*) AS unkeyed FROM read_parquet(${quoteLiteral(glob)}, union_by_name = true) WHERE ${nullTest}`,
+    );
+    const count = Number(rows[0]?.unkeyed ?? 0);
+    if (count === 0) return;
+    throw new BadRequestException(
+      `${count} row(s) in ${described} have no value for the primary key (${keyColumns.join(', ')}), so an incremental load cannot tell an update from a new object and would add a second copy of each of them on every run. Either make the load produce the key, publish the type with a primary key its data actually fills, or run this connector in "full" mode — a full run replaces the dataset outright and needs no key.`,
+    );
+  }
+
+  /** Rows in `snapshotId`'s carry-forward object. Zero when {@link carryForward} wrote none. */
+  private async countCarried(type: CatalogObjectTypeDef, snapshotId: string): Promise<number> {
+    const connection = await this.ready();
+    const key = carryForwardKey(type.name, snapshotId);
+    const rows = await connection.rows(
+      `SELECT count(*) AS total FROM read_parquet(${quoteLiteral(this.objects.locate(key))})`,
+    );
+    return Number(rows[0]?.total ?? 0);
+  }
+
+  /**
+   * Copy the previously SERVED snapshot's surviving rows into `snapshotId`, letting whatever
+   * this load already wrote win on a shared primary key.
+   *
+   * ## The merge source is the served snapshot, not the newest record
+   *
+   * `currentSnapshot` is the exact pointer `read`'s own docblock says an ordinary caller (no
+   * `query.snapshot`) resolves against — not a second opinion about "current". The core
+   * package's `CatalogWriteStore.currentSnapshot` docblock states why that matters here:
+   * committing an OLDER snapshot is how a rollback is expressed, so the newest record and the
+   * served one are different rows exactly when a rollback has happened, and a caller that
+   * reconstructed "current" from a list ordered by `createdAt` would confidently name the load
+   * that was just rolled back. Merging onto the newest live record instead of the served one
+   * would carry forward from a load nobody is serving.
+   *
+   * Falls back to the newest live record (excluding `snapshotId` itself) only when nothing has
+   * ever been served — the one case `currentSnapshot` cannot answer, since there is no pointer
+   * yet to consult. A served snapshot that happens to equal `snapshotId` is treated the same as
+   * "nothing served" for the same reason the fallback excludes self: that state means this exact
+   * merge already ran and was committed once and is now being redone, and merging a snapshot
+   * against its own rows would anti-join every previous row against itself, carry nothing
+   * forward, and silently erase whatever an earlier, legitimate carry-forward had copied in.
+   * Nothing in this package's own specs reaches that state; it is guarded here because the
+   * hazard is real, not because a test demanded it.
+   *
+   * ## The anti-join, and why the incoming glob excludes `carry.parquet`
+   *
+   * `NOT EXISTS` against a glob of this snapshot's loader batches (`part-*.parquet`) only —
+   * never against {@link carryForwardKey}'s object, which this call is about to overwrite.
+   * Reading the target of a `COPY` back into the statement that produces it is the self-feeding
+   * hazard the MikroORM and ClickHouse siblings guard against with an explicit `_batch <>
+   * CARRY_FORWARD_BATCH` predicate; naming the loader glob by the batches' own key shape (see
+   * {@link batchKey}) achieves the same exclusion without needing that predicate at all, since
+   * `carry.parquet` never matches `part-*.parquet`.
+   *
+   * `_principal_id` and `_loaded_at` cross untouched from the previous snapshot — see {@link
+   * CATALOG_PROVENANCE_COLUMNS}'s own docblock in the core package: a carried row is not a new
+   * load of that row, so restamping it would erase the one thing those columns are good for.
+   * `_batch` is stamped {@link CARRY_FORWARD_BATCH} (`-1`); `_row` is renumbered with `row_number()
+   * OVER ()` because the positions carried rows would otherwise inherit come from several
+   * different previous batches and would collide.
+   *
+   * `union_by_name = true` on every `read_parquet` here, matching every other one in this file —
+   * see `countStaged`'s own docblock for the failure that flag prevents — and the `SELECT`
+   * list's column order matches {@link stageColumns}'s and `stageRow`'s exactly: declared
+   * properties in `type.properties` order, then the five reserved columns in the same order
+   * `stageRow` writes them in. That is what Ruling 3 asks for and what makes it safe: a later
+   * `union_by_name` read over the mix of loader batches and this carried object matches columns
+   * by name regardless of order, but a name it cannot find in every file is a column silently
+   * dropped from the merged result, not an error — matching the order removes any reliance on
+   * that fallback ever being exercised.
+   *
+   * ## Idempotence
+   *
+   * Safe to call twice. `carry.parquet`'s key is fixed per `(type, snapshotId)` — see {@link
+   * carryForwardKey} — so a second call's `COPY … TO` overwrites the first call's output rather
+   * than adding to it, and the anti-join is recomputed from whatever loader batches exist when
+   * it runs, so a re-run after more batches landed sees them and a re-run after nothing changed
+   * reproduces the same file byte for byte.
+   *
+   * ## The ordering refusal
+   *
+   * Recording {@link CARRIED_FROM_LABEL} on the snapshot record, and clearing {@link
+   * CARRY_FORWARD_STALE_LABEL}, is what lets `commit` notice a batch that arrived after THIS
+   * call and refuse it — see `commit`'s own docblock and `write`'s marking comment for the two
+   * halves of that mechanism, which mirrors the MikroORM and ClickHouse siblings' own labels of
+   * the same names rather than inventing a third vocabulary for the same fact.
+   */
+  async carryForward(
+    type: CatalogObjectTypeDef,
+    snapshotId: string,
+    options: { principalId: string; labels?: Record<string, string> },
+  ): Promise<CarryForwardResult> {
+    if (type.primaryKey.length === 0) {
+      throw new BadRequestException(
+        `${type.name} declares no primary key, so an incremental load has no way to say which incoming row replaces which existing one. Publish the type with a primary key, or run this connector in "full" mode, which replaces the dataset outright and needs no key.`,
+      );
+    }
+    const keyColumns = type.primaryKey.map((name) => physicalColumn(name));
+
+    const served = await this.currentSnapshot(type);
+    const previous =
+      served && served.id !== snapshotId
+        ? served
+        : (await this.listSnapshotsWithRows(type)).find((each) => each.id !== snapshotId);
+
+    const prefix = snapshotPrefix(type.name, snapshotId);
+    const carryKey = carryForwardKey(type.name, snapshotId);
+    const loaderObjects = (await this.objects.list(prefix)).filter((each) => each !== carryKey);
+    const incomingGlob = this.objects.locate(`${prefix}/part-*.parquet`);
+
+    if (previous) {
+      const previousGlob = this.globFor(type, previous.id);
+      await this.assertKeyed(previousGlob, keyColumns, `snapshot ${previous.id}`);
+      if (loaderObjects.length > 0) {
+        await this.assertKeyed(
+          incomingGlob,
+          keyColumns,
+          `the rows already written for ${snapshotId}`,
+        );
+      }
+
+      const selected = [
+        ...type.properties.map(
+          (property) =>
+            `previous.${ident(physicalColumn(property.name))} AS ${ident(physicalColumn(property.name))}`,
+        ),
+        `${quoteLiteral(snapshotId)} AS ${ident(SNAPSHOT_COLUMN)}`,
+        `previous.${ident(PRINCIPAL_COLUMN)} AS ${ident(PRINCIPAL_COLUMN)}`,
+        `previous.${ident(LOADED_AT_COLUMN)} AS ${ident(LOADED_AT_COLUMN)}`,
+        `${CARRY_FORWARD_BATCH} AS ${ident(BATCH_COLUMN)}`,
+        `row_number() OVER () AS ${ident(ROW_COLUMN)}`,
+      ];
+      const join = keyColumns
+        .map((column) => `previous.${ident(column)} = incoming.${ident(column)}`)
+        .join(' AND ');
+      const antiJoin =
+        loaderObjects.length > 0
+          ? ` WHERE NOT EXISTS (SELECT 1 FROM read_parquet(${quoteLiteral(incomingGlob)}, union_by_name = true) AS incoming WHERE ${join})`
+          : '';
+
+      const connection = await this.ready();
+      await this.objects.prepare(carryKey);
+      await connection.run(
+        `COPY (SELECT ${selected.join(', ')} FROM read_parquet(${quoteLiteral(previousGlob)}, union_by_name = true) AS previous${antiJoin}) TO ${quoteLiteral(this.objects.locate(carryKey))} (FORMAT PARQUET, COMPRESSION SNAPPY)`,
+      );
+    }
+
+    const total = await this.countStaged(type, snapshotId);
+    const carried = previous ? await this.countCarried(type, snapshotId) : 0;
+
+    const existingRef = await this.snapshots.find(type.name, snapshotId);
+    const ref: SnapshotRef = existingRef ?? {
+      id: snapshotId,
+      createdAt: new Date().toISOString(),
+      rowCount: 0,
+      principalId: options.principalId,
+      ...(options.labels ? { labels: options.labels } : {}),
+    };
+    const labels = { ...ref.labels };
+    labels[CARRIED_FROM_LABEL] = previous?.id ?? CARRIED_FROM_NOTHING;
+    // The merge is current as of now, whatever it was before this call.
+    delete labels[CARRY_FORWARD_STALE_LABEL];
+    ref.labels = labels;
+    ref.rowCount = total;
+    await this.snapshots.put(type.name, ref);
+
+    return {
+      ...(previous ? { from: previous.id } : {}),
+      carried,
+      total,
+    };
   }
 }
 
