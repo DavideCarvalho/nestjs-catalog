@@ -50,6 +50,35 @@ describe('streamSnapshot', () => {
     expect(seen).toEqual(['a', 'b']);
   });
 
+  it('orders batches by parsed number, not by key string, past six digits', async () => {
+    // PROMOTED MINOR 1: batchKey zero-pads to six digits, which keeps a listing's STRING order
+    // agreeing with batch NUMBER order only below 1,000,000. `write` accepts any non-negative
+    // integer batch (no upper bound), and 999_999 pads to 'part-999999.parquet' while
+    // 1_000_000's own seven digits leave 'part-1000000.parquet' unpadded -- comparing the two
+    // as strings puts '1000000' before '999999' (the leading '1' sorts below '9'), which is
+    // backwards. Confirmed directly: ['part-1000000.parquet', 'part-999999.parquet'].sort()
+    // returns them in that (wrong) order.
+    const type = contractType('StreamBatchOrderPastSixDigits');
+    await store.ensureType(type);
+    await store.write(type, [contractRow('low', 'low-batch', 1)], {
+      snapshotId: 'run-1',
+      principalId: 'tester',
+      batch: 999_999,
+    });
+    await store.write(type, [contractRow('high', 'high-batch', 2)], {
+      snapshotId: 'run-1',
+      principalId: 'tester',
+      batch: 1_000_000,
+    });
+    await store.commit(type, 'run-1');
+
+    const seen: unknown[] = [];
+    for await (const row of store.streamSnapshot(type, ['id'], 'run-1')) {
+      seen.push(row.id);
+    }
+    expect(seen).toEqual(['low', 'high']);
+  });
+
   it('omits the provenance columns unless they are asked for, and supplies both when asked', async () => {
     const type = contractType('StreamProv');
     await store.ensureType(type);
@@ -383,6 +412,54 @@ describe('carryForward', () => {
     // Without the guard this names 'run-2' -- itself -- rather than the snapshot 'b' was
     // actually carried out of.
     expect(merged.from).toBe('run-1');
+  });
+
+  it('refuses to erase served rows when a replay finds its predecessor has been dropped', async () => {
+    // The self-merge-retry guard above assumes the replay's fallback resolves to the SAME
+    // predecessor the original successful carryForward used, reproducing the same content.
+    // That assumption breaks when the predecessor was dropped in between -- legal, since
+    // dropSnapshot only refuses the CURRENTLY SERVED snapshot, and dropping a superseded
+    // predecessor during retention is ordinary. Four steps, each individually permitted by
+    // this file's own refusals:
+    //   1. run-1 written and committed.
+    //   2. run-2 written; carryForward carries run-1's survivors into run-2's carry.parquet;
+    //      commit -- run-2 is now served.
+    //   3. dropSnapshot(run-1) -- legal, run-1 is not served.
+    //   4. carryForward(run-2) replays (the durable-retry state) -- served.id === snapshotId
+    //      sends it to the fallback; listLive no longer offers the dropped run-1; nothing else
+    //      carries COMMITTED_LABEL; previous is undefined.
+    // `read` globs every object under the prefix with no commit gate to pass first, so writing
+    // zero rows to run-2's carry.parquet here would delete 'b' from the currently served
+    // dataset with no error and nothing to make the change visible or reversible.
+    const type = contractType('CarryDroppedPredecessor');
+    await store.ensureType(type);
+
+    await store.write(type, [contractRow('a', 'old-a', 1), contractRow('b', 'old-b', 2)], {
+      snapshotId: 'run-1',
+      principalId: 'tester',
+      batch: 0,
+    });
+    await store.commit(type, 'run-1');
+
+    await store.write(type, [contractRow('a', 'new-a', 5)], {
+      snapshotId: 'run-2',
+      principalId: 'tester',
+      batch: 0,
+    });
+    await store.carryForward(type, 'run-2', { principalId: 'tester' });
+    await store.commit(type, 'run-2');
+
+    await store.dropSnapshot(type, 'run-1');
+
+    await expect(store.carryForward(type, 'run-2', { principalId: 'tester' })).rejects.toThrow(
+      /serv/i,
+    );
+
+    // The refusal must not have touched anything: 'b', carried forward before run-1 was
+    // dropped, is still there.
+    const read = await store.read(type, ['id', 'label'], { size: 10 });
+    const byId = Object.fromEntries(read.rows.map((row) => [row.id, row.label]));
+    expect(byId).toEqual({ a: 'new-a', b: 'old-b' });
   });
 
   it('carries nothing forward, without crashing, when the previous snapshot has no objects at all', async () => {

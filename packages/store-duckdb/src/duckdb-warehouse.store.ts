@@ -72,6 +72,11 @@ const CARRY_FORWARD_STALE_LABEL = '_carryForwardStale';
  * run's half-finished snapshot was eligible to be chosen as the next load's merge source — a
  * merge source nobody ever served, which is exactly the mistake Ruling 2's whole "served, not
  * newest" argument exists to prevent, reached through the one path that argument did not name.
+ *
+ * Stored on every `commit`, unconditionally — which means it also has to be kept OUT of what a
+ * caller outside this class sees, or every ordinary full load that never touches
+ * `carryForward` and never asked for a label at all would suddenly report one. See {@link
+ * omitCommittedLabel}.
  */
 const COMMITTED_LABEL = '_committed';
 
@@ -411,18 +416,26 @@ export class DuckDbWarehouseStore {
     };
     await this.snapshots.put(type.name, ref);
     await this.snapshots.setCurrent(type.name, snapshotId);
-    return ref;
+    return omitCommittedLabel(ref);
   }
 
-  /** The snapshot record behind the served pointer, or `undefined` when nothing has committed. */
+  /**
+   * The snapshot record behind the served pointer, or `undefined` when nothing has committed.
+   *
+   * {@link COMMITTED_LABEL} is stripped from the result — see {@link omitCommittedLabel}'s own
+   * docblock — which is safe here specifically because this method's only internal caller
+   * (`carryForward`, for `served`) only ever reads `.id` off what it gets back, never `.labels`.
+   */
   async currentSnapshot(type: CatalogObjectTypeDef): Promise<SnapshotRef | undefined> {
     const id = await this.snapshots.current(type.name);
-    return id ? this.snapshots.find(type.name, id) : undefined;
+    if (!id) return undefined;
+    const ref = await this.snapshots.find(type.name, id);
+    return ref ? omitCommittedLabel(ref) : undefined;
   }
 
-  /** Every record, newest first, tombstones included. */
+  /** Every record, newest first, tombstones included. {@link COMMITTED_LABEL} stripped. */
   async listSnapshots(type: CatalogObjectTypeDef): Promise<SnapshotRef[]> {
-    return this.snapshots.list(type.name);
+    return (await this.snapshots.list(type.name)).map(omitCommittedLabel);
   }
 
   /**
@@ -442,6 +455,14 @@ export class DuckDbWarehouseStore {
    * this method was given. Delegating to `listLive` moves the predicate inside the read
    * `SnapshotCatalog` does, where it can run before any cap is taken — see that method's own
    * docblock.
+   *
+   * **Deliberately NOT put through {@link omitCommittedLabel}**, unlike `listSnapshots`,
+   * `findSnapshot` and `currentSnapshot`. `carryForward`'s own fallback resolution reads
+   * {@link COMMITTED_LABEL} back off exactly this method's result to tell a served snapshot
+   * apart from a merely-written one — see that label's own docblock — and a version that
+   * stripped it first would make the fallback unable to find anything, ever. A caller outside
+   * this class sees the raw label here in exchange; the alternative is a fallback that never
+   * carries anything forward on a durable retry.
    */
   async listSnapshotsWithRows(
     type: CatalogObjectTypeDef,
@@ -450,12 +471,13 @@ export class DuckDbWarehouseStore {
     return this.snapshots.listLive(type.name, limit);
   }
 
-  /** Exact lookup by id, tombstone included, whatever the age. */
+  /** Exact lookup by id, tombstone included, whatever the age. {@link COMMITTED_LABEL} stripped. */
   async findSnapshot(
     type: CatalogObjectTypeDef,
     snapshotId: string,
   ): Promise<SnapshotRef | undefined> {
-    return this.snapshots.find(type.name, snapshotId);
+    const ref = await this.snapshots.find(type.name, snapshotId);
+    return ref ? omitCommittedLabel(ref) : undefined;
   }
 
   /**
@@ -721,12 +743,19 @@ export class DuckDbWarehouseStore {
    * different signature — exactly the cost this method exists to avoid.
    *
    * The fix is to never ask DuckDB to sort more than one file at a time. `(_batch, _row)` is
-   * reconstructed by iterating the snapshot's Parquet objects in **key order** — `carry.parquet`
-   * sorts before every `part-*.parquet` name the same way `_batch = -1` sorts before every
-   * non-negative batch (see {@link CARRY_FORWARD_BATCH}), and {@link batchKey}'s zero-padding
-   * makes ascending batch numbers sort the same way lexicographically as numerically — and
-   * running `ORDER BY _row` **per file**, which reproduces write order within one batch and
-   * costs a sort over one batch's rows rather than the whole snapshot.
+   * reconstructed by iterating the snapshot's Parquet objects in **parsed-batch-number order**
+   * — see {@link batchNumberOf} — and running `ORDER BY _row` **per file**, which reproduces
+   * write order within one batch and costs a sort over one batch's rows rather than the whole
+   * snapshot.
+   *
+   * Not a lexicographic sort of the key strings: an earlier version of this method sorted the
+   * keys directly, on the claim that {@link batchKey}'s zero-padding to six digits "makes
+   * ascending batch numbers sort the same way lexicographically as numerically" — which is
+   * true only below 1,000,000. `write` accepts any non-negative integer batch (see that
+   * method's own guard), and `'part-1000000.parquet' < 'part-999999.parquet'` as strings —
+   * confirmed directly — which is backwards. {@link batchNumberOf} parses the number back out
+   * instead of trusting the string, so this method's order agrees with `read`'s numeric
+   * `ORDER BY _batch` at every magnitude, not merely below seven digits.
    *
    * ## Genuinely streamed, on a connection of its own
    *
@@ -737,7 +766,15 @@ export class DuckDbWarehouseStore {
    * `streamSnapshot`) — measured against the real driver, and documented at length in
    * `duckdb.ts` because the failure is silent rather than thrown. The dedicated connection is
    * closed in `finally`, whether the loop below runs to completion or the generator is
-   * abandoned early.
+   * abandoned early via `break`, `return()`, or an error thrown by the consumer's own body —
+   * all three run this generator's `finally` by the language's own generator semantics.
+   *
+   * **Known, accepted gap**: a consumer that drives the iterator with raw `.next()` calls and
+   * simply stops calling it — never `for await`, never an explicit `.return()` — leaks this
+   * dedicated connection, because nothing ever resumes the generator to reach `finally`. That is
+   * inherent to the generator shape `AsyncIterable` asks for, not something this method can
+   * detect or guard against from the inside; `for await`, the ordinary way to consume this
+   * interface, does not have the problem.
    *
    * ## Refusals
    *
@@ -779,10 +816,11 @@ export class DuckDbWarehouseStore {
       }
     }
 
-    // Lexicographic key order, not a glob read with an `ORDER BY` — see the docblock above.
+    // Sorted by PARSED batch number, not the key string — see the docblock above and
+    // `batchNumberOf`'s own for why a lexicographic sort is wrong past six digits.
     const keys = (await this.objects.list(snapshotPrefix(type.name, snapshotId)))
       .filter((key) => key.endsWith('.parquet'))
-      .sort();
+      .sort((left, right) => batchNumberOf(left) - batchNumberOf(right));
     if (keys.length === 0) return;
 
     const primary = await this.ready();
@@ -898,6 +936,91 @@ export class DuckDbWarehouseStore {
   }
 
   /**
+   * Refuse to overwrite `carryKey` when `snapshotId` is the snapshot this type is CURRENTLY
+   * SERVING and this call found nothing to carry forward.
+   *
+   * `read` globs every object under a snapshot's prefix with no commit gate to pass first, so
+   * a served snapshot's own `carryKey` being overwritten is instantly live — there is no
+   * staging step protecting it the way an uncommitted snapshot's objects are protected simply
+   * by not being the one `read` resolves yet. Reachable without anything exotic: `run-2` carries
+   * `run-1`'s survivors forward and is committed (served); `run-1` is later dropped during
+   * ordinary retention (legal — `dropSnapshot` only refuses the served snapshot); a durable
+   * retry then replays `carryForward` for `run-2` — the self-merge-retry state, where
+   * `served.id === snapshotId` sends resolution to the fallback — and the fallback can no
+   * longer find `run-1`, live or otherwise. Clearing here would delete `run-1`'s carried rows
+   * from `run-2`'s already-served dataset, with no error and nothing to make the change visible
+   * or reversible — worse than the stale-count gap {@link clearCarryObject} exists to close,
+   * which at least left the rows alone. Refused instead: the caller that triggered this (a
+   * durable retry replaying `carryForward` after its own commit already succeeded) needs to
+   * know its merge source is gone, not have this call guess that "found nothing to carry" means
+   * "there was never anything to carry".
+   */
+  private refuseServedClear(
+    type: CatalogObjectTypeDef,
+    snapshotId: string,
+    carryKey: string,
+  ): never {
+    throw new Error(
+      `${type.name}'s snapshot ${snapshotId} is currently served and already carries rows forward from an earlier snapshot, but this call found no committed snapshot to carry from (its predecessor may have been dropped). Refusing to overwrite ${carryKey} rather than silently deleting rows ${type.name} is currently serving.`,
+    );
+  }
+
+  /**
+   * The anti-join `COPY`: `previous`'s rows, minus whichever of them a primary key already
+   * present among `snapshotId`'s own loader batches would replace, written to `carryKey`.
+   *
+   * Split out of `carryForward` itself so that method's own branching stays under this file's
+   * complexity budget — this is the one branch with anything to compute, and the NULL-key
+   * refusals, the anti-join's `WHERE`, and the `SELECT` list's column order (matching {@link
+   * stageColumns}'s and `stageRow`'s exactly — see `carryForward`'s own docblock, "the anti-join,
+   * and why the incoming glob excludes `carry.parquet`") all belong to this one statement.
+   */
+  private async writeMergedCarryObject(
+    type: CatalogObjectTypeDef,
+    snapshotId: string,
+    carryKey: string,
+    previous: SnapshotRef,
+    keyColumns: string[],
+    loaderObjects: string[],
+    incomingGlob: string,
+  ): Promise<void> {
+    const previousGlob = this.globFor(type, previous.id);
+    await this.assertKeyed(previousGlob, keyColumns, `snapshot ${previous.id}`);
+    if (loaderObjects.length > 0) {
+      await this.assertKeyed(
+        incomingGlob,
+        keyColumns,
+        `the rows already written for ${snapshotId}`,
+      );
+    }
+
+    const selected = [
+      ...type.properties.map(
+        (property) =>
+          `previous.${ident(physicalColumn(property.name))} AS ${ident(physicalColumn(property.name))}`,
+      ),
+      `${quoteLiteral(snapshotId)} AS ${ident(SNAPSHOT_COLUMN)}`,
+      `previous.${ident(PRINCIPAL_COLUMN)} AS ${ident(PRINCIPAL_COLUMN)}`,
+      `previous.${ident(LOADED_AT_COLUMN)} AS ${ident(LOADED_AT_COLUMN)}`,
+      `${CARRY_FORWARD_BATCH} AS ${ident(BATCH_COLUMN)}`,
+      `row_number() OVER () AS ${ident(ROW_COLUMN)}`,
+    ];
+    const join = keyColumns
+      .map((column) => `previous.${ident(column)} = incoming.${ident(column)}`)
+      .join(' AND ');
+    const antiJoin =
+      loaderObjects.length > 0
+        ? ` WHERE NOT EXISTS (SELECT 1 FROM read_parquet(${quoteLiteral(incomingGlob)}, union_by_name = true) AS incoming WHERE ${join})`
+        : '';
+
+    const connection = await this.ready();
+    await this.objects.prepare(carryKey);
+    await connection.run(
+      `COPY (SELECT ${selected.join(', ')} FROM read_parquet(${quoteLiteral(previousGlob)}, union_by_name = true) AS previous${antiJoin}) TO ${quoteLiteral(this.objects.locate(carryKey))} (FORMAT PARQUET, COMPRESSION SNAPPY)`,
+    );
+  }
+
+  /**
    * Copy the previously SERVED snapshot's surviving rows into `snapshotId`, letting whatever
    * this load already wrote win on a shared primary key.
    *
@@ -912,22 +1035,43 @@ export class DuckDbWarehouseStore {
    * that was just rolled back. Merging onto the newest live record instead of the served one
    * would carry forward from a load nobody is serving.
    *
-   * Falls back to the newest LIVE AND COMMITTED record (excluding `snapshotId` itself) only
-   * when nothing has ever been served — the one case `currentSnapshot` cannot answer, since
-   * there is no pointer yet to consult. The committed filter matters on its own: `carryForward`
-   * itself now creates a `SnapshotRef` (see below) before `commit` ever runs, so a load that
-   * ran `write` and `carryForward` but was then abandoned — a crash, a step that never reached
-   * `commit` — leaves a live, un-tombstoned record behind. Without the filter that record is
-   * indistinguishable from a served one to `listSnapshotsWithRows`, and a LATER load's fallback
-   * would pick an abandoned run's half-finished snapshot as its merge source: a merge source
-   * nobody ever served, reached through the one path Ruling 2's "served, not newest" argument
-   * did not originally name. See {@link COMMITTED_LABEL}'s own docblock.
+   * ## The fallback runs from TWO conditions, and it is not idle in either
    *
-   * A served snapshot that happens to equal `snapshotId` is treated the same as "nothing
-   * served" for a different reason: that state means this exact merge already ran and was
-   * committed once and is now being redone, and merging a snapshot against its own rows would
-   * anti-join every previous row against itself, carry nothing forward, and silently erase
-   * whatever an earlier, legitimate carry-forward had copied in.
+   * `previous` falls back to the newest LIVE AND COMMITTED record (excluding `snapshotId`
+   * itself) when `served` is `undefined` (nothing has ever been committed for this type) OR
+   * when `served.id === snapshotId` (this exact snapshot is the one being served, and is being
+   * carried forward into again). The two reach the same expression for different reasons, and
+   * only the first one has no candidate to find: if nothing has ever committed, nothing can
+   * carry {@link COMMITTED_LABEL} either, so the fallback in that branch always resolves to
+   * `undefined`.
+   *
+   * The SECOND branch is not idle — a served snapshot certainly exists, and other committed
+   * records commonly do too, and the fallback finding one of them is the load-bearing case, not
+   * a formality. `served.id === snapshotId` is the durable-retry state: this exact merge already
+   * ran and was committed once, and the whole step — `write`, `carryForward`, `commit` — is being
+   * replayed. Excluding `snapshotId` from its own candidacy here is what stops the anti-join
+   * from being run against its own rows, which would match every previous row against itself,
+   * carry nothing forward, and silently erase whatever the earlier, legitimate call had copied
+   * in — the fallback resolving to the SAME real predecessor as before is what makes the replay
+   * reproduce the same correct result rather than an empty one.
+   *
+   * The committed filter matters independently of which branch reached it: `carryForward`
+   * itself now creates a `SnapshotRef` (see below) before `commit` ever runs, so a load that ran
+   * `write` and `carryForward` but was then abandoned — a crash, a step that never reached
+   * `commit` — leaves a live, un-tombstoned record behind. Without the filter that record is
+   * indistinguishable from a served one to `listSnapshotsWithRows`, and the FIRST branch's
+   * fallback would pick an abandoned run's half-finished snapshot as its merge source: a merge
+   * source nobody ever served, reached through the one path Ruling 2's "served, not newest"
+   * argument did not originally name. See {@link COMMITTED_LABEL}'s own docblock.
+   *
+   * ## What the SECOND branch's fallback can find, and the hazard that follows from it
+   *
+   * Because the second branch's fallback CAN and typically DOES resolve to a real predecessor,
+   * that predecessor can also have been dropped since the original successful merge —
+   * `dropSnapshot` only refuses the currently served snapshot, and dropping a superseded one
+   * during retention is ordinary. When that happens the fallback resolves to `undefined` (no
+   * live, committed candidate left), and `snapshotId` is STILL the served snapshot: see the
+   * refusal below the anti-join for why that combination must refuse rather than clear.
    *
    * ## A previous snapshot with no objects at all
    *
@@ -968,7 +1112,7 @@ export class DuckDbWarehouseStore {
    * dropped from the merged result, not an error — matching the order removes any reliance on
    * that fallback ever being exercised.
    *
-   * ## Idempotence, both ways
+   * ## Idempotence, both ways — except when clearing would delete SERVED rows
    *
    * Safe to call twice with the same inputs. `carry.parquet`'s key is fixed per `(type,
    * snapshotId)` — see {@link carryForwardKey} — so a second call's `COPY … TO` overwrites the
@@ -980,6 +1124,19 @@ export class DuckDbWarehouseStore {
    * `carried` and `total` both describe what THIS call decided rather than a stale mix of this
    * call's `total` (recomputed fresh below, from whatever is actually on disk) and a first
    * call's carried rows sitting in a file nobody asked this call to rewrite.
+   *
+   * **Except** when `snapshotId` is the snapshot this type is CURRENTLY SERVING. `read` globs
+   * every object under a snapshot's prefix with no commit gate to pass first, so `carryKey`
+   * being part of an already-served snapshot means any write to it is instantly live — there is
+   * no staging step protecting it the way an uncommitted snapshot's own objects are protected
+   * simply by not being the one `read` resolves yet. The self-merge-retry path above (`served`
+   * resolves to `snapshotId` itself) is safe exactly because the merge branch recomputes the
+   * SAME correct content from the SAME previous — but if the predecessor that produced the
+   * current `carry.parquet` has since been dropped (legal: dropping a superseded snapshot
+   * during retention is ordinary, and `dropSnapshot` only refuses the served one), the replay
+   * finds no previous and would otherwise call {@link clearCarryObject}, deleting rows the type
+   * is currently serving with no error and no commit to make it visible or reversible. Refused
+   * instead — see the `else if` branch below.
    *
    * ## The ordering refusal
    *
@@ -1018,44 +1175,29 @@ export class DuckDbWarehouseStore {
       : [];
 
     if (previous && previousObjects.length > 0) {
-      const previousGlob = this.globFor(type, previous.id);
-      await this.assertKeyed(previousGlob, keyColumns, `snapshot ${previous.id}`);
-      if (loaderObjects.length > 0) {
-        await this.assertKeyed(
-          incomingGlob,
-          keyColumns,
-          `the rows already written for ${snapshotId}`,
-        );
-      }
-
-      const selected = [
-        ...type.properties.map(
-          (property) =>
-            `previous.${ident(physicalColumn(property.name))} AS ${ident(physicalColumn(property.name))}`,
-        ),
-        `${quoteLiteral(snapshotId)} AS ${ident(SNAPSHOT_COLUMN)}`,
-        `previous.${ident(PRINCIPAL_COLUMN)} AS ${ident(PRINCIPAL_COLUMN)}`,
-        `previous.${ident(LOADED_AT_COLUMN)} AS ${ident(LOADED_AT_COLUMN)}`,
-        `${CARRY_FORWARD_BATCH} AS ${ident(BATCH_COLUMN)}`,
-        `row_number() OVER () AS ${ident(ROW_COLUMN)}`,
-      ];
-      const join = keyColumns
-        .map((column) => `previous.${ident(column)} = incoming.${ident(column)}`)
-        .join(' AND ');
-      const antiJoin =
-        loaderObjects.length > 0
-          ? ` WHERE NOT EXISTS (SELECT 1 FROM read_parquet(${quoteLiteral(incomingGlob)}, union_by_name = true) AS incoming WHERE ${join})`
-          : '';
-
-      const connection = await this.ready();
-      await this.objects.prepare(carryKey);
-      await connection.run(
-        `COPY (SELECT ${selected.join(', ')} FROM read_parquet(${quoteLiteral(previousGlob)}, union_by_name = true) AS previous${antiJoin}) TO ${quoteLiteral(this.objects.locate(carryKey))} (FORMAT PARQUET, COMPRESSION SNAPPY)`,
+      await this.writeMergedCarryObject(
+        type,
+        snapshotId,
+        carryKey,
+        previous,
+        keyColumns,
+        loaderObjects,
+        incomingGlob,
       );
+    } else if (served?.id === snapshotId) {
+      // `snapshotId` is the snapshot this type is CURRENTLY SERVING, and this call found
+      // nothing to carry forward -- reachable exactly when the predecessor a previous,
+      // successful `carryForward` call for this same snapshotId carried rows FROM has since
+      // been dropped (legal: `dropSnapshot` only refuses the served snapshot, and dropping a
+      // superseded predecessor during retention is ordinary) and no other committed record
+      // stands in for it. See `refuseServedClear`'s own docblock for why this refuses rather
+      // than clears.
+      this.refuseServedClear(type, snapshotId, carryKey);
     } else {
       // Nothing to carry from -- no previous at all, or one that is itself a fully empty
-      // snapshot. Clears whatever an earlier call on THIS snapshotId left in `carryKey`,
-      // closing the same idempotence gap a re-sent batch's replace semantics close for `write`.
+      // snapshot -- and `snapshotId` is not yet served, so nothing is reading it as current.
+      // Clears whatever an earlier call on THIS snapshotId left in `carryKey`, closing the
+      // same idempotence gap a re-sent batch's replace semantics close for `write`.
       await this.clearCarryObject(type, carryKey);
     }
 
@@ -1263,6 +1405,58 @@ function normaliseRow(
     out[property.name] = normalise(row[outputAlias(property.name)], property.type);
   }
   return out;
+}
+
+/**
+ * The `_batch` a snapshot object was written under, parsed back out of its key — never read off
+ * the key's own lexicographic order.
+ *
+ * `streamSnapshot` needs this to reconstruct `(_batch, _row)` without asking DuckDB to sort the
+ * whole snapshot (see that method's own docblock). {@link batchKey} zero-pads to six digits,
+ * which keeps a listing's STRING order agreeing with batch NUMBER order only below 1,000,000 —
+ * `write` accepts any non-negative integer batch (see that method's own guard), and
+ * `'part-1000000.parquet' < 'part-999999.parquet'` as strings, which is backwards. Parsing the
+ * number back out and comparing numerically is correct at every magnitude a caller can reach.
+ *
+ * `carryForwardKey`'s object never matches `part-<digits>.parquet` — it is named `carry.parquet`
+ * precisely so it cannot (see that function's own docblock) — so it falls through to {@link
+ * CARRY_FORWARD_BATCH} here, which is also the exact value it is stamped with on disk: this
+ * function's answer for a carried object and the `_batch` a reader finds inside it agree by
+ * construction, not by coincidence.
+ */
+function batchNumberOf(key: string): number {
+  const match = /\/part-(\d+)\.parquet$/.exec(key);
+  return match ? Number(match[1]) : CARRY_FORWARD_BATCH;
+}
+
+/**
+ * Removes {@link COMMITTED_LABEL} before a `SnapshotRef` reaches code outside this class.
+ *
+ * `_committed` is set on every `commit` call, unconditionally — see that label's own docblock —
+ * which means every ordinary full load, one that never touches `carryForward` and never asked
+ * for a label of its own, would otherwise report one anyway. Before this label existed, a
+ * `SnapshotRef`'s `labels` was present only when a caller supplied some; this restores that
+ * contract for every method that hands a ref to code outside this class.
+ *
+ * `_carriedFrom` and `_carryForwardStale` are left alone, deliberately. Both are opt-in facts
+ * about a snapshot that actually went through an incremental merge, and the ClickHouse and
+ * MikroORM siblings surface those same two labels to their own callers without stripping them
+ * either. `_committed` is the one label that is not opt-in — every commit gets it whether or
+ * not the caller asked for a label at all — which is what makes it the one that has to come off
+ * before a caller sees it.
+ *
+ * Returns `ref` itself, unmodified, when `_committed` is absent — never true for anything this
+ * store's own `commit` has touched, but a defensive no-op costs nothing against a record this
+ * store did not write.
+ */
+function omitCommittedLabel(ref: SnapshotRef): SnapshotRef {
+  if (ref.labels?.[COMMITTED_LABEL] === undefined) return ref;
+  const { [COMMITTED_LABEL]: _committed, ...rest } = ref.labels;
+  if (Object.keys(rest).length === 0) {
+    const { labels: _labels, ...withoutLabels } = ref;
+    return withoutLabels;
+  }
+  return { ...ref, labels: rest };
 }
 
 /**

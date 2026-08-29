@@ -85,3 +85,56 @@ describe('listSnapshotsWithRows', () => {
     expect(live.map((each) => each.id)).toEqual(['load-5', 'load-2', 'load-1']);
   });
 });
+
+describe('COMMITTED_LABEL stays internal', () => {
+  it('does not appear on a plain full load that never asked for a label', async () => {
+    // PROMOTED MINOR 2: `_committed` is now set on every `commit`, unconditionally. Before
+    // that, `labels` was present on a SnapshotRef only when a caller supplied some -- an
+    // ordinary full load, one that never touches `carryForward` and never asked for a label
+    // at all, must still report none.
+    const type = await load('CommittedLabelHidden', 'run-1', 'A');
+
+    const committed = await store.commit(type, 'run-1');
+    expect(committed.labels).toBeUndefined();
+
+    const found = await store.findSnapshot(type, 'run-1');
+    expect(found?.labels).toBeUndefined();
+
+    const current = await store.currentSnapshot(type);
+    expect(current?.labels).toBeUndefined();
+
+    const listed = await store.listSnapshots(type);
+    expect(listed.find((each) => each.id === 'run-1')?.labels).toBeUndefined();
+  });
+
+  it('does not appear beside labels a caller actually supplied', async () => {
+    // `carryForward` is the path that actually persists caller-supplied labels onto a fresh
+    // SnapshotRef (`write`'s own `options.labels` has no equivalent for a plain full load that
+    // never touches `carryForward` -- a separate, pre-existing gap this task does not touch).
+    const type = contractType('CommittedLabelHiddenAmongReal');
+    await store.ensureType(type);
+    await store.write(type, [contractRow('a', 'A', 1)], {
+      snapshotId: 'run-1',
+      principalId: 'tester',
+      batch: 0,
+    });
+    await store.carryForward(type, 'run-1', {
+      principalId: 'tester',
+      labels: { source: 'nightly-sync' },
+    });
+    const committed = await store.commit(type, 'run-1');
+    expect(committed.labels?.source).toBe('nightly-sync');
+    expect(committed.labels?._committed).toBeUndefined();
+  });
+
+  it('stays raw on listSnapshotsWithRows, the one place carryForward reads it back', async () => {
+    // The trap the fix has to avoid: `carryForward`'s fallback reads COMMITTED_LABEL off
+    // `listSnapshotsWithRows`'s OWN result, which must stay UNSTRIPPED for that to keep
+    // working -- a version that stripped it here too would make the fallback unable to find
+    // anything, ever (see `excludes an uncommitted record from the fallback merge source` in
+    // duckdb-warehouse.stream.spec.ts for the behaviour this protects).
+    const type = await load('CommittedLabelFallbackStillWorks', 'run-1', 'A');
+    const live = await store.listSnapshotsWithRows(type);
+    expect(live[0]?.labels?._committed).toBe('true');
+  });
+});
