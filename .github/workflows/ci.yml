@@ -34,3 +34,23 @@ jobs:
       # a red typecheck here is a spec that has drifted from the code it claims to test, and the
       # whole lesson of this file is what happens when that is allowed to be somebody's later.
       - run: pnpm typecheck
+
+  test-db:
+    name: Store contract (real engines)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      # `test/catalog-store-contract.ts` is the definition of done for a store adapter: an
+      # adapter either passes the same cases the shipped ones pass, or the reason it cannot is
+      # stated out loud as a skip. Until this job existed that suite only ran locally, so the
+      # promise was never actually enforced — a PR could merge an adapter that had quietly
+      # stopped passing it. Docker is present on the GitHub-hosted runner, so the testcontainers
+      # engines this suite spins up need no extra setup here.
+      - run: pnpm test:db
