@@ -367,7 +367,16 @@ export class DuckDbWarehouseStore {
    * `filters` is `(query.filters ?? []).map(predicateFor)`, ANDed with {@link searchPredicate}'s
    * result (if any) into one `WHERE`. Each filter's column comes off `filter.property`,
    * resolved by the core service against the type before this method ever sees it — see
-   * `predicateFor`'s own docblock.
+   * `predicateFor`'s own docblock. Before that, though, every filter's property is checked
+   * against `properties` (the resolved `fields`) and refused by name if it names a column
+   * this read did not select — not a tidiness rule, an information leak: a predicate over a
+   * column outside the whitelist narrows which ROWS come back without ever putting the
+   * column's value in the SELECT list, so `gte`/`lte` let a caller who cannot see a column
+   * binary-search its value one request at a time, and `eq`/`contains` narrow it one guess at
+   * a time. The core service only ever resolves filters against the same visible columns it
+   * derives `fields` from, so this refusal is reached only by a caller building the request
+   * itself — the same caller `predicateFor`'s `filter.property`-not-the-request's-string
+   * design is guarding against one layer up.
    *
    * `search` and `sort`/`dir` are built by {@link searchPredicate} and {@link orderByClause}
    * respectively; see their own docblocks for how each matches the ClickHouse sibling's
@@ -414,9 +423,26 @@ export class DuckDbWarehouseStore {
       return property;
     });
 
-    // Checked here, beside `fields`, and ahead of the empty-glob guard below — see the
-    // docblock above for why an identical bad request must fail the same way regardless of
-    // what is on disk yet.
+    // A predicate over a column this read did not select is how a hidden or classified
+    // value leaks out through row membership even though it never reaches the SELECT list:
+    // `gte`/`lte` let a reader who cannot see a column binary-search its value one request at
+    // a time, and `eq`/`contains` narrow it one guess at a time. `read`'s whitelist promise —
+    // never return a column outside `fields` — is not kept by controlling the SELECT list
+    // alone, so every filter's property is checked against the same `properties` the SELECT
+    // list is built from before any statement is built. Checked here, beside `fields`, and
+    // ahead of the empty-glob guard below, for the same reason as `size`/`page` just below:
+    // an identical bad request must fail the same way regardless of what is on disk yet.
+    for (const filter of query.filters ?? []) {
+      if (!properties.some((property) => property.name === filter.property.name)) {
+        throw new Error(
+          `${filter.property.name} is not among the columns this read returns, so it cannot be filtered on.`,
+        );
+      }
+    }
+
+    // Checked here, beside `fields` and the filter-vs-`fields` check above, and ahead of the
+    // empty-glob guard below — see the docblock above for why an identical bad request must
+    // fail the same way regardless of what is on disk yet.
     const { size, page } = resolvedPaging(query);
 
     const connection = await this.ready();

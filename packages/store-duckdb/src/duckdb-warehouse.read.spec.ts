@@ -398,6 +398,36 @@ describe('commit and read', () => {
     expect(result.total).toBe(1);
   });
 
+  it('refuses a filter on a column the same read declined to return', async () => {
+    // A predicate over a column outside `fields` narrows which rows come back without ever
+    // putting the column in the SELECT list — a range operator lets a caller who cannot see
+    // the column binary-search its value one request at a time. This is the control pair: the
+    // refusing case below, and this one showing the identical filter still works when the
+    // property IS among the requested fields, so the refusal is about the fields mismatch and
+    // not about the filter itself being malformed.
+    const type = contractType('ReadFilterOutsideFields');
+    await store.ensureType(type);
+    await store.write(type, [contractRow('a', 'alpha', 1), contractRow('b', 'bravo', 2)], {
+      snapshotId: 'run-1',
+      principalId: 'tester',
+      batch: 0,
+    });
+    await store.commit(type, 'run-1');
+
+    const label = type.properties.find((property) => property.name === 'label');
+    if (!label) throw new Error('fixture is missing its own label property');
+
+    await expect(
+      store.read(type, ['id'], { filters: [{ property: label, op: 'eq', value: 'alpha' }] }),
+    ).rejects.toThrow(/label/i);
+
+    // Control: the identical filter, on a read that DOES select `label`, still narrows.
+    const allowed = await store.read(type, ['id', 'label'], {
+      filters: [{ property: label, op: 'eq', value: 'alpha' }],
+    });
+    expect(allowed.rows.map((row) => row.id)).toEqual(['a']);
+  });
+
   it('matches a search term against every visible string column, case-insensitively', async () => {
     const type = contractType('ReadSearchAcrossColumns');
     await store.ensureType(type);
