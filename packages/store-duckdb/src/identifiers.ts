@@ -1,4 +1,5 @@
 import { CATALOG_RESERVED_COLUMNS, assertSafeIdentifier } from '@dudousxd/nestjs-catalog';
+import { BadRequestException } from '@nestjs/common';
 
 /**
  * The reserved columns, taken from the core package rather than rebuilt here.
@@ -28,13 +29,86 @@ export function ident(value: string): string {
   return `"${value}"`;
 }
 
-/** The prefix holding everything about one object type. */
+/**
+ * What a path component of a key may be, and the reason this adapter needs a rule its
+ * siblings do not.
+ *
+ * On the MikroORM and ClickHouse stores a snapshot id is a VALUE in a column: it is bound as
+ * a parameter, it addresses nothing, and the worst a hostile one can do is match no rows.
+ * Here it is a path — `snapshotPrefix` makes it a directory component and `pathFor` in
+ * `object-store.ts` hands the result to `join()`. So the same string that is inert over there
+ * decides, over here, which directory DuckDB's `COPY … TO` writes into and which directory
+ * `deletePrefix` removes recursively. It arrives from outside: the publish controller takes it
+ * as `@Param('snapshot')` and its own docblock says the id is the caller's, chosen so a retry
+ * replaces its batches. Nothing between that parameter and `join()` looked at it before this.
+ *
+ * The rule is deliberately NOT {@link assertSafeIdentifier}. That one answers a different
+ * question — what may be written into SQL as an identifier — and its answer,
+ * `[A-Za-z_][A-Za-z0-9_]{0,62}`, rejects `run-1` and every UUID, which is to say every id the
+ * pipeline actually generates (`newSnapshotId` builds `<prefix>-<8 hex>`; a durable run id is
+ * a UUID). Borrowing it would refuse ordinary traffic, which is what would make this look like
+ * a security-versus-compatibility trade instead of what it is.
+ *
+ * What it rejects, and why each one:
+ *
+ * - **`..`, and `.` and empty with it** — `join` normalises, so `snapshotPrefix` of `'..'`
+ *   makes the key `<type>/..` and `pathFor` resolves that to the configured root itself. A
+ *   `deletePrefix` on it is `rm(root, { recursive: true, force: true })` — every type, every
+ *   snapshot, in one ordinary drop. `.` and empty both address the type prefix instead, which
+ *   is the same mistake one level down.
+ * - **`/`, `\` and NUL** — `/` is the separator this package builds keys from, so a segment
+ *   carrying one silently becomes two and reaches any depth `..` can climb from. `\` is the
+ *   same thing wherever the path is handled by something that treats it as a separator, and a
+ *   NUL truncates a path at the syscall boundary rather than at the character the caller sees.
+ * - **A leading `_`** — which reserves `_snapshots` and `_current.json` by construction rather
+ *   than by a list that could fall out of step with `snapshotRecordKey` and `currentKey`. With
+ *   no traversal character at all, `snapshotId = '_snapshots'` makes `snapshotPrefix` name the
+ *   directory holding the type's whole snapshot HISTORY, and `dropSnapshot` deletes that
+ *   prefix — one ordinary drop erasing every record the type ever had.
+ * - **A leading `-` or `.`** — not a traversal risk on its own, but `.`-leading is how `..`
+ *   is reached one character at a time and `-`-leading is a filename every shell tool reads
+ *   as a flag. Neither is a legitimate id and both are cheaper to refuse than to reason about.
+ *
+ * 128 rather than 255, which is the per-component ceiling on the filesystems this binding
+ * targets: a snapshot id also becomes a FILE name through `snapshotRecordKey`
+ * (`<id>.json`), and `writeThenRename` appends `.<uuid>.staging` — 37 more characters — to
+ * the name it is putting in place. 128 + 5 + 37 is comfortably under 255; 255 would not be.
+ */
+const KEY_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+/**
+ * Refuse a path component that cannot safely be joined into a key.
+ *
+ * `BadRequestException` rather than a bare `Error` for the reason the refusals in
+ * `duckdb-warehouse.store.ts` throw one: the value came in on an HTTP request — the publish
+ * controller's `:type` and `:snapshot` path parameters — and a 400 naming the parameter is the
+ * answer a caller can act on, where a 500 hides the message behind a generic body.
+ */
+function assertKeySegment(kind: string, value: string): void {
+  if (!KEY_SEGMENT.test(value)) {
+    throw new BadRequestException(
+      `Refusing "${value}" as a ${kind}: it becomes a directory in this store's object keys, so it must be 1-128 characters of letters, digits, dot, dash or underscore, starting with a letter or a digit. A leading underscore is reserved for this store's own objects (_snapshots, _current.json).`,
+    );
+  }
+}
+
+/**
+ * The prefix holding everything about one object type.
+ *
+ * Checked as well as the snapshot id, and not because a type name arrives from the same place
+ * — it comes from the published type registry, not from a request body. It is checked because
+ * this function is what turns it into a path component, and a rule that lives with the join is
+ * a rule that cannot be bypassed by a future caller who reaches `typePrefix` from somewhere the
+ * registry is not in the way.
+ */
 export function typePrefix(typeName: string): string {
+  assertKeySegment('type name', typeName);
   return typeName.toLowerCase();
 }
 
 /** The prefix holding one snapshot's row objects, and nothing else. */
 export function snapshotPrefix(typeName: string, snapshotId: string): string {
+  assertKeySegment('snapshot id', snapshotId);
   return `${typePrefix(typeName)}/${snapshotId}`;
 }
 
