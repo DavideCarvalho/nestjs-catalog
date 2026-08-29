@@ -183,13 +183,16 @@ describe('commit and read', () => {
   });
 
   it('returns a property spelled the way a source spells it under its own name, not the cleaned one', async () => {
-    // The core package records why this matters: thirteen types were loaded through a path
-    // that aliased a read to the cleaned column instead of the property's own name, and six
-    // came back with most of their columns empty — 313,833 rows on the largest. `write` keys
+    // The core package's `outputAlias` docblock records the incident this guards against,
+    // and it is a WRITE-side one: a verbatim alias forced `Asset Id` to be renamed to
+    // `Asset_Id` to survive `ident()`'s refusal, and since a load matches a record to a
+    // property by property NAME, the renamed property's every load read `undefined` out of a
+    // record the source keyed `Asset Id` — NULL on disk, in every row, for thirteen types.
+    // This test is about a narrower, read-side way to break the same round-trip: `write` keys
     // staged rows by `physicalColumn(name)`; `read` selects that column aliased to
     // `outputAlias(name)`; `normaliseRow` looks the value up by `outputAlias(name)` and hands
-    // it back under the property's own name. All three must agree, or `Asset Id` comes back
-    // under `Asset_Id` — or not at all.
+    // it back under the property's own name. All three must agree, or a value staged
+    // correctly still comes back keyed `Asset_Id` instead of `Asset Id`.
     const type = sourceSpelledType('ReadSpelled');
     await store.ensureType(type);
     await store.write(type, [{ id: 'a', 'Asset Id': 'A-71' }], {
@@ -203,5 +206,89 @@ describe('commit and read', () => {
     expect(result.rows).toHaveLength(1);
     expect(result.rows[0]?.['Asset Id']).toBe('A-71');
     expect(Object.keys(result.rows[0] ?? {}).sort()).toEqual(['Asset Id', 'id']);
+  });
+
+  it('commits a snapshot no write ever touched without a raw engine error', async () => {
+    // `commit` asks `principalOf` for a snapshot's loader when no record already names one,
+    // and `principalOf` reads over the snapshot's glob — a glob that matches nothing raises
+    // in DuckDB rather than answering with no rows. "Nobody has written this snapshot yet" is
+    // an ordinary state to commit into (an operator committing early, or a retry racing ahead
+    // of its own load), and must come back as a normal, if empty, commit rather than a raw
+    // "No files found that match the pattern" out of the engine.
+    const type = contractType('CommitNeverWritten');
+    await store.ensureType(type);
+    const ref = await store.commit(type, 'run-1');
+    expect(ref.rowCount).toBe(0);
+    expect(ref.principalId).toBe('unknown');
+    const result = await store.read(type, FIELDS, {});
+    expect(result.rows).toEqual([]);
+  });
+
+  it('keeps serving the current snapshot while a newer, uncommitted load is staged beside it', async () => {
+    // The invisibility promise's load-bearing case in production: not a type that has never
+    // committed, but one that already IS serving a snapshot, receiving a second load that
+    // has not committed yet. A `read` that globbed the whole type prefix instead of one
+    // snapshot's prefix would leak run-2's uncommitted row into this result.
+    const type = contractType('ReadHiddenBesideCurrent');
+    await store.ensureType(type);
+    await store.write(type, [contractRow('a', 'old', 1)], {
+      snapshotId: 'run-1',
+      principalId: 'tester',
+      batch: 1,
+    });
+    await store.commit(type, 'run-1');
+
+    await store.write(type, [contractRow('b', 'new', 2)], {
+      snapshotId: 'run-2',
+      principalId: 'tester',
+      batch: 1,
+    });
+
+    const result = await store.read(type, FIELDS, {});
+    expect(result.rows).toHaveLength(1);
+    expect(result.rows[0]?.label).toBe('old');
+    expect(result.snapshot).toEqual({ id: 'run-1', current: true });
+  });
+
+  it('refuses an unknown field the same way whether or not the snapshot has anything staged', async () => {
+    // The whitelist check used to live inside the SELECT-list builder, after the empty-glob
+    // guard — so the identical bad request (a field the type does not have) either threw or
+    // silently came back as `{ rows: [], total: 0 }`, depending on whether anything happened
+    // to be staged yet. Resolving `fields` before that guard makes the refusal unconditional.
+    const staged = contractType('ReadUnknownFieldStaged');
+    await store.ensureType(staged);
+    await store.write(staged, [contractRow('a', 'A', 1)], {
+      snapshotId: 'run-1',
+      principalId: 'tester',
+      batch: 1,
+    });
+    await store.commit(staged, 'run-1');
+    await expect(store.read(staged, ['bogus'], {})).rejects.toThrow(/no property named bogus/);
+
+    // A type with a real, committed pointer but an empty object glob (the never-written
+    // commit case `commit` now accepts cleanly) is the actual "does not have objects yet"
+    // case this guards: a type with no committed snapshot at all short-circuits earlier, at
+    // `if (!wanted) return { rows: [], total: 0 }`, and says nothing about this ordering.
+    const unstaged = contractType('ReadUnknownFieldUnstaged');
+    await store.ensureType(unstaged);
+    await store.commit(unstaged, 'run-1');
+    await expect(store.read(unstaged, ['bogus'], {})).rejects.toThrow(/no property named bogus/);
+  });
+
+  it('refuses a non-finite page size instead of interpolating LIMIT NaN', async () => {
+    // `write`'s own `batch` refuses a non-finite input with a named error rather than letting
+    // it flow into a key nothing could resolve; `size` gets the same rather than silently
+    // becoming `LIMIT NaN`.
+    const type = contractType('ReadNonFiniteSize');
+    await store.ensureType(type);
+    await store.write(type, [contractRow('a', 'A', 1)], {
+      snapshotId: 'run-1',
+      principalId: 'tester',
+      batch: 1,
+    });
+    await store.commit(type, 'run-1');
+    await expect(store.read(type, FIELDS, { size: Number.NaN })).rejects.toThrow(
+      /size must be a finite number/,
+    );
   });
 });

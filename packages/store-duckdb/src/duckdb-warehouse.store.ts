@@ -307,11 +307,48 @@ export class DuckDbWarehouseStore {
     return ref;
   }
 
+  /** The snapshot record behind the served pointer, or `undefined` when nothing has committed. */
   async currentSnapshot(type: CatalogObjectTypeDef): Promise<SnapshotRef | undefined> {
     const id = await this.snapshots.current(type.name);
     return id ? this.snapshots.find(type.name, id) : undefined;
   }
 
+  /**
+   * Resolve which snapshot is being asked for, refuse to serve a tombstone, apply the
+   * `fields` whitelist, and answer both the page and the total over the glob covering that
+   * snapshot's parts.
+   *
+   * ## Resolution
+   * `query.snapshot` if the caller named one, otherwise the type's served pointer. Neither
+   * being set means nothing has ever committed for this type, which is an empty result, not
+   * an error — the type is real, it simply has no load anyone has blessed yet.
+   *
+   * ## The tombstone check runs only when the caller named a snapshot
+   * `SnapshotCatalog`'s own docblock states the invariant this read leans on: **the snapshot
+   * a type is serving is never a tombstone**. It holds here by construction, from two
+   * separate refusals rather than by luck — `commit` above refuses to move the pointer to an
+   * already-dropped snapshot, and Task 10's `dropSnapshot` refuses to drop the snapshot the
+   * pointer currently names. Because the invariant holds, an ordinary read (no `snapshot` in
+   * the query) never needs to ask whether what it is about to serve is a tombstone; the
+   * lookup is skipped for it, not merely cheap. It runs for the one case the pointer's good
+   * behaviour says nothing about: a caller naming a specific, possibly historical snapshot.
+   *
+   * ## The `fields` whitelist is resolved before storage is touched
+   * Resolving `fields` to properties happens before the empty-glob guard below, so a caller
+   * naming a field the type does not have is refused the same way regardless of whether
+   * anything happens to be staged yet. Resolving it later, inside the SELECT-list builder,
+   * meant an identical bad request either threw or came back with zero rows depending on
+   * data state that has nothing to do with the request being malformed.
+   *
+   * ## Ordering
+   * `(_batch, _row)` is a total order over one snapshot's rows because {@link batchKey} is
+   * derived from `(type, snapshot, batch)`: two objects staged under one snapshot cannot
+   * share a `_batch`, since writing the same batch number again replaces that object rather
+   * than adding a second one at the same key. That fact lives in `identifiers.ts`, not here —
+   * and it is exactly what a later task's carry-forward write, landing in the same snapshot
+   * prefix under its own batch numbers, has to keep true for this ordering to still mean
+   * anything.
+   */
   async read(
     type: CatalogObjectTypeDef,
     fields: string[],
@@ -321,12 +358,28 @@ export class DuckDbWarehouseStore {
     const wanted = query.snapshot ?? currentId;
     if (!wanted) return { rows: [], total: 0 };
 
-    const ref = await this.snapshots.find(type.name, wanted);
-    if (ref?.droppedAt) {
-      throw new Error(
-        `snapshot ${wanted} of ${type.name} was dropped on ${ref.droppedAt}. Its rows are gone; this read cannot be served and is refused rather than answered with none.`,
-      );
+    // Only when the caller named a snapshot explicitly — see the docblock above for why the
+    // ordinary, pointer-resolved read is exempt from this lookup.
+    if (query.snapshot) {
+      const ref = await this.snapshots.find(type.name, wanted);
+      if (ref?.droppedAt) {
+        throw new Error(
+          `snapshot ${wanted} of ${type.name} was dropped on ${ref.droppedAt}. Its rows are gone; this read cannot be served and is refused rather than answered with none.`,
+        );
+      }
     }
+
+    // Resolved up front, ahead of the empty-glob guard, so a field the type does not have is
+    // refused identically whether or not the snapshot has anything staged yet.
+    const properties = fields.map((field) => {
+      const property = type.properties.find((each) => each.name === field);
+      if (!property) {
+        throw new Error(
+          `${type.name} has no property named ${field}; a store must never return a column outside the whitelist it was handed.`,
+        );
+      }
+      return property;
+    });
 
     const connection = await this.ready();
     // A glob that matches nothing is an error in DuckDB, not an empty result — and "this
@@ -338,19 +391,25 @@ export class DuckDbWarehouseStore {
     }
 
     const source = `read_parquet(${quoteLiteral(this.globFor(type, wanted))}, union_by_name = true)`;
-    const selected = fields
-      .map((field) => {
-        const property = type.properties.find((each) => each.name === field);
-        if (!property) {
-          throw new Error(
-            `${type.name} has no property named ${field}; a store must never return a column outside the whitelist it was handed.`,
-          );
-        }
-        return `${ident(physicalColumn(property.name))} AS ${ident(outputAlias(property.name))}`;
-      })
+    const selected = properties
+      .map(
+        (property) =>
+          `${ident(physicalColumn(property.name))} AS ${ident(outputAlias(property.name))}`,
+      )
       .join(', ');
 
-    const size = Math.max(1, query.size ?? 50);
+    // `write`'s own `batch` guards a non-finite input with a named error rather than letting
+    // it flow into a key nothing could resolve; `size` and `page` get the same rather than
+    // silently becoming `LIMIT NaN OFFSET NaN`, which is not a value DuckDB is owed to reject
+    // usefully. `size` also gets an upper bound: a page size sourced from a request is not a
+    // number a caller should be able to inflate into "the whole snapshot in one read".
+    if (query.size !== undefined && !Number.isFinite(query.size)) {
+      throw new Error(`size must be a finite number, got ${String(query.size)}.`);
+    }
+    if (query.page !== undefined && !Number.isFinite(query.page)) {
+      throw new Error(`page must be a finite number, got ${String(query.page)}.`);
+    }
+    const size = Math.min(1000, Math.max(1, query.size ?? 50));
     const page = Math.max(1, query.page ?? 1);
     const totalRows = await connection.rows(`SELECT count(*) AS total FROM ${source}`);
     // `count(*)` comes back as a `bigint` on this engine — DuckDB's INT64 — and
@@ -362,7 +421,7 @@ export class DuckDbWarehouseStore {
     );
 
     return {
-      rows: rows.map((row) => this.normaliseRow(type, fields, row)),
+      rows: rows.map((row) => normaliseRow(properties, row)),
       total,
       snapshot: { id: wanted, current: wanted === currentId },
     };
@@ -374,31 +433,6 @@ export class DuckDbWarehouseStore {
   }
 
   /**
-   * A row off the wire, keyed by the property's own name rather than by its physical column
-   * or its SQL alias.
-   *
-   * `read`'s SELECT list aliases each column to `outputAlias(property.name)` — the spelling
-   * `write`'s `stageRow` and this method's own lookup both agree on — and this is where that
-   * alias is translated back to the name the caller asked for. Losing that translation is
-   * exactly the incident `outputAlias`'s own docblock records: thirteen types loaded through a
-   * path that returned the cleaned column instead of the property's own name, six of them
-   * with most of their columns silently empty, 313,833 rows on the largest.
-   */
-  private normaliseRow(
-    type: CatalogObjectTypeDef,
-    fields: string[],
-    row: Record<string, unknown>,
-  ): Record<string, unknown> {
-    const out: Record<string, unknown> = {};
-    for (const field of fields) {
-      const property = type.properties.find((each) => each.name === field);
-      if (!property) continue;
-      out[field] = normalise(row[outputAlias(property.name)], property.type);
-    }
-    return out;
-  }
-
-  /**
    * Who loaded a snapshot, read off the rows when no record names them yet.
    *
    * `union_by_name = true` for the same reason every other `read_parquet` over a snapshot
@@ -406,8 +440,20 @@ export class DuckDbWarehouseStore {
    * rather than column-by-name, so a glob whose files disagree on column order can hand back
    * whatever sits at `_principal_id`'s position in the first file — which may not be
    * `_principal_id` at all in the others.
+   *
+   * Guarded against the empty glob the same way `read` and `countStaged` are: `commit` calls
+   * this for a snapshot `write` never touched — an operator committing early, or a retry racing
+   * ahead of its own load — and a glob matching nothing raises in DuckDB rather than answering
+   * with no rows. `'unknown'` is the answer chosen deliberately rather than a thrown refusal,
+   * because it is the identical answer a snapshot that DID get written already gets a few
+   * lines down, for a batch that happened to write zero rows: to a caller, "nothing was ever
+   * staged" and "a real batch staged nothing" are the same boring outcome, not two different
+   * failures that need two different error shapes.
    */
   private async principalOf(type: CatalogObjectTypeDef, snapshotId: string): Promise<string> {
+    if ((await this.objects.list(snapshotPrefix(type.name, snapshotId))).length === 0) {
+      return 'unknown';
+    }
     const connection = await this.ready();
     const rows = await connection.rows(
       `SELECT ${ident(PRINCIPAL_COLUMN)} AS principal FROM read_parquet(${quoteLiteral(this.globFor(type, snapshotId))}, union_by_name = true) LIMIT 1`,
@@ -474,6 +520,41 @@ function stageRow(
   staged[BATCH_COLUMN] = provenance.batch;
   staged[ROW_COLUMN] = provenance.row;
   return staged;
+}
+
+/**
+ * A row off the wire, keyed by the property's own name rather than by its physical column or
+ * its SQL alias.
+ *
+ * `read`'s SELECT list aliases each column to `outputAlias(property.name)` — the spelling
+ * `stageRow` keys by via `physicalColumn`, and the spelling this function reads back by — and
+ * this is where that alias is translated to the name the caller asked for. `properties` is
+ * already the resolved, whitelist-checked list `read` built before calling this, so there is
+ * no "field with no matching property" case here to guard against; a caller can only reach
+ * this function with properties `read` has already vouched for.
+ *
+ * The incident `outputAlias`'s own docblock records is on the WRITE side, not this one: a
+ * verbatim alias forced a source column like `Asset Id` to be renamed to `Asset_Id` to
+ * survive `ident()`'s refusal, and since a load matches a record to a property by property
+ * NAME — `stageRow` reads `row[property.name]` — the renamed property's every load read
+ * `undefined` out of a record the source keyed `Asset Id`, landing NULL on disk in every row.
+ * Thirteen types were loaded that way; six came back with most of their columns empty,
+ * 313,833 rows on the largest.
+ *
+ * This function's own failure mode, if it lost the translation, is different and narrower: a
+ * value staged correctly under `Asset_Id` would be handed back keyed `Asset_Id` instead of
+ * `Asset Id` — data under the wrong key, not a NULL on disk. It cannot reproduce the
+ * write-side incident; it is its own way of breaking the same round-trip.
+ */
+function normaliseRow(
+  properties: CatalogPropertyDef[],
+  row: Record<string, unknown>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const property of properties) {
+    out[property.name] = normalise(row[outputAlias(property.name)], property.type);
+  }
+  return out;
 }
 
 /**
