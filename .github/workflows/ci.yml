@@ -38,6 +38,7 @@ jobs:
   test-db:
     name: Store contract (real engines)
     runs-on: ubuntu-latest
+    needs: build
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
