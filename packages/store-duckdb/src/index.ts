@@ -21,6 +21,7 @@ export {
   type CatalogDuckDbStoreOptions,
   type DuckDbS3Options,
 } from './options';
+export { ensureBucket, s3ObjectStore } from './s3-object-store';
 export {
   objectSnapshotCatalog,
   SNAPSHOT_LIST_LIMIT,

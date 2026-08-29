@@ -39,6 +39,7 @@ import {
 } from './identifiers';
 import { type ObjectStore, isS3Root, localObjectStore } from './object-store';
 import { CATALOG_DUCKDB_OPTIONS, type CatalogDuckDbStoreOptions } from './options';
+import { s3ObjectStore } from './s3-object-store';
 import { SNAPSHOT_LIST_LIMIT, type SnapshotCatalog, objectSnapshotCatalog } from './snapshots';
 
 /**
@@ -122,7 +123,7 @@ export class DuckDbWarehouseStore {
     this.objects =
       options.objectStore ??
       (isS3Root(options.root)
-        ? unsupportedRemoteStore(options.root)
+        ? s3ObjectStore(options.root, options.s3)
         : localObjectStore(options.root));
     this.snapshots = options.snapshotCatalog ?? objectSnapshotCatalog(this.objects);
   }
@@ -1892,18 +1893,4 @@ function withProvenance(
     out[column] = normalise(row[column], column === '_loaded_at' ? 'date' : 'string');
   }
   return out;
-}
-
-/**
- * An `s3://` root with no object-store binding.
- *
- * DuckDB reaches S3 itself, so reads and writes would work — and everything this store does
- * *besides* moving rows (listing a snapshot's parts, swapping the pointer, tombstoning)
- * goes through the port, which has no S3 binding until Task 13. Refusing here is what keeps
- * that gap from presenting as a store that writes and then cannot remember what it wrote.
- */
-function unsupportedRemoteStore(root: string): ObjectStore {
-  throw new Error(
-    `root ${root} is object storage, but no \`objectStore\` was supplied. Bind s3ObjectStore(root) — DuckDB can read and write the Parquet itself, but the snapshot records and the served pointer go through the object store port.`,
-  );
 }
