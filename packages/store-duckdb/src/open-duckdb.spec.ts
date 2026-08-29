@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { DuckDbConnection } from './duckdb';
 import { openDuckDb } from './duckdb';
 
@@ -10,14 +10,17 @@ import { openDuckDb } from './duckdb';
 let root: string;
 const opened: DuckDbConnection[] = [];
 
+beforeAll(() => {
+  root = mkdtempSync(join(tmpdir(), 'catalog-duckdb-open-'));
+});
+
 afterAll(async () => {
   await Promise.all(opened.map((connection) => connection.close()));
-  if (root) rmSync(root, { recursive: true, force: true });
+  rmSync(root, { recursive: true, force: true });
 });
 
 describe('openDuckDb', () => {
   it('opens a connection that can run a query', async () => {
-    root = mkdtempSync(join(tmpdir(), 'catalog-duckdb-open-'));
     const connection = await openDuckDb({ root });
     opened.push(connection);
     expect(await connection.rows('SELECT 1 AS n')).toEqual([{ n: 1 }]);
