@@ -34,7 +34,7 @@ import {
 } from './identifiers';
 import { type ObjectStore, isS3Root, localObjectStore } from './object-store';
 import { CATALOG_DUCKDB_OPTIONS, type CatalogDuckDbStoreOptions } from './options';
-import { type SnapshotCatalog, objectSnapshotCatalog } from './snapshots';
+import { SNAPSHOT_LIST_LIMIT, type SnapshotCatalog, objectSnapshotCatalog } from './snapshots';
 
 @Injectable()
 export class DuckDbWarehouseStore {
@@ -326,6 +326,79 @@ export class DuckDbWarehouseStore {
     return id ? this.snapshots.find(type.name, id) : undefined;
   }
 
+  /** Every record, newest first, tombstones included. */
+  async listSnapshots(type: CatalogObjectTypeDef): Promise<SnapshotRef[]> {
+    return this.snapshots.list(type.name);
+  }
+
+  /**
+   * The newest N snapshots that still hold rows.
+   *
+   * The predicate is applied before the bound, not after it. A caller that takes the newest
+   * N records and then drops the tombstones among them is holding the live snapshots *of
+   * that window* — and past N tombstones the filtered list is empty, which is
+   * indistinguishable from "nothing to do" to every caller that asks this question.
+   */
+  async listSnapshotsWithRows(
+    type: CatalogObjectTypeDef,
+    limit = SNAPSHOT_LIST_LIMIT,
+  ): Promise<SnapshotRef[]> {
+    const all = await this.snapshots.list(type.name, SNAPSHOT_LIST_LIMIT);
+    return all.filter((ref) => !ref.droppedAt).slice(0, limit);
+  }
+
+  /** Exact lookup by id, tombstone included, whatever the age. */
+  async findSnapshot(
+    type: CatalogObjectTypeDef,
+    snapshotId: string,
+  ): Promise<SnapshotRef | undefined> {
+    return this.snapshots.find(type.name, snapshotId);
+  }
+
+  /**
+   * Take the rows and keep the record.
+   *
+   * The record survives because `catalog_connector_run` names the snapshot each run
+   * produced, so deleting it turns run history into pointers to nothing. The disk is held by
+   * the rows, and the two are separable.
+   *
+   * The count is read *before* the objects go, and `droppedAt` is written *after* — so a
+   * crash between them leaves rows deleted and a record that still claims them, which the
+   * next call repairs. Writing the tombstone first would leave a snapshot reported as
+   * dropped whose rows are still there and still costing.
+   *
+   * Refuses to drop the snapshot the type is currently serving — the one refusal that keeps
+   * `read`'s hot path free of the tombstone check. `commit` above refuses to move the pointer
+   * onto an already-dropped snapshot; this is the other half. Without it, dropping the served
+   * snapshot would make an ordinary read (no `query.snapshot`, which never looks the record
+   * up) answer with zero rows instead of the refusal a dropped snapshot is owed elsewhere in
+   * this file — the exact silent-wrong-answer the core interface forbids.
+   *
+   * Idempotent: a second call on an already-dropped snapshot is a no-op, so a durable step
+   * that replays this call does not rewrite `droppedAt` to the moment of its retry. The date
+   * is evidence of when the drop happened, not of when it was last asked for.
+   */
+  async dropSnapshot(type: CatalogObjectTypeDef, snapshotId: string): Promise<void> {
+    const existing = await this.snapshots.find(type.name, snapshotId);
+    if (existing?.droppedAt) return;
+    if ((await this.snapshots.current(type.name)) === snapshotId) {
+      throw new Error(
+        `snapshot ${snapshotId} is the one ${type.name} is currently serving and cannot be dropped. Commit another snapshot first — a served tombstone would make every ordinary read pay for the question.`,
+      );
+    }
+    const rowCount = existing?.rowCount ?? (await this.countStaged(type, snapshotId));
+    await this.objects.deletePrefix(snapshotPrefix(type.name, snapshotId));
+    await this.snapshots.put(type.name, {
+      id: snapshotId,
+      createdAt: existing?.createdAt ?? new Date().toISOString(),
+      rowCount,
+      principalId: existing?.principalId ?? 'unknown',
+      ...(existing?.labels ? { labels: existing.labels } : {}),
+      ...(existing?.archive ? { archive: existing.archive } : {}),
+      droppedAt: new Date().toISOString(),
+    });
+  }
+
   /**
    * Resolve which snapshot is being asked for, refuse to serve a tombstone, apply the
    * `fields` whitelist, and answer both the page and the total over the glob covering that
@@ -340,7 +413,7 @@ export class DuckDbWarehouseStore {
    * `SnapshotCatalog`'s own docblock states the invariant this read leans on: **the snapshot
    * a type is serving is never a tombstone**. It holds here by construction, from two
    * separate refusals rather than by luck — `commit` above refuses to move the pointer to an
-   * already-dropped snapshot, and Task 10's `dropSnapshot` refuses to drop the snapshot the
+   * already-dropped snapshot, and `dropSnapshot` above refuses to drop the snapshot the
    * pointer currently names. Because the invariant holds, an ordinary read (no `snapshot` in
    * the query) never needs to ask whether what it is about to serve is a tombstone; the
    * lookup is skipped for it, not merely cheap. It runs for the one case the pointer's good
