@@ -127,14 +127,19 @@ describe('COMMITTED_LABEL stays internal', () => {
     expect(committed.labels?._committed).toBeUndefined();
   });
 
-  it('stays raw on listSnapshotsWithRows, the one place carryForward reads it back', async () => {
-    // The trap the fix has to avoid: `carryForward`'s fallback reads COMMITTED_LABEL off
-    // `listSnapshotsWithRows`'s OWN result, which must stay UNSTRIPPED for that to keep
-    // working -- a version that stripped it here too would make the fallback unable to find
-    // anything, ever (see `excludes an uncommitted record from the fallback merge source` in
-    // duckdb-warehouse.stream.spec.ts for the behaviour this protects).
-    const type = await load('CommittedLabelFallbackStillWorks', 'run-1', 'A');
+  it('is also stripped from listSnapshotsWithRows, which is a public method, not an internal helper', async () => {
+    // Corrected from an earlier round: `listSnapshotsWithRows` is declared on the core
+    // `CatalogWriteStore` interface, re-exported through the fan-out, and consumed by the
+    // pipeline's eviction sweep -- not a method `carryForward` merely happens to share. Leaving
+    // it unstripped meant the SAME snapshot reported `labels: undefined` from `findSnapshot`
+    // and `{ _committed: 'true' }` from this method, an inconsistency no caller could explain.
+    // `carryForward`'s own fallback resolution now reads `this.snapshots.listLive` directly
+    // (the raw catalog this method wraps) instead of calling this public method, so stripping
+    // here does not touch that path -- see `excludes an uncommitted record from the fallback
+    // merge source` and `names the true origin, not itself` in duckdb-warehouse.stream.spec.ts
+    // for proof the fallback still works end to end.
+    const type = await load('CommittedLabelPublicListAlsoStripped', 'run-1', 'A');
     const live = await store.listSnapshotsWithRows(type);
-    expect(live[0]?.labels?._committed).toBe('true');
+    expect(live[0]?.labels?._committed).toBeUndefined();
   });
 });

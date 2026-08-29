@@ -311,4 +311,57 @@ describe('write', () => {
       await connection.close();
     }
   });
+
+  it('persists options.labels for a plain full load, not only for an incremental one', async () => {
+    // `options.labels` was declared and never read: a caller's provenance labels reached this
+    // method and were silently discarded unless `carryForward` also ran for the same snapshot
+    // (which DOES persist `options.labels` onto a fresh SnapshotRef). `commit` takes no
+    // `labels` parameter of its own, so a plain full load's caller-supplied labels never
+    // reached the committed SnapshotRef at all.
+    const type = contractType('WriteLabels');
+    await store.ensureType(type);
+    await store.write(type, [contractRow('a', 'A', 1)], {
+      snapshotId: 'run-1',
+      principalId: 'tester',
+      batch: 0,
+      labels: { source: 'nightly-sync' },
+    });
+    const committed = await store.commit(type, 'run-1');
+    expect(committed.labels).toEqual({ source: 'nightly-sync' });
+  });
+
+  it('keeps the FIRST batch labels rather than overwriting them from a later batch', async () => {
+    const type = contractType('WriteLabelsFirstWins');
+    await store.ensureType(type);
+    await store.write(type, [contractRow('a', 'A', 1)], {
+      snapshotId: 'run-1',
+      principalId: 'tester',
+      batch: 0,
+      labels: { source: 'first-batch' },
+    });
+    await store.write(type, [contractRow('b', 'B', 2)], {
+      snapshotId: 'run-1',
+      principalId: 'tester',
+      batch: 1,
+      labels: { source: 'second-batch' },
+    });
+    const committed = await store.commit(type, 'run-1');
+    expect(committed.labels).toEqual({ source: 'first-batch' });
+  });
+
+  it('refuses a batch above Number.MAX_SAFE_INTEGER', async () => {
+    // batchKey renders a batch through String(batch); past MAX_SAFE_INTEGER that can render as
+    // exponential notation ('1e+21'), which streamSnapshot's batchNumberOf cannot parse back
+    // out of the key -- an unparseable batch would silently fall into the slot reserved for
+    // the carry-forward object.
+    const type = contractType('WriteBatchTooLarge');
+    await store.ensureType(type);
+    await expect(
+      store.write(type, [contractRow('a', 'A', 1)], {
+        snapshotId: 'run-1',
+        principalId: 'tester',
+        batch: 1e21,
+      }),
+    ).rejects.toThrow(/batch/i);
+  });
 });

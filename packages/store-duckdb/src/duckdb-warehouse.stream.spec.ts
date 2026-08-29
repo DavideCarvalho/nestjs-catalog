@@ -462,6 +462,121 @@ describe('carryForward', () => {
     expect(byId).toEqual({ a: 'new-a', b: 'old-b' });
   });
 
+  it('does not refuse a replay of the first-ever incremental load, which never carried anything', async () => {
+    // NEW IMPORTANT A: refusing on `served.id === snapshotId` alone over-fires. This is the
+    // first legitimate replay path: run-1 is the FIRST snapshot this type has ever had,
+    // carryForward finds no previous, writes a zero-row carry.parquet, and commit serves it.
+    // A durable retry then replays write + carryForward for the same run-1 -- served.id ===
+    // snapshotId, and the fallback (excluding run-1 itself) still finds nothing, because
+    // nothing else has ever committed. Nothing was ever carried; carryKey holds zero rows both
+    // before and after; there is nothing for a refusal to protect.
+    const type = contractType('CarryFirstEverReplay');
+    await store.ensureType(type);
+    await store.write(type, [contractRow('a', 'A', 1)], {
+      snapshotId: 'run-1',
+      principalId: 'tester',
+      batch: 0,
+    });
+    await store.carryForward(type, 'run-1', { principalId: 'tester' });
+    await store.commit(type, 'run-1');
+
+    // The replay: write re-sends the same batch, then carryForward runs again for run-1 while
+    // run-1 is itself the served snapshot.
+    await store.write(type, [contractRow('a', 'A', 1)], {
+      snapshotId: 'run-1',
+      principalId: 'tester',
+      batch: 0,
+    });
+    const merged = await store.carryForward(type, 'run-1', { principalId: 'tester' });
+    expect(merged.carried).toBe(0);
+    expect(merged.total).toBe(1);
+    await store.commit(type, 'run-1');
+
+    const read = await store.read(type, ['id'], { size: 10 });
+    expect(read.rows.map((row) => row.id)).toEqual(['a']);
+  });
+
+  it('does not refuse a replay whose merge source is a legitimately empty predecessor', async () => {
+    // NEW IMPORTANT A, second legitimate path: run-1 is committed with nothing ever written to
+    // it (a genuinely empty snapshot, same as `carries nothing forward, without crashing`
+    // below). run-2 carries forward from it -- nothing to carry, carryKey stays at zero rows --
+    // and is committed, becoming served. A replay of carryForward(run-2) then has served.id
+    // === snapshotId, sending resolution to the fallback, which finds run-1 again (still live
+    // and committed) -- but run-1 is STILL empty, so `previousObjects.length === 0` and this
+    // hits the same "nothing worth protecting" branch as the first-ever case, not the merge
+    // branch. There is nothing carried before or after; refusing here would be exactly as
+    // wrong as refusing the first path.
+    const type = contractType('CarryEmptyPredecessorReplay');
+    await store.ensureType(type);
+    await store.commit(type, 'run-1');
+
+    await store.write(type, [contractRow('a', 'A', 1)], {
+      snapshotId: 'run-2',
+      principalId: 'tester',
+      batch: 0,
+    });
+    await store.carryForward(type, 'run-2', { principalId: 'tester' });
+    await store.commit(type, 'run-2');
+
+    const merged = await store.carryForward(type, 'run-2', { principalId: 'tester' });
+    expect(merged.from).toBe('run-1');
+    expect(merged.carried).toBe(0);
+    expect(merged.total).toBe(1);
+    await store.commit(type, 'run-2');
+
+    const read = await store.read(type, ['id'], { size: 10 });
+    expect(read.rows.map((row) => row.id)).toEqual(['a']);
+  });
+
+  it('refuses to substitute a different predecessor into an already-served snapshot', async () => {
+    // NEW IMPORTANT B: the self-merge-retry guard's docblocks used to claim a replay's
+    // fallback resolves to the SAME predecessor the original successful carryForward used.
+    // False -- the fallback returns the newest LIVE, COMMITTED record other than snapshotId,
+    // not the original predecessor by identity. History run-0 -> run-1 -> run-2, run-2 served
+    // and carrying from run-1: dropping run-1 while run-0 survives sends a replay's fallback to
+    // run-0 instead, which is a real, non-empty previous -- the MERGE branch runs, not the
+    // "nothing to carry" refusal, and would otherwise silently substitute run-0's survivors
+    // into run-2's already-served dataset.
+    const type = contractType('CarrySubstitutedOrigin');
+    await store.ensureType(type);
+
+    await store.write(type, [contractRow('z', 'old-z', 1)], {
+      snapshotId: 'run-0',
+      principalId: 'tester',
+      batch: 0,
+    });
+    await store.commit(type, 'run-0');
+
+    await store.write(type, [contractRow('a', 'old-a', 1), contractRow('b', 'old-b', 2)], {
+      snapshotId: 'run-1',
+      principalId: 'tester',
+      batch: 0,
+    });
+    await store.carryForward(type, 'run-1', { principalId: 'tester' }); // carries 'z' from run-0
+    await store.commit(type, 'run-1');
+
+    await store.write(type, [contractRow('a', 'new-a', 5)], {
+      snapshotId: 'run-2',
+      principalId: 'tester',
+      batch: 0,
+    });
+    await store.carryForward(type, 'run-2', { principalId: 'tester' }); // carries 'b','z' from run-1
+    await store.commit(type, 'run-2');
+
+    await store.dropSnapshot(type, 'run-1');
+
+    // Replay: served.id === 'run-2' === snapshotId; the fallback (run-1 gone) now resolves
+    // run-0 -- real, non-empty, but NOT what run-2's own record says it was carried from.
+    await expect(store.carryForward(type, 'run-2', { principalId: 'tester' })).rejects.toThrow(
+      /resolved a different source|substitut/i,
+    );
+
+    // Unaffected by the refused attempt.
+    const read = await store.read(type, ['id', 'label'], { size: 10 });
+    const byId = Object.fromEntries(read.rows.map((row) => [row.id, row.label]));
+    expect(byId).toEqual({ a: 'new-a', b: 'old-b', z: 'old-z' });
+  });
+
   it('carries nothing forward, without crashing, when the previous snapshot has no objects at all', async () => {
     // IMPORTANT 3: `commit` does not require `write` to have run first -- see `principalOf`'s
     // own docblock, "commit calls this for a snapshot write never touched" -- so a genuinely

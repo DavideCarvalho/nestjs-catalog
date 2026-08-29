@@ -226,9 +226,17 @@ export class DuckDbWarehouseStore {
     // `??`, because `??` only catches `null`/`undefined` and would let a `NaN` batch straight
     // through into a key nothing could ever `list()` back out consistently.
     const batch = Number.isFinite(options.batch) ? Number(options.batch) : 0;
-    if (!Number.isInteger(batch) || batch < 0) {
+    // Bounded at MAX_SAFE_INTEGER, not merely non-negative: `batchKey` renders a batch through
+    // `String(batch)`, and a batch past that bound (`1e21`, say) renders as `'1e+21'` rather
+    // than digits `batchNumberOf` — `streamSnapshot`'s per-file ordering, see that function's
+    // own docblock — can parse back out of the key. An unparseable batch key falls through to
+    // `CARRY_FORWARD_BATCH`, landing an ordinary loader batch in the slot reserved for the one
+    // object no caller of `write` can forge into — silently, since nothing here would raise on
+    // it. Refusing the batch outright keeps `batchNumberOf`'s fallback exhaustive rather than
+    // merely true of every batch this file's own specs happened to try.
+    if (!Number.isInteger(batch) || batch < 0 || batch > Number.MAX_SAFE_INTEGER) {
       throw new Error(
-        `batch must be a non-negative integer, got ${String(options.batch)}. The batch number is half of this store's object key, and a key it cannot derive is a batch a retry cannot replace.`,
+        `batch must be a non-negative integer no greater than Number.MAX_SAFE_INTEGER, got ${String(options.batch)}. The batch number is half of this store's object key, and a key it cannot derive — or cannot parse back out of a listing — is a batch a retry cannot replace and an ordered read cannot place.`,
       );
     }
     // Records that match nothing are a misconfiguration, not a load.
@@ -308,16 +316,32 @@ export class DuckDbWarehouseStore {
     // ordinary batch write into a scan of the previous snapshot on every call — and certainly
     // rather than ignored: `commit` refuses on this mark, so the only way past it is to run
     // `carryForward` again, which is exactly what a full retry of the load does anyway.
-    //
-    // Only reached when a snapshot record already exists: `carryForward` is the one thing that
-    // creates one before `commit` does (see its own docblock), so an ordinary write for a
-    // snapshot no `carryForward` has ever touched finds nothing here and this block is a no-op
-    // — the write path for a plain full load is unchanged bit for bit.
     const existingRef = await this.snapshots.find(type.name, options.snapshotId);
-    if (existingRef?.labels?.[CARRIED_FROM_LABEL] !== undefined) {
+    if (existingRef) {
+      if (existingRef.labels?.[CARRIED_FROM_LABEL] !== undefined) {
+        await this.snapshots.put(type.name, {
+          ...existingRef,
+          labels: { ...existingRef.labels, [CARRY_FORWARD_STALE_LABEL]: 'true' },
+        });
+      }
+    } else if (options.labels) {
+      // `options.labels` used to be declared and never read: a caller's provenance labels —
+      // which base, which file, which workflow run — reached this method and were silently
+      // discarded for a plain full load, one that never touches `carryForward` (which DOES
+      // persist `options.labels` onto a fresh `SnapshotRef` — see that method's own docblock).
+      // `commit` takes no `labels` parameter of its own and only ever sees labels that arrived
+      // on an existing record, so with nothing written here a full load's own record — created
+      // by `commit`, since nothing else had — never carried the caller's labels at all,
+      // whatever the caller passed to every `write` call. Written on the FIRST batch only,
+      // matching `carryForward`'s own precedent: a later batch that finds a record already
+      // here leaves it alone rather than overwriting labels a caller may have supplied once and
+      // not repeated.
       await this.snapshots.put(type.name, {
-        ...existingRef,
-        labels: { ...existingRef.labels, [CARRY_FORWARD_STALE_LABEL]: 'true' },
+        id: options.snapshotId,
+        createdAt: loadedAt,
+        rowCount: 0,
+        principalId: options.principalId,
+        labels: options.labels,
       });
     }
 
@@ -456,19 +480,23 @@ export class DuckDbWarehouseStore {
    * `SnapshotCatalog` does, where it can run before any cap is taken — see that method's own
    * docblock.
    *
-   * **Deliberately NOT put through {@link omitCommittedLabel}**, unlike `listSnapshots`,
-   * `findSnapshot` and `currentSnapshot`. `carryForward`'s own fallback resolution reads
-   * {@link COMMITTED_LABEL} back off exactly this method's result to tell a served snapshot
-   * apart from a merely-written one — see that label's own docblock — and a version that
-   * stripped it first would make the fallback unable to find anything, ever. A caller outside
-   * this class sees the raw label here in exchange; the alternative is a fallback that never
-   * carries anything forward on a durable retry.
+   * {@link COMMITTED_LABEL} is stripped here too, same as `listSnapshots`, `findSnapshot` and
+   * `currentSnapshot` — this method is not an internal helper `carryForward` happens to share.
+   * It is declared on the core `CatalogWriteStore` interface, re-exported through the fan-out,
+   * and consumed by the pipeline's eviction sweep, so a caller reaching it from any of those
+   * places sees the identical contract every other snapshot-returning method on this class
+   * already gives: `labels` present only when a caller supplied some.
+   *
+   * `carryForward`'s own fallback resolution does NOT call this method — it calls
+   * `this.snapshots.listLive` directly, the same catalog read this method wraps, exactly the
+   * way it already calls `this.snapshots.find` directly rather than the public `findSnapshot`.
+   * Stripping happens once, here, for the one caller that is not this class itself.
    */
   async listSnapshotsWithRows(
     type: CatalogObjectTypeDef,
     limit = SNAPSHOT_LIST_LIMIT,
   ): Promise<SnapshotRef[]> {
-    return this.snapshots.listLive(type.name, limit);
+    return (await this.snapshots.listLive(type.name, limit)).map(omitCommittedLabel);
   }
 
   /** Exact lookup by id, tombstone included, whatever the age. {@link COMMITTED_LABEL} stripped. */
@@ -937,7 +965,7 @@ export class DuckDbWarehouseStore {
 
   /**
    * Refuse to overwrite `carryKey` when `snapshotId` is the snapshot this type is CURRENTLY
-   * SERVING and this call found nothing to carry forward.
+   * SERVING, this call found nothing to carry forward, AND `carryKey` currently holds rows.
    *
    * `read` globs every object under a snapshot's prefix with no commit gate to pass first, so
    * a served snapshot's own `carryKey` being overwritten is instantly live — there is no
@@ -954,6 +982,19 @@ export class DuckDbWarehouseStore {
    * durable retry replaying `carryForward` after its own commit already succeeded) needs to
    * know its merge source is gone, not have this call guess that "found nothing to carry" means
    * "there was never anything to carry".
+   *
+   * **The `countCarried > 0` gate at the call site is not an optimisation — it is what keeps
+   * this from refusing a call that would destroy nothing.** Two reachable, legitimate replays
+   * have `served.id === snapshotId` and resolve no `previous`, with `carryKey` already holding
+   * zero rows: the first-ever incremental load of a type (`write('run-1')` →
+   * `carryForward('run-1')` finds no previous, writes a zero-row `carryKey`, `commit('run-1')`
+   * — a replay reaches the identical state), and a merge from a legitimately empty committed
+   * predecessor (see the "carries nothing forward, without crashing" case). Refusing on
+   * `served.id === snapshotId` alone would strand both, including `commit`'s own documented
+   * recovery from the stale-merge refusal ("Carry forward again, then commit") for any type
+   * with no second live committed snapshot to fall back to. The message above is only true when
+   * something is actually at stake, which is exactly what the gate at the call site restricts
+   * this method to.
    */
   private refuseServedClear(
     type: CatalogObjectTypeDef,
@@ -966,6 +1007,38 @@ export class DuckDbWarehouseStore {
   }
 
   /**
+   * Refuse to substitute a different dataset's survivors into a snapshot that is already
+   * SERVED and already carries rows forward from a specific, recorded origin.
+   *
+   * The self-merge-retry state (`served.id === snapshotId`) assumes a replay's fallback
+   * resolves to the SAME predecessor the original successful `carryForward` used, which is
+   * what makes overwriting `carryKey` safe: the recomputed content matches what is already
+   * being served. That assumption does not always hold. The fallback returns the newest LIVE,
+   * COMMITTED record other than `snapshotId` — not the original predecessor by identity — so a
+   * history of `run-0` → `run-1` → `run-2`, with `run-2` served and carrying from `run-1`,
+   * takes the merge branch onto `run-0` instead the moment `run-1` is dropped while `run-0`
+   * survives (reachable through an ordinary bundled retention sweep that catches one
+   * candidate's failure and continues past it, not only through a single manual drop). Nothing
+   * about that state resembles the missing-predecessor case {@link
+   * DuckDbWarehouseStore.refuseServedClear} guards — `previous` resolves to something real —
+   * so the anti-join would run and quietly substitute `run-0`'s survivors into `run-2`'s
+   * already-served dataset, with no error and no commit to make the change visible or
+   * reversible. Comparing the resolved `previous.id` against what `snapshotId`'s own record
+   * says it was carried from ({@link CARRIED_FROM_LABEL}) is what tells the safe replay apart
+   * from this one.
+   */
+  private refuseSubstitutedOrigin(
+    type: CatalogObjectTypeDef,
+    snapshotId: string,
+    recordedOrigin: string,
+    resolvedOrigin: string,
+  ): never {
+    throw new Error(
+      `${type.name}'s snapshot ${snapshotId} is currently served and was carried forward from ${recordedOrigin}, but this call resolved a different source: ${resolvedOrigin}. That happens when ${recordedOrigin} is no longer a live, committed snapshot (most likely dropped) and a different one took its place as the newest live committed record. Refusing to substitute ${resolvedOrigin}'s survivors into a snapshot ${type.name} is already serving under ${recordedOrigin}'s name.`,
+    );
+  }
+
+  /**
    * The anti-join `COPY`: `previous`'s rows, minus whichever of them a primary key already
    * present among `snapshotId`'s own loader batches would replace, written to `carryKey`.
    *
@@ -974,6 +1047,11 @@ export class DuckDbWarehouseStore {
    * refusals, the anti-join's `WHERE`, and the `SELECT` list's column order (matching {@link
    * stageColumns}'s and `stageRow`'s exactly — see `carryForward`'s own docblock, "the anti-join,
    * and why the incoming glob excludes `carry.parquet`") all belong to this one statement.
+   *
+   * `isServedReplay`/`recordedOrigin` exist for exactly one check, ahead of everything else:
+   * see {@link refuseSubstitutedOrigin}'s own docblock for the hazard a served snapshot's
+   * replay resolving a DIFFERENT live predecessor than the one it originally used for reasons
+   * of its own.
    */
   private async writeMergedCarryObject(
     type: CatalogObjectTypeDef,
@@ -983,7 +1061,12 @@ export class DuckDbWarehouseStore {
     keyColumns: string[],
     loaderObjects: string[],
     incomingGlob: string,
+    isServedReplay: boolean,
+    recordedOrigin: string | undefined,
   ): Promise<void> {
+    if (isServedReplay && recordedOrigin !== undefined && recordedOrigin !== previous.id) {
+      this.refuseSubstitutedOrigin(type, snapshotId, recordedOrigin, previous.id);
+    }
     const previousGlob = this.globFor(type, previous.id);
     await this.assertKeyed(previousGlob, keyColumns, `snapshot ${previous.id}`);
     if (loaderObjects.length > 0) {
@@ -1052,8 +1135,15 @@ export class DuckDbWarehouseStore {
    * replayed. Excluding `snapshotId` from its own candidacy here is what stops the anti-join
    * from being run against its own rows, which would match every previous row against itself,
    * carry nothing forward, and silently erase whatever the earlier, legitimate call had copied
-   * in — the fallback resolving to the SAME real predecessor as before is what makes the replay
-   * reproduce the same correct result rather than an empty one.
+   * in.
+   *
+   * **What the fallback does NOT promise, and used to be documented here as though it did**:
+   * that it resolves to the SAME predecessor the original successful call used. It does not —
+   * it returns the newest LIVE, COMMITTED record other than `snapshotId`, by recency, with no
+   * memory of what a previous call actually used. See {@link
+   * DuckDbWarehouseStore.refuseSubstitutedOrigin}'s own docblock for the case that gap opens
+   * and the check that closes it: a served snapshot's replay resolving a DIFFERENT live
+   * predecessor than the one recorded in its own {@link CARRIED_FROM_LABEL}.
    *
    * The committed filter matters independently of which branch reached it: `carryForward`
    * itself now creates a `SnapshotRef` (see below) before `commit` ever runs, so a load that ran
@@ -1064,14 +1154,24 @@ export class DuckDbWarehouseStore {
    * source nobody ever served, reached through the one path Ruling 2's "served, not newest"
    * argument did not originally name. See {@link COMMITTED_LABEL}'s own docblock.
    *
-   * ## What the SECOND branch's fallback can find, and the hazard that follows from it
+   * ## What the SECOND branch's fallback can find, and the two hazards that follow from it
    *
-   * Because the second branch's fallback CAN and typically DOES resolve to a real predecessor,
-   * that predecessor can also have been dropped since the original successful merge —
-   * `dropSnapshot` only refuses the currently served snapshot, and dropping a superseded one
-   * during retention is ordinary. When that happens the fallback resolves to `undefined` (no
-   * live, committed candidate left), and `snapshotId` is STILL the served snapshot: see the
-   * refusal below the anti-join for why that combination must refuse rather than clear.
+   * The second branch's fallback CAN and typically DOES resolve to a real predecessor. Two
+   * things can go wrong with that predecessor by the time a replay runs, and they are answered
+   * two different ways:
+   *
+   * - **It can be gone entirely.** `dropSnapshot` only refuses the currently served snapshot,
+   *   and dropping a superseded one during retention is ordinary. When that happens the
+   *   fallback resolves to `undefined` (no live, committed candidate left), and `snapshotId` is
+   *   STILL the served snapshot: see {@link DuckDbWarehouseStore.refuseServedClear} for why
+   *   that combination must refuse rather than clear — gated on whether anything is actually at
+   *   stake, not on `served.id === snapshotId` alone.
+   * - **It can be replaced by a DIFFERENT live, committed record.** Dropping the recorded
+   *   predecessor does not mean nothing else is left to find — an older snapshot can still be
+   *   live and committed, and the fallback returns THAT one, not `undefined`. The merge branch
+   *   then runs against a real, non-empty `previous` that disagrees with what `snapshotId`'s own
+   *   record says it was carried from. See {@link
+   *   DuckDbWarehouseStore.refuseSubstitutedOrigin} for why that must also refuse.
    *
    * ## A previous snapshot with no objects at all
    *
@@ -1125,18 +1225,32 @@ export class DuckDbWarehouseStore {
    * call's `total` (recomputed fresh below, from whatever is actually on disk) and a first
    * call's carried rows sitting in a file nobody asked this call to rewrite.
    *
-   * **Except** when `snapshotId` is the snapshot this type is CURRENTLY SERVING. `read` globs
-   * every object under a snapshot's prefix with no commit gate to pass first, so `carryKey`
-   * being part of an already-served snapshot means any write to it is instantly live — there is
-   * no staging step protecting it the way an uncommitted snapshot's own objects are protected
-   * simply by not being the one `read` resolves yet. The self-merge-retry path above (`served`
-   * resolves to `snapshotId` itself) is safe exactly because the merge branch recomputes the
-   * SAME correct content from the SAME previous — but if the predecessor that produced the
-   * current `carry.parquet` has since been dropped (legal: dropping a superseded snapshot
-   * during retention is ordinary, and `dropSnapshot` only refuses the served one), the replay
-   * finds no previous and would otherwise call {@link clearCarryObject}, deleting rows the type
-   * is currently serving with no error and no commit to make it visible or reversible. Refused
-   * instead — see the `else if` branch below.
+   * **Except** when `snapshotId` is the snapshot this type is CURRENTLY SERVING, and even then
+   * only when something would actually change. `read` globs every object under a snapshot's
+   * prefix with no commit gate to pass first, so `carryKey` being part of an already-served
+   * snapshot means any write to it is instantly live — there is no staging step protecting it
+   * the way an uncommitted snapshot's own objects are protected simply by not being the one
+   * `read` resolves yet. The self-merge-retry path above (`served` resolves to `snapshotId`
+   * itself) is ordinarily safe because the merge branch recomputes content from the same
+   * predecessor the original call used, reproducing the same result — but the fallback that
+   * resolves `previous` on a replay has no memory of what an earlier call actually used (see
+   * "the fallback runs from TWO conditions" above), so that assumption can fail in two distinct
+   * ways, each with its own guard:
+   *
+   * - **The predecessor is gone and nothing replaces it.** `dropSnapshot` only refuses the
+   *   served snapshot, and dropping a superseded one during retention is ordinary. The replay
+   *   then finds no previous and would otherwise call {@link clearCarryObject}, deleting rows
+   *   the type is currently serving with no error and no commit to make it visible or
+   *   reversible. Refused by {@link refuseServedClear} — but only when `carryKey` currently
+   *   holds something to lose; see that method's own docblock for the two legitimate replays
+   *   (a first-ever incremental load, a merge from a genuinely empty predecessor) that must NOT
+   *   be refused because there is nothing to protect.
+   * - **The predecessor is gone and a DIFFERENT live, committed record takes its place.** The
+   *   merge branch then runs — `previous` is real and non-empty, so this is not the case above
+   *   — against a source that disagrees with what `snapshotId`'s own record says it was carried
+   *   from. Refused by {@link refuseSubstitutedOrigin} instead, which is the check that compares
+   *   the resolved `previous.id` against {@link CARRIED_FROM_LABEL} before the merge branch
+   *   below is allowed to run on an already-served snapshot.
    *
    * ## The ordering refusal
    *
@@ -1159,10 +1273,15 @@ export class DuckDbWarehouseStore {
     const keyColumns = type.primaryKey.map((name) => physicalColumn(name));
 
     const served = await this.currentSnapshot(type);
+    // `this.snapshots.listLive` directly, not the public `listSnapshotsWithRows` — that method
+    // strips {@link COMMITTED_LABEL} before returning (see its own docblock), and this
+    // resolution is the one place inside this class that has to see the raw label. Matches how
+    // this method already reads `this.snapshots.find` directly a few lines below rather than
+    // the public `findSnapshot`.
     const previous =
       served && served.id !== snapshotId
         ? served
-        : (await this.listSnapshotsWithRows(type)).find(
+        : (await this.snapshots.listLive(type.name, SNAPSHOT_LIST_LIMIT)).find(
             (each) => each.id !== snapshotId && each.labels?.[COMMITTED_LABEL] !== undefined,
           );
 
@@ -1173,6 +1292,13 @@ export class DuckDbWarehouseStore {
     const previousObjects = previous
       ? await this.objects.list(snapshotPrefix(type.name, previous.id))
       : [];
+    // Read once, ahead of every branch below: the merge branch needs it to detect a
+    // substituted origin, the clear-refusal branch needs nothing from it directly but reads
+    // the SAME record again afterward to build `ref`, and reading it twice would risk the two
+    // reads disagreeing if anything else touched the record in between (nothing does, but the
+    // single read makes that true by construction rather than by accident).
+    const existingRef = await this.snapshots.find(type.name, snapshotId);
+    const isServedReplay = served?.id === snapshotId;
 
     if (previous && previousObjects.length > 0) {
       await this.writeMergedCarryObject(
@@ -1183,19 +1309,23 @@ export class DuckDbWarehouseStore {
         keyColumns,
         loaderObjects,
         incomingGlob,
+        isServedReplay,
+        existingRef?.labels?.[CARRIED_FROM_LABEL],
       );
-    } else if (served?.id === snapshotId) {
-      // `snapshotId` is the snapshot this type is CURRENTLY SERVING, and this call found
-      // nothing to carry forward -- reachable exactly when the predecessor a previous,
-      // successful `carryForward` call for this same snapshotId carried rows FROM has since
-      // been dropped (legal: `dropSnapshot` only refuses the served snapshot, and dropping a
-      // superseded predecessor during retention is ordinary) and no other committed record
-      // stands in for it. See `refuseServedClear`'s own docblock for why this refuses rather
-      // than clears.
+    } else if (isServedReplay && (await this.countCarried(type, snapshotId)) > 0) {
+      // `snapshotId` is the snapshot this type is CURRENTLY SERVING, this call found nothing to
+      // carry forward, AND `carryKey` currently holds rows -- reachable exactly when the
+      // predecessor a previous, successful `carryForward` call for this same snapshotId
+      // carried rows FROM has since been dropped (legal: `dropSnapshot` only refuses the
+      // served snapshot, and dropping a superseded predecessor during retention is ordinary)
+      // and no other committed record stands in for it. The `countCarried` guard is what keeps
+      // this from over-firing on a snapshot that never carried anything in the first place —
+      // see `refuseServedClear`'s own docblock for both halves of this reasoning.
       this.refuseServedClear(type, snapshotId, carryKey);
     } else {
-      // Nothing to carry from -- no previous at all, or one that is itself a fully empty
-      // snapshot -- and `snapshotId` is not yet served, so nothing is reading it as current.
+      // Nothing worth protecting: either nothing to carry from and nothing currently carried
+      // (a first-ever incremental load, or one merging from a legitimately empty predecessor),
+      // or `snapshotId` is not yet served, so nothing is reading it as current either way.
       // Clears whatever an earlier call on THIS snapshotId left in `carryKey`, closing the
       // same idempotence gap a re-sent batch's replace semantics close for `write`.
       await this.clearCarryObject(type, carryKey);
@@ -1204,7 +1334,6 @@ export class DuckDbWarehouseStore {
     const total = await this.countStaged(type, snapshotId);
     const carried = await this.countCarried(type, snapshotId);
 
-    const existingRef = await this.snapshots.find(type.name, snapshotId);
     const ref: SnapshotRef = existingRef ?? {
       id: snapshotId,
       createdAt: new Date().toISOString(),
@@ -1413,16 +1542,23 @@ function normaliseRow(
  *
  * `streamSnapshot` needs this to reconstruct `(_batch, _row)` without asking DuckDB to sort the
  * whole snapshot (see that method's own docblock). {@link batchKey} zero-pads to six digits,
- * which keeps a listing's STRING order agreeing with batch NUMBER order only below 1,000,000 —
- * `write` accepts any non-negative integer batch (see that method's own guard), and
- * `'part-1000000.parquet' < 'part-999999.parquet'` as strings, which is backwards. Parsing the
- * number back out and comparing numerically is correct at every magnitude a caller can reach.
+ * which keeps a listing's STRING order agreeing with batch NUMBER order only below 1,000,000,
+ * and `'part-1000000.parquet' < 'part-999999.parquet'` as strings, which is backwards. Parsing
+ * the number back out and comparing numerically is correct regardless.
  *
  * `carryForwardKey`'s object never matches `part-<digits>.parquet` — it is named `carry.parquet`
  * precisely so it cannot (see that function's own docblock) — so it falls through to {@link
  * CARRY_FORWARD_BATCH} here, which is also the exact value it is stamped with on disk: this
  * function's answer for a carried object and the `_batch` a reader finds inside it agree by
  * construction, not by coincidence.
+ *
+ * **That fallthrough is exhaustive, not merely true of every batch this file's own specs
+ * happen to try, because `write` bounds a batch at `Number.MAX_SAFE_INTEGER`** (see that
+ * method's own guard). Without the bound, a batch like `1e21` renders through `batchKey` as
+ * `'part-1e+21.parquet'` — the regex below does not match exponential notation — and would
+ * silently fall through to `CARRY_FORWARD_BATCH` here too, landing an ordinary loader batch in
+ * the slot this function otherwise reserves for the one object no caller of `write` can forge
+ * into.
  */
 function batchNumberOf(key: string): number {
   const match = /\/part-(\d+)\.parquet$/.exec(key);
