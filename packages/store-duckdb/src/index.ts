@@ -1,3 +1,4 @@
+export { coerce, duckDbType, normalise } from './column-types';
 export {
   BATCH_COLUMN,
   batchKey,
