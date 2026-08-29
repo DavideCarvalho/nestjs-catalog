@@ -21,6 +21,33 @@ import { DuckDbWarehouseStore } from './duckdb-warehouse.store';
  * real `duckdb` engine reading and writing real files under a temp directory.
  */
 
+/**
+ * How many readers keep pointer reads in flight for the whole race, and how many times the
+ * pointer moves under them.
+ *
+ * Sixteen readers rather than a single batch of two hundred, because what this experiment
+ * needs is not a large number of reads but reads still being issued when `setCurrent` fires,
+ * which only a looping reader supplies. Sixteen keeps the default four-thread libuv pool —
+ * the one serving both the pointer reads and the pointer writes — busy for the whole race:
+ * measured, the readers get through roughly 4,500-4,800 reads across the 200 cutovers.
+ */
+const RACE_READERS = 16;
+const RACE_CUTOVERS = 200;
+
+/** What a caught value says, without asserting it is an `Error`. */
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** A promise plus the handle to settle it, so a reader can tell the race it has started. */
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve = (): void => undefined;
+  const promise = new Promise<void>((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
+
 let root: string;
 let store: DuckDbWarehouseStore;
 
@@ -43,19 +70,37 @@ describe('DuckDbWarehouseStore', () => {
       // resolves the served snapshot from its own pointer, so shaping storage is the whole
       // of publishing here.
       publish: (type) => store.ensureType(type),
-      // DuckDB spells a quoted identifier with double quotes; the contract defaults to
-      // backticks, which this engine answers with a syntax error.
+      // DuckDB spells a quoted identifier with double quotes, not the backticks the
+      // contract defaults to. Nothing in this run exercises it: the only case that calls
+      // it is the SQL-console one, which skips because this adapter implements no
+      // `CatalogQueryStore`. Supplied anyway, so the day one is added the contract quotes
+      // with the spelling this engine accepts rather than the one it rejects.
       quoteIdentifier: (value) => `"${value}"`,
       noModelReason:
         'This adapter stores rows, not the model. A deployment mounts it for the rows and a transactional store for the type model, saved queries and connector definitions — small, mutable, read-modify-write data that object storage is the wrong home for.',
     }),
   );
 
+  /**
+   * Whether a read issued while the served pointer is moving can observe a torn cutover.
+   *
+   * The window is one file. `read` touches the pointer exactly once, at its first await
+   * (`snapshots.current`), and everything after that reads Parquet under the id it already
+   * resolved, which no commit rewrites. `commit` moves that same pointer through
+   * `ObjectStore.put`, which the local binding spells as `writeFile` — an `O_TRUNC` open and
+   * then a separate write, with the file empty in between. So this experiment is sensitive
+   * only while a pointer read is in flight during a pointer write, and its whole design is
+   * about arranging that overlap: the readers loop for the lifetime of the commits, and the
+   * commits do not start until every reader has completed a read and is going round again.
+   * A fixed batch of reads fired once up front measures nothing — all of them resolve before
+   * the first `setCurrent` lands, since every commit clears `snapshots.find`, a `countStaged`
+   * scan and a `snapshots.put` first, so `failures` would be empty by construction.
+   */
   it('measures whether a cutover is atomic under concurrent reads', async () => {
-    // `atomicCutover` is a property of the statement the adapter chose, not of the
-    // engine — the ClickHouse adapter got 18 errors from one statement and none
-    // from another on the same server. So it is measured here, and the capability
-    // object states only what this proves.
+    // `atomicCutover` is a property of the statement the adapter chose, not of the engine —
+    // the ClickHouse adapter got 18 errors from one statement and none from another on the
+    // same server. So it is measured here, and the capability object states only what this
+    // proves.
     const type = contractType('CutoverRace');
     await store.ensureType(type);
     for (const id of ['run-1', 'run-2']) {
@@ -65,23 +110,58 @@ describe('DuckDbWarehouseStore', () => {
         batch: 1,
       });
     }
+    // Both committed before the race starts, so the pointer only ever flips between two
+    // snapshots that already have a record and rows: a read that resolves either id has
+    // something to serve, and any failure is the cutover rather than the fixture.
     await store.commit(type, 'run-1');
+    await store.commit(type, 'run-2');
 
     const failures: unknown[] = [];
-    const reads = Array.from({ length: 200 }, async () => {
-      try {
-        await store.read(type, ['id', 'label'], {});
-      } catch (error) {
-        failures.push(error);
+    let reads = 0;
+    let racing = true;
+
+    const started = Array.from({ length: RACE_READERS }, deferred);
+    const readers = started.map(async (start) => {
+      while (racing) {
+        try {
+          await store.read(type, ['id', 'label'], {});
+          reads += 1;
+        } catch (error) {
+          failures.push(error);
+        }
+        start.resolve();
       }
     });
-    const commits = Array.from({ length: 200 }, (_value, index) =>
-      store.commit(type, index % 2 === 0 ? 'run-2' : 'run-1'),
-    );
-    await Promise.all([...reads, ...commits]);
 
-    // Record the number here rather than asserting zero: this assertion is what
-    // licenses the capability value, so it has to be the measurement.
-    expect(failures).toEqual([]);
-  }, 120_000);
+    // Gate the commits on the readers being in flight rather than on queue position: each
+    // reader settles its own promise the moment it finishes a read, so when this barrier
+    // lifts all RACE_READERS are between iterations and about to issue their next pointer
+    // read, and they keep issuing them until `racing` goes false.
+    await Promise.all(started.map((start) => start.promise));
+
+    const readsBefore = reads;
+    for (let index = 0; index < RACE_CUTOVERS; index += 1) {
+      await store.commit(type, index % 2 === 0 ? 'run-2' : 'run-1');
+    }
+    racing = false;
+    await Promise.all(readers);
+    const readsDuring = reads - readsBefore;
+
+    console.log(
+      `[cutover] ${RACE_CUTOVERS} cutovers, ${readsDuring} reads during the race, ${failures.length} torn`,
+    );
+    for (const message of new Set(failures.map(messageOf))) console.log(`[cutover] ${message}`);
+
+    // First, that the experiment was switched on. An experiment that issued no reads while
+    // the pointer was moving reports zero failures for the same reason an unplugged detector
+    // does, and the previous shape of this test did exactly that: 200 reads fired once, all
+    // resolved before the first `setCurrent` landed, zero failures by construction.
+    expect(readsDuring).toBeGreaterThan(0);
+    // Then what the capability object is allowed to say, bound to what this run observed.
+    // Conditional on purpose, and the two directions are not symmetric: one torn read
+    // disproves `atomicCutover` outright, while a clean run proves nothing beyond itself and
+    // so constrains nothing. Every run of this against the local binding has been dirty; a
+    // binding whose pointer swap is genuinely atomic passes this untouched.
+    if (failures.length > 0) expect(store.capabilities.atomicCutover).toBeUndefined();
+  }, 300_000);
 });

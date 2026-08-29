@@ -90,22 +90,42 @@ export class DuckDbWarehouseStore {
    * DuckDB keeps no history of its own. History here is a prefix per load and a pointer at
    * one of them, which is emulation in exactly the sense MySQL's `_snapshot_id` column is.
    *
-   * ## `atomicCutover: true` — measured, not assumed
+   * ## `atomicCutover` — left absent, because it was measured and the measurement said no
    *
    * `commit` repoints the served pointer with one `SnapshotCatalog.setCurrent` call, which is
    * one `ObjectStore.put` of a small JSON body (`{"snapshotId":"..."}`, a few dozen bytes) —
-   * see `snapshots.ts`. The db-spec's own `measures whether a cutover is atomic under
-   * concurrent reads` test races 200 concurrent `read`s against 200 concurrent `commit`s
-   * flipping the pointer back and forth between two committed snapshots, and asserts that no
-   * read ever throws. Run repeatedly against the local filesystem binding while writing this,
-   * it came back with **zero failures out of 200** every time — a read during a swap always
-   * saw one whole pointer or the other, never a torn or missing one. That is a property of a
-   * `write()` syscall on a body this small being effectively atomic on the filesystems this
-   * was measured against, not a promise this store's code makes by construction; it is
-   * reported here because it is what was actually observed, not because the mechanism
-   * guarantees it in the general case.
+   * see `snapshots.ts`. Small does not mean atomic here, and that is the whole finding. The
+   * local filesystem binding spells `put` as `writeFile`, which opens the key with
+   * `O_CREAT|O_TRUNC` and then writes the body as a separate operation: the file is zero
+   * bytes on disk between those two, so a `read` whose `snapshots.current` lands inside that
+   * window parses an empty body and throws. It is the same truncate-then-write named under
+   * `atomicBatchReplace` below, on a smaller object; the size of the body is irrelevant
+   * because the gap is ahead of the write, not inside it.
    *
-   * ## `atomicBatchReplace` and `transactional` — left absent, deliberately
+   * The db-spec's `measures whether a cutover is atomic under concurrent reads` test observes
+   * exactly that. Sixteen readers loop for the lifetime of 200 cutovers, so pointer reads are
+   * still being issued while `setCurrent` fires, and five runs against the local binding came
+   * back with **229, 248, 250, 264 and 8,296 torn reads** against 4,540–4,749 reads served —
+   * every one of them the same error, `Current-snapshot pointer at … is not valid JSON
+   * (Unexpected end of JSON input)`. The count varies by an order of magnitude between runs
+   * because a torn read fails fast and lets its reader come round again sooner; what does not
+   * vary is that torn reads happen, in every run.
+   *
+   * The same experiment against a `put` that writes a temp object and renames it over the key
+   * came back 0 torn out of 5,244 reads, which is what says the test measures atomicity rather
+   * than merely concurrency — the detector can come back clean, it just does not come back
+   * clean for this binding. That control is not committed; making the local pointer swap
+   * atomic is a change to the store, not to what the store currently is.
+   *
+   * Absent rather than `false`, for the reason `atomicBatchReplace` gives below: what was
+   * measured is the local binding, and the S3 binding moves the same pointer with a single
+   * `PutObjectCommand`, which by S3's own contract never exposes a partial object — a
+   * mechanism argument, not a measurement, and not something the numbers above cover. One
+   * field cannot answer for both bindings, so the class gets the third answer. A caller reads
+   * absent the pessimistic way the core package prescribes — "assume a reader can catch the
+   * swap in progress" — which here is not a precaution but a description of what happened.
+   *
+   * ## `atomicBatchReplace` — left absent, deliberately
    *
    * `atomicBatchReplace` asks what a concurrent reader sees while a batch already served is
    * being replaced — and the two bindings this store ships disagree. The local filesystem
@@ -119,9 +139,11 @@ export class DuckDbWarehouseStore {
    * change than this measurement earns, so it stays absent for both rather than picking one
    * binding's answer and letting it stand for the class.
    *
-   * `transactional: false` is the earned answer, not the unmeasured one, and is stated rather
-   * than left absent: there is no cross-statement transaction anywhere in this file — `commit`
-   * is three separate calls (`countStaged`, `snapshots.put`, `snapshots.setCurrent`) and
+   * ## `transactional: false` — stated, not left absent
+   *
+   * The earned answer, not the unmeasured one, and stated rather than left absent: there is
+   * no cross-statement transaction anywhere in this file — `commit` is three separate calls
+   * (`countStaged`, `snapshots.put`, `snapshots.setCurrent`) and
    * `carryForward` is a `COPY` followed by a label write, each of which can succeed while the
    * next one fails. Every one of those sequences is ordered so that re-running it from the top
    * is the repair (see `commit`'s and `carryForward`'s own docblocks), which is what a store
@@ -131,7 +153,6 @@ export class DuckDbWarehouseStore {
     snapshots: 'emulated',
     writable: true,
     timeTravel: true,
-    atomicCutover: true,
     transactional: false,
   };
 

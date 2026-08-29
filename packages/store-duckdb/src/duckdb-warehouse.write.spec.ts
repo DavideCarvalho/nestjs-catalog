@@ -80,10 +80,12 @@ describe('DuckDbWarehouseStore capabilities', () => {
   });
 
   it('declares only the atomicity it has measured', () => {
-    // `atomicCutover` is earned: the db-spec's own concurrent-read/concurrent-commit
-    // race (`duckdb-warehouse.db.spec.ts`) came back with zero failures out of 200
-    // reads, every time it was run.
-    expect(store.capabilities.atomicCutover).toBe(true);
+    // Absent because it WAS measured and the measurement came back dirty: the db-spec's
+    // race (`duckdb-warehouse.db.spec.ts`) keeps pointer reads in flight across 200
+    // cutovers and sees hundreds of them parse an empty pointer, since `writeFile`
+    // truncates the key before it writes the body. Absent is the third answer — not
+    // stated — and it is the one this store has earned.
+    expect(store.capabilities.atomicCutover).toBeUndefined();
     // `false`, not absent: there is no cross-statement transaction anywhere in this
     // file, so this is a measured "no" rather than an unmeasured silence.
     expect(store.capabilities.transactional).toBe(false);
