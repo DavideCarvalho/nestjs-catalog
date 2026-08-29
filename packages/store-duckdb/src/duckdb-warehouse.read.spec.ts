@@ -115,6 +115,54 @@ function classifiedType(name: string): CatalogObjectTypeDef {
   };
 }
 
+/**
+ * A type with one `uuid`-typed column, for the `empty`/`notEmpty`-on-`''` case.
+ *
+ * `filterOperatorsFor` in the core package offers `empty`/`notEmpty` to `uuid` and `unknown`
+ * columns exactly as it does to `string` ones (its `default` branch covers all three), and
+ * `duckDbType` stores all three as `VARCHAR`. What makes an empty string on this column a
+ * real, reachable state rather than a corner nobody hits: `coerce` in `column-types.ts`
+ * writes `''` through verbatim for every non-number/boolean/date type, so a row loaded with
+ * `tag: ''` lands on disk as the empty string, not as NULL.
+ */
+function uuidColumnType(name: string): CatalogObjectTypeDef {
+  return {
+    name,
+    displayName: name,
+    pluralDisplayName: `${name}s`,
+    description: "Fixture with one uuid-typed column, for the empty/notEmpty-on-'' case.",
+    tableName: `obj_${name.toLowerCase()}`,
+    group: 'Contract',
+    primaryKey: ['id'],
+    enriched: true,
+    properties: [
+      {
+        name: 'id',
+        displayName: 'id',
+        type: 'string',
+        columnName: 'id',
+        nullable: false,
+        primary: true,
+        hidden: false,
+        order: 0,
+        enriched: false,
+      },
+      {
+        name: 'tag',
+        displayName: 'tag',
+        type: 'uuid',
+        columnName: 'tag',
+        nullable: true,
+        primary: false,
+        hidden: false,
+        order: 1,
+        enriched: false,
+      },
+    ],
+    relations: [],
+  };
+}
+
 beforeAll(() => {
   root = mkdtempSync(join(tmpdir(), 'catalog-duckdb-read-'));
   store = new DuckDbWarehouseStore({ root });
@@ -428,6 +476,125 @@ describe('commit and read', () => {
     expect(allowed.rows.map((row) => row.id)).toEqual(['a']);
   });
 
+  it('narrows on a range operator over a number column, against the real engine', async () => {
+    // `filters.spec.ts` only proves `gt`/`gte`/`lt`/`lte` compile to a string containing the
+    // right operator; nothing there proves the predicate reaches the engine and actually
+    // narrows. A `predicateFor` returning the literal `'TRUE'` for all four would pass every
+    // unit test in that file and every case here except this one and the date case below.
+    const type = contractType('ReadFilterNumberRange');
+    await store.ensureType(type);
+    await store.write(
+      type,
+      [
+        contractRow('a', 'alpha', 10),
+        contractRow('b', 'bravo', 20),
+        contractRow('c', 'charlie', 30),
+      ],
+      { snapshotId: 'run-1', principalId: 'tester', batch: 0 },
+    );
+    await store.commit(type, 'run-1');
+
+    const score = type.properties.find((property) => property.name === 'score');
+    if (!score) throw new Error('fixture is missing its own score property');
+
+    const gte = await store.read(type, FIELDS, {
+      filters: [{ property: score, op: 'gte', value: 20 }],
+    });
+    expect(gte.rows.map((row) => row.id)).toEqual(['b', 'c']);
+    expect(gte.total).toBe(2);
+
+    const lt = await store.read(type, FIELDS, {
+      filters: [{ property: score, op: 'lt', value: 20 }],
+    });
+    expect(lt.rows.map((row) => row.id)).toEqual(['a']);
+    expect(lt.total).toBe(1);
+  });
+
+  it('narrows on a range operator over a date column, against the real engine', async () => {
+    const type = contractType('ReadFilterDateRange');
+    await store.ensureType(type);
+    // Raw rows rather than `contractRow`, which pins every row to one fixed `seenAt` — a
+    // range filter over a column with a single distinct value could not prove narrowing.
+    await store.write(
+      type,
+      [
+        { id: 'a', label: 'alpha', score: 1, active: true, seenAt: '2026-01-01T00:00:00.000Z' },
+        { id: 'b', label: 'bravo', score: 2, active: true, seenAt: '2026-02-01T00:00:00.000Z' },
+        { id: 'c', label: 'charlie', score: 3, active: true, seenAt: '2026-03-01T00:00:00.000Z' },
+      ],
+      { snapshotId: 'run-1', principalId: 'tester', batch: 0 },
+    );
+    await store.commit(type, 'run-1');
+
+    const seenAt = type.properties.find((property) => property.name === 'seenAt');
+    if (!seenAt) throw new Error('fixture is missing its own seenAt property');
+
+    const result = await store.read(type, FIELDS, {
+      filters: [{ property: seenAt, op: 'gte', value: new Date('2026-02-01T00:00:00.000Z') }],
+    });
+    expect(result.rows.map((row) => row.id)).toEqual(['b', 'c']);
+    expect(result.total).toBe(2);
+  });
+
+  it('narrows with notEmpty, against the real engine', async () => {
+    const type = contractType('ReadFilterNotEmpty');
+    await store.ensureType(type);
+    await store.write(
+      type,
+      [
+        { id: 'a', label: 'alpha', score: 1, active: true, seenAt: '2026-01-01T00:00:00.000Z' },
+        { id: 'b', label: '', score: 2, active: true, seenAt: '2026-01-01T00:00:00.000Z' },
+      ],
+      { snapshotId: 'run-1', principalId: 'tester', batch: 0 },
+    );
+    await store.commit(type, 'run-1');
+
+    const label = type.properties.find((property) => property.name === 'label');
+    if (!label) throw new Error('fixture is missing its own label property');
+
+    const result = await store.read(type, FIELDS, {
+      filters: [{ property: label, op: 'notEmpty' }],
+    });
+    expect(result.rows.map((row) => row.id)).toEqual(['a']);
+    expect(result.total).toBe(1);
+  });
+
+  it('treats an empty string as no value on a uuid column, alongside NULL', async () => {
+    // `filterOperatorsFor` offers `empty`/`notEmpty` to `uuid` and `unknown` columns exactly
+    // as it does to `string`, and `coerce` writes `''` through verbatim on all three — so a
+    // gate on `type === 'string'` alone would answer this column's `''` row wrongly in both
+    // directions: `empty` would miss it (NULL-only) and `notEmpty` would wrongly include it
+    // (NULL-only, inverted). Both are asserted here against a real `''` row and a real NULL
+    // row, not merely against the predicate's rendered text.
+    const type = uuidColumnType('ReadEmptyUuid');
+    await store.ensureType(type);
+    await store.write(
+      type,
+      [
+        { id: 'blank', tag: '' },
+        { id: 'missing', tag: null },
+        { id: 'present', tag: 'a45f0e2e-0000-4000-8000-000000000000' },
+      ],
+      { snapshotId: 'run-1', principalId: 'tester', batch: 0 },
+    );
+    await store.commit(type, 'run-1');
+
+    const tag = type.properties.find((property) => property.name === 'tag');
+    if (!tag) throw new Error('fixture is missing its own tag property');
+
+    const empty = await store.read(type, ['id', 'tag'], {
+      filters: [{ property: tag, op: 'empty' }],
+    });
+    expect(empty.rows.map((row) => row.id).sort()).toEqual(['blank', 'missing']);
+    expect(empty.total).toBe(2);
+
+    const notEmpty = await store.read(type, ['id', 'tag'], {
+      filters: [{ property: tag, op: 'notEmpty' }],
+    });
+    expect(notEmpty.rows.map((row) => row.id)).toEqual(['present']);
+    expect(notEmpty.total).toBe(1);
+  });
+
   it('matches a search term against every visible string column, case-insensitively', async () => {
     const type = contractType('ReadSearchAcrossColumns');
     await store.ensureType(type);
@@ -437,14 +604,25 @@ describe('commit and read', () => {
         contractRow('a', 'Alpha Team', 1),
         contractRow('b', 'Bravo Squad', 2),
         contractRow('c', 'Charlie Crew', 3),
+        // `id` is a `string` property too, and is deliberately the ONLY column carrying this
+        // term: a `searchPredicate` that only ever inspected the first string property
+        // (`label`, in `FIELDS`' declared order) would pass the `bravo` case below by
+        // matching `label` alone and never prove the `OR` across columns at all. Matching
+        // `zulu-marker` on `id` — with a `label` that does not contain it — is what that case
+        // for the `OR` actually is.
+        contractRow('zulu-marker', 'Nothing special', 4),
       ],
       { snapshotId: 'run-1', principalId: 'tester', batch: 0 },
     );
     await store.commit(type, 'run-1');
 
-    const result = await store.read(type, FIELDS, { search: 'bravo' });
-    expect(result.rows.map((row) => row.id)).toEqual(['b']);
-    expect(result.total).toBe(1);
+    const byLabel = await store.read(type, FIELDS, { search: 'bravo' });
+    expect(byLabel.rows.map((row) => row.id)).toEqual(['b']);
+    expect(byLabel.total).toBe(1);
+
+    const byId = await store.read(type, FIELDS, { search: 'zulu-marker' });
+    expect(byId.rows.map((row) => row.id)).toEqual(['zulu-marker']);
+    expect(byId.total).toBe(1);
   });
 
   it('leaves the result unfiltered when search is blank or only whitespace', async () => {
@@ -499,11 +677,14 @@ describe('commit and read', () => {
   });
 
   it('falls back to batch/row order when sort names a property the read does not return', async () => {
-    // The service already narrows `query.sort` to a real, visible column before a store ever
-    // sees one — an unrecognised name falls back to the primary key there. This is the
-    // store's own defence for a caller that bypasses the service, matching the ClickHouse
-    // sibling: a `sort` naming nothing among the selected properties is not a refusal, it is
-    // silently ignored in favour of the same (_batch, _row) order an unsorted read gets.
+    // `CatalogService.readObjects` already narrows `query.sort` to a real, visible column
+    // before a store ever sees one (`catalog.service.ts`: `columns.some((c) => c.name ===
+    // query.sort) ? query.sort : undefined`) — an unrecognised name becomes `undefined`
+    // there, nothing more; no primary-key substitution happens anywhere downstream. This test
+    // is the store's own defence for a caller that bypasses the service and hands `read` a
+    // `sort` directly, matching the ClickHouse sibling: a `sort` naming nothing among the
+    // selected properties is not a refusal, it is silently ignored in favour of the same
+    // (_batch, _row) order an unsorted read gets.
     const type = contractType('ReadSortUnknown');
     await store.ensureType(type);
     await store.write(type, [contractRow('a', 'first', 1), contractRow('b', 'second', 2)], {

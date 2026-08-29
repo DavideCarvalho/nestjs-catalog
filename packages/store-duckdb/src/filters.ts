@@ -1,12 +1,31 @@
-import type { CatalogResolvedFilter } from '@dudousxd/nestjs-catalog';
+import type { CatalogResolvedFilter, ScalarType } from '@dudousxd/nestjs-catalog';
 import { physicalColumn } from '@dudousxd/nestjs-catalog';
 import { quoteLiteral } from './duckdb';
 import { ident } from './identifiers';
 
+/**
+ * A resolved filter value, rendered as a SQL literal.
+ *
+ * `number` is guarded the same way `resolvedPaging` guards `size`/`page` in
+ * `duckdb-warehouse.store.ts`, and for the same reason: `String(NaN)` is the text `NaN`,
+ * which is not a numeric literal — it is an unquoted identifier, so `"score" > NaN` asks
+ * DuckDB for a column named `NaN` and fails with "Referenced column NaN not found" instead
+ * of naming the actual problem, which is the value this filter was built from. The core
+ * service's own `coerceFilterValue` already rejects a non-numeric string before a
+ * `CatalogResolvedFilter` exists, so this is unreachable through the documented path — it is
+ * here for the same reason `resolvedPaging`'s checks are: a caller who builds
+ * `CatalogResolvedFilter` by hand, bypassing the service, gets a named refusal rather than a
+ * raw engine error that points at the wrong thing.
+ */
 function literal(value: string | number | boolean | Date | undefined): string {
   if (value === undefined) return 'NULL';
   if (value instanceof Date) return quoteLiteral(value.toISOString());
-  if (typeof value === 'number') return String(value);
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) {
+      throw new Error(`filter value must be a finite number, got ${value}.`);
+    }
+    return String(value);
+  }
   if (typeof value === 'boolean') return value ? 'TRUE' : 'FALSE';
   return quoteLiteral(value);
 }
@@ -21,6 +40,34 @@ function literal(value: string | number | boolean | Date | undefined): string {
 function containsPattern(value: string): string {
   const escaped = value.replaceAll('\\', '\\\\').replaceAll('%', '\\%').replaceAll('_', '\\_');
   return `%${escaped}%`;
+}
+
+/**
+ * Whether `empty`/`notEmpty` should also treat an empty string as "no value" on this column's
+ * type, alongside NULL.
+ *
+ * The negative form — every type except the three that cannot hold `''` — rather than a
+ * positive list of the text-shaped ones, because `filterOperatorsFor` in the core package
+ * (`catalog.filters.ts`) offers `empty`/`notEmpty` to four scalar types, not one:
+ * `string`, `uuid`, `unknown` (its `default` branch) and `date`/`number`/`boolean` each on
+ * their own branch. A predicate gated on `type === 'string'` alone answered `uuid` and
+ * `unknown` — both stored as `VARCHAR` here, per `duckDbType` — with the NULL-only half of
+ * the rule, silently narrower than the operator `filterOperatorsFor` had already promised the
+ * caller.
+ *
+ * This is not a theoretical gap in this adapter specifically: `coerce` in `column-types.ts`
+ * writes an empty string through **verbatim** for every non-number/boolean/date type
+ * (`typeof value === 'string' ? value : String(value)`, with no `''`-to-`null` step) —
+ * unlike the ClickHouse sibling, which nulls it on the way in. So a `uuid`/`unknown` column
+ * holding `''` is a real, reachable row on this store: gating on `'string'` alone meant
+ * `empty` missed it (rendering `IS NULL` only, so a row with no value at all did not count as
+ * empty) and `notEmpty` wrongly included it (rendering `IS NOT NULL` only, so a row with no
+ * value at all counted as having one) — a declared operator answering both directions
+ * incorrectly on exactly the columns most likely to hold blanks arriving as `''` rather than
+ * as a missing field.
+ */
+function emptyable(type: ScalarType): boolean {
+  return type !== 'number' && type !== 'boolean' && type !== 'date';
 }
 
 /**
@@ -55,9 +102,9 @@ export function predicateFor(filter: CatalogResolvedFilter): string {
     case 'lte':
       return `${column} <= ${literal(filter.value)}`;
     case 'empty':
-      return `(${column} IS NULL${filter.property.type === 'string' ? ` OR ${column} = ''` : ''})`;
+      return `(${column} IS NULL${emptyable(filter.property.type) ? ` OR ${column} = ''` : ''})`;
     case 'notEmpty':
-      return `(${column} IS NOT NULL${filter.property.type === 'string' ? ` AND ${column} <> ''` : ''})`;
+      return `(${column} IS NOT NULL${emptyable(filter.property.type) ? ` AND ${column} <> ''` : ''})`;
     default: {
       const unreachable: never = filter.op;
       throw new Error(`unhandled filter operator: ${String(unreachable)}`);

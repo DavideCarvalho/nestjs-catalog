@@ -416,7 +416,7 @@ export class DuckDbWarehouseStore {
     const properties = fields.map((field) => {
       const property = type.properties.find((each) => each.name === field);
       if (!property) {
-        throw new Error(
+        throw new BadRequestException(
           `${type.name} has no property named ${field}; a store must never return a column outside the whitelist it was handed.`,
         );
       }
@@ -434,7 +434,7 @@ export class DuckDbWarehouseStore {
     // an identical bad request must fail the same way regardless of what is on disk yet.
     for (const filter of query.filters ?? []) {
       if (!properties.some((property) => property.name === filter.property.name)) {
-        throw new Error(
+        throw new BadRequestException(
           `${filter.property.name} is not among the columns this read returns, so it cannot be filtered on.`,
         );
       }
@@ -598,10 +598,10 @@ function orderByClause(properties: CatalogPropertyDef[], query: CatalogReadQuery
  */
 function resolvedPaging(query: CatalogReadQuery): { size: number; page: number } {
   if (query.size !== undefined && !Number.isFinite(query.size)) {
-    throw new Error(`size must be a finite number, got ${String(query.size)}.`);
+    throw new BadRequestException(`size must be a finite number, got ${String(query.size)}.`);
   }
   if (query.page !== undefined && !Number.isFinite(query.page)) {
-    throw new Error(`page must be a finite number, got ${String(query.page)}.`);
+    throw new BadRequestException(`page must be a finite number, got ${String(query.page)}.`);
   }
   return {
     size: Math.min(1000, Math.max(1, query.size ?? 50)),
