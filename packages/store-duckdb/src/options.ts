@@ -30,6 +30,9 @@ export interface CatalogDuckDbStoreOptions {
   memoryLimit?: string;
   threads?: number;
   tempDirectory?: string;
-  /** Overrides the binding derived from {@link root}. Supplied by tests, and by a host with its own transport. */
+  /**
+   * Overrides the binding derived from {@link root}. Supplied by tests, and by a host
+   * with its own transport.
+   */
   objectStore?: ObjectStore;
 }

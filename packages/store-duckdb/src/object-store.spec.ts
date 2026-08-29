@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -70,5 +70,29 @@ describe('localObjectStore', () => {
     const key = 'deep/nested/dir/object.parquet';
     await store.prepare(key);
     await writeFile(store.locate(key), 'ok', 'utf8');
+  });
+
+  it('propagates a get failure that is not "the key is absent"', async () => {
+    // EISDIR is a cheap, reliable way to produce a non-ENOENT fault without filling a disk:
+    // reading a directory as though it were a file. `get` must not report this as "never
+    // written" — a reader built on `get` (the snapshot lookup Task 5 adds) needs "this does
+    // not exist" and "I could not read it" to land in different places.
+    mkdirSync(join(root, 'a-directory'));
+    await expect(store.get('a-directory')).rejects.toThrow();
+  });
+
+  it('propagates a putIfAbsent failure that is not a lost race', async () => {
+    // A permission fault under the target directory, not EEXIST. `mkdir` on an
+    // already-existing directory is a no-op regardless of its permissions, so the failure
+    // surfaces where it actually would in production: the exclusive `open` itself, as
+    // EACCES. That must not be swallowed as "someone else already wrote it".
+    const lockedDir = join(root, 'locked');
+    mkdirSync(lockedDir);
+    chmodSync(lockedDir, 0o000);
+    try {
+      await expect(store.putIfAbsent('locked/race.json', 'x')).rejects.toThrow();
+    } finally {
+      chmodSync(lockedDir, 0o700);
+    }
   });
 });
