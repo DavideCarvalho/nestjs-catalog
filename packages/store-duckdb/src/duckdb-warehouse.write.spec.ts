@@ -79,10 +79,18 @@ describe('DuckDbWarehouseStore capabilities', () => {
     expect(store.capabilities.timeTravel).toBe(true);
   });
 
-  it('states nothing about atomicity it has not measured', () => {
-    // `undefined` is a third answer with a meaning: not stated. Task 12 measures
-    // these and replaces this assertion with the measured values.
-    expect(store.capabilities.atomicCutover).toBeUndefined();
+  it('declares only the atomicity it has measured', () => {
+    // `atomicCutover` is earned: the db-spec's own concurrent-read/concurrent-commit
+    // race (`duckdb-warehouse.db.spec.ts`) came back with zero failures out of 200
+    // reads, every time it was run.
+    expect(store.capabilities.atomicCutover).toBe(true);
+    // `false`, not absent: there is no cross-statement transaction anywhere in this
+    // file, so this is a measured "no" rather than an unmeasured silence.
+    expect(store.capabilities.transactional).toBe(false);
+    // Absent on purpose. The local and S3 bindings disagree on whether a batch
+    // replace is atomic — a `COPY … TO` over an existing path is not, a `PutObject`
+    // is — and one field cannot honestly describe both.
+    expect(store.capabilities.atomicBatchReplace).toBeUndefined();
   });
 });
 
