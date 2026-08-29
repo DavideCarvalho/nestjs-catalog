@@ -346,12 +346,32 @@ export class DuckDbWarehouseStore {
    * lookup is skipped for it, not merely cheap. It runs for the one case the pointer's good
    * behaviour says nothing about: a caller naming a specific, possibly historical snapshot.
    *
-   * ## The `fields` whitelist is resolved before storage is touched
+   * ## The `fields` whitelist, and `size`/`page`, are resolved before storage is touched
    * Resolving `fields` to properties happens before the empty-glob guard below, so a caller
    * naming a field the type does not have is refused the same way regardless of whether
    * anything happens to be staged yet. Resolving it later, inside the SELECT-list builder,
    * meant an identical bad request either threw or came back with zero rows depending on
-   * data state that has nothing to do with the request being malformed.
+   * data state that has nothing to do with the request being malformed. `size` and `page`'s
+   * own finiteness checks sit right beside it for the same reason: a `{ size: NaN }` read
+   * against a snapshot with nothing staged used to return a quiet `{ rows: [], total: 0 }`
+   * from the guard below rather than the named refusal it gets once anything is on disk —
+   * two different answers to one bad request, depending on data state a caller cannot see.
+   *
+   * ## `filters`, `search`, `sort` and `dir`
+   * All four narrow or order the same two statements — the count and the page — never just
+   * one, because they share the `clause`/`orderBy` built once below. A filter or a search
+   * term applied to only one of them is a screen showing three rows above the words "of
+   * 4,812", which reads as more wrong than not filtering at all: the count and the page then
+   * disagree about the same question.
+   *
+   * `filters` is `(query.filters ?? []).map(predicateFor)`, ANDed with {@link searchPredicate}'s
+   * result (if any) into one `WHERE`. Each filter's column comes off `filter.property`,
+   * resolved by the core service against the type before this method ever sees it — see
+   * `predicateFor`'s own docblock.
+   *
+   * `search` and `sort`/`dir` are built by {@link searchPredicate} and {@link orderByClause}
+   * respectively; see their own docblocks for how each matches the ClickHouse sibling's
+   * `read` and where it deviates.
    *
    * ## Ordering
    * `(_batch, _row)` is a total order over one snapshot's rows because {@link batchKey} is
@@ -394,6 +414,11 @@ export class DuckDbWarehouseStore {
       return property;
     });
 
+    // Checked here, beside `fields`, and ahead of the empty-glob guard below — see the
+    // docblock above for why an identical bad request must fail the same way regardless of
+    // what is on disk yet.
+    const { size, page } = resolvedPaging(query);
+
     const connection = await this.ready();
     // A glob that matches nothing is an error in DuckDB, not an empty result — and "this
     // snapshot has no objects yet" is an ordinary state during a load. Asking the object store
@@ -411,26 +436,23 @@ export class DuckDbWarehouseStore {
       )
       .join(', ');
 
-    // `write`'s own `batch` guards a non-finite input with a named error rather than letting
-    // it flow into a key nothing could resolve; `size` and `page` get the same rather than
-    // silently becoming `LIMIT NaN OFFSET NaN`, which is not a value DuckDB is owed to reject
-    // usefully. `size` also gets an upper bound: a page size sourced from a request is not a
-    // number a caller should be able to inflate into "the whole snapshot in one read".
-    if (query.size !== undefined && !Number.isFinite(query.size)) {
-      throw new Error(`size must be a finite number, got ${String(query.size)}.`);
-    }
-    if (query.page !== undefined && !Number.isFinite(query.page)) {
-      throw new Error(`page must be a finite number, got ${String(query.page)}.`);
-    }
-    const size = Math.min(1000, Math.max(1, query.size ?? 50));
-    const page = Math.max(1, query.page ?? 1);
-    const totalRows = await connection.rows(`SELECT count(*) AS total FROM ${source}`);
+    // One `WHERE`, built once and used by both statements below — see the docblock's
+    // "filters, search, sort and dir" section for why a predicate applied to only one of
+    // them is worse than applying it to neither.
+    const predicates: string[] = [];
+    const search = searchPredicate(properties, query.search);
+    if (search) predicates.push(search);
+    predicates.push(...(query.filters ?? []).map(predicateFor));
+    const clause = predicates.length > 0 ? ` WHERE ${predicates.join(' AND ')}` : '';
+    const orderBy = orderByClause(properties, query);
+
+    const totalRows = await connection.rows(`SELECT count(*) AS total FROM ${source}${clause}`);
     // `count(*)` comes back as a `bigint` on this engine — DuckDB's INT64 — and
     // `JSON.stringify` throws on a bare bigint rather than rendering it, so a response body
     // built from the raw value would fail the serialiser rather than the read.
     const total = Number(totalRows[0]?.total ?? 0);
     const rows = await connection.rows(
-      `SELECT ${selected} FROM ${source} ORDER BY ${ident(BATCH_COLUMN)}, ${ident(ROW_COLUMN)} LIMIT ${size} OFFSET ${(page - 1) * size}`,
+      `SELECT ${selected} FROM ${source}${clause} ORDER BY ${orderBy} LIMIT ${size} OFFSET ${(page - 1) * size}`,
     );
 
     return {
@@ -474,6 +496,91 @@ export class DuckDbWarehouseStore {
     const principal = rows[0]?.principal;
     return typeof principal === 'string' ? principal : 'unknown';
   }
+}
+
+/**
+ * The search box's predicate, or nothing when there is nothing to search.
+ *
+ * Matches the ClickHouse sibling's `read`: the term is trimmed, and a blank one (missing,
+ * empty, or only whitespace) means no predicate at all rather than one that matches
+ * everything vacuously. `properties` is the same fields-whitelisted list the SELECT list is
+ * built from, not `type.properties` — a search never reaches over a column this read was not
+ * asked to return.
+ *
+ * Only `string` columns with no `classification` are searched, for the reason
+ * `filterOperatorsFor` in the core package excludes a classified column from filtering: a
+ * predicate over it — even one as coarse as a substring match — leaks the value's presence
+ * through row membership, though the value itself is never rendered.
+ *
+ * `ILIKE` for the same case-insensitivity `contains` in `filters.ts` uses: DuckDB's `LIKE` is
+ * case-sensitive, and a search box that behaved differently depending on which adapter is
+ * mounted would look like a bug in the data. Unlike `contains`, the term is **not** escaped
+ * against `%`/`_` — the ClickHouse sibling does not escape it either, so a caller sees the
+ * same search behaviour whichever adapter is mounted, at the cost of a literal `%` or `_` in
+ * a search term acting as a wildcard instead of matching itself.
+ */
+function searchPredicate(
+  properties: CatalogPropertyDef[],
+  search: string | undefined,
+): string | undefined {
+  const term = search?.trim();
+  if (!term) return undefined;
+  const searchable = properties.filter(
+    (property) => property.type === 'string' && !property.classification,
+  );
+  if (searchable.length === 0) return undefined;
+  return `(${searchable
+    .map((property) => `${ident(physicalColumn(property.name))} ILIKE ${quoteLiteral(`%${term}%`)}`)
+    .join(' OR ')})`;
+}
+
+/**
+ * `ORDER BY`, composing an explicit sort with the fallback rather than replacing it.
+ *
+ * `query.sort` is matched against `properties` — the same fields-whitelisted list `read`
+ * selects from — so a `sort` naming a column this read does not return behaves exactly like
+ * one naming nothing at all: neither is a refusal. The core service already narrows
+ * `query.sort` to a real, visible column before a store ever sees one (`CatalogService`'s own
+ * `readObjects` falls it back to `undefined` there), so a store-level refusal here would be a
+ * second, redundant guard on the ordinary path and a needless failure for a caller that
+ * reaches `read` directly, such as this package's own specs.
+ *
+ * `(_batch, _row)` is appended whether or not a sort resolved, because it is what
+ * {@link batchKey} guarantees is a total order over one snapshot's rows — see `read`'s own
+ * docblock. Two rows tying on the sorted column would otherwise come back in whatever order
+ * the engine feels like, which is a page whose boundary moves under a caller paging through it.
+ */
+function orderByClause(properties: CatalogPropertyDef[], query: CatalogReadQuery): string {
+  const sortProperty = properties.find((property) => property.name === query.sort);
+  const tiebreak = `${ident(BATCH_COLUMN)}, ${ident(ROW_COLUMN)}`;
+  if (!sortProperty) return tiebreak;
+  const direction = query.dir === 'desc' ? 'DESC' : 'ASC';
+  return `${ident(physicalColumn(sortProperty.name))} ${direction}, ${tiebreak}`;
+}
+
+/**
+ * `size` and `page`, refused if either is non-finite and clamped otherwise.
+ *
+ * `write`'s own `batch` guards a non-finite input with a named error rather than letting it
+ * flow into a key nothing could resolve; `size` and `page` get the same rather than silently
+ * becoming `LIMIT NaN OFFSET NaN`, which is not a value DuckDB is owed to reject usefully.
+ * `read` calls this ahead of its empty-glob guard — see that method's own docblock for why an
+ * identical bad request must be refused the same way regardless of what is on disk yet.
+ *
+ * `size` also gets an upper bound: a page size sourced from a request is not a number a
+ * caller should be able to inflate into "the whole snapshot in one read".
+ */
+function resolvedPaging(query: CatalogReadQuery): { size: number; page: number } {
+  if (query.size !== undefined && !Number.isFinite(query.size)) {
+    throw new Error(`size must be a finite number, got ${String(query.size)}.`);
+  }
+  if (query.page !== undefined && !Number.isFinite(query.page)) {
+    throw new Error(`page must be a finite number, got ${String(query.page)}.`);
+  }
+  return {
+    size: Math.min(1000, Math.max(1, query.size ?? 50)),
+    page: Math.max(1, query.page ?? 1),
+  };
 }
 
 /**

@@ -56,6 +56,65 @@ function sourceSpelledType(name: string): CatalogObjectTypeDef {
   };
 }
 
+/**
+ * A type with one classified string column, for the search-skips-classified case.
+ *
+ * `filterOperatorsFor` in the core package already excludes a classified column from
+ * filtering, on the grounds that a predicate over it leaks the value through row
+ * membership even though the value itself is never rendered — the same reasoning applies
+ * to `search`, which is why the ClickHouse sibling's `read` excludes `!p.classification`
+ * from its searchable set alongside `p.type === 'string'`.
+ */
+function classifiedType(name: string): CatalogObjectTypeDef {
+  return {
+    name,
+    displayName: name,
+    pluralDisplayName: `${name}s`,
+    description: 'Fixture with one classified string column, for the search-skips-classified case.',
+    tableName: `obj_${name.toLowerCase()}`,
+    group: 'Contract',
+    primaryKey: ['id'],
+    enriched: true,
+    properties: [
+      {
+        name: 'id',
+        displayName: 'id',
+        type: 'string',
+        columnName: 'id',
+        nullable: false,
+        primary: true,
+        hidden: false,
+        order: 0,
+        enriched: false,
+      },
+      {
+        name: 'label',
+        displayName: 'label',
+        type: 'string',
+        columnName: 'label',
+        nullable: true,
+        primary: false,
+        hidden: false,
+        order: 1,
+        enriched: false,
+      },
+      {
+        name: 'secret',
+        displayName: 'secret',
+        type: 'string',
+        columnName: 'secret',
+        nullable: true,
+        primary: false,
+        hidden: false,
+        order: 2,
+        enriched: false,
+        classification: 'CUI',
+      },
+    ],
+    relations: [],
+  };
+}
+
 beforeAll(() => {
   root = mkdtempSync(join(tmpdir(), 'catalog-duckdb-read-'));
   store = new DuckDbWarehouseStore({ root });
@@ -290,5 +349,157 @@ describe('commit and read', () => {
     await expect(store.read(type, FIELDS, { size: Number.NaN })).rejects.toThrow(
       /size must be a finite number/,
     );
+  });
+
+  it('refuses a non-finite page number even when nothing is staged yet', async () => {
+    // Sibling to the size case above, and the sweep this task adds: `size`/`page` used to be
+    // checked after the empty-glob guard, so `{ page: NaN }` against a snapshot with nothing
+    // staged returned a quiet `{ rows: [], total: 0 }` instead of the same named refusal a
+    // caller with staged data gets. Moving both checks beside the `fields` whitelist — which
+    // was moved above the guard for exactly this reason — makes the refusal unconditional.
+    const type = contractType('ReadNonFinitePageUnstaged');
+    await store.ensureType(type);
+    await store.commit(type, 'run-1');
+    await expect(store.read(type, FIELDS, { page: Number.NaN })).rejects.toThrow(
+      /page must be a finite number/,
+    );
+  });
+
+  it('refuses a non-finite page size even when nothing is staged yet', async () => {
+    const type = contractType('ReadNonFiniteSizeUnstaged');
+    await store.ensureType(type);
+    await store.commit(type, 'run-1');
+    await expect(store.read(type, FIELDS, { size: Number.NaN })).rejects.toThrow(
+      /size must be a finite number/,
+    );
+  });
+
+  it('applies a filter to both the count and the page it returns', async () => {
+    const type = contractType('ReadFilterBoth');
+    await store.ensureType(type);
+    await store.write(
+      type,
+      [contractRow('a', 'alpha', 1), contractRow('b', 'bravo', 2), contractRow('c', 'charlie', 3)],
+      { snapshotId: 'run-1', principalId: 'tester', batch: 0 },
+    );
+    await store.commit(type, 'run-1');
+
+    const label = type.properties.find((property) => property.name === 'label');
+    if (!label) throw new Error('fixture is missing its own label property');
+
+    const result = await store.read(type, FIELDS, {
+      filters: [{ property: label, op: 'eq', value: 'bravo' }],
+    });
+
+    // Proves the predicate NARROWS rather than merely compiling: a store that ignored the
+    // filter would answer with all three rows and a total of 3, same as an unfiltered read.
+    expect(result.rows).toHaveLength(1);
+    expect(result.rows[0]?.label).toBe('bravo');
+    expect(result.total).toBe(1);
+  });
+
+  it('matches a search term against every visible string column, case-insensitively', async () => {
+    const type = contractType('ReadSearchAcrossColumns');
+    await store.ensureType(type);
+    await store.write(
+      type,
+      [
+        contractRow('a', 'Alpha Team', 1),
+        contractRow('b', 'Bravo Squad', 2),
+        contractRow('c', 'Charlie Crew', 3),
+      ],
+      { snapshotId: 'run-1', principalId: 'tester', batch: 0 },
+    );
+    await store.commit(type, 'run-1');
+
+    const result = await store.read(type, FIELDS, { search: 'bravo' });
+    expect(result.rows.map((row) => row.id)).toEqual(['b']);
+    expect(result.total).toBe(1);
+  });
+
+  it('leaves the result unfiltered when search is blank or only whitespace', async () => {
+    const type = contractType('ReadSearchBlank');
+    await store.ensureType(type);
+    await store.write(type, [contractRow('a', 'Alpha', 1), contractRow('b', 'Bravo', 2)], {
+      snapshotId: 'run-1',
+      principalId: 'tester',
+      batch: 0,
+    });
+    await store.commit(type, 'run-1');
+
+    const result = await store.read(type, FIELDS, { search: '   ' });
+    expect(result.total).toBe(2);
+  });
+
+  it('does not search a classified string column', async () => {
+    const type = classifiedType('ReadSearchClassified');
+    await store.ensureType(type);
+    await store.write(
+      type,
+      [
+        { id: 'a', label: 'nothing interesting', secret: 'zulu-target' },
+        { id: 'b', label: 'zulu team', secret: 'unrelated' },
+      ],
+      { snapshotId: 'run-1', principalId: 'tester', batch: 0 },
+    );
+    await store.commit(type, 'run-1');
+
+    const result = await store.read(type, ['id', 'label', 'secret'], { search: 'zulu' });
+    // Row `a` matches only in the classified `secret` column. A search that covered it would
+    // leak the classified value's presence through row membership — only `b`, matching in
+    // the plain `label` column, comes back.
+    expect(result.rows.map((row) => row.id)).toEqual(['b']);
+  });
+
+  it('orders by an explicit sort column and honours dir', async () => {
+    const type = contractType('ReadSortExplicit');
+    await store.ensureType(type);
+    await store.write(
+      type,
+      [contractRow('a', 'charlie', 3), contractRow('b', 'alpha', 1), contractRow('c', 'bravo', 2)],
+      { snapshotId: 'run-1', principalId: 'tester', batch: 0 },
+    );
+    await store.commit(type, 'run-1');
+
+    const ascending = await store.read(type, FIELDS, { sort: 'label', dir: 'asc' });
+    expect(ascending.rows.map((row) => row.label)).toEqual(['alpha', 'bravo', 'charlie']);
+
+    const descending = await store.read(type, FIELDS, { sort: 'label', dir: 'desc' });
+    expect(descending.rows.map((row) => row.label)).toEqual(['charlie', 'bravo', 'alpha']);
+  });
+
+  it('falls back to batch/row order when sort names a property the read does not return', async () => {
+    // The service already narrows `query.sort` to a real, visible column before a store ever
+    // sees one — an unrecognised name falls back to the primary key there. This is the
+    // store's own defence for a caller that bypasses the service, matching the ClickHouse
+    // sibling: a `sort` naming nothing among the selected properties is not a refusal, it is
+    // silently ignored in favour of the same (_batch, _row) order an unsorted read gets.
+    const type = contractType('ReadSortUnknown');
+    await store.ensureType(type);
+    await store.write(type, [contractRow('a', 'first', 1), contractRow('b', 'second', 2)], {
+      snapshotId: 'run-1',
+      principalId: 'tester',
+      batch: 0,
+    });
+    await store.commit(type, 'run-1');
+
+    const result = await store.read(type, FIELDS, { sort: 'not-a-real-property' });
+    expect(result.rows.map((row) => row.id)).toEqual(['a', 'b']);
+  });
+
+  it('breaks ties in an explicit sort with the batch/row order', async () => {
+    const type = contractType('ReadSortTiebreak');
+    await store.ensureType(type);
+    await store.write(
+      type,
+      [contractRow('a', 'same', 1), contractRow('b', 'same', 2), contractRow('c', 'same', 3)],
+      { snapshotId: 'run-1', principalId: 'tester', batch: 0 },
+    );
+    await store.commit(type, 'run-1');
+
+    const result = await store.read(type, FIELDS, { sort: 'label', dir: 'asc' });
+    // All three rows tie on `label`; the write order (batch 0, rows 0..2) is what breaks the
+    // tie — the explicit sort composes with the fallback ordering rather than replacing it.
+    expect(result.rows.map((row) => row.id)).toEqual(['a', 'b', 'c']);
   });
 });
