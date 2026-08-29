@@ -3,6 +3,7 @@ import { rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type {
+  CatalogFilterOperator,
   CatalogObjectTypeDef,
   CatalogPropertyDef,
   CatalogReadQuery,
@@ -11,6 +12,7 @@ import type {
   SnapshotRef,
 } from '@dudousxd/nestjs-catalog';
 import {
+  CATALOG_FILTER_OPERATORS,
   assertNoColumnCollisions,
   assertSafeIdentifier,
   outputAlias,
@@ -19,6 +21,7 @@ import {
 import { BadRequestException, Inject, Injectable } from '@nestjs/common';
 import { coerce, duckDbType, normalise } from './column-types';
 import { type DuckDbConnection, openDuckDb, quoteLiteral } from './duckdb';
+import { predicateFor } from './filters';
 import {
   BATCH_COLUMN,
   LOADED_AT_COLUMN,
@@ -52,6 +55,16 @@ export class DuckDbWarehouseStore {
     writable: true,
     timeTravel: true,
   };
+
+  /**
+   * Every operator the core package declares.
+   *
+   * All of them, because `predicateFor` answers all of them behind an exhaustive switch. A
+   * store that declares an operator it does not apply returns more rows than were asked for,
+   * and nothing in that answer distinguishes it from a filter that genuinely matched
+   * everything.
+   */
+  readonly objectFilterOperators: readonly CatalogFilterOperator[] = CATALOG_FILTER_OPERATORS;
 
   private readonly objects: ObjectStore;
   private readonly snapshots: SnapshotCatalog;
