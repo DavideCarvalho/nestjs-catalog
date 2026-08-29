@@ -113,7 +113,15 @@ export class DuckDbWarehouseStore {
       labels?: Record<string, string>;
     },
   ): Promise<{ written: number }> {
-    const batch = options.batch ?? 1;
+    // Matches the sibling adapters (store-mikro-orm, store-clickhouse) exactly: a batch-less
+    // write is batch 0, not batch 1. A divergent default would mean the same logical batch
+    // lands under a different key here than on a MikroORM primary behind the same fan-out —
+    // a false mismatch — and, worse locally, a batch-less write followed by an explicit
+    // `batch: 1` write would land at two different keys instead of the same one, silently
+    // keeping both instead of the second replacing the first. `Number.isFinite` rather than
+    // `??`, because `??` only catches `null`/`undefined` and would let a `NaN` batch straight
+    // through into a key nothing could ever `list()` back out consistently.
+    const batch = Number.isFinite(options.batch) ? Number(options.batch) : 0;
     if (!Number.isInteger(batch) || batch < 0) {
       throw new Error(
         `batch must be a non-negative integer, got ${String(options.batch)}. The batch number is half of this store's object key, and a key it cannot derive is a batch a retry cannot replace.`,
@@ -184,6 +192,12 @@ export class DuckDbWarehouseStore {
  * literal mapping a column name to a type name, both spelled as text, and `quoteLiteral` is
  * what produces a string literal. `ident()` belongs to statements that reference a column by
  * name — a `SELECT` list, a `CREATE TABLE` — which this is not.
+ *
+ * Tested against the real engine both ways: on this DuckDB build, a double-quoted `ident()`
+ * key parses here too, including for a mixed-case name and one that is a reserved word — only
+ * a bare unquoted key fails. So this is not working around an observed failure; it is using
+ * the form that matches what the argument actually is, on the basis that a parser being
+ * lenient about a string-literal position today is not a guarantee it stays lenient.
  */
 function stageColumns(type: CatalogObjectTypeDef): string {
   const declared = type.properties.map(

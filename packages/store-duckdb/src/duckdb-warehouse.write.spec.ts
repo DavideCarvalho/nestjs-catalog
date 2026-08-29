@@ -117,4 +117,46 @@ describe('write', () => {
     ]);
     expect(await store.countStaged(type, 'run-1')).toBe(0);
   });
+
+  it('defaults an unnumbered batch to 0, matching the sibling adapters', async () => {
+    // A divergent default would land the same logical batch under a different key
+    // in this store than in a MikroORM or ClickHouse primary sitting behind the
+    // same fan-out, which reads back as a false mismatch between them. It also
+    // matters on its own: a caller that writes once with no `batch` and then
+    // again with an explicit `batch: 1` means two batches, not one overwrite.
+    const type = contractType('WriteDefaultBatch');
+    await store.ensureType(type);
+    await store.write(type, [contractRow('a', 'A', 1)], {
+      snapshotId: 'run-1',
+      principalId: 'tester',
+    });
+    expect(await localObjectStore(root).list('writedefaultbatch/run-1')).toEqual([
+      'writedefaultbatch/run-1/part-000000.parquet',
+    ]);
+
+    // A batch-less write and an explicit `batch: 0` write hit the same key: the
+    // second replaces the first, and the snapshot still holds one row.
+    await store.write(type, [contractRow('a', 'A', 1)], {
+      snapshotId: 'run-1',
+      principalId: 'tester',
+      batch: 0,
+    });
+    expect(await localObjectStore(root).list('writedefaultbatch/run-1')).toEqual([
+      'writedefaultbatch/run-1/part-000000.parquet',
+    ]);
+    expect(await store.countStaged(type, 'run-1')).toBe(1);
+
+    // A batch-less write and an explicit `batch: 1` write are two different
+    // batches: both objects exist, and both rows are staged.
+    await store.write(type, [contractRow('b', 'B', 2)], {
+      snapshotId: 'run-1',
+      principalId: 'tester',
+      batch: 1,
+    });
+    expect(await localObjectStore(root).list('writedefaultbatch/run-1')).toEqual([
+      'writedefaultbatch/run-1/part-000000.parquet',
+      'writedefaultbatch/run-1/part-000001.parquet',
+    ]);
+    expect(await store.countStaged(type, 'run-1')).toBe(2);
+  });
 });
