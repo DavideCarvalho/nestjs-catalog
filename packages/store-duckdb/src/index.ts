@@ -13,6 +13,7 @@ export {
   SNAPSHOT_COLUMN,
   typePrefix,
 } from './identifiers';
+export { ensureLocalRoot, isS3Root, localObjectStore, type ObjectStore } from './object-store';
 export {
   CATALOG_DUCKDB_OPTIONS,
   type CatalogDuckDbStoreOptions,

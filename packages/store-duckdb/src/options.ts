@@ -1,3 +1,5 @@
+import type { ObjectStore } from './object-store';
+
 export const CATALOG_DUCKDB_OPTIONS = Symbol('CATALOG_DUCKDB_OPTIONS');
 
 /** Credentials for an `s3://` root. Omit to let DuckDB use the AWS credential chain. */
@@ -28,4 +30,6 @@ export interface CatalogDuckDbStoreOptions {
   memoryLimit?: string;
   threads?: number;
   tempDirectory?: string;
+  /** Overrides the binding derived from {@link root}. Supplied by tests, and by a host with its own transport. */
+  objectStore?: ObjectStore;
 }
