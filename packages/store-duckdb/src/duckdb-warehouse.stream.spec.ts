@@ -125,6 +125,58 @@ describe('streamSnapshot', () => {
     }
     expect(seen).toEqual(['a']);
   });
+
+  it('is not truncated by another store operation running while it is still open', async () => {
+    // CRITICAL 1: `DuckDbWarehouseStore` is `@Injectable()`, so it is a singleton with one
+    // memoized connection (`this.ready()`). Before `streamSnapshot` opened its own dedicated
+    // connection, a stream left open across `await`s on that shared connection was silently
+    // truncated by any other query the store issued while it was open -- not an error, a
+    // `fetchChunk` reporting an empty result that a `for await` reads as the stream simply
+    // ending.
+    //
+    // 6,000 rows forces three 2,048-row chunks, and the pause point (2,100 rows pulled) sits
+    // inside chunk 2 -- so chunk 1 and chunk 2 are already fetched by the time the unrelated
+    // operation below runs, and only chunk 3 remains, requiring a NEW native `fetchChunk` call
+    // AFTER that operation. A smaller fixture (a total that fits in two chunks) would pause
+    // with nothing left to fetch, and this test would pass whether or not the connection was
+    // actually shared -- proving nothing about the bug it exists to catch.
+    const type = contractType('StreamConcurrent');
+    await store.ensureType(type);
+    const rows = Array.from({ length: 6000 }, (_, index) =>
+      contractRow(String(index).padStart(4, '0'), `label-${index}`, index),
+    );
+    await store.write(type, rows, { snapshotId: 'run-1', principalId: 'tester', batch: 0 });
+    await store.commit(type, 'run-1');
+
+    const seen: string[] = [];
+    const iterator = store.streamSnapshot(type, ['id'], 'run-1')[Symbol.asyncIterator]();
+    for (let index = 0; index < 2100; index += 1) {
+      const step = await iterator.next();
+      if (step.done) break;
+      seen.push(String(step.value.id));
+    }
+    expect(seen).toHaveLength(2100);
+
+    // An unrelated store operation, on the store's own shared connection, while the stream
+    // above is still open and mid-iteration on its own connection.
+    const otherType = contractType('StreamConcurrentOther');
+    await store.ensureType(otherType);
+    await store.write(otherType, [contractRow('x', 'X', 1)], {
+      snapshotId: 'other-run',
+      principalId: 'tester',
+      batch: 0,
+    });
+    expect(await store.countStaged(type, 'run-1')).toBe(6000);
+
+    let step = await iterator.next();
+    while (!step.done) {
+      seen.push(String(step.value.id));
+      step = await iterator.next();
+    }
+    expect(seen).toHaveLength(6000);
+    expect(seen[0]).toBe('0000');
+    expect(seen[5999]).toBe('5999');
+  });
 });
 
 describe('carryForward', () => {
@@ -331,6 +383,110 @@ describe('carryForward', () => {
     // Without the guard this names 'run-2' -- itself -- rather than the snapshot 'b' was
     // actually carried out of.
     expect(merged.from).toBe('run-1');
+  });
+
+  it('carries nothing forward, without crashing, when the previous snapshot has no objects at all', async () => {
+    // IMPORTANT 3: `commit` does not require `write` to have run first -- see `principalOf`'s
+    // own docblock, "commit calls this for a snapshot write never touched" -- so a genuinely
+    // empty, committed snapshot (a first run that fetched nothing from its source) is a real,
+    // reachable `previous`. Every other glob in this file checks `objects.list(...)` before
+    // handing a glob to DuckDB, because a glob matching nothing is an IO error in this engine,
+    // not an empty result (see `countStaged`'s own docblock); `carryForward`'s previous-side
+    // glob used not to, and would die on that error instead of carrying nothing forward.
+    const type = contractType('CarryEmptyPrevious');
+    await store.ensureType(type);
+
+    // A first, genuinely empty run: nothing written, straight to commit.
+    await store.commit(type, 'run-1');
+
+    await store.write(type, [contractRow('a', 'from-run-2', 1)], {
+      snapshotId: 'run-2',
+      principalId: 'tester',
+      batch: 0,
+    });
+    const merged = await store.carryForward(type, 'run-2', { principalId: 'tester' });
+    expect(merged.from).toBe('run-1');
+    expect(merged.carried).toBe(0);
+    expect(merged.total).toBe(1);
+    await store.commit(type, 'run-2');
+
+    const read = await store.read(type, ['id'], { size: 10 });
+    expect(read.rows.map((row) => row.id)).toEqual(['a']);
+  });
+
+  it('clears a stale carried row when a later call finds the previous snapshot empty', async () => {
+    // The other half of the same fix, and a real idempotence gap it closes (a MINOR item
+    // alongside the Critical/Important review): a second `carryForward` call for the SAME
+    // snapshotId, whose own `previous` resolves to something with no rows, must not leave an
+    // earlier call's carried row sitting in `carry.parquet` -- `total` would otherwise still
+    // count a row this call's own answer says should not be there.
+    const type = contractType('CarryStaleClears');
+    await store.ensureType(type);
+    await store.write(type, [contractRow('a', 'old-a', 1)], {
+      snapshotId: 'run-1',
+      principalId: 'tester',
+      batch: 0,
+    });
+    await store.commit(type, 'run-1');
+
+    await store.write(type, [contractRow('b', 'new-b', 2)], {
+      snapshotId: 'run-2',
+      principalId: 'tester',
+      batch: 0,
+    });
+    const first = await store.carryForward(type, 'run-2', { principalId: 'tester' });
+    expect(first.carried).toBe(1); // 'a' carried forward from run-1
+    expect(first.total).toBe(2);
+
+    // Roll the served pointer to a genuinely empty snapshot. 'run-2' is not yet committed, so
+    // this is legal, and it makes run-2's OWN previous resolve to something with no rows.
+    await store.commit(type, 'run-0');
+
+    const second = await store.carryForward(type, 'run-2', { principalId: 'tester' });
+    expect(second.from).toBe('run-0');
+    expect(second.carried).toBe(0);
+    // Only 'b' -- 'a' must not still be sitting in carry.parquet from the first call.
+    expect(second.total).toBe(1);
+    await store.commit(type, 'run-2');
+
+    const read = await store.read(type, ['id'], { size: 10 });
+    expect(read.rows.map((row) => row.id)).toEqual(['b']);
+  });
+
+  it('excludes an uncommitted record from the fallback merge source', async () => {
+    // IMPORTANT 4: `carryForward` creates a live `SnapshotRef` before `commit` ever runs (see
+    // CARRIED_FROM_LABEL), so an aborted load -- write, then carryForward, but never commit --
+    // leaves a live record `listSnapshotsWithRows` cannot tell apart from a served one by
+    // tombstone status alone. Without COMMITTED_LABEL's filter, that record would be eligible
+    // as the fallback's merge source the next time nothing is served for this type -- a merge
+    // source nobody ever served, the same mistake Ruling 2 exists to prevent, reached through
+    // carryForward's own bookkeeping rather than through "newest record" reasoning.
+    const type = contractType('CarryUncommittedFallback');
+    await store.ensureType(type);
+
+    // The aborted run: write, then carryForward, never commit.
+    await store.write(type, [contractRow('a', 'from-aborted-run', 1)], {
+      snapshotId: 'aborted',
+      principalId: 'tester',
+      batch: 0,
+    });
+    await store.carryForward(type, 'aborted', { principalId: 'tester' });
+
+    // A second load. Nothing has EVER been committed for this type, so `served` is still
+    // undefined and the fallback runs.
+    await store.write(type, [contractRow('b', 'from-run-2', 2)], {
+      snapshotId: 'run-2',
+      principalId: 'tester',
+      batch: 0,
+    });
+    const merged = await store.carryForward(type, 'run-2', { principalId: 'tester' });
+    expect(merged.from).toBeUndefined();
+    expect(merged.carried).toBe(0);
+    await store.commit(type, 'run-2');
+
+    const read = await store.read(type, ['id'], { size: 10 });
+    // Without the fix this would include 'a', carried forward from the aborted run.
+    expect(read.rows.map((row) => row.id)).toEqual(['b']);
   });
 
   it('refuses a type with no primary key', async () => {

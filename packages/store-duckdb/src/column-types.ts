@@ -9,12 +9,21 @@ import type { ScalarType } from '@dudousxd/nestjs-catalog';
  * Found, not assumed: `runAndReadAll().getRowObjects()` and `stream()`'s chunk-at-a-time
  * `appendToRowObjects` were both checked against a real TIMESTAMPTZ column, and both handed
  * back a `DuckDBTimestampTZValue` — never a native `Date` — so this conversion is not specific
- * to either read path. Before this existed, `normalise` fell through every branch below for
- * that value and returned it untouched: no test had ever asserted the *value* of a date-typed
- * column read back from a live query (only that filtering on one narrowed the right rows), so
- * every `_loaded_at` and every declared `date` property this store has ever served was this
- * opaque, un-stringified object rather than the ISO string this function's own docblock
- * promises.
+ * to either read path.
+ *
+ * **Before this existed, every `date`-typed column this store ever served came back `null`,
+ * not this opaque object.** `normalise`'s `type === 'date'` branch is what a `date` column
+ * always reaches — `date` is the only scalar {@link duckDbType} maps to `TIMESTAMP WITH TIME
+ * ZONE`, so nothing else can produce this value under that branch — and that branch's own
+ * `else` clause, reached because a `DuckDBTimestampTZValue` is none of `Date`, `number`,
+ * `bigint` or `string`, is `return null`. It never fell through to the *generic* `instanceof
+ * Date`/`bigint` checks further down the function, because the `date` branch returns
+ * unconditionally before those are ever reached. So the failure was not an unstringified value
+ * reaching a caller — it was every `_loaded_at` and every declared `date` property silently
+ * becoming NULL, indistinguishable from "nobody sent one". No test had ever asserted the
+ * *value* of a date-typed column read back from a live query — only that filtering on one
+ * narrowed the right rows — so nothing caught a store quietly dropping the one thing that could
+ * not be reconstructed from anything else.
  */
 function fromTimestampTZ(value: DuckDBTimestampTZValue): Date {
   return new Date(Number(value.micros / 1000n));

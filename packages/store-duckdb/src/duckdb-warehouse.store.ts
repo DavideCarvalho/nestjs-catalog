@@ -57,6 +57,23 @@ const CARRIED_FROM_NOTHING = 'none';
  * docblock for why refusal, and not a silent repair, is the only safe response.
  */
 const CARRY_FORWARD_STALE_LABEL = '_carryForwardStale';
+/**
+ * Set on the snapshot record by {@link DuckDbWarehouseStore.commit} alone, never by `write` or
+ * `carryForward` — the ClickHouse sibling's `findPreviousCommitted` guards its own fallback the
+ * same way with a `committed = 1` predicate over its own schema's dedicated column (see
+ * `packages/store-clickhouse/src/snapshots.ts`); this store has no such column, so the label
+ * carries the fact the ecosystem already agrees a merge source needs.
+ *
+ * Why this exists: before it did, a load that ran `write` and `carryForward` but never
+ * `commit` — an aborted or still-in-flight run — left behind a live `SnapshotRef` (created by
+ * `carryForward`'s own bookkeeping) that `listSnapshotsWithRows` cannot tell apart from a
+ * genuinely served one, because "live" there means only "not tombstoned". `carryForward`'s own
+ * fallback resolution reads that same list when nothing is currently served, so an aborted
+ * run's half-finished snapshot was eligible to be chosen as the next load's merge source — a
+ * merge source nobody ever served, which is exactly the mistake Ruling 2's whole "served, not
+ * newest" argument exists to prevent, reached through the one path that argument did not name.
+ */
+const COMMITTED_LABEL = '_committed';
 
 @Injectable()
 export class DuckDbWarehouseStore {
@@ -358,6 +375,14 @@ export class DuckDbWarehouseStore {
    * caller that its ordering was wrong, and the caller would never learn to fix the batch that
    * produced the problem in the first place. The repair is stated in the message: carry forward
    * again, then commit.
+   *
+   * ## Marks the record committed, unconditionally
+   *
+   * {@link COMMITTED_LABEL} is set on every successful call, merged into whatever labels the
+   * record already carried (from an earlier `carryForward`, or from a caller's own
+   * `options.labels` on `write`) rather than replacing them. This is the fact `carryForward`'s
+   * own fallback resolution reads back to exclude a written-but-never-committed snapshot from
+   * standing in as a merge source — see that label's own docblock.
    */
   async commit(type: CatalogObjectTypeDef, snapshotId: string): Promise<SnapshotRef> {
     const existing = await this.snapshots.find(type.name, snapshotId);
@@ -378,7 +403,10 @@ export class DuckDbWarehouseStore {
       createdAt: existing?.createdAt ?? new Date().toISOString(),
       rowCount: await this.countStaged(type, snapshotId),
       principalId: existing?.principalId ?? (await this.principalOf(type, snapshotId)),
-      ...(existing?.labels ? { labels: existing.labels } : {}),
+      // Unconditional: this IS the fact that a commit records, and `carryForward`'s fallback
+      // resolution reads it back to tell a served snapshot apart from a merely-written one —
+      // see COMMITTED_LABEL's own docblock.
+      labels: { ...existing?.labels, [COMMITTED_LABEL]: 'true' },
       ...(existing?.archive ? { archive: existing.archive } : {}),
     };
     await this.snapshots.put(type.name, ref);
@@ -561,15 +589,7 @@ export class DuckDbWarehouseStore {
 
     // Resolved up front, ahead of the empty-glob guard, so a field the type does not have is
     // refused identically whether or not the snapshot has anything staged yet.
-    const properties = fields.map((field) => {
-      const property = type.properties.find((each) => each.name === field);
-      if (!property) {
-        throw new BadRequestException(
-          `${type.name} has no property named ${field}; a store must never return a column outside the whitelist it was handed.`,
-        );
-      }
-      return property;
-    });
+    const properties = this.resolveProperties(type, fields);
 
     // A predicate over a column this read did not select is how a hidden or classified
     // value leaks out through row membership even though it never reaches the SELECT list:
@@ -687,21 +707,47 @@ export class DuckDbWarehouseStore {
    * never share a `_batch` — and a carried object's `_batch` is {@link CARRY_FORWARD_BATCH}
    * (`-1`), which sorts before every ordinary batch rather than colliding with one.
    *
-   * ## Genuinely streamed
+   * ## No `ORDER BY` over the whole snapshot — reconstructed from file order instead
    *
-   * Through `connection.stream` — see that method's own docblock in `duckdb.ts` for how this
-   * was checked against the running engine rather than assumed from the driver's types — which
-   * pulls DuckDB's own chunk-at-a-time result and yields from it as each chunk is fetched, so an
-   * abandoned `for await` (a `break`, an error thrown by the consumer) leaves the rest of the
-   * snapshot unfetched rather than sitting in a Node array nobody asked for.
+   * A first version of this method did one `read_parquet` over the snapshot's whole glob with
+   * `ORDER BY _batch, _row`. That is wrong, and measurably so: `ORDER BY` is a blocking
+   * operator, so DuckDB has to see every input row before it can produce the first output row —
+   * `stream` still pulls chunk-by-chunk faithfully once the result exists, but the result does
+   * not exist until the whole snapshot has been sorted. Measured directly (see `duckdb.ts`'s
+   * `stream` docblock for the numbers): a 4,000,000-row unsorted scan returns its first chunk in
+   * single-digit milliseconds; the same table sorted took roughly ten times as long and pulled
+   * tens of megabytes into the process before that first chunk came back. A `streamSnapshot`
+   * that materialises the whole snapshot before yielding row 1 is a slower `read` wearing a
+   * different signature — exactly the cost this method exists to avoid.
+   *
+   * The fix is to never ask DuckDB to sort more than one file at a time. `(_batch, _row)` is
+   * reconstructed by iterating the snapshot's Parquet objects in **key order** — `carry.parquet`
+   * sorts before every `part-*.parquet` name the same way `_batch = -1` sorts before every
+   * non-negative batch (see {@link CARRY_FORWARD_BATCH}), and {@link batchKey}'s zero-padding
+   * makes ascending batch numbers sort the same way lexicographically as numerically — and
+   * running `ORDER BY _row` **per file**, which reproduces write order within one batch and
+   * costs a sort over one batch's rows rather than the whole snapshot.
+   *
+   * ## Genuinely streamed, on a connection of its own
+   *
+   * `openStreamConnection` — see that method's own docblock in `duckdb.ts` — rather than
+   * `this.ready()`'s single memoized connection: DuckDB serialises within one connection, so a
+   * stream left open across `await`s on the store's shared connection is silently truncated by
+   * any other query this store issues while it is open (a `read`, a `write`, a concurrent
+   * `streamSnapshot`) — measured against the real driver, and documented at length in
+   * `duckdb.ts` because the failure is silent rather than thrown. The dedicated connection is
+   * closed in `finally`, whether the loop below runs to completion or the generator is
+   * abandoned early.
    *
    * ## Refusals
    *
-   * A dropped snapshot is refused outright, ahead of the empty-glob check below: iterating zero
-   * rows here would let a workflow report success and commit an empty load downstream, which is
-   * the exact failure `read`'s own tombstone check exists to prevent — see that method's
-   * docblock. `fields` is resolved to properties and refused by name exactly as `read` refuses
-   * it, so a caller cannot reach over the whitelist by calling this method instead of that one.
+   * A dropped snapshot is refused outright: iterating zero rows here would let a workflow
+   * report success and commit an empty load downstream, which is the exact failure `read`'s own
+   * tombstone check exists to prevent — see that method's docblock. `fields` is resolved to
+   * properties and refused by name exactly as `read` refuses it, ahead of the empty-object
+   * check below — matching `read`'s own reasoning for doing the same in that order: an
+   * identical bad request (an unknown field) must fail the same way whether or not anything is
+   * staged yet, rather than depend on data state a caller cannot see.
    *
    * `provenance: true` adds both of {@link CATALOG_PROVENANCE_COLUMNS} or throws — this store
    * never has to choose the latter: `write`'s own `stageRow` puts `_principal_id` and
@@ -721,18 +767,8 @@ export class DuckDbWarehouseStore {
         `snapshot ${snapshotId} of ${type.name} was dropped on ${ref.droppedAt} and cannot be streamed. Iterating zero rows here would let a workflow report success and commit an empty load downstream.`,
       );
     }
-    if ((await this.objects.list(snapshotPrefix(type.name, snapshotId))).length === 0) return;
 
-    const properties = fields.map((field) => {
-      const property = type.properties.find((each) => each.name === field);
-      if (!property) {
-        throw new BadRequestException(
-          `${type.name} has no property named ${field}; a store must never return a column outside the whitelist it was handed.`,
-        );
-      }
-      return property;
-    });
-
+    const properties = this.resolveProperties(type, fields);
     const selected = properties.map(
       (property) =>
         `${ident(physicalColumn(property.name))} AS ${ident(outputAlias(property.name))}`,
@@ -743,17 +779,44 @@ export class DuckDbWarehouseStore {
       }
     }
 
-    const connection = await this.ready();
-    const sql = `SELECT ${selected.join(', ')} FROM read_parquet(${quoteLiteral(this.globFor(type, snapshotId))}, union_by_name = true) ORDER BY ${ident(BATCH_COLUMN)}, ${ident(ROW_COLUMN)}`;
-    for await (const row of connection.stream(sql)) {
-      const out = normaliseRow(properties, row);
-      if (options?.provenance) {
-        for (const column of CATALOG_PROVENANCE_COLUMNS) {
-          out[column] = normalise(row[column], column === '_loaded_at' ? 'date' : 'string');
+    // Lexicographic key order, not a glob read with an `ORDER BY` — see the docblock above.
+    const keys = (await this.objects.list(snapshotPrefix(type.name, snapshotId)))
+      .filter((key) => key.endsWith('.parquet'))
+      .sort();
+    if (keys.length === 0) return;
+
+    const primary = await this.ready();
+    const stream = await primary.openStreamConnection();
+    try {
+      for (const key of keys) {
+        const sql = `SELECT ${selected.join(', ')} FROM read_parquet(${quoteLiteral(this.objects.locate(key))}, union_by_name = true) ORDER BY ${ident(ROW_COLUMN)}`;
+        for await (const row of stream.stream(sql)) {
+          yield options?.provenance
+            ? withProvenance(normaliseRow(properties, row), row)
+            : normaliseRow(properties, row);
         }
       }
-      yield out;
+    } finally {
+      await stream.close();
     }
+  }
+
+  /**
+   * `fields` resolved to the type's own declared properties, refused by name for a field the
+   * type does not have — shared by `read` and `streamSnapshot` so the whitelist refusal reads
+   * identically from either entry point rather than being maintained as two copies that could
+   * drift apart on the exact wording or the exact check.
+   */
+  private resolveProperties(type: CatalogObjectTypeDef, fields: string[]): CatalogPropertyDef[] {
+    return fields.map((field) => {
+      const property = type.properties.find((each) => each.name === field);
+      if (!property) {
+        throw new BadRequestException(
+          `${type.name} has no property named ${field}; a store must never return a column outside the whitelist it was handed.`,
+        );
+      }
+      return property;
+    });
   }
 
   /**
@@ -782,14 +845,56 @@ export class DuckDbWarehouseStore {
     );
   }
 
-  /** Rows in `snapshotId`'s carry-forward object. Zero when {@link carryForward} wrote none. */
+  /**
+   * Rows in `snapshotId`'s carry-forward object.
+   *
+   * Safe to call unconditionally after `carryForward` has run at least once for `snapshotId`:
+   * that method now always leaves `carryKey` holding something, whether a real merge result or
+   * {@link DuckDbWarehouseStore.clearCarryObject}'s zero rows, so this never meets a glob with
+   * nothing behind it the way the loader-batch globs elsewhere in this file have to guard for.
+   * `union_by_name = true`, matching every other `read_parquet` in this file — a single file has
+   * nothing to union against, but the flag costs nothing here either, and its absence would be
+   * the one `read_parquet` call in this method that did not match its own docblock's claim that
+   * all of them carry it.
+   */
   private async countCarried(type: CatalogObjectTypeDef, snapshotId: string): Promise<number> {
     const connection = await this.ready();
     const key = carryForwardKey(type.name, snapshotId);
     const rows = await connection.rows(
-      `SELECT count(*) AS total FROM read_parquet(${quoteLiteral(this.objects.locate(key))})`,
+      `SELECT count(*) AS total FROM read_parquet(${quoteLiteral(this.objects.locate(key))}, union_by_name = true)`,
     );
     return Number(rows[0]?.total ?? 0);
+  }
+
+  /**
+   * Write zero rows, with the full declared schema, to `carryKey`.
+   *
+   * Used whenever a `carryForward` call finds nothing to carry — no previous snapshot at all,
+   * or one that is itself a fully empty, committed snapshot (a first run that fetched nothing;
+   * see `carryForward`'s own docblock) — so that `carryKey` always exists after the call
+   * returns and always reflects what THIS call decided, rather than whatever an earlier call on
+   * the same `snapshotId` left there. Without this, a call that finds nothing to carry would
+   * leave an earlier call's carried rows in place untouched: not merely a stale lineage label,
+   * but `total` still counting rows that call's own answer says should not be there.
+   *
+   * The same technique `write` uses for a zero-row batch, and for the same reason: an empty
+   * NDJSON file read through `read_json` with an explicit `columns` map yields zero rows of the
+   * declared schema, and `COPY` of that produces a valid, zero-row Parquet object rather than an
+   * error or a missing file — see `write`'s own docblock for where this was verified against the
+   * real engine.
+   */
+  private async clearCarryObject(type: CatalogObjectTypeDef, carryKey: string): Promise<void> {
+    const connection = await this.ready();
+    const staging = join(tmpdir(), `catalog-duckdb-${randomUUID()}.ndjson`);
+    try {
+      await writeFile(staging, '', 'utf8');
+      await this.objects.prepare(carryKey);
+      await connection.run(
+        `COPY (SELECT * FROM read_json(${quoteLiteral(staging)}, columns = ${stageColumns(type)}, format = 'newline_delimited')) TO ${quoteLiteral(this.objects.locate(carryKey))} (FORMAT PARQUET, COMPRESSION SNAPPY)`,
+      );
+    } finally {
+      await rm(staging, { force: true });
+    }
   }
 
   /**
@@ -807,15 +912,34 @@ export class DuckDbWarehouseStore {
    * that was just rolled back. Merging onto the newest live record instead of the served one
    * would carry forward from a load nobody is serving.
    *
-   * Falls back to the newest live record (excluding `snapshotId` itself) only when nothing has
-   * ever been served — the one case `currentSnapshot` cannot answer, since there is no pointer
-   * yet to consult. A served snapshot that happens to equal `snapshotId` is treated the same as
-   * "nothing served" for the same reason the fallback excludes self: that state means this exact
-   * merge already ran and was committed once and is now being redone, and merging a snapshot
-   * against its own rows would anti-join every previous row against itself, carry nothing
-   * forward, and silently erase whatever an earlier, legitimate carry-forward had copied in.
-   * Nothing in this package's own specs reaches that state; it is guarded here because the
-   * hazard is real, not because a test demanded it.
+   * Falls back to the newest LIVE AND COMMITTED record (excluding `snapshotId` itself) only
+   * when nothing has ever been served — the one case `currentSnapshot` cannot answer, since
+   * there is no pointer yet to consult. The committed filter matters on its own: `carryForward`
+   * itself now creates a `SnapshotRef` (see below) before `commit` ever runs, so a load that
+   * ran `write` and `carryForward` but was then abandoned — a crash, a step that never reached
+   * `commit` — leaves a live, un-tombstoned record behind. Without the filter that record is
+   * indistinguishable from a served one to `listSnapshotsWithRows`, and a LATER load's fallback
+   * would pick an abandoned run's half-finished snapshot as its merge source: a merge source
+   * nobody ever served, reached through the one path Ruling 2's "served, not newest" argument
+   * did not originally name. See {@link COMMITTED_LABEL}'s own docblock.
+   *
+   * A served snapshot that happens to equal `snapshotId` is treated the same as "nothing
+   * served" for a different reason: that state means this exact merge already ran and was
+   * committed once and is now being redone, and merging a snapshot against its own rows would
+   * anti-join every previous row against itself, carry nothing forward, and silently erase
+   * whatever an earlier, legitimate carry-forward had copied in.
+   *
+   * ## A previous snapshot with no objects at all
+   *
+   * Reachable without anything exotic: `commit` does not require `write` to have run first —
+   * see `principalOf`'s own docblock, "`commit` calls this for a snapshot `write` never
+   * touched" — so a run that fetched nothing from its source at all can `commit` straight away,
+   * publishing a legitimate, empty snapshot whose prefix holds zero Parquet objects. That
+   * snapshot can then become `previous` for the next incremental load. Every other glob in this
+   * file checks `objects.list(...)` before handing a glob to DuckDB, because a glob matching
+   * nothing is an IO error in this engine, not an empty result (see `countStaged`'s own
+   * docblock) — this one used not to, and would die on that error instead of doing the correct
+   * thing, which is to carry nothing forward. Checked below via `previousObjects`.
    *
    * ## The anti-join, and why the incoming glob excludes `carry.parquet`
    *
@@ -844,13 +968,18 @@ export class DuckDbWarehouseStore {
    * dropped from the merged result, not an error — matching the order removes any reliance on
    * that fallback ever being exercised.
    *
-   * ## Idempotence
+   * ## Idempotence, both ways
    *
-   * Safe to call twice. `carry.parquet`'s key is fixed per `(type, snapshotId)` — see {@link
-   * carryForwardKey} — so a second call's `COPY … TO` overwrites the first call's output rather
-   * than adding to it, and the anti-join is recomputed from whatever loader batches exist when
-   * it runs, so a re-run after more batches landed sees them and a re-run after nothing changed
-   * reproduces the same file byte for byte.
+   * Safe to call twice with the same inputs. `carry.parquet`'s key is fixed per `(type,
+   * snapshotId)` — see {@link carryForwardKey} — so a second call's `COPY … TO` overwrites the
+   * first call's output rather than adding to it, and the anti-join is recomputed from whatever
+   * loader batches exist when it runs, so a re-run after more batches landed sees them.
+   *
+   * Also safe when a SECOND call finds nothing to carry after a FIRST call found something —
+   * {@link clearCarryObject} runs in that branch rather than leaving `carryKey` untouched, so
+   * `carried` and `total` both describe what THIS call decided rather than a stale mix of this
+   * call's `total` (recomputed fresh below, from whatever is actually on disk) and a first
+   * call's carried rows sitting in a file nobody asked this call to rewrite.
    *
    * ## The ordering refusal
    *
@@ -876,14 +1005,19 @@ export class DuckDbWarehouseStore {
     const previous =
       served && served.id !== snapshotId
         ? served
-        : (await this.listSnapshotsWithRows(type)).find((each) => each.id !== snapshotId);
+        : (await this.listSnapshotsWithRows(type)).find(
+            (each) => each.id !== snapshotId && each.labels?.[COMMITTED_LABEL] !== undefined,
+          );
 
     const prefix = snapshotPrefix(type.name, snapshotId);
     const carryKey = carryForwardKey(type.name, snapshotId);
     const loaderObjects = (await this.objects.list(prefix)).filter((each) => each !== carryKey);
     const incomingGlob = this.objects.locate(`${prefix}/part-*.parquet`);
+    const previousObjects = previous
+      ? await this.objects.list(snapshotPrefix(type.name, previous.id))
+      : [];
 
-    if (previous) {
+    if (previous && previousObjects.length > 0) {
       const previousGlob = this.globFor(type, previous.id);
       await this.assertKeyed(previousGlob, keyColumns, `snapshot ${previous.id}`);
       if (loaderObjects.length > 0) {
@@ -918,10 +1052,15 @@ export class DuckDbWarehouseStore {
       await connection.run(
         `COPY (SELECT ${selected.join(', ')} FROM read_parquet(${quoteLiteral(previousGlob)}, union_by_name = true) AS previous${antiJoin}) TO ${quoteLiteral(this.objects.locate(carryKey))} (FORMAT PARQUET, COMPRESSION SNAPPY)`,
       );
+    } else {
+      // Nothing to carry from -- no previous at all, or one that is itself a fully empty
+      // snapshot. Clears whatever an earlier call on THIS snapshotId left in `carryKey`,
+      // closing the same idempotence gap a re-sent batch's replace semantics close for `write`.
+      await this.clearCarryObject(type, carryKey);
     }
 
     const total = await this.countStaged(type, snapshotId);
-    const carried = previous ? await this.countCarried(type, snapshotId) : 0;
+    const carried = await this.countCarried(type, snapshotId);
 
     const existingRef = await this.snapshots.find(type.name, snapshotId);
     const ref: SnapshotRef = existingRef ?? {
@@ -1122,6 +1261,23 @@ function normaliseRow(
   const out: Record<string, unknown> = {};
   for (const property of properties) {
     out[property.name] = normalise(row[outputAlias(property.name)], property.type);
+  }
+  return out;
+}
+
+/**
+ * Adds {@link CATALOG_PROVENANCE_COLUMNS} to an already-`normaliseRow`d row, read off the RAW
+ * row rather than the normalised one: `_principal_id`/`_loaded_at` are selected verbatim (no
+ * `outputAlias`) in `streamSnapshot`'s SELECT list, since they are reserved columns rather than
+ * declared properties, so they live on `row` under their own literal names, not under whatever
+ * `normaliseRow` keyed its output by.
+ */
+function withProvenance(
+  out: Record<string, unknown>,
+  row: Record<string, unknown>,
+): Record<string, unknown> {
+  for (const column of CATALOG_PROVENANCE_COLUMNS) {
+    out[column] = normalise(row[column], column === '_loaded_at' ? 'date' : 'string');
   }
   return out;
 }
