@@ -5,15 +5,19 @@ import { join } from 'node:path';
 import type {
   CatalogObjectTypeDef,
   CatalogPropertyDef,
+  CatalogReadQuery,
+  CatalogReadResult,
   CatalogStoreCapabilities,
+  SnapshotRef,
 } from '@dudousxd/nestjs-catalog';
 import {
   assertNoColumnCollisions,
   assertSafeIdentifier,
+  outputAlias,
   physicalColumn,
 } from '@dudousxd/nestjs-catalog';
 import { BadRequestException, Inject, Injectable } from '@nestjs/common';
-import { coerce, duckDbType } from './column-types';
+import { coerce, duckDbType, normalise } from './column-types';
 import { type DuckDbConnection, openDuckDb, quoteLiteral } from './duckdb';
 import {
   BATCH_COLUMN,
@@ -22,6 +26,7 @@ import {
   ROW_COLUMN,
   SNAPSHOT_COLUMN,
   batchKey,
+  ident,
   snapshotPrefix,
 } from './identifiers';
 import { type ObjectStore, isS3Root, localObjectStore } from './object-store';
@@ -242,6 +247,13 @@ export class DuckDbWarehouseStore {
 
   /** How many rows are staged under a snapshot. Present for this package's own specs. */
   async countStaged(type: CatalogObjectTypeDef, snapshotId: string): Promise<number> {
+    // A glob that matches nothing is an error in DuckDB, not an empty result — and "this
+    // snapshot has no objects yet" is an ordinary state during a load. Asking the object store
+    // first keeps the difference between "nothing written yet" and "the engine could not
+    // read what was written".
+    if ((await this.objects.list(snapshotPrefix(type.name, snapshotId))).length === 0) {
+      return 0;
+    }
     const connection = await this.ready();
     const glob = this.objects.locate(`${snapshotPrefix(type.name, snapshotId)}/*.parquet`);
     // `union_by_name = true`, kept even though testing this against the real engine found
@@ -259,6 +271,149 @@ export class DuckDbWarehouseStore {
       `SELECT count(*) AS total FROM read_parquet(${quoteLiteral(glob)}, union_by_name = true)`,
     );
     return Number(rows[0]?.total ?? 0);
+  }
+
+  /**
+   * Make a staged snapshot the one readers get.
+   *
+   * Three steps, ordered so that re-running is the repair: count the rows, record the
+   * snapshot, then move the pointer. A crash after the record leaves a snapshot nobody
+   * serves, which the next attempt overwrites; the reverse order would leave the pointer at
+   * a snapshot with no record, and nothing later could tell whether that load finished.
+   *
+   * The pointer move goes through `SnapshotCatalog.setCurrent`, which is a blind write, not a
+   * compare-and-swap — see that method's own docblock. This is deliberate rather than a gap:
+   * committing an older snapshot is how a rollback is expressed, so `commit` must be able to
+   * move the pointer backwards, and a guard here that only accepted a newer snapshot would
+   * make a rollback impossible to express through this method at all.
+   */
+  async commit(type: CatalogObjectTypeDef, snapshotId: string): Promise<SnapshotRef> {
+    const existing = await this.snapshots.find(type.name, snapshotId);
+    if (existing?.droppedAt) {
+      throw new Error(
+        `snapshot ${snapshotId} of ${type.name} was dropped on ${existing.droppedAt} and cannot be committed. Its rows are gone; the record survives so run history stays resolvable.`,
+      );
+    }
+    const ref: SnapshotRef = {
+      id: snapshotId,
+      createdAt: existing?.createdAt ?? new Date().toISOString(),
+      rowCount: await this.countStaged(type, snapshotId),
+      principalId: existing?.principalId ?? (await this.principalOf(type, snapshotId)),
+      ...(existing?.labels ? { labels: existing.labels } : {}),
+      ...(existing?.archive ? { archive: existing.archive } : {}),
+    };
+    await this.snapshots.put(type.name, ref);
+    await this.snapshots.setCurrent(type.name, snapshotId);
+    return ref;
+  }
+
+  async currentSnapshot(type: CatalogObjectTypeDef): Promise<SnapshotRef | undefined> {
+    const id = await this.snapshots.current(type.name);
+    return id ? this.snapshots.find(type.name, id) : undefined;
+  }
+
+  async read(
+    type: CatalogObjectTypeDef,
+    fields: string[],
+    query: CatalogReadQuery,
+  ): Promise<CatalogReadResult> {
+    const currentId = await this.snapshots.current(type.name);
+    const wanted = query.snapshot ?? currentId;
+    if (!wanted) return { rows: [], total: 0 };
+
+    const ref = await this.snapshots.find(type.name, wanted);
+    if (ref?.droppedAt) {
+      throw new Error(
+        `snapshot ${wanted} of ${type.name} was dropped on ${ref.droppedAt}. Its rows are gone; this read cannot be served and is refused rather than answered with none.`,
+      );
+    }
+
+    const connection = await this.ready();
+    // A glob that matches nothing is an error in DuckDB, not an empty result — and "this
+    // snapshot has no objects yet" is an ordinary state during a load. Asking the object store
+    // first keeps the difference between "nothing written yet" and "the engine could not
+    // read what was written".
+    if ((await this.objects.list(snapshotPrefix(type.name, wanted))).length === 0) {
+      return { rows: [], total: 0, snapshot: { id: wanted, current: wanted === currentId } };
+    }
+
+    const source = `read_parquet(${quoteLiteral(this.globFor(type, wanted))}, union_by_name = true)`;
+    const selected = fields
+      .map((field) => {
+        const property = type.properties.find((each) => each.name === field);
+        if (!property) {
+          throw new Error(
+            `${type.name} has no property named ${field}; a store must never return a column outside the whitelist it was handed.`,
+          );
+        }
+        return `${ident(physicalColumn(property.name))} AS ${ident(outputAlias(property.name))}`;
+      })
+      .join(', ');
+
+    const size = Math.max(1, query.size ?? 50);
+    const page = Math.max(1, query.page ?? 1);
+    const totalRows = await connection.rows(`SELECT count(*) AS total FROM ${source}`);
+    // `count(*)` comes back as a `bigint` on this engine — DuckDB's INT64 — and
+    // `JSON.stringify` throws on a bare bigint rather than rendering it, so a response body
+    // built from the raw value would fail the serialiser rather than the read.
+    const total = Number(totalRows[0]?.total ?? 0);
+    const rows = await connection.rows(
+      `SELECT ${selected} FROM ${source} ORDER BY ${ident(BATCH_COLUMN)}, ${ident(ROW_COLUMN)} LIMIT ${size} OFFSET ${(page - 1) * size}`,
+    );
+
+    return {
+      rows: rows.map((row) => this.normaliseRow(type, fields, row)),
+      total,
+      snapshot: { id: wanted, current: wanted === currentId },
+    };
+  }
+
+  /** The glob covering one snapshot's parts, and only that snapshot's. */
+  private globFor(type: CatalogObjectTypeDef, snapshotId: string): string {
+    return this.objects.locate(`${snapshotPrefix(type.name, snapshotId)}/*.parquet`);
+  }
+
+  /**
+   * A row off the wire, keyed by the property's own name rather than by its physical column
+   * or its SQL alias.
+   *
+   * `read`'s SELECT list aliases each column to `outputAlias(property.name)` — the spelling
+   * `write`'s `stageRow` and this method's own lookup both agree on — and this is where that
+   * alias is translated back to the name the caller asked for. Losing that translation is
+   * exactly the incident `outputAlias`'s own docblock records: thirteen types loaded through a
+   * path that returned the cleaned column instead of the property's own name, six of them
+   * with most of their columns silently empty, 313,833 rows on the largest.
+   */
+  private normaliseRow(
+    type: CatalogObjectTypeDef,
+    fields: string[],
+    row: Record<string, unknown>,
+  ): Record<string, unknown> {
+    const out: Record<string, unknown> = {};
+    for (const field of fields) {
+      const property = type.properties.find((each) => each.name === field);
+      if (!property) continue;
+      out[field] = normalise(row[outputAlias(property.name)], property.type);
+    }
+    return out;
+  }
+
+  /**
+   * Who loaded a snapshot, read off the rows when no record names them yet.
+   *
+   * `union_by_name = true` for the same reason every other `read_parquet` over a snapshot
+   * glob in this file carries it: without it, DuckDB matches a glob's files column-by-position
+   * rather than column-by-name, so a glob whose files disagree on column order can hand back
+   * whatever sits at `_principal_id`'s position in the first file — which may not be
+   * `_principal_id` at all in the others.
+   */
+  private async principalOf(type: CatalogObjectTypeDef, snapshotId: string): Promise<string> {
+    const connection = await this.ready();
+    const rows = await connection.rows(
+      `SELECT ${ident(PRINCIPAL_COLUMN)} AS principal FROM read_parquet(${quoteLiteral(this.globFor(type, snapshotId))}, union_by_name = true) LIMIT 1`,
+    );
+    const principal = rows[0]?.principal;
+    return typeof principal === 'string' ? principal : 'unknown';
   }
 }
 
