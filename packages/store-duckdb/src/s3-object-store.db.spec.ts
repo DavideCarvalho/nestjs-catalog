@@ -85,4 +85,19 @@ describe('s3ObjectStore', () => {
       's3://catalog-test/prefix/mvr/run-1/part-000001.parquet',
     );
   });
+
+  it('matches list and deletePrefix at a directory boundary, not a raw string prefix', async () => {
+    // `run-1` is a string prefix of `run-10` — the exact pair the brief names as the failure
+    // mode a bare `Prefix` would produce. This would fail if `list`'s `Prefix` were built
+    // without the trailing slash: `list('mvr/run-1')` would also return `run-10`'s object, and
+    // `deletePrefix('mvr/run-1')` would take `run-10`'s snapshot down with it.
+    await store.put('mvr/run-1/part-000001.parquet', 'one');
+    await store.put('mvr/run-10/part-000001.parquet', 'ten');
+
+    expect(await store.list('mvr/run-1')).toEqual(['mvr/run-1/part-000001.parquet']);
+
+    expect(await store.deletePrefix('mvr/run-1')).toBe(1);
+    expect(await store.list('mvr/run-1')).toEqual([]);
+    expect(await store.list('mvr/run-10')).toEqual(['mvr/run-10/part-000001.parquet']);
+  });
 });

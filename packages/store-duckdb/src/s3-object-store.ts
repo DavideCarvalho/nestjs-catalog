@@ -24,6 +24,11 @@ function isPreconditionFailure(error: unknown): boolean {
 }
 
 /**
+ * S3's multi-object delete accepts at most 1,000 keys per request; see `deletePrefix`.
+ */
+const DELETE_BATCH_SIZE = 1000;
+
+/**
  * Object storage, with the two conditional writes the pointer swap needs.
  *
  * `If-None-Match: *` is create-if-absent and `If-Match` is compare-and-swap, and unlike the
@@ -160,15 +165,32 @@ export function s3ObjectStore(root: string, options: DuckDbS3Options = {}): Obje
       return found;
     },
 
+    /**
+     * Chunked at {@link DELETE_BATCH_SIZE}, because a single `DeleteObjectsCommand` is
+     * rejected outright past 1,000 keys, and a snapshot's batch parts (zero-padded to six
+     * digits by `batchKey`) can realistically run past that once a snapshot has been written
+     * to for long enough — this is the write-side edge of the same limit `list`'s
+     * `ContinuationToken` pagination handles on the read side.
+     *
+     * If a chunk after the first throws, every chunk before it is already deleted — S3 has
+     * no all-or-nothing delete across requests — and this rethrows rather than returning a
+     * count that would understate what actually happened. That partial state is not silently
+     * wrong: `dropSnapshot` calls this to reclaim a tombstoned snapshot's space after already
+     * counting its rows, so a caller that retries a failed `deletePrefix` re-lists first and
+     * finds only the keys still standing — the retry finishes the job instead of re-deleting
+     * keys that are already gone or losing count of ones that are not.
+     */
     async deletePrefix(deletePrefix) {
       const keys = await this.list(deletePrefix);
-      if (keys.length === 0) return 0;
-      await client.send(
-        new DeleteObjectsCommand({
-          Bucket: bucket,
-          Delete: { Objects: keys.map((key) => ({ Key: keyFor(key) })) },
-        }),
-      );
+      for (let offset = 0; offset < keys.length; offset += DELETE_BATCH_SIZE) {
+        const chunk = keys.slice(offset, offset + DELETE_BATCH_SIZE);
+        await client.send(
+          new DeleteObjectsCommand({
+            Bucket: bucket,
+            Delete: { Objects: chunk.map((key) => ({ Key: keyFor(key) })) },
+          }),
+        );
+      }
       return keys.length;
     },
 
