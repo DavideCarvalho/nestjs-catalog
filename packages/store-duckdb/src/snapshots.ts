@@ -33,7 +33,10 @@ export interface SnapshotCatalog {
   put(typeName: string, ref: SnapshotRef): Promise<void>;
   /** Exact lookup, tombstone included, `undefined` only when it never existed. */
   find(typeName: string, snapshotId: string): Promise<SnapshotRef | undefined>;
-  /** Newest first, tombstones included, bounded. */
+  /**
+   * Newest first, tombstones included. `limit` bounds what is RETURNED, not what is READ —
+   * see the binding's own docblock for what a call actually costs.
+   */
   list(typeName: string, limit?: number): Promise<SnapshotRef[]>;
   current(typeName: string): Promise<string | undefined>;
   /**
@@ -53,11 +56,34 @@ export interface SnapshotCatalog {
 function isSnapshotRef(value: unknown): value is SnapshotRef {
   if (typeof value !== 'object' || value === null) return false;
   const candidate: Record<string, unknown> = { ...value };
-  return typeof candidate.id === 'string' && typeof candidate.createdAt === 'string';
+  return (
+    typeof candidate.id === 'string' &&
+    typeof candidate.createdAt === 'string' &&
+    typeof candidate.rowCount === 'number' &&
+    typeof candidate.principalId === 'string'
+  );
 }
 
-function parseRef(body: string): SnapshotRef | undefined {
-  const parsed: unknown = JSON.parse(body);
+/**
+ * `JSON.parse`, but a failure names the object it was reading and what that object was for.
+ *
+ * A truncated or hand-edited object under a type's `_snapshots/` prefix otherwise throws a
+ * bare `SyntaxError` out of `list()` for the whole type, naming neither the key nor the
+ * reason anyone was reading it — which sends an operator looking for a bug in this module
+ * rather than at the one object actually at fault. Thrown rather than swallowed: skipping a
+ * corrupt governance record silently is worse than failing loudly on it.
+ */
+function parseJson(body: string, key: string, purpose: string): unknown {
+  try {
+    return JSON.parse(body);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(`${purpose} at "${key}" is not valid JSON (${reason}).`);
+  }
+}
+
+function parseRef(body: string, key: string): SnapshotRef | undefined {
+  const parsed = parseJson(body, key, 'Snapshot record');
   return isSnapshotRef(parsed) ? parsed : undefined;
 }
 
@@ -65,9 +91,17 @@ function parseRef(body: string): SnapshotRef | undefined {
  * Records and pointer as objects beside the rows.
  *
  * `find` is a single GET at a derived key rather than a scan, which is what lets it answer
- * about a snapshot older than any bound. `list` reads the record prefix, which is the one
- * operation here whose cost grows with history — bounded by {@link SNAPSHOT_LIST_LIMIT},
- * and the reason `find` is not implemented on top of it.
+ * about a snapshot older than any bound. `list` has no equivalent shortcut: it reads every
+ * record ever written for the type, and its cost grows with history regardless of `limit`,
+ * which bounds only what comes back. The alternative — encoding recency into the key so a
+ * listing itself could be bounded — needs an inverted timestamp, and an inverted-timestamp
+ * key is incompatible with `find`'s single derived-key `get`, the invariant this module
+ * exists to protect. A second alternative, an index object, would bound `list` but adds a
+ * contention point to a binding whose whole argument is that it needs nothing but a bucket.
+ * Neither trade is taken here: a host for which `list`'s cost is a problem binds its own
+ * `SnapshotCatalog` over a transactional database — which is exactly why this is a port and
+ * not a class. Nothing on the hot path pays this cost regardless: an incremental load
+ * resolves its merge source through `current()`, a single get, never through `list`.
  */
 export function objectSnapshotCatalog(objects: ObjectStore): SnapshotCatalog {
   return {
@@ -76,8 +110,9 @@ export function objectSnapshotCatalog(objects: ObjectStore): SnapshotCatalog {
     },
 
     async find(typeName, snapshotId) {
-      const found = await objects.get(snapshotRecordKey(typeName, snapshotId));
-      return found ? parseRef(found.body) : undefined;
+      const key = snapshotRecordKey(typeName, snapshotId);
+      const found = await objects.get(key);
+      return found ? parseRef(found.body, key) : undefined;
     },
 
     async list(typeName, limit = SNAPSHOT_LIST_LIMIT) {
@@ -85,17 +120,26 @@ export function objectSnapshotCatalog(objects: ObjectStore): SnapshotCatalog {
       const refs: SnapshotRef[] = [];
       for (const key of keys) {
         const found = await objects.get(key);
-        const ref = found ? parseRef(found.body) : undefined;
+        const ref = found ? parseRef(found.body, key) : undefined;
         if (ref) refs.push(ref);
       }
-      refs.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+      refs.sort((left, right) => {
+        const byCreatedAt = right.createdAt.localeCompare(left.createdAt);
+        if (byCreatedAt !== 0) return byCreatedAt;
+        // `createdAt` is the caller's clock, not this store's: two snapshots created in
+        // the same batch, or under a coarse clock, can share it exactly. `id` breaks the
+        // tie so "newest first" is a total order rather than whatever `objects.list()`
+        // happened to return — an ordering that port makes no promise of.
+        return right.id.localeCompare(left.id);
+      });
       return refs.slice(0, limit);
     },
 
     async current(typeName) {
-      const found = await objects.get(currentKey(typeName));
+      const key = currentKey(typeName);
+      const found = await objects.get(key);
       if (!found) return undefined;
-      const parsed: unknown = JSON.parse(found.body);
+      const parsed = parseJson(found.body, key, 'Current-snapshot pointer');
       if (typeof parsed !== 'object' || parsed === null) return undefined;
       const candidate: Record<string, unknown> = { ...parsed };
       return typeof candidate.snapshotId === 'string' ? candidate.snapshotId : undefined;
