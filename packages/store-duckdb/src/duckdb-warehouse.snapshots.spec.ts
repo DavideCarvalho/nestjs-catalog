@@ -108,9 +108,11 @@ describe('COMMITTED_LABEL stays internal', () => {
   });
 
   it('does not appear beside labels a caller actually supplied', async () => {
-    // `carryForward` is the path that actually persists caller-supplied labels onto a fresh
-    // SnapshotRef (`write`'s own `options.labels` has no equivalent for a plain full load that
-    // never touches `carryForward` -- a separate, pre-existing gap this task does not touch).
+    // Written through `carryForward`, which persists caller-supplied labels onto a fresh
+    // SnapshotRef. `write` does too, on a load's first batch -- see `persists options.labels
+    // for a plain full load` in duckdb-warehouse.write.spec.ts, which covers that path; this
+    // case is here for the incremental one, so both routes to a caller's own labels are pinned
+    // against `_committed` leaking in beside them.
     const type = contractType('CommittedLabelHiddenAmongReal');
     await store.ensureType(type);
     await store.write(type, [contractRow('a', 'A', 1)], {
@@ -141,5 +143,95 @@ describe('COMMITTED_LABEL stays internal', () => {
     const type = await load('CommittedLabelPublicListAlsoStripped', 'run-1', 'A');
     const live = await store.listSnapshotsWithRows(type);
     expect(live[0]?.labels?._committed).toBeUndefined();
+  });
+});
+
+describe('the row count on an uncommitted snapshot', () => {
+  it('reports the rows actually staged, never the placeholder the record was created with', async () => {
+    // `write` creates the snapshot record before `commit` ever runs, with `rowCount: 0` as a
+    // placeholder it has no way to maintain across later batches. Every method here hands that
+    // record to code outside this class, and the pipeline's own row-count bound
+    // (`assertRowCountIsPlausible`, which runs BEFORE `store.commit`) reads `rowCount` off the
+    // pending snapshot: a stored 0 is indistinguishable from a load that collapsed, and its
+    // `pending === 0` branch refuses unconditionally -- no bound, no `minRows` floor. Every
+    // full-mode connector load onto a type already serving rows would be refused at commit,
+    // with a sentence saying the snapshot holds no rows while its rows sit staged on disk.
+    const type = contractType('PendingRowCount');
+    await store.ensureType(type);
+    await store.write(type, [contractRow('a', 'A', 1)], {
+      snapshotId: 'run-1',
+      principalId: 'tester',
+      batch: 0,
+    });
+    await store.commit(type, 'run-1');
+
+    await store.write(type, [contractRow('a', 'A', 1), contractRow('b', 'B', 2)], {
+      snapshotId: 'run-2',
+      principalId: 'tester',
+      batch: 0,
+      labels: { source: 'connector' },
+    });
+
+    expect((await store.findSnapshot(type, 'run-2'))?.rowCount).toBe(2);
+    expect((await store.listSnapshots(type)).find((each) => each.id === 'run-2')?.rowCount).toBe(2);
+    expect(
+      (await store.listSnapshotsWithRows(type)).find((each) => each.id === 'run-2')?.rowCount,
+    ).toBe(2);
+  });
+
+  it('freezes the count a tombstone actually held, not the placeholder', async () => {
+    // `dropSnapshot` took `existing?.rowCount` verbatim, which is the same unmaintained
+    // placeholder -- so dropping a load that was written but never committed wrote a permanent
+    // record claiming it held nothing, and the rows are gone by then, so nothing can correct it.
+    const type = contractType('PendingDropCount');
+    await store.ensureType(type);
+    await store.write(type, [contractRow('a', 'A', 1)], {
+      snapshotId: 'served',
+      principalId: 'tester',
+      batch: 0,
+    });
+    await store.commit(type, 'served');
+
+    await store.write(type, [contractRow('a', 'A', 1), contractRow('b', 'B', 2)], {
+      snapshotId: 'abandoned',
+      principalId: 'tester',
+      batch: 0,
+      labels: { source: 'connector' },
+    });
+    await store.dropSnapshot(type, 'abandoned');
+    expect((await store.findSnapshot(type, 'abandoned'))?.rowCount).toBe(2);
+  });
+});
+
+describe('createdAt', () => {
+  it('is anchored on the first write of the load, whether or not labels were supplied', async () => {
+    // `createdAt` is what `listLive`/`list` sort on, so it is what "newest" means to
+    // `carryForward`'s fallback merge source. Two otherwise identical loads must not be
+    // anchored differently: the record used to be created by `write` only when a caller
+    // supplied labels, and by `commit` otherwise -- so supplying a label moved a load's
+    // `createdAt` from commit time back to first-write time, and two loads overlapping in
+    // time could swap places in that ordering purely on whether their caller passed labels.
+    const type = contractType('CreatedAtAnchor');
+    await store.ensureType(type);
+    await store.write(type, [contractRow('a', 'A', 1)], {
+      snapshotId: 'labelled',
+      principalId: 'tester',
+      batch: 0,
+      labels: { source: 'connector' },
+    });
+    await store.write(type, [contractRow('a', 'A', 1)], {
+      snapshotId: 'plain',
+      principalId: 'tester',
+      batch: 0,
+    });
+    const afterBothWrites = new Date().toISOString();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    await store.commit(type, 'labelled');
+    await store.commit(type, 'plain');
+
+    const labelled = await store.findSnapshot(type, 'labelled');
+    const plain = await store.findSnapshot(type, 'plain');
+    expect(labelled?.createdAt.localeCompare(afterBothWrites)).toBeLessThan(0);
+    expect(plain?.createdAt.localeCompare(afterBothWrites)).toBeLessThan(0);
   });
 });

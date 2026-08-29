@@ -206,6 +206,10 @@ export class DuckDbWarehouseStore {
    * and a schema a later `read` can open, carrying no rows and no lie about it. Returning
    * early instead would mean a batch whose key `countStaged` and `read` can never resolve,
    * for the one case a caller is guaranteed to hit on every empty source.
+   *
+   * Creates the load's snapshot record on its first batch and never rewrites it on a later one
+   * — see the comment at the end of the body for what that record carries, why this call is
+   * what anchors its `createdAt`, and why its `rowCount` is a placeholder rather than a count.
    */
   async write(
     type: CatalogObjectTypeDef,
@@ -306,48 +310,87 @@ export class DuckDbWarehouseStore {
       await rm(staging, { force: true });
     }
 
-    // A batch that lands after a carry-forward invalidates it.
-    //
-    // `carryForward` decides which of the previous snapshot's rows survive by looking at the
-    // batches present under `snapshotId` when it runs; a batch arriving afterwards has nothing
-    // to displace, so the previous version of every row it touches is still sitting there,
-    // carried, and the snapshot now holds both under one primary key. Marked here rather than
-    // repaired — repairing would mean re-running the merge from inside `write`, which turns an
-    // ordinary batch write into a scan of the previous snapshot on every call — and certainly
-    // rather than ignored: `commit` refuses on this mark, so the only way past it is to run
-    // `carryForward` again, which is exactly what a full retry of the load does anyway.
-    const existingRef = await this.snapshots.find(type.name, options.snapshotId);
-    if (existingRef) {
-      if (existingRef.labels?.[CARRIED_FROM_LABEL] !== undefined) {
-        await this.snapshots.put(type.name, {
-          ...existingRef,
-          labels: { ...existingRef.labels, [CARRY_FORWARD_STALE_LABEL]: 'true' },
-        });
-      }
-    } else if (options.labels) {
-      // `options.labels` used to be declared and never read: a caller's provenance labels —
-      // which base, which file, which workflow run — reached this method and were silently
-      // discarded for a plain full load, one that never touches `carryForward` (which DOES
-      // persist `options.labels` onto a fresh `SnapshotRef` — see that method's own docblock).
-      // `commit` takes no `labels` parameter of its own and only ever sees labels that arrived
-      // on an existing record, so with nothing written here a full load's own record — created
-      // by `commit`, since nothing else had — never carried the caller's labels at all,
-      // whatever the caller passed to every `write` call. Written on the FIRST batch only,
-      // matching `carryForward`'s own precedent: a later batch that finds a record already
-      // here leaves it alone rather than overwriting labels a caller may have supplied once and
-      // not repeated.
-      await this.snapshots.put(type.name, {
-        id: options.snapshotId,
-        createdAt: loadedAt,
-        rowCount: 0,
-        principalId: options.principalId,
-        labels: options.labels,
-      });
-    }
+    await this.recordWrittenBatch(type, options, loadedAt);
 
     // Rows accepted by THIS call. Never the snapshot's running total: a caller sums these
     // across batches, and a fan-out compares its primary's answer with its follower's.
     return { written: rows.length };
+  }
+
+  /**
+   * The snapshot record `write` leaves behind, created on a load's first batch and marked when
+   * a batch lands after a merge.
+   *
+   * Split out of {@link write} rather than left inline for this file's complexity budget, which
+   * the record's two jobs pushed that method past. They are separate jobs and both belong to a
+   * batch write rather than to the commit that follows it:
+   *
+   * ## Marking a merge a later batch invalidated
+   *
+   * `carryForward` decides which of the previous snapshot's rows survive by looking at the
+   * batches present under `snapshotId` when it runs; a batch arriving afterwards has nothing to
+   * displace, so the previous version of every row it touches is still sitting there, carried,
+   * and the snapshot now holds both under one primary key. Marked here rather than repaired —
+   * repairing would mean re-running the merge from inside a batch write, which turns an ordinary
+   * write into a scan of the previous snapshot on every call — and certainly rather than
+   * ignored: `commit` refuses on this mark, so the only way past it is to run `carryForward`
+   * again, which is exactly what a full retry of the load does anyway.
+   *
+   * ## Creating the load's record on its first batch
+   *
+   * Created once and never rewritten by a later batch, matching both siblings, whose `write`
+   * upserts the same row on every batch and leaves whatever it finds
+   * (`packages/store-mikro-orm/src/warehouse.store.ts`, "upserted rather than inserted so a
+   * retried batch does not create a second one"). It carries two things nothing else is in a
+   * position to record.
+   *
+   * The first is `options.labels`: a caller's provenance — which base, which file, which
+   * workflow run — which used to be declared on `write` and never read, so a plain full load's
+   * labels were silently discarded, `commit` taking no `labels` parameter of its own and only
+   * ever seeing labels that arrived on a record something else had already written. A key
+   * recorded here is never overwritten later; see `carryForward`'s own merge of the same
+   * parameter for the other half of that rule.
+   *
+   * The second is `createdAt`, and it is why this runs whether or not any labels came with it.
+   * `createdAt` is what `SnapshotCatalog`'s `list`/`listLive` sort on, so it is what "newest"
+   * means to `carryForward`'s fallback merge source and to a retention sweep. Creating the
+   * record only for a caller that supplied labels anchored `createdAt` on the load's first write
+   * for that caller and on commit time for every other one — two otherwise identical loads
+   * ordered by different clocks, differing by however long the load ran, decided by a parameter
+   * that has nothing to do with when anything happened. One anchor, stated: **`createdAt` is
+   * when this store first saw the load**, which is the first batch for every load that writes
+   * anything, and `commit` for the one shape that does not (an empty load, committed with
+   * nothing ever staged — see `principalOf`'s own docblock).
+   *
+   * `rowCount: 0` is a placeholder, not a count. Nothing here can maintain it: the batches that
+   * follow this one are what determine the load's size. It is not to be read off an uncommitted
+   * record — see {@link present}, which is where that is enforced for every caller outside this
+   * class.
+   */
+  private async recordWrittenBatch(
+    type: CatalogObjectTypeDef,
+    options: { snapshotId: string; principalId: string; labels?: Record<string, string> },
+    loadedAt: string,
+  ): Promise<void> {
+    const existingRef = await this.snapshots.find(type.name, options.snapshotId);
+    if (!existingRef) {
+      const created: SnapshotRef = {
+        id: options.snapshotId,
+        createdAt: loadedAt,
+        rowCount: 0,
+        principalId: options.principalId,
+      };
+      await this.snapshots.put(
+        type.name,
+        options.labels ? { ...created, labels: options.labels } : created,
+      );
+      return;
+    }
+    if (existingRef.labels?.[CARRIED_FROM_LABEL] === undefined) return;
+    await this.snapshots.put(type.name, {
+      ...existingRef,
+      labels: { ...existingRef.labels, [CARRY_FORWARD_STALE_LABEL]: 'true' },
+    });
   }
 
   /** How many rows are staged under a snapshot. Present for this package's own specs. */
@@ -429,6 +472,12 @@ export class DuckDbWarehouseStore {
     }
     const ref: SnapshotRef = {
       id: snapshotId,
+      // Never restamped. `write` anchors `createdAt` on the load's first batch and this keeps
+      // it, so a load's place in `list`/`listLive`'s recency order is when it started rather
+      // than when it finished — one anchor for every load, instead of one for the loads that
+      // wrote something and another for the loads that did not. `?? now` is reached only by a
+      // snapshot `write` never touched: an empty load committed with nothing staged, whose
+      // first record this call is (see `principalOf`'s own docblock).
       createdAt: existing?.createdAt ?? new Date().toISOString(),
       rowCount: await this.countStaged(type, snapshotId),
       principalId: existing?.principalId ?? (await this.principalOf(type, snapshotId)),
@@ -440,26 +489,35 @@ export class DuckDbWarehouseStore {
     };
     await this.snapshots.put(type.name, ref);
     await this.snapshots.setCurrent(type.name, snapshotId);
+    // `omitCommittedLabel` rather than `present`: the ref built just above already carries a
+    // freshly counted, now-final `rowCount`, and it is the record this call just wrote, so
+    // there is nothing for a recount to correct and a second `countStaged` would only be a
+    // second chance for the two numbers to disagree.
     return omitCommittedLabel(ref);
   }
 
   /**
    * The snapshot record behind the served pointer, or `undefined` when nothing has committed.
    *
-   * {@link COMMITTED_LABEL} is stripped from the result — see {@link omitCommittedLabel}'s own
-   * docblock — which is safe here specifically because this method's only internal caller
-   * (`carryForward`, for `served`) only ever reads `.id` off what it gets back, never `.labels`.
+   * Goes through {@link present} like every other method here that hands a `SnapshotRef` to
+   * code outside this class, which is a no-op for its own answer in particular: the served
+   * pointer is moved by `commit` alone, so what this resolves is always a committed record and
+   * always carries a final, stored `rowCount`. Routed through it anyway rather than special-
+   * cased, so there is one answer in this file to "what does a caller see", not four.
    */
   async currentSnapshot(type: CatalogObjectTypeDef): Promise<SnapshotRef | undefined> {
     const id = await this.snapshots.current(type.name);
     if (!id) return undefined;
     const ref = await this.snapshots.find(type.name, id);
-    return ref ? omitCommittedLabel(ref) : undefined;
+    return ref ? this.present(type, ref) : undefined;
   }
 
-  /** Every record, newest first, tombstones included. {@link COMMITTED_LABEL} stripped. */
+  /**
+   * Every record, newest first, tombstones included. {@link COMMITTED_LABEL} stripped and
+   * `rowCount` recomputed where the stored one is a placeholder — see {@link present}.
+   */
   async listSnapshots(type: CatalogObjectTypeDef): Promise<SnapshotRef[]> {
-    return (await this.snapshots.list(type.name)).map(omitCommittedLabel);
+    return this.presentAll(type, await this.snapshots.list(type.name));
   }
 
   /**
@@ -496,16 +554,94 @@ export class DuckDbWarehouseStore {
     type: CatalogObjectTypeDef,
     limit = SNAPSHOT_LIST_LIMIT,
   ): Promise<SnapshotRef[]> {
-    return (await this.snapshots.listLive(type.name, limit)).map(omitCommittedLabel);
+    return this.presentAll(type, await this.snapshots.listLive(type.name, limit));
   }
 
-  /** Exact lookup by id, tombstone included, whatever the age. {@link COMMITTED_LABEL} stripped. */
+  /**
+   * Exact lookup by id, tombstone included, whatever the age. {@link COMMITTED_LABEL} stripped
+   * and `rowCount` recomputed where the stored one is a placeholder — see {@link present}.
+   */
   async findSnapshot(
     type: CatalogObjectTypeDef,
     snapshotId: string,
   ): Promise<SnapshotRef | undefined> {
     const ref = await this.snapshots.find(type.name, snapshotId);
-    return ref ? omitCommittedLabel(ref) : undefined;
+    return ref ? this.present(type, ref) : undefined;
+  }
+
+  /**
+   * One `SnapshotRef` as code outside this class is allowed to see it: {@link COMMITTED_LABEL}
+   * removed, and `rowCount` counted fresh when the stored one is not a fact about the data.
+   *
+   * ## Which refs carry a computed count, and which carry a stored one
+   *
+   * Two states carry a number the operation that produced them was in a position to know, and
+   * both are handed back verbatim. A **tombstone** carries what `dropSnapshot` recorded before
+   * deleting the rows; recounting one would answer zero for a load that held millions. A
+   * **committed** record carries what `commit` counted while blessing it, which is also the
+   * number the pipeline's bound compared against, and it stays that until another `commit`
+   * republishes it. Nothing in this store refuses a `write` into an already-committed snapshot,
+   * so that number can be overtaken on disk — but those rows are a load nobody has blessed, and
+   * recounting here would change what a committed snapshot claims with no commit having said
+   * so. Re-running `commit` is what makes such a number current, and that is the only thing
+   * that should.
+   *
+   * Every OTHER writer of a record writes a `rowCount` it has no way to maintain: `write`
+   * creates one on a load's first batch, before the rest of the load exists, and `carryForward`
+   * records the total as of the moment it merged, which a later batch invalidates. For a record
+   * that is neither committed nor dropped the stored number is a placeholder, and the count
+   * comes fresh from {@link countStaged} — the same statement `commit` itself uses, so the
+   * number a caller sees before a commit and the number that commit records cannot disagree.
+   *
+   * The MikroORM sibling reaches the same contract by the same route, in `snapshotWindow` (see
+   * `packages/store-mikro-orm/src/warehouse.store.ts`): stored for committed and dropped rows,
+   * recounted for the rest, and its `write` says outright that `rowCount` "is not maintained
+   * here and is not to be read off an uncommitted row".
+   *
+   * ## Why this is not cosmetic
+   *
+   * The pipeline's row-count bound (`assertRowCountIsPlausible` in
+   * `packages/pipeline/src/publish.service.ts`) runs BEFORE `store.commit` and reads `rowCount`
+   * off the pending snapshot it finds in `listSnapshots`. `refuseRowCountDrift`'s `pending === 0`
+   * branch (`packages/pipeline/src/load-expectations.ts`) refuses unconditionally — under no
+   * bound and below any `minRows` floor — because a load that collapsed to nothing is never
+   * plausible. A placeholder reaching that branch means every full-mode load onto a type already
+   * serving rows is refused at commit, with a sentence saying the snapshot holds no rows while
+   * its rows are staged on disk and about to be committed.
+   *
+   * ## Cost
+   *
+   * One `countStaged` per record that is neither committed nor dropped, sequentially. That set
+   * is the loads in flight plus any that were abandoned before commit and not yet retired, not
+   * the type's history — a committed record, which is what a type accumulates, costs nothing
+   * here. It is also small against what the two list methods reaching this already pay:
+   * `SnapshotCatalog.list` and `listLive` read every record ever written for the type, one GET
+   * each (see that module's own docblock). `findSnapshot` and `currentSnapshot` reach it one ref
+   * at a time, so they pay at most one count each.
+   */
+  private async present(type: CatalogObjectTypeDef, ref: SnapshotRef): Promise<SnapshotRef> {
+    if (hasFinalRowCount(ref)) return omitCommittedLabel(ref);
+    return omitCommittedLabel({ ...ref, rowCount: await this.countStaged(type, ref.id) });
+  }
+
+  /**
+   * {@link present}, over a list, one at a time.
+   *
+   * Sequential rather than `Promise.all`, and deliberately so: every count below runs on the
+   * one connection `ready()` memoizes for the whole store, and overlapping two uses of that
+   * single connection is the failure `streamSnapshot` was rewritten to avoid — an open result
+   * on it came back truncated, with no error, when another statement ran against it (measured;
+   * see `openStreamConnection`'s docblock in `duckdb.ts`). Whether `count(*)` in particular
+   * would survive that has not been measured here, and issuing N of them at once to find out is
+   * not what this method is for.
+   */
+  private async presentAll(
+    type: CatalogObjectTypeDef,
+    refs: SnapshotRef[],
+  ): Promise<SnapshotRef[]> {
+    const presented: SnapshotRef[] = [];
+    for (const ref of refs) presented.push(await this.present(type, ref));
+    return presented;
   }
 
   /**
@@ -539,7 +675,18 @@ export class DuckDbWarehouseStore {
         `snapshot ${snapshotId} is the one ${type.name} is currently serving and cannot be dropped. Commit another snapshot first — a served tombstone would make every ordinary read pay for the question.`,
       );
     }
-    const rowCount = existing?.rowCount ?? (await this.countStaged(type, snapshotId));
+    // The stored number when it is final, a fresh count otherwise — the same split {@link
+    // present} makes, and for the same reason. `existing?.rowCount` verbatim wrote a permanent
+    // tombstone claiming zero rows whenever the record was one `write` or `carryForward` had
+    // created and `commit` had not yet reached, since those two store a placeholder; the rows
+    // are deleted a line below, so nothing can ever correct that number afterwards. A fresh
+    // count unconditionally would break this method's own crash repair instead: a retry that
+    // finds `deletePrefix` already done but `droppedAt` never written has nothing left to count
+    // and must fall back to what the committed record recorded.
+    const rowCount =
+      existing && hasFinalRowCount(existing)
+        ? existing.rowCount
+        : await this.countStaged(type, snapshotId);
     await this.objects.deletePrefix(snapshotPrefix(type.name, snapshotId));
     await this.snapshots.put(type.name, {
       id: snapshotId,
@@ -912,20 +1059,32 @@ export class DuckDbWarehouseStore {
   }
 
   /**
-   * Rows in `snapshotId`'s carry-forward object.
+   * Rows in `snapshotId`'s carry-forward object, and zero when there is no such object.
    *
-   * Safe to call unconditionally after `carryForward` has run at least once for `snapshotId`:
-   * that method now always leaves `carryKey` holding something, whether a real merge result or
-   * {@link DuckDbWarehouseStore.clearCarryObject}'s zero rows, so this never meets a glob with
-   * nothing behind it the way the loader-batch globs elsewhere in this file have to guard for.
+   * Safe to call at any point in a snapshot's life, including before `carryForward` has ever
+   * run for it. That is not free: `read_parquet` on an exact path that does not exist is a raw
+   * IO error in this engine, not an empty result — the same fact `countStaged`, `read` and
+   * `principalOf` each guard their globs against — so the object store is asked first, exactly
+   * as they ask it. The precondition this used to state instead ("safe after `carryForward` has
+   * run at least once for `snapshotId`") was true of the two call sites that read the result and
+   * false of the one that decides a branch: {@link DuckDbWarehouseStore.carryForward}'s
+   * served-clear guard runs this BEFORE anything has written `carryKey`, and a plain full load
+   * that was committed and is now served has no `carry.parquet` at all.
+   *
+   * Zero rather than a refusal, because "no carry object" and "a carry object holding nothing"
+   * are the same answer to the only question anyone asks this: whether overwriting `carryKey`
+   * would destroy anything.
+   *
    * `union_by_name = true`, matching every other `read_parquet` in this file — a single file has
    * nothing to union against, but the flag costs nothing here either, and its absence would be
    * the one `read_parquet` call in this method that did not match its own docblock's claim that
    * all of them carry it.
    */
   private async countCarried(type: CatalogObjectTypeDef, snapshotId: string): Promise<number> {
-    const connection = await this.ready();
     const key = carryForwardKey(type.name, snapshotId);
+    const staged = await this.objects.list(snapshotPrefix(type.name, snapshotId));
+    if (!staged.includes(key)) return 0;
+    const connection = await this.ready();
     const rows = await connection.rows(
       `SELECT count(*) AS total FROM read_parquet(${quoteLiteral(this.objects.locate(key))}, union_by_name = true)`,
     );
@@ -984,17 +1143,30 @@ export class DuckDbWarehouseStore {
    * "there was never anything to carry".
    *
    * **The `countCarried > 0` gate at the call site is not an optimisation — it is what keeps
-   * this from refusing a call that would destroy nothing.** Two reachable, legitimate replays
-   * have `served.id === snapshotId` and resolve no `previous`, with `carryKey` already holding
-   * zero rows: the first-ever incremental load of a type (`write('run-1')` →
-   * `carryForward('run-1')` finds no previous, writes a zero-row `carryKey`, `commit('run-1')`
-   * — a replay reaches the identical state), and a merge from a legitimately empty committed
-   * predecessor (see the "carries nothing forward, without crashing" case). Refusing on
-   * `served.id === snapshotId` alone would strand both, including `commit`'s own documented
-   * recovery from the stale-merge refusal ("Carry forward again, then commit") for any type
-   * with no second live committed snapshot to fall back to. The message above is only true when
-   * something is actually at stake, which is exactly what the gate at the call site restricts
-   * this method to.
+   * this from refusing a call that would destroy nothing.** Three reachable, legitimate calls
+   * have `served.id === snapshotId` and reach this branch with `carryKey` holding zero rows or
+   * missing entirely, and they get there by two different routes rather than one:
+   *
+   * - **No `previous` resolves.** The first-ever incremental load of a type — `write('run-1')`
+   *   → `carryForward('run-1')` finds no previous and writes a zero-row `carryKey` →
+   *   `commit('run-1')` — replayed, reaches the identical state, with the fallback excluding
+   *   `run-1` itself and nothing else ever committed. So does a plain full load, committed and
+   *   served, for which `carryForward` is called with no other committed snapshot to find; that
+   *   one has never had a `carryKey` written at all, which is why {@link
+   *   DuckDbWarehouseStore.countCarried} answers about a missing object rather than assuming
+   *   one.
+   * - **A `previous` DOES resolve, and holds nothing.** A merge from a legitimately empty
+   *   committed predecessor (see the "carries nothing forward, without crashing" case): the
+   *   fallback finds that predecessor, live and committed, and what skips the merge branch is
+   *   `previousObjects.length === 0`, not an absent `previous`. An earlier version of this
+   *   passage said both legitimate replays "resolve no `previous`", which was true of the first
+   *   route and false of this one.
+   *
+   * Refusing on `served.id === snapshotId` alone would strand all three, including `commit`'s
+   * own documented recovery from the stale-merge refusal ("Carry forward again, then commit")
+   * for any type with no second live committed snapshot to fall back to. The message above is
+   * only true when something is actually at stake, which is exactly what the gate at the call
+   * site restricts this method to.
    */
   private refuseServedClear(
     type: CatalogObjectTypeDef,
@@ -1007,8 +1179,11 @@ export class DuckDbWarehouseStore {
   }
 
   /**
-   * Refuse to substitute a different dataset's survivors into a snapshot that is already
-   * SERVED and already carries rows forward from a specific, recorded origin.
+   * Refuse to put one dataset's rows into a snapshot that is already SERVED, when that
+   * snapshot's own record does not name the source this call resolved.
+   *
+   * Two shapes of "does not name it", covered in the two sections below: the record names a
+   * DIFFERENT origin, and the record names no origin at all.
    *
    * The self-merge-retry state (`served.id === snapshotId`) assumes a replay's fallback
    * resolves to the SAME predecessor the original successful `carryForward` used, which is
@@ -1026,13 +1201,35 @@ export class DuckDbWarehouseStore {
    * reversible. Comparing the resolved `previous.id` against what `snapshotId`'s own record
    * says it was carried from ({@link CARRIED_FROM_LABEL}) is what tells the safe replay apart
    * from this one.
+   *
+   * ## A served snapshot whose record names no origin at all
+   *
+   * `recordedOrigin` is `undefined` for a snapshot that never carried anything: a plain full
+   * load. That used to short-circuit this comparison, on the reading that with nothing recorded
+   * there is nothing to disagree with — which left the same mutation uncovered one state over.
+   * A full load, committed and served, with any older committed snapshot still live resolves a
+   * real `previous` through the fallback the moment someone calls `carryForward` for it (a
+   * connector switching a type from full to incremental, a durable step replaying past its own
+   * commit), and the merge branch then injects that predecessor's rows into the served dataset
+   * — the identical silent, uncommitted mutation, reached without a drop and without a
+   * substitution. So the comparison is `recordedOrigin !== previous.id` with no exemption for
+   * `undefined`: on an already-served snapshot, a merge is allowed only when it recomputes the
+   * one origin that snapshot's own record already names. Everything reached before a snapshot
+   * is served — every ordinary in-flight incremental load, whose first `carryForward` records
+   * an origin where there was none — is outside this method entirely, gated by `isServedReplay`
+   * at the call site.
    */
   private refuseSubstitutedOrigin(
     type: CatalogObjectTypeDef,
     snapshotId: string,
-    recordedOrigin: string,
+    recordedOrigin: string | undefined,
     resolvedOrigin: string,
   ): never {
+    if (recordedOrigin === undefined) {
+      throw new Error(
+        `${type.name}'s snapshot ${snapshotId} is the one currently being served and its record says it has never carried rows forward from anything, but this call resolved ${resolvedOrigin} as a source to merge in. Merging would put ${resolvedOrigin}'s rows straight into the dataset ${type.name} is serving, with no commit to make that visible or reversible. Carry forward into a new snapshot and commit that instead.`,
+      );
+    }
     throw new Error(
       `${type.name}'s snapshot ${snapshotId} is currently served and was carried forward from ${recordedOrigin}, but this call resolved a different source: ${resolvedOrigin}. That happens when ${recordedOrigin} is no longer a live, committed snapshot (most likely dropped) and a different one took its place as the newest live committed record. Refusing to substitute ${resolvedOrigin}'s survivors into a snapshot ${type.name} is already serving under ${recordedOrigin}'s name.`,
     );
@@ -1049,9 +1246,11 @@ export class DuckDbWarehouseStore {
    * and why the incoming glob excludes `carry.parquet`") all belong to this one statement.
    *
    * `isServedReplay`/`recordedOrigin` exist for exactly one check, ahead of everything else:
-   * see {@link refuseSubstitutedOrigin}'s own docblock for the hazard a served snapshot's
-   * replay resolving a DIFFERENT live predecessor than the one it originally used for reasons
-   * of its own.
+   * on a snapshot that is already SERVED, the merge may only recompute the one origin that
+   * snapshot's own record already names. Anything else — a different live predecessor standing
+   * in for a dropped one, or no recorded origin at all — would put rows a caller never asked
+   * for into a dataset that is already live, with no commit to make it visible or reversible.
+   * See {@link refuseSubstitutedOrigin}'s own docblock for both states and how each is reached.
    */
   private async writeMergedCarryObject(
     type: CatalogObjectTypeDef,
@@ -1064,7 +1263,10 @@ export class DuckDbWarehouseStore {
     isServedReplay: boolean,
     recordedOrigin: string | undefined,
   ): Promise<void> {
-    if (isServedReplay && recordedOrigin !== undefined && recordedOrigin !== previous.id) {
+    // No exemption for `recordedOrigin === undefined`: a served snapshot that never carried
+    // anything is the state where a merge has the LEAST claim to run, not the most — see
+    // `refuseSubstitutedOrigin`'s own docblock.
+    if (isServedReplay && recordedOrigin !== previous.id) {
       this.refuseSubstitutedOrigin(type, snapshotId, recordedOrigin, previous.id);
     }
     const previousGlob = this.globFor(type, previous.id);
@@ -1141,37 +1343,42 @@ export class DuckDbWarehouseStore {
    * that it resolves to the SAME predecessor the original successful call used. It does not —
    * it returns the newest LIVE, COMMITTED record other than `snapshotId`, by recency, with no
    * memory of what a previous call actually used. See {@link
-   * DuckDbWarehouseStore.refuseSubstitutedOrigin}'s own docblock for the case that gap opens
-   * and the check that closes it: a served snapshot's replay resolving a DIFFERENT live
-   * predecessor than the one recorded in its own {@link CARRIED_FROM_LABEL}.
+   * DuckDbWarehouseStore.refuseSubstitutedOrigin}'s own docblock for the cases that gap opens
+   * and the check that closes them: a served snapshot resolving a live predecessor other than
+   * the one recorded in its own {@link CARRIED_FROM_LABEL}, an absent label included.
    *
-   * The committed filter matters independently of which branch reached it: `carryForward`
-   * itself now creates a `SnapshotRef` (see below) before `commit` ever runs, so a load that ran
-   * `write` and `carryForward` but was then abandoned — a crash, a step that never reached
-   * `commit` — leaves a live, un-tombstoned record behind. Without the filter that record is
-   * indistinguishable from a served one to `listSnapshotsWithRows`, and the FIRST branch's
-   * fallback would pick an abandoned run's half-finished snapshot as its merge source: a merge
+   * The committed filter matters independently of which branch reached it: `write` creates a
+   * `SnapshotRef` on a load's first batch and `carryForward` updates it (see below), both
+   * before `commit` ever runs, so a load that was abandoned — a crash, a step that never
+   * reached `commit` — leaves a live, un-tombstoned record behind. Without the filter that
+   * record is indistinguishable from a served one to `listSnapshotsWithRows`, and the FIRST
+   * branch's fallback would pick an abandoned run's half-finished snapshot as its merge source: a merge
    * source nobody ever served, reached through the one path Ruling 2's "served, not newest"
    * argument did not originally name. See {@link COMMITTED_LABEL}'s own docblock.
    *
    * ## What the SECOND branch's fallback can find, and the two hazards that follow from it
    *
-   * The second branch's fallback CAN and typically DOES resolve to a real predecessor. Two
-   * things can go wrong with that predecessor by the time a replay runs, and they are answered
-   * two different ways:
+   * The second branch's fallback CAN and typically DOES resolve to a real snapshot. Whatever it
+   * resolves, `snapshotId` is by then the snapshot the type is SERVING, so anything written
+   * under it is instantly live — and the fallback has no memory of what, if anything, an
+   * earlier call for this same snapshot actually merged. Two things can therefore be wrong
+   * about what it hands back, and they are answered two different ways:
    *
-   * - **It can be gone entirely.** `dropSnapshot` only refuses the currently served snapshot,
-   *   and dropping a superseded one during retention is ordinary. When that happens the
-   *   fallback resolves to `undefined` (no live, committed candidate left), and `snapshotId` is
-   *   STILL the served snapshot: see {@link DuckDbWarehouseStore.refuseServedClear} for why
-   *   that combination must refuse rather than clear — gated on whether anything is actually at
-   *   stake, not on `served.id === snapshotId` alone.
-   * - **It can be replaced by a DIFFERENT live, committed record.** Dropping the recorded
-   *   predecessor does not mean nothing else is left to find — an older snapshot can still be
-   *   live and committed, and the fallback returns THAT one, not `undefined`. The merge branch
-   *   then runs against a real, non-empty `previous` that disagrees with what `snapshotId`'s own
-   *   record says it was carried from. See {@link
-   *   DuckDbWarehouseStore.refuseSubstitutedOrigin} for why that must also refuse.
+   * - **It can find nothing at all.** `dropSnapshot` only refuses the currently served
+   *   snapshot, and dropping a superseded one during retention is ordinary, so the recorded
+   *   predecessor can be gone with nothing left to stand in for it. The fallback resolves to
+   *   `undefined` while `snapshotId` is STILL served: see {@link
+   *   DuckDbWarehouseStore.refuseServedClear} for why that combination must refuse rather than
+   *   clear — gated on whether anything is actually at stake, not on `served.id === snapshotId`
+   *   alone.
+   * - **It can find a snapshot this one was never merged with.** The recorded predecessor being
+   *   dropped does not mean nothing else is left to find: an older snapshot can still be live
+   *   and committed, and the fallback returns THAT one. Neither does `snapshotId` need to have
+   *   carried from anything in the first place — a plain full load, committed and served, has
+   *   no recorded origin at all, and the fallback answers it just the same. Either way the
+   *   merge branch runs against a real, non-empty `previous` that disagrees with what
+   *   `snapshotId`'s own record says. See {@link DuckDbWarehouseStore.refuseSubstitutedOrigin}
+   *   for why both must refuse.
    *
    * ## A previous snapshot with no objects at all
    *
@@ -1242,14 +1449,19 @@ export class DuckDbWarehouseStore {
    *   then finds no previous and would otherwise call {@link clearCarryObject}, deleting rows
    *   the type is currently serving with no error and no commit to make it visible or
    *   reversible. Refused by {@link refuseServedClear} — but only when `carryKey` currently
-   *   holds something to lose; see that method's own docblock for the two legitimate replays
-   *   (a first-ever incremental load, a merge from a genuinely empty predecessor) that must NOT
-   *   be refused because there is nothing to protect.
-   * - **The predecessor is gone and a DIFFERENT live, committed record takes its place.** The
-   *   merge branch then runs — `previous` is real and non-empty, so this is not the case above
-   *   — against a source that disagrees with what `snapshotId`'s own record says it was carried
-   *   from. Refused by {@link refuseSubstitutedOrigin} instead, which is the check that compares
-   *   the resolved `previous.id` against {@link CARRIED_FROM_LABEL} before the merge branch
+   *   holds something to lose; see that method's own docblock for the three legitimate calls
+   *   (a first-ever incremental load, a plain full load that never carried anything, a merge
+   *   from a genuinely empty predecessor) that must NOT be refused because there is nothing to
+   *   protect.
+   * - **A live, committed record resolves that is not the one this snapshot carried from.**
+   *   The merge branch then runs — `previous` is real and non-empty, so this is not the case
+   *   above — against a source that disagrees with what `snapshotId`'s own record says. Two
+   *   ways in: the recorded predecessor was dropped and an older one took its place as the
+   *   newest live committed record, or `snapshotId` never carried from anything at all (a plain
+   *   full load, committed and served, for which `carryForward` is then called) and the
+   *   fallback finds a predecessor it was never merged with. Both are refused by {@link
+   *   refuseSubstitutedOrigin}, which compares the resolved `previous.id` against {@link
+   *   CARRIED_FROM_LABEL} — an absent label included, not exempted — before the merge branch
    *   below is allowed to run on an already-served snapshot.
    *
    * ## The ordering refusal
@@ -1319,13 +1531,16 @@ export class DuckDbWarehouseStore {
       // carried rows FROM has since been dropped (legal: `dropSnapshot` only refuses the
       // served snapshot, and dropping a superseded predecessor during retention is ordinary)
       // and no other committed record stands in for it. The `countCarried` guard is what keeps
-      // this from over-firing on a snapshot that never carried anything in the first place —
-      // see `refuseServedClear`'s own docblock for both halves of this reasoning.
+      // this from over-firing on a snapshot that never carried anything in the first place --
+      // including a plain full load, whose `carry.parquet` does not exist at all, which is why
+      // `countCarried` answers about a missing object rather than assuming one. See
+      // `refuseServedClear`'s own docblock for both halves of this reasoning.
       this.refuseServedClear(type, snapshotId, carryKey);
     } else {
       // Nothing worth protecting: either nothing to carry from and nothing currently carried
-      // (a first-ever incremental load, or one merging from a legitimately empty predecessor),
-      // or `snapshotId` is not yet served, so nothing is reading it as current either way.
+      // (a first-ever incremental load, a plain full load nothing was ever merged into, or one
+      // merging from a legitimately empty predecessor), or `snapshotId` is not yet served, so
+      // nothing is reading it as current either way.
       // Clears whatever an earlier call on THIS snapshotId left in `carryKey`, closing the
       // same idempotence gap a re-sent batch's replace semantics close for `write`.
       await this.clearCarryObject(type, carryKey);
@@ -1339,9 +1554,16 @@ export class DuckDbWarehouseStore {
       createdAt: new Date().toISOString(),
       rowCount: 0,
       principalId: options.principalId,
-      ...(options.labels ? { labels: options.labels } : {}),
     };
-    const labels = { ...ref.labels };
+    // One rule for a caller's labels across all three writers of this record: **a key is
+    // recorded by the first call that supplies it and never overwritten by a later one.**
+    // `write` creates the record on the first batch and leaves it alone on the ones after;
+    // this merges whatever `options.labels` brings UNDER what is already recorded, so labels
+    // supplied only here (a caller that labels its merge and not its batches) are kept, and
+    // labels supplied to both do not flip value halfway through a load. Written as a spread in
+    // that order rather than as a branch on `existingRef`, because branching is how this
+    // parameter came to be read on one path and silently discarded on the other.
+    const labels = { ...options.labels, ...ref.labels };
     labels[CARRIED_FROM_LABEL] = previous?.id ?? CARRIED_FROM_NOTHING;
     // The merge is current as of now, whatever it was before this call.
     delete labels[CARRY_FORWARD_STALE_LABEL];
@@ -1563,6 +1785,24 @@ function normaliseRow(
 function batchNumberOf(key: string): number {
   const match = /\/part-(\d+)\.parquet$/.exec(key);
   return match ? Number(match[1]) : CARRY_FORWARD_BATCH;
+}
+
+/**
+ * Whether a record's stored `rowCount` is a fact about the data or a placeholder.
+ *
+ * True for exactly the two states whose count was written by the operation that made it final:
+ * a tombstone, whose rows are gone and whose number `dropSnapshot` took before deleting them,
+ * and a committed record, whose number `commit` counted while blessing it. False for everything
+ * else, including the record `write` creates on a load's first batch and the one `carryForward`
+ * updates mid-load — see {@link DuckDbWarehouseStore.present} for what is done with the
+ * difference and why it is load-bearing rather than tidy.
+ *
+ * A plain `boolean` rather than a type predicate: the question is about a record's contents,
+ * not about whether one is there, and a predicate over `SnapshotRef | undefined` would narrow
+ * its own negative branch to `never` for the caller that already holds a record.
+ */
+function hasFinalRowCount(ref: SnapshotRef): boolean {
+  return ref.droppedAt !== undefined || ref.labels?.[COMMITTED_LABEL] !== undefined;
 }
 
 /**

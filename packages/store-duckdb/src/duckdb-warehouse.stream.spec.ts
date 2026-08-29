@@ -773,3 +773,91 @@ describe('commit refuses a merge a later batch invalidated', () => {
     expect(byId).toEqual({ a: 'alpha-2', b: 'bravo-2' });
   });
 });
+
+describe('carryForward on a snapshot that is already served', () => {
+  it('does not crash asking how many rows a carry object that was never written holds', async () => {
+    // `countCarried` reads an EXACT path with no `objects.list` guard, and the branch that
+    // decides whether to refuse a served clear calls it before any branch has written
+    // `carry.parquet`. A plain full load that was committed and is now served has no
+    // `carry.parquet` at all, so a `carryForward` for that same snapshot -- a connector
+    // switching a type from full to incremental, or a durable step replaying past its own
+    // commit -- met a glob matching nothing, which is a raw DuckDB IO error in this engine
+    // rather than an empty result. Nothing is at stake in that state: there is nothing carried
+    // to destroy, so it must skip rather than raise.
+    const type = contractType('CarryNeverWritten');
+    await store.ensureType(type);
+    await store.write(type, [contractRow('a', 'A', 1)], {
+      snapshotId: 'run-1',
+      principalId: 'tester',
+      batch: 0,
+    });
+    await store.commit(type, 'run-1');
+
+    const merged = await store.carryForward(type, 'run-1', { principalId: 'tester' });
+    expect(merged.from).toBeUndefined();
+    expect(merged.carried).toBe(0);
+    expect(merged.total).toBe(1);
+
+    const read = await store.read(type, ['id'], { size: 10 });
+    expect(read.rows.map((row) => row.id)).toEqual(['a']);
+  });
+
+  it('refuses to merge a predecessor into a served snapshot whose record names no origin', async () => {
+    // The origin comparison short-circuited on `recordedOrigin !== undefined`, which left one
+    // served-snapshot mutation uncovered: a snapshot that never carried anything carries no
+    // `_carriedFrom` label at all, so the comparison abstained and the merge branch ran. A
+    // plain full load, committed and served, with an older committed snapshot still live is
+    // exactly that state -- and the merge would inject that older snapshot's rows straight
+    // into the dataset the type is serving, with no commit to make it visible or reversible.
+    const type = contractType('CarryServedNoOrigin');
+    await store.ensureType(type);
+
+    await store.write(type, [contractRow('z', 'old-z', 9)], {
+      snapshotId: 'run-0',
+      principalId: 'tester',
+      batch: 0,
+    });
+    await store.commit(type, 'run-0');
+
+    await store.write(type, [contractRow('a', 'A', 1)], {
+      snapshotId: 'run-1',
+      principalId: 'tester',
+      batch: 0,
+    });
+    await store.commit(type, 'run-1');
+
+    await expect(store.carryForward(type, 'run-1', { principalId: 'tester' })).rejects.toThrow(
+      /serv/i,
+    );
+
+    const read = await store.read(type, ['id'], { size: 10 });
+    expect(read.rows.map((row) => row.id)).toEqual(['a']);
+  });
+});
+
+describe('the labels a snapshot record ends up with', () => {
+  it('keeps what write recorded first and picks up what only carryForward supplied', async () => {
+    // One rule across all three writers of the record: a key is recorded by the first call
+    // that supplies it and never overwritten by a later one. `write` now creates the record on
+    // a load's first batch, so a merge that overwrote labels wholesale would flip a caller's
+    // provenance halfway through a load -- and one that ignored `options.labels` whenever a
+    // record already existed would leave `carryForward`'s own parameter declared and never
+    // read, which is the same defect `write`'s own `options.labels` is pinned against in
+    // duckdb-warehouse.write.spec.ts.
+    const type = contractType('CarryLabelMerge');
+    await store.ensureType(type);
+    await store.write(type, [contractRow('a', 'A', 1)], {
+      snapshotId: 'run-1',
+      principalId: 'tester',
+      batch: 0,
+      labels: { source: 'connector' },
+    });
+    await store.carryForward(type, 'run-1', {
+      principalId: 'tester',
+      labels: { source: 'merge-time', run: 'nightly' },
+    });
+    const committed = await store.commit(type, 'run-1');
+    expect(committed.labels?.source).toBe('connector');
+    expect(committed.labels?.run).toBe('nightly');
+  });
+});
