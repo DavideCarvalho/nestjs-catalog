@@ -1,4 +1,5 @@
 export { coerce, duckDbType, normalise } from './column-types';
+export { configureS3, DuckDbConnection, openDuckDb, quoteLiteral } from './duckdb';
 export {
   BATCH_COLUMN,
   batchKey,
