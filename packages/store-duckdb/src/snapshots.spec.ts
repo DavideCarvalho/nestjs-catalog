@@ -69,6 +69,29 @@ describe('objectSnapshotCatalog', () => {
     expect((await catalog.list('cap', 2)).map((each) => each.id)).toEqual(['z', 'y']);
   });
 
+  it('applies the live predicate before the raw-read bound, not after', async () => {
+    // objectSnapshotCatalog reads every record and sorts before ever slicing,
+    // so a raw cap smaller than the type's whole history must not be able to
+    // hide a live record that sits below it once tombstones are filtered out.
+    // A filter-after-bound `listLive` would take the newest `cap` records off
+    // the *unfiltered* sort, discard the tombstones among them, and never see
+    // the live one sitting just past the cap at all.
+    await catalog.put('deephist', ref('live-old', '2026-01-01T00:00:00.000Z'));
+    await catalog.put(
+      'deephist',
+      ref('tomb-1', '2026-01-02T00:00:00.000Z', { droppedAt: '2026-01-03T00:00:00.000Z' }),
+    );
+    await catalog.put(
+      'deephist',
+      ref('tomb-2', '2026-01-03T00:00:00.000Z', { droppedAt: '2026-01-04T00:00:00.000Z' }),
+    );
+    await catalog.put('deephist', ref('live-new', '2026-01-04T00:00:00.000Z'));
+    // Newest-first: live-new, tomb-2, tomb-1, live-old. A raw cap of 2 taken
+    // before filtering keeps only [live-new, tomb-2] and loses live-old.
+    const live = await catalog.listLive('deephist', 2);
+    expect(live.map((each) => each.id)).toEqual(['live-new', 'live-old']);
+  });
+
   it('has no current snapshot until one is set', async () => {
     expect(await catalog.current('fresh')).toBeUndefined();
     await catalog.setCurrent('fresh', 'run-9');

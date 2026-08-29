@@ -36,8 +36,37 @@ export interface SnapshotCatalog {
   /**
    * Newest first, tombstones included. `limit` bounds what is RETURNED, not what is READ —
    * see the binding's own docblock for what a call actually costs.
+   *
+   * No predicate is applied here, and `limit` is a raw cap over the *unfiltered* history —
+   * which is exactly why {@link listLive} exists as its own method rather than as
+   * `(await list(typeName, limit)).filter(ref => !ref.droppedAt)` at the call site. That
+   * expression bounds before it filters: past `limit` tombstones, a live snapshot lying
+   * beyond the raw cutoff is gone from the result before the filter ever runs, and a caller
+   * cannot tell that outcome apart from "there is nothing live left". See `listLive`'s own
+   * docblock for the guarantee a binding owes instead.
    */
   list(typeName: string, limit?: number): Promise<SnapshotRef[]>;
+  /**
+   * The newest `limit` snapshots that still hold rows — the predicate applied *before* the
+   * bound, not after it.
+   *
+   * This is a separate method from {@link list} rather than a filter layered over it because
+   * the two orderings answer different questions. Bounding first and filtering second answers
+   * "of the newest `limit` records, which are live" — a window that can be made entirely of
+   * tombstones by nothing more than a type being swept for long enough, at which point the
+   * answer is an empty array indistinguishable from "no live snapshots exist". Filtering first
+   * and bounding second answers the question a caller is actually asking: the newest `limit`
+   * snapshots that still have rows, wherever they sit in the type's full history.
+   *
+   * The ClickHouse adapter's `listSnapshotsWithRows` learned this by putting `dropped_at IS
+   * NULL` inside the statement, ahead of its `ORDER BY … LIMIT` — see
+   * `packages/store-clickhouse/src/snapshots.ts`. A binding backed by a SQL engine can put the
+   * predicate in the `WHERE` clause the same way and let the bound run after it for free. A
+   * binding with no engine to push the predicate into — this one — has no such shortcut and
+   * must apply it in code, but the *order* is not optional either way: filter first, bound
+   * second, always.
+   */
+  listLive(typeName: string, limit?: number): Promise<SnapshotRef[]>;
   current(typeName: string): Promise<string | undefined>;
   /**
    * Move the served pointer.
@@ -88,20 +117,55 @@ function parseRef(body: string, key: string): SnapshotRef | undefined {
 }
 
 /**
+ * Every record for a type, parsed and sorted newest-first, tombstones included and no
+ * predicate applied.
+ *
+ * Shared by {@link objectSnapshotCatalog}'s `list` and `listLive` so the sort's tiebreak rule
+ * exists in exactly one place. It used to be inlined into `list` alone; duplicating it into
+ * `listLive` when that method was added would have left two copies of the `createdAt`/`id`
+ * ordering free to drift apart, which is the one property both callers depend on agreeing
+ * about — `list`'s bound and `listLive`'s predicate are both applied to whatever this
+ * returns, so a mismatch here would silently change "newest" for one of them and not the
+ * other. Reads every record ever written for the type; neither caller bounds what is READ,
+ * only what is returned, and each explains in its own docblock why.
+ */
+async function readSortedRefs(objects: ObjectStore, typeName: string): Promise<SnapshotRef[]> {
+  const keys = await objects.list(`${typePrefix(typeName)}/_snapshots`);
+  const refs: SnapshotRef[] = [];
+  for (const key of keys) {
+    const found = await objects.get(key);
+    const parsed = found ? parseRef(found.body, key) : undefined;
+    if (parsed) refs.push(parsed);
+  }
+  refs.sort((left, right) => {
+    const byCreatedAt = right.createdAt.localeCompare(left.createdAt);
+    if (byCreatedAt !== 0) return byCreatedAt;
+    // `createdAt` is the caller's clock, not this store's: two snapshots created in
+    // the same batch, or under a coarse clock, can share it exactly. `id` breaks the
+    // tie so "newest first" is a total order rather than whatever `objects.list()`
+    // happened to return — an ordering that port makes no promise of.
+    return right.id.localeCompare(left.id);
+  });
+  return refs;
+}
+
+/**
  * Records and pointer as objects beside the rows.
  *
  * `find` is a single GET at a derived key rather than a scan, which is what lets it answer
- * about a snapshot older than any bound. `list` has no equivalent shortcut: it reads every
- * record ever written for the type, and its cost grows with history regardless of `limit`,
- * which bounds only what comes back. The alternative — encoding recency into the key so a
- * listing itself could be bounded — needs an inverted timestamp, and an inverted-timestamp
- * key is incompatible with `find`'s single derived-key `get`, the invariant this module
- * exists to protect. A second alternative, an index object, would bound `list` but adds a
- * contention point to a binding whose whole argument is that it needs nothing but a bucket.
- * Neither trade is taken here: a host for which `list`'s cost is a problem binds its own
- * `SnapshotCatalog` over a transactional database — which is exactly why this is a port and
- * not a class. Nothing on the hot path pays this cost regardless: an incremental load
- * resolves its merge source through `current()`, a single get, never through `list`.
+ * about a snapshot older than any bound. `list` and `listLive` have no equivalent shortcut:
+ * both go through {@link readSortedRefs}, which reads every record ever written for the type,
+ * and their cost grows with history regardless of `limit`, which bounds only what comes back
+ * from each of them — `list` slices the raw sort, `listLive` filters it first and slices what
+ * survives. The alternative — encoding recency into the key so a listing itself could be
+ * bounded — needs an inverted timestamp, and an inverted-timestamp key is incompatible with
+ * `find`'s single derived-key `get`, the invariant this module exists to protect. A second
+ * alternative, an index object, would bound the read but adds a contention point to a binding
+ * whose whole argument is that it needs nothing but a bucket. Neither trade is taken here: a
+ * host for which this cost is a problem binds its own `SnapshotCatalog` over a transactional
+ * database — which is exactly why this is a port and not a class. Nothing on the hot path pays
+ * this cost regardless: an incremental load resolves its merge source through `current()`, a
+ * single get, never through `list` or `listLive`.
  */
 export function objectSnapshotCatalog(objects: ObjectStore): SnapshotCatalog {
   return {
@@ -116,23 +180,15 @@ export function objectSnapshotCatalog(objects: ObjectStore): SnapshotCatalog {
     },
 
     async list(typeName, limit = SNAPSHOT_LIST_LIMIT) {
-      const keys = await objects.list(`${typePrefix(typeName)}/_snapshots`);
-      const refs: SnapshotRef[] = [];
-      for (const key of keys) {
-        const found = await objects.get(key);
-        const ref = found ? parseRef(found.body, key) : undefined;
-        if (ref) refs.push(ref);
-      }
-      refs.sort((left, right) => {
-        const byCreatedAt = right.createdAt.localeCompare(left.createdAt);
-        if (byCreatedAt !== 0) return byCreatedAt;
-        // `createdAt` is the caller's clock, not this store's: two snapshots created in
-        // the same batch, or under a coarse clock, can share it exactly. `id` breaks the
-        // tie so "newest first" is a total order rather than whatever `objects.list()`
-        // happened to return — an ordering that port makes no promise of.
-        return right.id.localeCompare(left.id);
-      });
+      const refs = await readSortedRefs(objects, typeName);
       return refs.slice(0, limit);
+    },
+
+    async listLive(typeName, limit = SNAPSHOT_LIST_LIMIT) {
+      // Filter before bound, per this method's own docblock: a raw cap taken before the
+      // filter can discard a live record sitting beyond it and never let the filter see it.
+      const refs = await readSortedRefs(objects, typeName);
+      return refs.filter((ref) => !ref.droppedAt).slice(0, limit);
     },
 
     async current(typeName) {

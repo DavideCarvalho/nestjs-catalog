@@ -338,13 +338,22 @@ export class DuckDbWarehouseStore {
    * N records and then drops the tombstones among them is holding the live snapshots *of
    * that window* — and past N tombstones the filtered list is empty, which is
    * indistinguishable from "nothing to do" to every caller that asks this question.
+   *
+   * That guarantee has to live in `SnapshotCatalog.listLive`, not here: this method used to
+   * build it out of `this.snapshots.list(type.name, SNAPSHOT_LIST_LIMIT)` and its own
+   * `.filter().slice()`, which filters correctly relative to *that call*, but `list`'s own
+   * `limit` is a raw cap applied before `list` ever hands back a result — so for a type whose
+   * lifetime history exceeds `SNAPSHOT_LIST_LIMIT`, the filtering here ran on an already-cut
+   * window and a live snapshot older than that raw cutoff was invisible no matter what `limit`
+   * this method was given. Delegating to `listLive` moves the predicate inside the read
+   * `SnapshotCatalog` does, where it can run before any cap is taken — see that method's own
+   * docblock.
    */
   async listSnapshotsWithRows(
     type: CatalogObjectTypeDef,
     limit = SNAPSHOT_LIST_LIMIT,
   ): Promise<SnapshotRef[]> {
-    const all = await this.snapshots.list(type.name, SNAPSHOT_LIST_LIMIT);
-    return all.filter((ref) => !ref.droppedAt).slice(0, limit);
+    return this.snapshots.listLive(type.name, limit);
   }
 
   /** Exact lookup by id, tombstone included, whatever the age. */
