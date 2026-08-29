@@ -6,6 +6,7 @@ import {
   PutObjectCommand,
   S3Client,
   S3ServiceException,
+  type _Error,
 } from '@aws-sdk/client-s3';
 import type { ObjectStore } from './object-store';
 import type { DuckDbS3Options } from './options';
@@ -27,6 +28,46 @@ function isPreconditionFailure(error: unknown): boolean {
  * S3's multi-object delete accepts at most 1,000 keys per request; see `deletePrefix`.
  */
 const DELETE_BATCH_SIZE = 1000;
+
+/** How many failed keys a refusal names before it summarises the rest. */
+const NAMED_DELETE_FAILURES = 3;
+
+/**
+ * Refuse a delete S3 answered `200 OK` while reporting, in the response body, that some of the
+ * keys are still there.
+ *
+ * `DeleteObjectsCommand` is the one call in this binding whose failure is not an exception.
+ * Every other command here either succeeds or throws, so `await client.send(...)` returning is
+ * proof the work happened; this one returns a per-key `Errors` array alongside `Deleted` and
+ * the SDK raises nothing for it. A caller that only awaited the send would therefore read a
+ * partially-failed delete as a whole one.
+ *
+ * That distinction is the retention path's whole safety property. `dropSnapshot` writes
+ * `droppedAt` *after* `deletePrefix` returns, deliberately, so that a crash in between leaves
+ * rows deleted and a record still claiming them — a state the next call repairs. A silent
+ * partial failure inverts it: the tombstone lands, asserts the rows are gone, and nothing ever
+ * looks at that prefix again while the objects and their storage bill remain. The incident
+ * behind the tombstone feature was a deployment sitting at 441 snapshots and 100 GB.
+ *
+ * The first {@link NAMED_DELETE_FAILURES} keys are named with their codes, because the codes
+ * differ in what the operator has to do: `AccessDenied` is a policy to widen, an SLOW_DOWN-ish
+ * throttle is a retry, and the retry is safe — `deletePrefix` re-lists first, so it finishes
+ * the job rather than re-deleting keys that are already gone.
+ */
+export function assertDeleteSucceeded(errors: _Error[] | undefined, bucket: string): void {
+  if (!errors || errors.length === 0) return;
+  const named = errors
+    .slice(0, NAMED_DELETE_FAILURES)
+    .map((each) => `${each.Key ?? '<unnamed>'} (${each.Code ?? 'no code'})`)
+    .join(', ');
+  const rest =
+    errors.length > NAMED_DELETE_FAILURES
+      ? ` and ${errors.length - NAMED_DELETE_FAILURES} more`
+      : '';
+  throw new Error(
+    `S3 refused to delete ${errors.length} object(s) under ${bucket}: ${named}${rest}. The request itself succeeded, so this is reported rather than thrown by the SDK; the objects are still there. Re-running the drop re-lists the prefix first and deletes only what is left.`,
+  );
+}
 
 /**
  * Object storage, with the two conditional writes the pointer swap needs.
@@ -172,24 +213,31 @@ export function s3ObjectStore(root: string, options: DuckDbS3Options = {}): Obje
      * to for long enough — this is the write-side edge of the same limit `list`'s
      * `ContinuationToken` pagination handles on the read side.
      *
-     * If a chunk after the first throws, every chunk before it is already deleted — S3 has
-     * no all-or-nothing delete across requests — and this rethrows rather than returning a
-     * count that would understate what actually happened. That partial state is not silently
-     * wrong: `dropSnapshot` calls this to reclaim a tombstoned snapshot's space after already
-     * counting its rows, so a caller that retries a failed `deletePrefix` re-lists first and
+     * Two ways a chunk can fail and both end here as a throw. A transport-level failure raises
+     * out of `client.send` on its own. A per-key failure does not: S3 answers `200 OK` with an
+     * `Errors` array and the SDK returns normally, which is what {@link assertDeleteSucceeded}
+     * is checked for after every chunk. Returning the listed count without that check would be
+     * returning "keys attempted" while the docblock said "removed".
+     *
+     * If a chunk after the first fails, every chunk before it is already deleted — S3 has no
+     * all-or-nothing delete across requests — and this throws rather than returning a count
+     * that would overstate what happened. That partial state is not silently wrong:
+     * `dropSnapshot` calls this to reclaim a tombstoned snapshot's space after already counting
+     * its rows and *before* writing `droppedAt`, so a caller that retries re-lists first and
      * finds only the keys still standing — the retry finishes the job instead of re-deleting
-     * keys that are already gone or losing count of ones that are not.
+     * keys that are already gone.
      */
     async deletePrefix(deletePrefix) {
       const keys = await this.list(deletePrefix);
       for (let offset = 0; offset < keys.length; offset += DELETE_BATCH_SIZE) {
         const chunk = keys.slice(offset, offset + DELETE_BATCH_SIZE);
-        await client.send(
+        const response = await client.send(
           new DeleteObjectsCommand({
             Bucket: bucket,
             Delete: { Objects: chunk.map((key) => ({ Key: keyFor(key) })) },
           }),
         );
+        assertDeleteSucceeded(response.Errors, bucket);
       }
       return keys.length;
     },

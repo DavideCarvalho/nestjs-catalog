@@ -100,4 +100,37 @@ describe('s3ObjectStore', () => {
     expect(await store.list('mvr/run-1')).toEqual([]);
     expect(await store.list('mvr/run-10')).toEqual(['mvr/run-10/part-000001.parquet']);
   });
+
+  it('pages a listing and chunks a delete past S3 own thousand-key limits', async () => {
+    // 1,001 objects, one past both limits at once, which is the point: `ListObjectsV2` caps a
+    // page at 1,000 keys and `DeleteObjects` rejects a request carrying more than 1,000. Those
+    // two loops — `list`'s `ContinuationToken` and `deletePrefix`'s chunking — are the only
+    // unbounded loops in this binding and neither had any coverage: every other case here fits
+    // in one page and one request, so a `ContinuationToken` that was never re-sent or a chunk
+    // size off by one would have passed all of them.
+    //
+    // Not a synthetic number either. A snapshot's parts are zero-padded to six digits by
+    // `batchKey` precisely because a load can run to that many batches, and `dropSnapshot`
+    // deletes the whole prefix in one call.
+    const keys = Array.from(
+      { length: 1001 },
+      (_unused, index) => `bulk/run-1/part-${String(index).padStart(6, '0')}.parquet`,
+    );
+    // Bounded concurrency rather than one `Promise.all` over 1,001 sends: the SDK's default
+    // agent would queue them all anyway, and a burst that large against a container is how a
+    // test starts failing on socket limits instead of on the thing it measures.
+    for (let offset = 0; offset < keys.length; offset += 50) {
+      await Promise.all(keys.slice(offset, offset + 50).map((key) => store.put(key, 'x')));
+    }
+
+    const listed = await store.list('bulk/run-1');
+    expect(listed).toHaveLength(1001);
+    expect(new Set(listed).size).toBe(1001);
+
+    // The count is keys REMOVED, which is only true if every chunk came back with no per-key
+    // `Errors` — see `assertDeleteSucceeded`, which runs against both chunks here. The empty
+    // listing afterwards is what makes that claim checkable rather than asserted.
+    expect(await store.deletePrefix('bulk/run-1')).toBe(1001);
+    expect(await store.list('bulk/run-1')).toEqual([]);
+  }, 300_000);
 });

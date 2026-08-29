@@ -23,6 +23,27 @@ export interface ObjectStore {
   putIfAbsent(key: string, body: string): Promise<{ etag: string } | undefined>;
   putIfMatch(key: string, body: string, etag: string): Promise<{ etag: string } | undefined>;
   list(prefix: string): Promise<string[]>;
+  /**
+   * Remove every key under `prefix`, and answer how many were removed.
+   *
+   * **Removed, not attempted** — and stating it here rather than in one binding, because both
+   * bindings arrive at the number the same way and each has its own way of being wrong about
+   * it. Both list the prefix and then delete it, so the count comes from the listing; what a
+   * binding owes is that the delete's failure reaches the caller instead of being rounded up
+   * into that count. On a filesystem `rm` raises. On S3 a per-key failure is *not* an
+   * exception — the request answers `200 OK` carrying an `Errors` array — so that binding has
+   * to read the response and throw itself; see `assertDeleteSucceeded` in `s3-object-store.ts`.
+   *
+   * A partial failure therefore throws rather than returning a smaller number. There is no
+   * count that would describe it usefully: the one caller that matters, `dropSnapshot`, writes
+   * its tombstone only after this returns, so a throw leaves the record still claiming the rows
+   * and the retry re-lists and finishes the job. A number would have let the tombstone land.
+   *
+   * A key written after the listing is neither counted nor deleted. That race is not closed
+   * here, deliberately: closing it would need the port to hold a lock over a whole prefix, and
+   * the only caller — `dropSnapshot` — is already written so that running it again is the
+   * repair.
+   */
   deletePrefix(prefix: string): Promise<number>;
   /**
    * How DuckDB names this key.
@@ -136,8 +157,28 @@ export function localObjectStore(root: string): ObjectStore {
     return join(base, key);
   }
 
+  /**
+   * Descend one directory, appending every file below it as a key.
+   *
+   * Only `ENOENT` answers "nothing here". A prefix that was never written is the ordinary case
+   * — `countStaged` asks before a load has staged anything, `carryForward` asks about a
+   * predecessor that may not exist — so that one has to be `[]`.
+   *
+   * Everything else propagates, and the reason is {@link STAGING_NAME}'s: empty is the one
+   * wrong answer nothing downstream can tell apart from the truth. An `EACCES` on a directory
+   * mid-listing, an `EMFILE` under load, an `EIO` off a failing disk — each used to be reported
+   * as an empty prefix, and each caller then did something irreversible with it. `countStaged`
+   * commits `rowCount: 0`; `read` takes its empty-glob guard and answers a zero-row page;
+   * `dropSnapshot` writes a tombstone claiming the snapshot held nothing and deletes what it
+   * could not read; `countCarried` and `carryForward`'s `previousObjects` decide a merge
+   * carried nothing forward. `get` in this same binding was narrowed to `ENOENT` for exactly this reason, and
+   * this is the listing half of it.
+   */
   async function walk(directory: string, prefix: string, into: string[]): Promise<void> {
-    const entries = await readdir(directory, { withFileTypes: true }).catch(() => []);
+    const entries = await readdir(directory, { withFileTypes: true }).catch((error: unknown) => {
+      if (isErrnoException(error) && error.code === 'ENOENT') return [];
+      throw error;
+    });
     for (const entry of entries) {
       // A body being written right now is not a key yet — see STAGING_NAME, which also says
       // why a directory is never skipped no matter what it is called.

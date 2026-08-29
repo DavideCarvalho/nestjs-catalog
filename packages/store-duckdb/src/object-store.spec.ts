@@ -127,6 +127,27 @@ describe('localObjectStore', () => {
     await expect(store.get('a-directory')).rejects.toThrow();
   });
 
+  it('propagates a list failure that is not "the prefix was never written"', async () => {
+    // ENOENT is ordinary — `countStaged` asks about a snapshot before anything is staged — and
+    // must stay `[]`. EACCES is not, and reporting it as an empty prefix is the one wrong
+    // answer nothing downstream can tell apart from the truth: `countStaged` would commit
+    // `rowCount: 0`, and `dropSnapshot` would write a tombstone claiming the snapshot held
+    // nothing while deleting objects it never managed to read.
+    expect(await store.list('never-written')).toEqual([]);
+
+    const lockedDir = join(root, 'locked-list');
+    mkdirSync(lockedDir);
+    chmodSync(lockedDir, 0o000);
+    try {
+      await expect(store.list('locked-list')).rejects.toThrow(/EACCES/);
+      // `deletePrefix` lists first, so the same fault has to stop a delete from reporting a
+      // count for objects it could not see.
+      await expect(store.deletePrefix('locked-list')).rejects.toThrow(/EACCES/);
+    } finally {
+      chmodSync(lockedDir, 0o700);
+    }
+  });
+
   it('propagates a putIfAbsent failure that is not a lost race', async () => {
     // A permission fault under the target directory, not EEXIST. `mkdir` on an
     // already-existing directory is a no-op regardless of its permissions, so the failure
