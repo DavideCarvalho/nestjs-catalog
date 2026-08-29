@@ -278,6 +278,61 @@ describe('carryForward', () => {
     expect(byId).toEqual({ a: 'from-run-1', b: 'only-run-1', c: 'only-run-3' });
   });
 
+  it('names the true origin, not itself, when carryForward runs again on the served snapshot', async () => {
+    // A durable retry that replays a step whose commit already succeeded runs `write` (a
+    // no-op re-send of the same batch), then `carryForward`, again -- and by then
+    // `currentSnapshot` names THIS OWN snapshot, because the earlier attempt's commit
+    // already landed. The MikroORM sibling's `findPreviousCommitted` docblock names the
+    // hazard this guards against directly: carrying forward from itself would delete the
+    // carried rows and then find nothing to replace them with, silently reducing the
+    // dataset to whatever the run happened to fetch. That hazard is real for a store where
+    // "previous" and "incoming" share one physical table (both siblings do). Checked here
+    // against the real engine rather than assumed to transfer: for THIS adapter, row
+    // content survives a self-merge even without the guard, because the anti-join's
+    // "incoming" side is deliberately built from `part-*.parquet` only (see `carryForward`'s
+    // own docblock, "why the incoming glob excludes carry.parquet") -- a carried row can
+    // never match itself there, self-merge or not, so it is always re-carried rather than
+    // dropped. What the guard demonstrably fixes for this adapter is `merged.from`: without
+    // it, a self-merge reports `from: snapshotId` -- the snapshot claiming to have carried
+    // rows forward from ITSELF, which is not a fact about the data, it is a wrong answer to
+    // "where did this come from" that would corrupt a lineage or audit trail built on it.
+    // Both properties are asserted below: the row content (defence in depth, and the literal
+    // ask), and the attribution (what actually regresses without the guard on this adapter).
+    const type = contractType('CarrySelfMerge');
+    await store.ensureType(type);
+    await store.write(type, [contractRow('a', 'old-a', 1), contractRow('b', 'old-b', 2)], {
+      snapshotId: 'run-1',
+      principalId: 'tester',
+      batch: 0,
+    });
+    await store.commit(type, 'run-1');
+
+    await store.write(type, [contractRow('a', 'new-a', 5)], {
+      snapshotId: 'run-2',
+      principalId: 'tester',
+      batch: 0,
+    });
+    await store.carryForward(type, 'run-2', { principalId: 'tester' });
+    await store.commit(type, 'run-2');
+
+    // The retry: `write` re-sends the same batch (idempotent, same key), then `carryForward`
+    // runs again for 'run-2' while 'run-2' is itself the served snapshot.
+    await store.write(type, [contractRow('a', 'new-a', 5)], {
+      snapshotId: 'run-2',
+      principalId: 'tester',
+      batch: 0,
+    });
+    const merged = await store.carryForward(type, 'run-2', { principalId: 'tester' });
+    await store.commit(type, 'run-2');
+
+    const read = await store.read(type, ['id', 'label'], { size: 10 });
+    const byId = Object.fromEntries(read.rows.map((row) => [row.id, row.label]));
+    expect(byId).toEqual({ a: 'new-a', b: 'old-b' });
+    // Without the guard this names 'run-2' -- itself -- rather than the snapshot 'b' was
+    // actually carried out of.
+    expect(merged.from).toBe('run-1');
+  });
+
   it('refuses a type with no primary key', async () => {
     const type = contractType('CarryNoKey');
     type.primaryKey = [];
