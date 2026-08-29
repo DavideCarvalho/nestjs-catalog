@@ -59,13 +59,21 @@ export function coerce(value: unknown, type: ScalarType): string | number | bool
   if (value === null || value === undefined) return null;
   switch (type) {
     case 'number': {
-      const asNumber = typeof value === 'bigint' ? Number(value) : Number(value);
+      const asNumber = Number(value);
       return Number.isFinite(asNumber) ? asNumber : null;
     }
     case 'boolean':
       return coerceBoolean(value);
     case 'date': {
-      const asDate = value instanceof Date ? value : new Date(String(value));
+      // Accept numeric epochs (milliseconds since epoch) directly, then string representations.
+      let asDate: Date;
+      if (typeof value === 'number' || typeof value === 'bigint') {
+        asDate = new Date(Number(value));
+      } else if (value instanceof Date) {
+        asDate = value;
+      } else {
+        asDate = new Date(String(value));
+      }
       return Number.isNaN(asDate.getTime()) ? null : asDate.toISOString();
     }
     case 'json':
@@ -85,11 +93,30 @@ export function coerce(value: unknown, type: ScalarType): string | number | bool
  * `bigint` is the other half: DuckDB returns INT64 as one, and `JSON.stringify` throws on a
  * bigint rather than rendering it — so a row that reached a response body untouched would
  * fail the serialiser rather than the read.
+ *
+ * Date-typed values return as ISO strings regardless of their input representation (Date
+ * instance, numeric epoch, or string), matching the file's contract. An unparseable string
+ * returns `null` rather than throwing, consistent with `coerce` — a warehouse driver may hand
+ * back invalid state and crashing the read is worse than losing the value.
  */
 export function normalise(value: unknown, type: ScalarType): unknown {
   if (value === null || value === undefined) return null;
+  // Check for date-typed values first, before generic type checks. A date-typed value that
+  // arrives as a bigint (epoch ms) or number (epoch ms) must return an ISO string, not a raw number.
+  if (type === 'date') {
+    let asDate: Date;
+    if (value instanceof Date) {
+      asDate = value;
+    } else if (typeof value === 'number' || typeof value === 'bigint') {
+      asDate = new Date(Number(value));
+    } else if (typeof value === 'string') {
+      asDate = new Date(value);
+    } else {
+      return null;
+    }
+    return Number.isNaN(asDate.getTime()) ? null : asDate.toISOString();
+  }
   if (value instanceof Date) return value.toISOString();
   if (typeof value === 'bigint') return Number(value);
-  if (type === 'date' && typeof value === 'string') return new Date(value).toISOString();
   return value;
 }

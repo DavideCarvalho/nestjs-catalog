@@ -43,6 +43,21 @@ describe('coerce', () => {
     expect(coerce('not a number', 'number')).toBeNull();
   });
 
+  it('accepts numeric epochs as milliseconds since the epoch', () => {
+    // A warehouse may hand over timestamps as raw milliseconds. A numeric epoch is a real
+    // date and must not be silently dropped.
+    const epochMs = 1699999999999;
+    expect(coerce(epochMs, 'date')).toBe(new Date(epochMs).toISOString());
+    expect(coerce(BigInt(epochMs), 'date')).toBe(new Date(Number(BigInt(epochMs))).toISOString());
+  });
+
+  it('returns null for an unparseable date string, not throw', () => {
+    // The writer may hand back strings a Date constructor cannot parse. Crashing the read
+    // is worse than losing the value — consistent with coerce's other error cases.
+    expect(coerce('not a date', 'date')).toBeNull();
+    expect(coerce('', 'date')).toBeNull();
+  });
+
   it('reads a textual boolean the way the source meant it', () => {
     // A CSV has no boolean type, so "false" arrives as text — and Boolean("false")
     // is true, which would invert every false this store ever loaded.
@@ -60,6 +75,23 @@ describe('normalise', () => {
     expect(normalise(new Date('2026-01-02T03:04:05.000Z'), 'date')).toBe(
       '2026-01-02T03:04:05.000Z',
     );
+  });
+
+  it('converts a date-typed numeric epoch to ISO, not raw number', () => {
+    // A warehouse may hand over epochs as raw numbers. A date-typed value must always
+    // return as ISO string, regardless of input representation.
+    const epochMs = 1699999999999;
+    expect(normalise(epochMs, 'date')).toBe(new Date(epochMs).toISOString());
+    expect(normalise(BigInt(epochMs), 'date')).toBe(
+      new Date(Number(BigInt(epochMs))).toISOString(),
+    );
+  });
+
+  it('returns null for a date-typed unparseable string, not throw', () => {
+    // The driver may hand back strings a Date constructor cannot parse. Crashing the read
+    // is worse than losing the value — consistent with coerce and the file's own docblock.
+    expect(normalise('not a date', 'date')).toBeNull();
+    expect(normalise('', 'date')).toBeNull();
   });
 
   it('converts a bigint to a number, because JSON.stringify throws on one', () => {
