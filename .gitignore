@@ -19,3 +19,6 @@ packages/store-prisma/prisma/*.db
 # "Vitest cannot be imported in a CommonJS module".
 test/*.js
 test/*.d.ts
+
+# SDD scratch: ledger, briefs, review packages. Process artifacts, never tracked.
+.superpowers/
