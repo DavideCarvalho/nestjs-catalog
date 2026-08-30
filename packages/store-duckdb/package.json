@@ -1,0 +1,44 @@
+{
+  "name": "@dudousxd/nestjs-catalog-store-duckdb",
+  "version": "0.0.0",
+  "description": "DuckDB + Parquet warehouse store for @dudousxd/nestjs-catalog: one Parquet object per snapshot batch, read back through read_parquet.",
+  "license": "MIT",
+  "author": "Davide Carvalho",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/DavideCarvalho/nestjs-catalog.git",
+    "directory": "packages/store-duckdb"
+  },
+  "keywords": ["nestjs", "catalog", "duckdb", "parquet", "warehouse", "snapshots"],
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsc -p tsconfig.json --watch"
+  },
+  "peerDependencies": {
+    "@aws-sdk/client-s3": ">=3",
+    "@duckdb/node-api": ">=1.4",
+    "@dudousxd/nestjs-catalog": ">=0.1",
+    "@nestjs/common": ">=10"
+  },
+  "peerDependenciesMeta": {
+    "@aws-sdk/client-s3": { "optional": true }
+  },
+  "devDependencies": {
+    "@aws-sdk/client-s3": "3.946.0",
+    "@duckdb/node-api": "1.5.5-r.4",
+    "@dudousxd/nestjs-catalog": "workspace:*",
+    "@nestjs/common": "11.1.19",
+    "@types/node": "25.6.0",
+    "testcontainers": "11.7.1",
+    "typescript": "5.9.3"
+  }
+}

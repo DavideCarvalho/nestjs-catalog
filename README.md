@@ -9,6 +9,7 @@ family of plug-n-play libraries under the `@dudousxd` scope.
 | [`@dudousxd/nestjs-catalog-react`](./packages/react) | The React console: explorer, query console, dashboards, pipeline and workflow editors. |
 | [`@dudousxd/nestjs-catalog-store-mikro-orm`](./packages/store-mikro-orm) | MikroORM store: boot-managed schema, the registry read from the catalog's own tables, and a MySQL warehouse store over `obj_*` snapshot tables. |
 | [`@dudousxd/nestjs-catalog-store-clickhouse`](./packages/store-clickhouse) | ClickHouse store. |
+| [`@dudousxd/nestjs-catalog-store-duckdb`](./packages/store-duckdb) | DuckDB + Parquet store: one Parquet object per snapshot batch in a bucket or a directory, read back through `read_parquet`, with the snapshot records and the served pointer as objects beside them. |
 | [`@dudousxd/nestjs-catalog-store-fanout`](./packages/store-fanout) | One primary that decides, N followers kept in step, with a durable failure journal and snapshot replay — so a catalog can move between engines without a big-bang cutover. |
 | [`@dudousxd/nestjs-catalog-telescope`](./packages/telescope) | Telescope watcher for catalog events. |
 
