@@ -38,12 +38,7 @@ jobs:
       # workflow as its trusted publisher on npmjs.com.
       #
       # npm only learned OIDC in 11.5.1, and .nvmrc pins Node 22, which ships
-      # 10.9.x. The version is exact, not a range: changesets 2.31.0 parses the
-      # JSON npm prints when a publish fails, and npm releases past 11.6.2 changed
-      # that shape, so the publish dies in `isAlreadyPublishedError` reading
-      # undefined and npm's real error never reaches the log. Raise this pin only
-      # together with a changesets upgrade that understands the newer shape.
-      # Without this step the publish fails as
+      # 10.9.x. Without this step the publish fails as
       # `E404 - PUT https://registry.npmjs.org/<pkg>` — npm answers 404 rather
       # than 403 for an unauthorized package, so it reads as "no such package"
       # rather than "not authenticated", which is a long way from the cause.
@@ -51,7 +46,7 @@ jobs:
       # stays identical to the rest of Aviary and only the publish step differs.
       - name: Upgrade npm for OIDC trusted publishing
         run: |
-          npm install -g npm@11.6.2
+          npm install -g npm@^11.5.1
           npm --version
 
       - name: Install dependencies
