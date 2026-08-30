@@ -1,6 +1,6 @@
 {
   "name": "@dudousxd/nestjs-catalog-store-duckdb",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "DuckDB + Parquet warehouse store for @dudousxd/nestjs-catalog: one Parquet object per snapshot batch, read back through read_parquet.",
   "license": "MIT",
   "author": "Davide Carvalho",
