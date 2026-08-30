@@ -73,6 +73,18 @@ describe('key segments', () => {
     expect(() => snapshotPrefix('mvr', '_hidden')).toThrow(/leading underscore/);
   });
 
+  it('refuses the same id on the record key, which is the read half of the same join', () => {
+    // `snapshotRecordKey` builds its path with its own template rather than through
+    // `snapshotPrefix`, so it is a second join and needs the rule at it. It is what
+    // `SnapshotCatalog.find` builds, and `read`, `commit`, `dropSnapshot` and `findSnapshot`
+    // all call `find` before anything else validates — so a plain time-travel GET
+    // (`?snapshot=…`) reached `join()` with the caller's string, and a non-JSON file answered
+    // with its first bytes inside the parse failure.
+    expect(() => snapshotRecordKey('mvr', '../../../../etc/hosts')).toThrow(/snapshot id/);
+    expect(() => snapshotRecordKey('mvr', '..')).toThrow(/snapshot id/);
+    expect(() => snapshotRecordKey('mvr', '_current')).toThrow(/leading underscore/);
+  });
+
   it('refuses `_snapshots` specifically, because dropping it would erase the whole history', () => {
     // With no traversal character at all, this id makes `snapshotPrefix` name the directory
     // holding every snapshot record the type has — and `dropSnapshot` deletes that prefix.

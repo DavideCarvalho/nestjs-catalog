@@ -163,8 +163,24 @@ export function carryForwardKey(typeName: string, snapshotId: string): string {
   return `${snapshotPrefix(typeName, snapshotId)}/carry.parquet`;
 }
 
-/** One snapshot's record, under a prefix the row glob cannot reach. */
+/**
+ * One snapshot's record, under a prefix the row glob cannot reach.
+ *
+ * The snapshot id is checked here too, and not only in {@link snapshotPrefix}. This function
+ * builds a path out of it with its own `${}` rather than by calling that one, so the rule the
+ * docblock on {@link typePrefix} claims "cannot be bypassed by a future caller" has to live at
+ * every join, not at the one the write path happens to go through. This is the READ half of the
+ * same hazard: `objectSnapshotCatalog.find` builds this key, and `read`, `commit`,
+ * `dropSnapshot` and `findSnapshot` all call `find` before anything else validates — so
+ * `?snapshot=../../../../etc/hosts` reached `join()` through a plain time-travel GET, and a
+ * non-JSON file's first bytes came back out in the `JSON.parse` failure `parseJson` reports.
+ * No write and no delete, but a read oracle is still a read.
+ *
+ * Safe for every caller: the only two are `SnapshotCatalog`'s `put` and `find` (`snapshots.ts`),
+ * and any id reaching `put` came off a record `write` had already validated.
+ */
 export function snapshotRecordKey(typeName: string, snapshotId: string): string {
+  assertKeySegment('snapshot id', snapshotId);
   return `${typePrefix(typeName)}/_snapshots/${snapshotId}.json`;
 }
 

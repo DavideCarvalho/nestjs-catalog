@@ -1,6 +1,7 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { CatalogObjectTypeDef } from '@dudousxd/nestjs-catalog';
 import { isCatalogStoreCapabilities, isWriteStore } from '@dudousxd/nestjs-catalog';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -438,6 +439,40 @@ describe('write', () => {
     const type = contractType('WriteReservedLabels');
     await store.ensureType(type);
     for (const key of ['_committed', '_carryForwardStale', '_carriedFrom']) {
+      await expect(
+        store.write(type, [contractRow('a', 'A', 1)], {
+          snapshotId: 'run-1',
+          principalId: 'tester',
+          labels: { [key]: 'forged' },
+        }),
+      ).rejects.toThrow(new RegExp(key));
+    }
+  });
+
+  it('refuses every label constant the store module declares, so a fourth cannot be missed', async () => {
+    // The reservation is only as complete as `STORE_OWNED_LABELS`, and nothing about adding a
+    // fourth `*_LABEL` constant to that module forces anyone to extend the list — the store
+    // would keep working, and the new label would keep being settable from a request body. So
+    // the list is checked against the declarations rather than against a copy of itself.
+    //
+    // Read off the source because the constants are module-private, which is where they belong:
+    // exporting three internals to make them testable would be widening the package's surface
+    // to hold a list still. Located from this file rather than from the working directory, so
+    // the guard does not depend on where vitest was invoked.
+    const source = readFileSync(
+      fileURLToPath(new URL('./duckdb-warehouse.store.ts', import.meta.url)),
+      'utf8',
+    );
+    const declared = [...source.matchAll(/^const \w+_LABEL = '([^']+)';$/gm)].map(
+      (match) => match[1],
+    );
+    expect(declared).toEqual(
+      expect.arrayContaining(['_committed', '_carriedFrom', '_carryForwardStale']),
+    );
+
+    const type = contractType('WriteAllReservedLabels');
+    await store.ensureType(type);
+    for (const key of declared) {
       await expect(
         store.write(type, [contractRow('a', 'A', 1)], {
           snapshotId: 'run-1',

@@ -138,10 +138,15 @@ notices, and a host that does finds out at boot.
 
 Never a silent fallback:
 
-- **A snapshot id or type name that is not a safe path component** — empty, `.`,
-  `..`, containing `/`, `\` or NUL, beginning with `_`, or over 128 characters.
-  On the siblings a snapshot id is a column value; here it is a directory, so it
-  decides where a `COPY … TO` writes and what a `deletePrefix` removes.
+- **A snapshot id or type name that is not a safe path component.** The rule is
+  a charset, not a blocklist: 1-128 characters of letters, digits, dot, dash or
+  underscore, starting with a letter or a digit. So `..`, `.`, empty, anything
+  containing `/`, `\` or NUL and anything with a leading `_` are refused — and so
+  are a leading `-`, an id containing a space, and a non-ASCII id like `café`. On
+  the siblings a snapshot id is a column value; here it is a path component, so
+  it decides where a `COPY … TO` writes, what a `deletePrefix` removes, and —
+  through `snapshotRecordKey`, which every read of a named snapshot goes through
+  — which file a record lookup opens.
 - **A label key this store owns** — `_committed`, `_carriedFrom`,
   `_carryForwardStale`. They arrive on the same public surface a publisher's own
   labels do, and each one forges a fact the store reads back for its own
@@ -222,7 +227,7 @@ objects itself**, at the path `locate` builds, never through this package.
 | Action | Why |
 |---|---|
 | `s3:PutObject` | every write, from both clients |
-| `s3:GetObject` | reads — **and `putIfMatch`**, which needs it beyond `PutObject`: S3 reads the current object to compare its etag before allowing the write, so a write-only policy fails every conditional write with `403` |
+| `s3:GetObject` | reads — **and, per AWS's conditional-request documentation, `putIfMatch`**, which needs it beyond `PutObject`, S3 reading the current object to compare its etag before allowing the write. That one is taken from the documentation rather than measured here, unlike everything else in this file; a write-only policy is expected to fail every conditional write with `403`. |
 | `s3:ListBucket` | `list` and `deletePrefix`; **on the bucket resource, not the object resource** |
 | `s3:DeleteObject` | `dropSnapshot` |
 

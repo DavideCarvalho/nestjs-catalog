@@ -382,6 +382,19 @@ describe('commit and read', () => {
     await expect(store.read(unstaged, ['bogus'], {})).rejects.toThrow(/no property named bogus/);
   });
 
+  it('refuses a traversing query.snapshot before it reaches a filesystem join', async () => {
+    // The reachable route the branch review found: `GET /objects/:name?snapshot=…` checks only
+    // `timeTravel` on the way in, and `read` resolves the named snapshot through
+    // `SnapshotCatalog.find` -> `snapshotRecordKey` -> `join(base, key)`, which has no
+    // containment check of its own. Read-only, but a non-JSON file answered with its first
+    // bytes inside the parse failure, which is an oracle.
+    const type = contractType('ReadTraversingSnapshot');
+    await store.ensureType(type);
+    await expect(store.read(type, FIELDS, { snapshot: '../../../../etc/hosts' })).rejects.toThrow(
+      /snapshot id/,
+    );
+  });
+
   it('refuses a non-finite page size instead of interpolating LIMIT NaN', async () => {
     // `write`'s own `batch` refuses a non-finite input with a named error rather than letting
     // it flow into a key nothing could resolve; `size` gets the same rather than silently
