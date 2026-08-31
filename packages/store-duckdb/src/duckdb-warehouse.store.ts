@@ -21,6 +21,7 @@ import {
   CATALOG_PROVENANCE_COLUMNS,
   assertNoColumnCollisions,
   assertSafeIdentifier,
+  emitCatalog,
   outputAlias,
   physicalColumn,
 } from '@dudousxd/nestjs-catalog';
@@ -239,6 +240,13 @@ export class DuckDbWarehouseStore
    * unreadable: every later `SELECT` list in this store goes through `ident()`, which refuses
    * it. Refusing at `ensureType` turns that into a refusal at publish time instead of a read
    * that can never name the column it wrote.
+   *
+   * **No `schema.changed`, and that is a statement rather than a gap.** The other three
+   * lifecycle events this store emits have an equivalent moment here; this one does not. Its
+   * payload names a `table` and the `addedColumns` a DDL statement put on it, and there is
+   * neither — emitting it would mean inventing a table name and reporting a column addition
+   * that no storage performed, to a trail whose whole value is that its entries happened. See
+   * `is never emitted, because this store applies no DDL` in `duckdb-warehouse.events.spec.ts`.
    */
   async ensureType(type: CatalogObjectTypeDef): Promise<void> {
     assertNoColumnCollisions(type, physicalColumn, {
@@ -369,6 +377,17 @@ export class DuckDbWarehouseStore
     }
 
     await this.recordWrittenBatch(type, options, loadedAt);
+
+    // After the object and the record, never before either: the event says a batch landed, and
+    // a subscriber that reacts to it — a lineage feed, a progress panel — must be able to
+    // resolve what it names. `rows` is this call's own count for the same reason the return
+    // value is, below.
+    emitCatalog('snapshot.written', {
+      typeName: type.name,
+      snapshotId: options.snapshotId,
+      principalId: options.principalId,
+      rows: rows.length,
+    });
 
     // Rows accepted by THIS call. Never the snapshot's running total: a caller sums these
     // across batches, and a fan-out compares its primary's answer with its follower's.
@@ -562,6 +581,19 @@ export class DuckDbWarehouseStore
     };
     await this.snapshots.put(type.name, ref);
     await this.snapshots.setCurrent(type.name, snapshotId);
+
+    // Strictly after the pointer moved. The event means "this load is the one readers get", so
+    // a subscriber that reads back what it names — a retention sweep asking which snapshots are
+    // now superseded — has to find the pointer already on it. Both refusals above return before
+    // this, which is the other half of the same rule: nothing announces a snapshot as serving
+    // that no read will ever be served from.
+    emitCatalog('snapshot.committed', {
+      typeName: type.name,
+      snapshotId,
+      principalId: ref.principalId,
+      rowCount: ref.rowCount,
+    });
+
     // `omitCommittedLabel` rather than `present`: the ref built just above already carries a
     // freshly counted, now-final `rowCount`, and it is the record this call just wrote, so
     // there is nothing for a recount to correct and a second `countStaged` would only be a
@@ -775,6 +807,12 @@ export class DuckDbWarehouseStore
       ...(existing?.archive ? { archive: existing.archive } : {}),
       droppedAt: new Date().toISOString(),
     });
+
+    // Only on the call that actually dropped something. The early return above — a snapshot
+    // already carrying a tombstone — is a no-op, and a retention sweep re-reaching a snapshot
+    // it evicted last night must not put a second eviction in the trail for rows that were
+    // gone before it ran.
+    emitCatalog('snapshot.dropped', { typeName: type.name, snapshotId });
   }
 
   /**
@@ -1648,6 +1686,18 @@ export class DuckDbWarehouseStore
     ref.labels = labels;
     ref.rowCount = total;
     await this.snapshots.put(type.name, ref);
+
+    // `snapshot.written` rather than an event of its own, matching the MikroORM sibling and its
+    // stated reason: rows landed in a snapshot, which is what the event means, and a lineage
+    // feed reporting the carried rows as a write is telling the truth about where the data in
+    // that snapshot came from. `carried` alone, not `total` — the merged rows are what this
+    // call put there; the rest were already written and already reported.
+    emitCatalog('snapshot.written', {
+      typeName: type.name,
+      snapshotId,
+      principalId: options.principalId,
+      rows: carried,
+    });
 
     return {
       ...(previous ? { from: previous.id } : {}),
