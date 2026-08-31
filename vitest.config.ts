@@ -29,6 +29,10 @@ export default defineConfig({
   test: {
     globals: true,
     environment: 'node',
+    // Runs in every worker, and is a no-op outside jsdom. See the file itself for
+    // what Node 24+ takes away from a jsdom spec and why nothing here can borrow
+    // it back from jsdom.
+    setupFiles: ['./test/jsdom-web-storage.ts'],
     include: ['packages/*/src/**/*.{test,spec}.{ts,tsx}'],
     // `*.db.spec.ts` boot real engines through testcontainers — run them via `pnpm test:db`
     // (vitest.db.config.ts) so the default suite stays fast and needs no Docker.
