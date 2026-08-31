@@ -78,6 +78,8 @@ describe('DuckDbWarehouseStore', () => {
       quoteIdentifier: (value) => `"${value}"`,
       noModelReason:
         'This adapter stores rows, not the model. A deployment mounts it for the rows and a transactional store for the type model, saved queries and connector definitions — small, mutable, read-modify-write data that object storage is the wrong home for.',
+      noSchemaEventReason:
+        'this adapter applies no DDL. A Parquet object carries its own schema, so `ensureType` only validates the def it is handed — the event names a `table` and the `addedColumns` a statement put on it, and there is neither. See ensureType in duckdb-warehouse.store.ts.',
     }),
   );
 

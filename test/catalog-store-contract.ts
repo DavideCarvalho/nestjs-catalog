@@ -1,3 +1,4 @@
+import { subscribe, unsubscribe } from 'node:diagnostics_channel';
 import type {
   CatalogObjectTypeDef,
   CatalogPropertyDef,
@@ -7,7 +8,9 @@ import type {
   ScalarType,
 } from '@dudousxd/nestjs-catalog';
 import {
+  CATALOG_EVENTS,
   CATALOG_PROVENANCE_COLUMNS,
+  channelNameFor,
   isCatalogStoreCapabilities,
   isWriteStore,
   resolveObjectFilters,
@@ -76,6 +79,21 @@ export interface ContractStore {
   readBackType?(name: string): Promise<CatalogObjectTypeDef | undefined>;
   /** Why {@link readBackType} is absent. Required when it is. */
   readonly noModelReason?: string;
+  /**
+   * Why this adapter emits no `schema.changed`, when it emits none.
+   *
+   * The sibling of {@link noModelReason}, and present for the same reason: an
+   * adapter that applies no DDL has no honest moment to emit that event at, and
+   * the difference between "does not apply" and "nobody wired it up" has to be a
+   * statement rather than a silence. `store-duckdb` is the case — a Parquet
+   * object carries its own schema, so there is no table to name and no column
+   * addition any storage performed.
+   *
+   * Deliberately narrow. There is no equivalent escape for the three snapshot
+   * events, because a store that writes, commits and drops snapshots has a
+   * moment for each of them by definition.
+   */
+  readonly noSchemaEventReason?: string;
   /**
    * How this store's engine quotes an identifier, for the one case that has to
    * write a statement by hand.
@@ -324,6 +342,70 @@ async function ready(caseName: string): Promise<CatalogObjectTypeDef> {
 function skipping(context: { skip: () => void }, reason: string): void {
   console.log(`[contract] ${subject.name}: ${reason}`);
   context.skip();
+}
+
+/**
+ * Every catalog event published while `work` ran.
+ *
+ * Subscribed the way the shipped `CatalogAuditRecorder` subscribes — by
+ * iterating `CATALOG_EVENTS` and taking `channelNameFor` at its word — rather
+ * than by spying on `emitCatalog`. A spy passes on an event published under a
+ * name no recorder listens to, which is a trail that reaches nobody; a
+ * subscriber gets exactly what production would get, so membership in
+ * `CATALOG_EVENTS` is part of what these cases pin.
+ *
+ * The channel is process-global and these run against real engines, so the
+ * subscription is opened and closed around the one call under test rather than
+ * in a hook: anything another case is doing concurrently would otherwise land
+ * in the same list.
+ */
+async function eventsDuring(work: () => Promise<unknown>): Promise<Recorded[]> {
+  const recorded: Recorded[] = [];
+  const handlers = new Map<string, (message: unknown) => void>();
+  for (const event of CATALOG_EVENTS) {
+    const channel = channelNameFor(event);
+    const handler = (message: unknown): void => {
+      const envelope = message && typeof message === 'object' ? message : {};
+      const raw = Reflect.get(envelope, 'payload');
+      recorded.push({ event, payload: raw && typeof raw === 'object' ? { ...raw } : {} });
+    };
+    subscribe(channel, handler);
+    handlers.set(channel, handler);
+  }
+  try {
+    await work();
+  } finally {
+    for (const [channel, handler] of handlers) unsubscribe(channel, handler);
+  }
+  return recorded;
+}
+
+interface Recorded {
+  event: string;
+  payload: Record<string, unknown>;
+}
+
+/**
+ * The payloads published under `event` that name this type, and this snapshot
+ * where the payload carries one.
+ *
+ * Filtered rather than counted, and the cases below assert **at least one**
+ * match rather than exactly one. The fan-out adapter delegates a load to a
+ * primary and a follower that each emit, so one call through it legitimately
+ * publishes two of everything. Pinning a count here would assert the fan-out's
+ * delegation shape instead of the property under test, and would fail an adapter
+ * for being composed rather than for being silent.
+ */
+function announcing(
+  recorded: Recorded[],
+  event: string,
+  typeName: string,
+  snapshotId?: string,
+): Array<Record<string, unknown>> {
+  return recorded
+    .filter((each) => each.event === event && each.payload.typeName === typeName)
+    .filter((each) => snapshotId === undefined || each.payload.snapshotId === snapshotId)
+    .map((each) => each.payload);
 }
 
 /**
@@ -1378,6 +1460,135 @@ export function describeCatalogStoreContract(boot: () => ContractStore): void {
           order: each.order,
         })),
       );
+    });
+
+    describe('lifecycle events', () => {
+      /**
+       * Emission is not part of `CatalogWriteStore`. It is a side effect of five
+       * methods, so nothing in the type system pairs an adapter with the trail it
+       * owes — which is how `store-duckdb` shipped two releases publishing nothing
+       * at all on `aviary:catalog:*`, with no test failing and nothing at boot
+       * pointing it out. Both sides of that seam are silent: a consumer cannot
+       * tell "no snapshots have been committed" from "this store does not report
+       * commits". These cases are where the pairing lives instead.
+       */
+      it('announces a batch it wrote', async () => {
+        const def = await ready('ContractEventWritten');
+
+        const recorded = await eventsDuring(() =>
+          subject.store.write(def, [contractRow('a', 'alpha', 1), contractRow('b', 'bravo', 2)], {
+            snapshotId: 'events-written',
+            principalId: 'contract',
+            batch: 0,
+          }),
+        );
+
+        const written = announcing(recorded, 'snapshot.written', def.name, 'events-written');
+        expect(written.length).toBeGreaterThan(0);
+        // The rows THIS call took, which is what the event's own declaration says
+        // it carries and what lets a subscriber sum a load's batches into its
+        // size. A store reporting the snapshot's running total here would give a
+        // multi-batch load a lineage feed that double-counts every batch after
+        // the first.
+        expect(written[0]?.rows).toBe(2);
+        expect(written[0]?.principalId).toBe('contract');
+      });
+
+      it('announces the commit that made a load servable', async () => {
+        // The event with downstream subscribers today: a host driving retention
+        // off `snapshot.committed` gets, on a silent adapter, a subscription that
+        // succeeds and then waits forever.
+        const def = await ready('ContractEventCommitted');
+        await subject.store.write(def, [contractRow('a', 'alpha', 1)], {
+          snapshotId: 'events-committed',
+          principalId: 'contract',
+          batch: 0,
+        });
+
+        const recorded = await eventsDuring(() => subject.store.commit(def, 'events-committed'));
+
+        const committed = announcing(recorded, 'snapshot.committed', def.name, 'events-committed');
+        expect(committed.length).toBeGreaterThan(0);
+        expect(committed[0]?.rowCount).toBe(1);
+        expect(committed[0]?.principalId).toBe('contract');
+      });
+
+      it('stays quiet about a commit it refused', async (context) => {
+        // The negative half, and it is not decoration: without it the case above
+        // is satisfied by an adapter that announces a commit it did not perform,
+        // and a subscriber would act on a snapshot no read will ever be served
+        // from.
+        const def = await ready('ContractEventRefused');
+
+        const recorded = await eventsDuring(async () => {
+          await subject.store.commit(def, 'events-never-written').catch(() => undefined);
+        });
+
+        const committed = announcing(
+          recorded,
+          'snapshot.committed',
+          def.name,
+          'events-never-written',
+        );
+        if (committed.length > 0) {
+          // Committing an empty snapshot that nothing was ever written to is a
+          // legitimate shape — a full load of zero rows has to be publishable —
+          // so an adapter that accepts it has no refusal here to stay quiet
+          // about. Skipped out loud rather than asserted around, and the row
+          // count is still checked, because "announced a commit of nothing" and
+          // "announced a commit of something that is not there" are different
+          // answers and only the first is allowed.
+          expect(committed[0]?.rowCount).toBe(0);
+          skipping(
+            context,
+            'commits a snapshot nothing was written to rather than refusing it, so it has no refused commit to stay quiet about.',
+          );
+          return;
+        }
+        expect(committed).toEqual([]);
+      });
+
+      it('announces a drop', async (context) => {
+        const store = tombstoneSubject(context);
+        if (!store) return;
+
+        const def = await ready('ContractEventDropped');
+        await store.write(def, [contractRow('a', 'alpha', 1)], {
+          snapshotId: 'events-old',
+          principalId: 'contract',
+          batch: 0,
+        });
+        await store.commit(def, 'events-old');
+        await store.write(def, [contractRow('b', 'bravo', 2)], {
+          snapshotId: 'events-new',
+          principalId: 'contract',
+          batch: 0,
+        });
+        await store.commit(def, 'events-new');
+
+        const recorded = await eventsDuring(() => store.dropSnapshot(def, 'events-old'));
+
+        expect(
+          announcing(recorded, 'snapshot.dropped', def.name, 'events-old').length,
+        ).toBeGreaterThan(0);
+      });
+
+      it('announces the DDL it applied for a type it had never seen', async (context) => {
+        if (subject.noSchemaEventReason) {
+          skipping(context, `emits no schema.changed: ${subject.noSchemaEventReason}`);
+          return;
+        }
+        // A name no other case has used, so this is the CREATE path rather than a
+        // no-op on a table something else already made.
+        const def = contractType('ContractEventSchema');
+
+        const recorded = await eventsDuring(() => subject.publish(def));
+
+        const changed = announcing(recorded, 'schema.changed', def.name);
+        expect(changed.length).toBeGreaterThan(0);
+        expect(changed[0]?.created).toBe(true);
+        expect(Array.isArray(changed[0]?.addedColumns)).toBe(true);
+      });
     });
   });
 }
