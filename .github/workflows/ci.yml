@@ -35,6 +35,21 @@ jobs:
       # whole lesson of this file is what happens when that is allowed to be somebody's later.
       - run: pnpm typecheck
 
+      # The fourth gate, and the step the three above were standing in for.
+      #
+      # `typecheck` above proves the specs COMPILE. It says nothing about whether they pass,
+      # and until this step existed nothing in this repo ran them: 3,552 unit tests across 233
+      # files, none of them gating a merge, while `test-db` gated the store contract alone. A
+      # spec could be correct, compile, and assert something nobody had checked since it was
+      # written.
+      #
+      # Turning it on required fixing what it found first, which is why it arrives after the
+      # others rather than with them: `catalog.export.integration.spec.ts` read a streaming
+      # pipeline's parked row count after a fixed sleep and bounded it at a number that is a
+      # property of the machine's socket buffers rather than of the code, so it failed roughly
+      # one run in four on a pipeline that was working.
+      - run: pnpm test
+
   test-db:
     name: Store contract (real engines)
     runs-on: ubuntu-latest

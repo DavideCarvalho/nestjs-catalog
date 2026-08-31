@@ -330,6 +330,62 @@ function idle(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * How many rows the generator had produced once it stopped producing, or a
+ * failure naming which way it did not stop.
+ *
+ * ## Why this is polled rather than read after a sleep
+ *
+ * *When* a paused pipeline reaches its parked state depends on how much CPU
+ * this process is getting. Reading the count after a fixed sleep therefore
+ * samples a mid-flight number whenever the machine is busy, and the caller's
+ * "did it creep on afterwards?" assertion then compares the real plateau
+ * against that. Measured: a full-suite run read 6,300 at 300ms and 9,450 two
+ * hundred milliseconds later, and failed — on a pipeline that was working.
+ *
+ * ## Why "stopped" is a quiet window and not two equal readings
+ *
+ * The generator advances a batch at a time, so two polls a few milliseconds
+ * apart land inside one gap between bursts routinely, and reading that as the
+ * plateau is the same mid-flight sample in a different disguise. Measured, by an
+ * earlier version of this helper that did exactly that: it returned 3,906
+ * against a real plateau of 11,592.
+ *
+ * ## Why there is a ceiling
+ *
+ * Because a pipeline that ignores back-pressure also stops producing — at the
+ * end of the table — so a quiet window on its own is satisfied by the very
+ * failure this is here to catch. The ceiling turns that into a refusal, and it
+ * throws at the ceiling rather than letting the run continue so the rows never
+ * reach the heap.
+ */
+async function parkedAt(store: StreamingStore, ceiling: number): Promise<number> {
+  const QUIET_MS = 250;
+  const DEADLINE_MS = 5_000;
+  const startedAt = Date.now();
+  let counted = store.produced;
+  let changedAt = startedAt;
+
+  while (Date.now() - startedAt < DEADLINE_MS) {
+    await idle(25);
+    const { produced } = store;
+    if (produced >= ceiling) {
+      throw new Error(
+        `The generator reached ${produced} rows while the client was paused, past the ${ceiling}-row ceiling. Back-pressure is not reaching it.`,
+      );
+    }
+    if (produced !== counted) {
+      counted = produced;
+      changedAt = Date.now();
+      continue;
+    }
+    if (counted > 0 && Date.now() - changedAt >= QUIET_MS) return counted;
+  }
+  throw new Error(
+    `The generator never parked: it was at ${store.produced} rows after ${DEADLINE_MS}ms, last moving ${Date.now() - changedAt}ms earlier.`,
+  );
+}
+
 // ---------------------------------------------------------------------------
 
 describe('exporting a saved query as CSV', () => {
@@ -366,21 +422,26 @@ describe('exporting a saved query as CSV', () => {
     // process then races ahead of a slow client and holds the rows it has not
     // managed to send: back-pressure has to reach from the socket, through the
     // pipe and the readable, into the generator.
-    const store = new StreamingStore(200_000);
+    // Two million rows, of which a working pipeline pulls a few thousand. The
+    // table is deliberately far larger than anything that can be buffered, so
+    // "parked" and "ran to the end" are separated by two orders of magnitude
+    // rather than by a margin. It costs nothing: the generator only produces
+    // what is pulled out of it.
+    const store = new StreamingStore(2_000_000);
     app = await boot(store);
 
     const response = await open(app);
     response.pause();
-    await idle(300);
 
-    const parked = store.produced;
+    // 50,000 rows is 25MB, and it is a bound on the machine's socket buffers
+    // rather than on the code — which is why it is this loose. Measured over
+    // fifteen runs here, the plateau ranged from 3,024 rows to 22,554, because
+    // how much a paused loopback socket absorbs is up to TCP window tuning and
+    // not up to this pipeline. The predecessor of this line asserted `< 20_000`
+    // and failed roughly one run in four for that reason, on code that was
+    // working. What does NOT vary is the distance to 2,000,000.
+    const parked = await parkedAt(store, 50_000);
     expect(parked).toBeGreaterThan(0);
-    // Bounded by the buffers between the generator and the socket, which are
-    // measured in kilobytes. 20,000 rows of 512 bytes is ten megabytes — an
-    // order of magnitude past anything those buffers hold, and still a tenth of
-    // the table, so this fails loudly on a pipeline that ignores back-pressure
-    // without being sensitive to what any one buffer is sized at.
-    expect(parked).toBeLessThan(20_000);
 
     await idle(200);
     // Still parked: the generator did not creep on while nobody was reading.
