@@ -12,7 +12,10 @@ import { ensureBucket, s3ObjectStore } from './s3-object-store';
  * mechanism the pointer swap rests on, and a fake that returned `undefined` on a losing race
  * would pass while proving nothing about `If-Match`.
  */
-const MINIO_IMAGE = 'minio/minio:RELEASE.2025-04-22T22-12-26Z';
+// quay.io, not Docker Hub: MinIO withdrew the `minio/minio` repository from Hub, which now
+// answers 404 there, and testcontainers surfaces that as "pull access denied ... may require
+// docker login". Same release, same digest — only the registry moved.
+const MINIO_IMAGE = 'quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z';
 
 let container: StartedTestContainer;
 let store: ObjectStore;
