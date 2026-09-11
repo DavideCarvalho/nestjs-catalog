@@ -37,7 +37,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@dudousxd/nestjs-diagnostics": "0.7.0"
+    "@dudousxd/nestjs-diagnostics": "0.7.1"
   },
   "peerDependencies": {
     "@dudousxd/nestjs-catalog": ">=0.1.0",
