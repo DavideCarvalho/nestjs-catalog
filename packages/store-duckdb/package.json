@@ -44,7 +44,7 @@
     }
   },
   "devDependencies": {
-    "@aws-sdk/client-s3": "3.946.0",
+    "@aws-sdk/client-s3": "3.1128.0",
     "@duckdb/node-api": "1.5.5-r.4",
     "@dudousxd/nestjs-catalog": "workspace:*",
     "@nestjs/common": "11.1.19",
