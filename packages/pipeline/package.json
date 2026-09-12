@@ -39,7 +39,7 @@
     "@aws-sdk/client-s3": "3.1104.0",
     "@dudousxd/nestjs-catalog": "workspace:*",
     "@dudousxd/nestjs-catalog-store-mikro-orm": "workspace:*",
-    "@dudousxd/nestjs-durable": "0.39.1",
+    "@dudousxd/nestjs-durable": "0.43.1",
     "@dudousxd/nestjs-durable-core": "0.70.0",
     "@mikro-orm/core": "7.0.17",
     "@mikro-orm/mysql": "7.0.17",
