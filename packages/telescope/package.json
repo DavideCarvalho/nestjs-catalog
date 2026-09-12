@@ -50,7 +50,7 @@
   },
   "devDependencies": {
     "@dudousxd/nestjs-catalog": "workspace:*",
-    "@dudousxd/nestjs-telescope": "1.24.0",
+    "@dudousxd/nestjs-telescope": "1.29.0",
     "@nestjs/common": "11.1.19",
     "@nestjs/core": "11.1.19",
     "@types/node": "25.6.0",
