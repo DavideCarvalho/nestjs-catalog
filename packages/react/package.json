@@ -9,6 +9,9 @@
     "url": "https://github.com/DavideCarvalho/nestjs-catalog.git",
     "directory": "packages/react"
   },
+  "bugs": {
+    "url": "https://github.com/DavideCarvalho/nestjs-catalog/issues"
+  },
   "keywords": [
     "nestjs",
     "catalog",

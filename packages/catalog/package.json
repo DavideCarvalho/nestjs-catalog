@@ -8,6 +8,9 @@
     "type": "git",
     "url": "https://github.com/DavideCarvalho/nestjs-catalog.git"
   },
+  "bugs": {
+    "url": "https://github.com/DavideCarvalho/nestjs-catalog/issues"
+  },
   "keywords": [
     "nestjs",
     "catalog",
