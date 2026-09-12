@@ -223,17 +223,16 @@ export const ARCHIVE_ROW_GROUP_ROWS = 20_000;
  * *string* rather than a number, so nothing reaches here that a double would
  * narrow. This mapping cannot lose a digit that the ordinary read path keeps.
  *
- * ## `json` and `unknown` are STRING, and that is a bug being routed around
+ * ## `json` and `unknown` are STRING
  *
- * Parquet has a JSON logical type, `hyparquet-writer` offers it, and it **loses
- * data**. Measured against 0.16.5, which is the current release: a JSON column
- * holding `[{a:1}, null, {c:3}]` reads back as `[{a:1}, null, null]`, and
- * `[null, {b:2}, {c:3}]` reads back as `[null, null, {b:2}]`. Values after a
- * null are dropped or shifted. It is the writer rather than this package's
- * reader — hyparquet's own `parquetReadObjects`, with no custom parsers,
- * produces the same wrong answer from the same file — and the same three cases
- * are exact for STRING, DOUBLE and BOOLEAN, so it is specific to that one
- * encoder. A nullable JSON column is the ordinary case here, not an exotic one.
+ * Parquet has a JSON logical type and `hyparquet-writer` offers it. This does
+ * not use it. The encoding was chosen when that type lost data — through 0.16.5
+ * a JSON column holding `[{a:1}, null, {c:3}]` read back as
+ * `[{a:1}, null, null]`, values after a null dropped or shifted — and 0.16.9
+ * writes them correctly, so that reason is spent. What keeps the encoding now is
+ * the format: every archive already written stores its JSON columns as text, and
+ * switching changes what a reader finds in new ones. `snapshot-archive.spec.ts`
+ * asserts the writer is still correct, so the door stays open.
  *
  * So the value is serialised to text and written as a STRING, which round-trips
  * exactly. What that costs is a real divergence and it is worth naming: an
