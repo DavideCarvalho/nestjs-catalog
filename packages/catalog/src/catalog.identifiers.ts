@@ -121,7 +121,7 @@ export function assertSafeIdentifier(value: string): void {
  * refusal and the DDL have to be running the same cleaning rather than two
  * copies of it. `store-mikro-orm` and `store-clickhouse` each carried a
  * byte-identical private copy, and `store-mikro-orm` carried two of its own —
- * one in `query.ts` for the view, one in `mysql-warehouse.store.ts` for
+ * one in `query.ts` for the view, one in `warehouse.store.ts` for
  * everything else. Three copies of the function that decides where a column's
  * data lives is three chances for a view to point at a column no load ever
  * wrote.
