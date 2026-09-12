@@ -297,8 +297,8 @@ describe('archiveSnapshot', () => {
 
     // Every column comes back as it went in, except the two the manifest calls
     // `json` and `unknown` — those come back as the JSON text they were stored
-    // as. That divergence is the price of routing around the writer's JSON bug
-    // and it is what the manifest exists to make undoable.
+    // as. That divergence is the price of the text encoding and it is what the
+    // manifest exists to make undoable.
     expect(back).toEqual(
       rows.map((row) => ({
         ...row,
@@ -314,16 +314,17 @@ describe('archiveSnapshot', () => {
   });
 
   /**
-   * The upstream bug this file routes around, pinned so a fixed release is
-   * noticed rather than assumed.
+   * `hyparquet-writer` used to drop or shift JSON values that followed a null
+   * inside a row group, which is why {@link parquetTypeFor} carries JSON as
+   * text. 0.16.9 writes them correctly, so the text encoding is now a choice
+   * rather than a workaround — the archive format is what keeps it, since
+   * changing it rewrites how every new archive stores its JSON columns.
    *
-   * `hyparquet-writer` 0.16.5 — the current release — drops or shifts JSON
-   * values that follow a null inside a row group. It is the writer and not this
-   * package's reader: hyparquet's own reader, with no custom parsers, produces
-   * the same wrong answer from the same bytes. If this test ever fails, the bug
-   * is fixed and `parquetTypeFor` can stop encoding JSON as text.
+   * Kept pointed the other way round: this asserts the writer is still correct,
+   * so a regression upstream is noticed here rather than in an archive nobody
+   * reads back until they need it.
    */
-  it('pins the hyparquet-writer JSON-after-null bug that forces the text encoding', async () => {
+  it('round-trips a JSON value that follows a null, which the writer once did not', async () => {
     const parquet = await import('hyparquet-writer');
     const writer = new parquet.ByteWriter();
     await parquet.parquetWriteRows({
@@ -342,8 +343,7 @@ describe('archiveSnapshot', () => {
     for await (const record of parquetRecordsFrom(file, 'json-bug')) {
       if (record !== null && typeof record === 'object' && 'v' in record) back.push(record.v);
     }
-    // The third value is `{ c: 3 }` on the way in and null on the way out.
-    expect(back).toEqual([{ a: 1 }, null, null]);
+    expect(back).toEqual([{ a: 1 }, null, { c: 3 }]);
   });
 
   it('writes a manifest that maps the archive back to the object type', async () => {
