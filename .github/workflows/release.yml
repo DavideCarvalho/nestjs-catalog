@@ -25,20 +25,13 @@ jobs:
         uses: pnpm/action-setup@v6.1.0
 
       - name: Setup Node
-        uses: actions/setup-node@v4.4.0
+        uses: actions/setup-node@v7.0.0
         with:
           # pnpm 11.5 (the pinned packageManager) needs Node >= 22.13; .nvmrc pins it.
           node-version-file: .nvmrc
           cache: pnpm
           # Writes ~/.npmrc pointing at npm and reading NODE_AUTH_TOKEN, so
           # `changeset publish` authenticates without a committed token.
-          # HELD AT v4. This job publishes over OIDC with no NODE_AUTH_TOKEN, as the changesets
-          # step below explains. v7 stops exporting setup-node's dummy token but still writes
-          # `//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}` into .npmrc either way, so with
-          # the variable unset that line carries an unresolved reference. Whether npm reads that
-          # as absent, and proceeds to the OIDC exchange, or as empty, and does not, decides
-          # whether this job can publish — and no CI job exercises the path. Bump it on its own,
-          # with a package to publish.
           registry-url: "https://registry.npmjs.org"
 
       # This repo publishes with npm trusted publishing (OIDC) rather than a
