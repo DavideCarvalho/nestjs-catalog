@@ -203,18 +203,20 @@ async function provenanceTable() {
 /**
  * Choose a strategy from the vendored select.
  *
- * Keyboard rather than a click on the option, and the reason is worth recording: Base UI commits a
- * selection on the pointer sequence a real mouse produces, which `fireEvent.click` alone is not —
- * the click lands, the popup closes, and nothing is selected, so the test passes for the wrong
- * reason. Enter on the highlighted item is a real way to operate the control and one jsdom can
- * deliver faithfully.
+ * The full pointer sequence, because Base UI commits on what a real mouse produces and a bare
+ * `fireEvent.click` is not it — on any option but the highlighted one the click lands and nothing
+ * is selected, so the test would pass for the wrong reason.
+ *
+ * Waits on the value the control ends up showing rather than on the popup going away: the options
+ * stay mounted after a selection, so their absence marks nothing.
  */
 async function chooseStrategy(match: RegExp) {
   fireEvent.click(strategySelect());
   const option = await screen.findByRole('option', { name: match });
-  fireEvent.keyDown(option, { key: 'Enter' });
-  fireEvent.keyUp(option, { key: 'Enter' });
-  await waitFor(() => expect(screen.queryByRole('option', { name: match })).toBeNull());
+  fireEvent.pointerDown(option);
+  fireEvent.pointerUp(option);
+  fireEvent.click(option);
+  await waitFor(() => expect(strategySelect().textContent).toMatch(match));
 }
 
 /** Submit the form itself, past the disabled button — what Enter in a field does. */
