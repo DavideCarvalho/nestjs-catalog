@@ -47,7 +47,7 @@
     "@types/node": "25.6.0",
     "cron-parser": "^5.7.0",
     "hyparquet": "1.28.1",
-    "hyparquet-writer": "0.16.5",
+    "hyparquet-writer": "0.16.9",
     "typescript": "5.9.3",
     "xlsx": "npm:@e965/xlsx@0.20.3"
   }
