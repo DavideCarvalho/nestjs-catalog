@@ -25,7 +25,7 @@ jobs:
         uses: pnpm/action-setup@v6.1.0
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v4.4.0
         with:
           # pnpm 11.5 (the pinned packageManager) needs Node >= 22.13; .nvmrc pins it.
           node-version-file: .nvmrc
