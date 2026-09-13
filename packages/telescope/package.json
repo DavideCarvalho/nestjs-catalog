@@ -53,7 +53,7 @@
     "@dudousxd/nestjs-telescope": "1.29.0",
     "@nestjs/common": "11.1.19",
     "@nestjs/core": "11.1.19",
-    "@types/node": "25.6.0",
+    "@types/node": "25.9.6",
     "typescript": "5.9.3"
   },
   "//engines": "22, not 20. This package emits CommonJS (matching @dudousxd/nestjs-catalog's tsconfig, so both compile identically inside a host) while @dudousxd/nestjs-telescope and @dudousxd/nestjs-diagnostics are ESM-only, so loading it needs require(esm) — stable from Node 22.",
