@@ -90,7 +90,7 @@
     "@dudousxd/nestjs-catalog": "workspace:*",
     "@pierre/diffs": "1.3.3",
     "@tanstack/react-query": "5.102.8",
-    "@tanstack/react-table": "9.0.0",
+    "@tanstack/react-table": "9.2.4",
     "@tiptap/core": "3.29.2",
     "@tiptap/pm": "3.29.2",
     "@tiptap/react": "3.29.2",
