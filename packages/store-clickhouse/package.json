@@ -43,7 +43,7 @@
     "@clickhouse/client": "1.23.1",
     "@dudousxd/nestjs-catalog": "workspace:*",
     "@nestjs/common": "11.1.19",
-    "@types/node": "25.6.0",
+    "@types/node": "25.9.6",
     "typescript": "5.9.3"
   }
 }
