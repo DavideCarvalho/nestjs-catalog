@@ -181,8 +181,8 @@ importers:
         specifier: workspace:*
         version: link:../store-mikro-orm
       '@dudousxd/nestjs-durable':
-        specifier: 0.43.1
-        version: 0.43.1(@dudousxd/nestjs-durable-core@0.70.0(cron-parser@5.10.0)(reflect-metadata@0.2.2)(zod@3.25.76))(@nestjs/common@11.1.19(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.1.19)(reflect-metadata@0.2.2)(zod@3.25.76)
+        specifier: 0.43.2
+        version: 0.43.2(@dudousxd/nestjs-durable-core@0.70.0(cron-parser@5.10.0)(reflect-metadata@0.2.2)(zod@3.25.76))(@nestjs/common@11.1.19(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.1.19)(reflect-metadata@0.2.2)(zod@3.25.76)
       '@dudousxd/nestjs-durable-core':
         specifier: 0.70.0
         version: 0.70.0(cron-parser@5.10.0)(reflect-metadata@0.2.2)(zod@3.25.76)
@@ -933,8 +933,8 @@ packages:
       cron-parser:
         optional: true
 
-  '@dudousxd/nestjs-durable@0.43.1':
-    resolution: {integrity: sha512-MEm1bM2K+sG/IizqhKlHwiyj9BoPP9EqRH7iyjwXcXE2g1bYZw2M/5QFH8GRn4QZ9xt0KxJD1hpN5XkTLD2WJw==}
+  '@dudousxd/nestjs-durable@0.43.2':
+    resolution: {integrity: sha512-bI+RTNaI8OlcXSTdCUUAXknpS2uKttg+aAGejMlcgTLBrhymnqa8Uhb9RAewT9+xxmLg4DwtUpUsyFMtnPIAIg==}
     peerDependencies:
       '@dudousxd/durable-worker': '>=0.1.0 <1.0.0'
       '@dudousxd/nestjs-context': '>=0.1.0 <1.0.0'
@@ -5541,7 +5541,7 @@ snapshots:
     optionalDependencies:
       cron-parser: 5.10.0
 
-  '@dudousxd/nestjs-durable@0.43.1(@dudousxd/nestjs-durable-core@0.70.0(cron-parser@5.10.0)(reflect-metadata@0.2.2)(zod@3.25.76))(@nestjs/common@11.1.19(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.1.19)(reflect-metadata@0.2.2)(zod@3.25.76)':
+  '@dudousxd/nestjs-durable@0.43.2(@dudousxd/nestjs-durable-core@0.70.0(cron-parser@5.10.0)(reflect-metadata@0.2.2)(zod@3.25.76))(@nestjs/common@11.1.19(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.1.19)(reflect-metadata@0.2.2)(zod@3.25.76)':
     dependencies:
       '@dudousxd/nestjs-durable-core': 0.70.0(cron-parser@5.10.0)(reflect-metadata@0.2.2)(zod@3.25.76)
       '@nestjs/common': 11.1.19(reflect-metadata@0.2.2)(rxjs@7.8.2)
