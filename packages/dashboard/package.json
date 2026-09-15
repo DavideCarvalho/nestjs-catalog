@@ -65,7 +65,7 @@
     "@dudousxd/nestjs-catalog-react": "workspace:*",
     "@tanstack/react-query": "5.102.8",
     "@vitejs/plugin-react": "4.7.0",
-    "lucide-react": "0.468.0",
+    "lucide-react": "0.577.0",
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "@types/react": "19.2.18",
