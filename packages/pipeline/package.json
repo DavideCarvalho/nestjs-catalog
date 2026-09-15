@@ -43,7 +43,7 @@
     "@dudousxd/nestjs-catalog": "workspace:*",
     "@dudousxd/nestjs-catalog-store-mikro-orm": "workspace:*",
     "@dudousxd/nestjs-durable": "0.43.2",
-    "@dudousxd/nestjs-durable-core": "0.70.0",
+    "@dudousxd/nestjs-durable-core": "0.70.1",
     "@mikro-orm/core": "7.0.17",
     "@mikro-orm/mysql": "7.0.17",
     "@nestjs/common": "11.1.19",
