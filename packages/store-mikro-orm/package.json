@@ -46,7 +46,7 @@
     "@mikro-orm/decorators": "7.0.17",
     "@mikro-orm/mysql": "7.0.17",
     "@mikro-orm/postgresql": "7.0.17",
-    "@nestjs/common": "11.1.19",
+    "@nestjs/common": "11.2.3",
     "@types/node": "25.9.6",
     "pg": "8.13.1",
     "typescript": "5.9.3",
