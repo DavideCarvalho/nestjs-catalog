@@ -1,5 +1,11 @@
 # @dudousxd/nestjs-catalog-store-fanout
 
+## 0.4.1
+
+### Patch Changes
+
+- fix(deps): update dependency @dudousxd/nestjs-diagnostics to v0.7.2 ([#193](https://github.com/DavideCarvalho/nestjs-catalog/issues/193))
+
 ## 0.4.0
 
 ### Minor Changes

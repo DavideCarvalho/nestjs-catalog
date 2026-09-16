@@ -1,5 +1,11 @@
 # @dudousxd/nestjs-catalog
 
+## 0.34.2
+
+### Patch Changes
+
+- fix(deps): update dependency @dudousxd/nestjs-diagnostics to v0.7.2 ([#193](https://github.com/DavideCarvalho/nestjs-catalog/issues/193))
+
 ## 0.34.1
 
 ### Patch Changes
