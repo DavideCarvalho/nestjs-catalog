@@ -49,9 +49,9 @@
     "@nestjs/core": "11.1.19",
     "@types/node": "25.9.6",
     "typescript": "5.9.3",
-    "@dudousxd/nestjs-diagnostics": "0.7.1"
+    "@dudousxd/nestjs-diagnostics": "0.7.2"
   },
   "dependencies": {
-    "@dudousxd/nestjs-diagnostics": "0.7.1"
+    "@dudousxd/nestjs-diagnostics": "0.7.2"
   }
 }
