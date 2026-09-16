@@ -46,6 +46,6 @@
     "typescript": "5.9.3"
   },
   "dependencies": {
-    "@dudousxd/nestjs-diagnostics": "0.7.1"
+    "@dudousxd/nestjs-diagnostics": "0.7.2"
   }
 }
