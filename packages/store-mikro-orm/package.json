@@ -48,7 +48,7 @@
     "@mikro-orm/postgresql": "7.0.17",
     "@nestjs/common": "11.1.19",
     "@types/node": "25.9.6",
-    "pg": "8.13.1",
+    "pg": "8.23.0",
     "typescript": "5.9.3",
     "@mikro-orm/sql": "7.0.17"
   },
