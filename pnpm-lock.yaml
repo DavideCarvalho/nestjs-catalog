@@ -172,8 +172,8 @@ importers:
   packages/pipeline:
     devDependencies:
       '@aws-sdk/client-s3':
-        specifier: 3.1132.0
-        version: 3.1132.0
+        specifier: 3.1133.0
+        version: 3.1133.0
       '@dudousxd/nestjs-catalog':
         specifier: workspace:*
         version: link:../catalog
@@ -326,8 +326,8 @@ importers:
   packages/secrets-aws:
     devDependencies:
       '@aws-sdk/client-kms':
-        specifier: 3.1132.0
-        version: 3.1132.0
+        specifier: 3.1133.0
+        version: 3.1133.0
       '@dudousxd/nestjs-catalog':
         specifier: workspace:*
         version: link:../catalog
@@ -377,8 +377,8 @@ importers:
   packages/store-duckdb:
     devDependencies:
       '@aws-sdk/client-s3':
-        specifier: 3.1132.0
-        version: 3.1132.0
+        specifier: 3.1133.0
+        version: 3.1133.0
       '@duckdb/node-api':
         specifier: 1.5.5-r.5
         version: 1.5.5-r.5
@@ -491,12 +491,12 @@ packages:
     resolution: {integrity: sha512-6uTniZc87q+B5eXouGTl+7Tmc482rEeCcvxpsvREP8EfF0gvloRZ41UOA9sbSJlyy8TbqIBXb3kKfKarEArUQA==}
     engines: {node: '>=20.0.0'}
 
-  '@aws-sdk/client-kms@3.1132.0':
-    resolution: {integrity: sha512-bJMqHHmSaQXXrczadq5vzXd9Gd8MGw3HDUFsr3h97DjRl9pX8LmX79vWF8tRgyljHQjTHXapj8E8qtP2h3C9bQ==}
+  '@aws-sdk/client-kms@3.1133.0':
+    resolution: {integrity: sha512-mM/vqPsT97lNsH0shXqAAuWHDLJExKnKwFvva5l5uyJPRZfF1tHC78CVzmyt9L3EMc5ibjguwGEIQogQvas9+Q==}
     engines: {node: '>=20.0.0'}
 
-  '@aws-sdk/client-s3@3.1132.0':
-    resolution: {integrity: sha512-ccS2utR3YpKE1KEkAlo1Oq9kUhzy/IOIbpwHAcENn/JzpzCj9l79I2o6stTzXGOKbL8+XEdH2P7c2Znp8PbBlQ==}
+  '@aws-sdk/client-s3@3.1133.0':
+    resolution: {integrity: sha512-b7IVvFjNxNt6i//qUr2tWQC1JhUY0HpIiM41vvXv30br/nuXjYtKAADrMFluxGYX0X7LQB5GvzUcFDxNOoLMLg==}
     engines: {node: '>=20.0.0'}
 
   '@aws-sdk/core@3.978.0':
@@ -5133,7 +5133,7 @@ snapshots:
       '@smithy/types': 4.18.0
       tslib: 2.8.1
 
-  '@aws-sdk/client-kms@3.1132.0':
+  '@aws-sdk/client-kms@3.1133.0':
     dependencies:
       '@aws-sdk/core': 3.978.0
       '@aws-sdk/credential-provider-node': 3.972.83
@@ -5144,7 +5144,7 @@ snapshots:
       '@smithy/types': 4.18.0
       tslib: 2.8.1
 
-  '@aws-sdk/client-s3@3.1132.0':
+  '@aws-sdk/client-s3@3.1133.0':
     dependencies:
       '@aws-sdk/checksums': 3.1001.0
       '@aws-sdk/core': 3.978.0
