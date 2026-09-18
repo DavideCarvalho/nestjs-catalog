@@ -47,7 +47,7 @@
     "@nestjs/common": ">=10"
   },
   "devDependencies": {
-    "@aws-sdk/client-kms": "3.1131.0",
+    "@aws-sdk/client-kms": "3.1132.0",
     "@dudousxd/nestjs-catalog": "workspace:*",
     "@nestjs/common": "11.1.19",
     "@types/node": "25.9.6",
