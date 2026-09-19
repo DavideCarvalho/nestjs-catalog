@@ -52,7 +52,7 @@
     "@dudousxd/nestjs-catalog": "workspace:*",
     "@nestjs/common": "11.1.19",
     "@types/node": "25.9.7",
-    "testcontainers": "10.16.0",
+    "testcontainers": "10.28.0",
     "typescript": "5.9.3"
   }
 }
