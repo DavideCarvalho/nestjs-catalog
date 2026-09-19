@@ -47,7 +47,7 @@
   "devDependencies": {
     "@dudousxd/nestjs-catalog": "workspace:*",
     "@nestjs/common": "11.1.19",
-    "@types/node": "25.9.6",
+    "@types/node": "25.9.7",
     "typescript": "5.9.3"
   },
   "//engines": "18 is where global fetch became available unflagged enough to rely on, and AbortSignal.timeout landed in 17.3. A host on an older runtime can still use this by passing its own `fetch`.",
