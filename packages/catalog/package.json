@@ -45,8 +45,8 @@
   },
   "devDependencies": {
     "@mikro-orm/core": "7.0.17",
-    "@nestjs/common": "11.1.19",
-    "@nestjs/core": "11.1.19",
+    "@nestjs/common": "11.2.5",
+    "@nestjs/core": "11.2.5",
     "@types/node": "25.9.7",
     "typescript": "5.9.3",
     "@dudousxd/nestjs-diagnostics": "0.7.2"
