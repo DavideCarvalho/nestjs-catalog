@@ -202,8 +202,8 @@ importers:
         specifier: 5.10.1
         version: 5.10.1
       hyparquet:
-        specifier: 1.31.0
-        version: 1.31.0
+        specifier: 1.31.1
+        version: 1.31.1
       hyparquet-writer:
         specifier: 0.16.9
         version: 0.16.9
@@ -3441,8 +3441,8 @@ packages:
   hyparquet@1.29.2:
     resolution: {integrity: sha512-2LxinZ8X0JqToST+9OXcy9t3t5Q7ZneMTkSqUx/36Hv18pCTk/N71IWZc7APTSNG1Me39l/jjEvzZSZ0R+Knbw==}
 
-  hyparquet@1.31.0:
-    resolution: {integrity: sha512-jd1eIm+dPFuJAHzgWWW+GXkTYoGXwTJpGreoQA4SYnsMBPO3cAhf+N1bt1+1kUseo5/81g5RBKjT+MZtif2C7Q==}
+  hyparquet@1.31.1:
+    resolution: {integrity: sha512-tF9580Xb+41+Eb+mH0av1k7m1PWl+PSKrX66Yd7UOZ760cwEXP9/enwHRMSCeVncaubRI8XPb3v580/ujYKK5w==}
 
   iconv-lite@0.6.3:
     resolution: {integrity: sha512-4fCk79wshMdzMp2rH06qWrJE4iolqLhCUH+OiuIgU++RB0+94NlDL81atO7GX55uUKueo0txHNtvEyI6D7WdMw==}
@@ -8080,7 +8080,7 @@ snapshots:
 
   hyparquet@1.29.2: {}
 
-  hyparquet@1.31.0: {}
+  hyparquet@1.31.1: {}
 
   iconv-lite@0.6.3:
     dependencies:
