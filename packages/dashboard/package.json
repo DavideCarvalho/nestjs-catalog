@@ -59,7 +59,7 @@
   "devDependencies": {
     "@nestjs/common": "11.2.5",
     "@nestjs/core": "11.2.5",
-    "@types/node": "25.9.7",
+    "@types/node": "25.9.8",
     "typescript": "5.9.3",
     "tsup": "8.5.1",
     "@dudousxd/nestjs-catalog-react": "workspace:*",
