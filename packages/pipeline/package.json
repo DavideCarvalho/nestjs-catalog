@@ -47,7 +47,7 @@
     "@mikro-orm/core": "7.0.17",
     "@mikro-orm/mysql": "7.0.17",
     "@nestjs/common": "11.2.5",
-    "@types/node": "25.9.7",
+    "@types/node": "25.9.8",
     "cron-parser": "5.10.1",
     "hyparquet": "1.31.1",
     "hyparquet-writer": "0.16.9",

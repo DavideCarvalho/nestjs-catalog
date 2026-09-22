@@ -51,7 +51,7 @@
     "@duckdb/node-api": "1.5.5-r.5",
     "@dudousxd/nestjs-catalog": "workspace:*",
     "@nestjs/common": "11.2.5",
-    "@types/node": "25.9.7",
+    "@types/node": "25.9.8",
     "testcontainers": "10.16.0",
     "typescript": "5.9.3"
   }
