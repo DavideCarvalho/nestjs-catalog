@@ -17,7 +17,7 @@
     "test:db": "vitest run --config vitest.db.config.ts"
   },
   "devDependencies": {
-    "@biomejs/biome": "1.9.4",
+    "@biomejs/biome": "2.5.14",
     "@changesets/changelog-github": "0.7.0",
     "@changesets/cli": "2.31.1",
     "@dudousxd/nestjs-catalog": "workspace:*",
