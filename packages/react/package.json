@@ -115,13 +115,13 @@
     "react": "19.3.0",
     "react-dom": "19.3.0",
     "recharts": "2.15.4",
-    "tailwind-merge": "3.4.1",
+    "tailwind-merge": "3.7.0",
     "tiptap-markdown": "0.9.0",
     "typescript": "5.9.3"
   },
   "dependencies": {
     "clsx": "2.1.1",
-    "tailwind-merge": "3.4.1"
+    "tailwind-merge": "3.7.0"
   },
   "peerDependenciesMeta": {
     "recharts": {
