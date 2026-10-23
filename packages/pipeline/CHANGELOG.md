@@ -1,5 +1,14 @@
 # @dudousxd/nestjs-catalog-pipeline
 
+## 0.30.1
+
+### Patch Changes
+
+- [#225](https://github.com/DavideCarvalho/nestjs-catalog/pull/225) [`91e5fba`](https://github.com/DavideCarvalho/nestjs-catalog/commit/91e5fba4440b6303fbb1217249214672c1f851d0) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Guarantee catalog runs are stamped with `origin: '@dudousxd/nestjs-catalog-pipeline'`, so the durable
+  console's ORIGIN facet separates `catalog.connector-run` / `catalog.workflow-run` from the app's own
+  runs. The origin is derived by `@dudousxd/nestjs-durable` from the `@Workflow` classes' declaring
+  file, which only happens from 0.40.0 on, so the peer range moves from `>=0.39.0` to `>=0.40.0`.
+
 ## 0.30.0
 
 ### Minor Changes
@@ -2543,9 +2552,9 @@ equals?}` or `{kind: 'rowCount', atLeast}` — where it used to carry `envVar` a
   Every scheduled connector in a deployment was silently inert. The worker said so
   at boot, once, and contradicted itself on the next line:
 
-                                            ERROR [ConnectorScheduler] No connector will run on a schedule:
-                                                  parser.parseExpression is not a function.
-                                            LOG   [ConnectorScheduler] Watching connector schedules every 30000ms.
+                                              ERROR [ConnectorScheduler] No connector will run on a schedule:
+                                                    parser.parseExpression is not a function.
+                                              LOG   [ConnectorScheduler] Watching connector schedules every 30000ms.
 
   `cron-parser` v4 exported `parseExpression`; v5 replaced it with
   `CronExpressionParser.parse`. The durable core read only the v4 shape, so
