@@ -23,7 +23,7 @@
     "@dudousxd/nestjs-catalog": "workspace:*",
     "@nestjs/platform-express": "11.2.5",
     "@nestjs/testing": "11.2.5",
-    "@swc/core": "1.16.2",
+    "@swc/core": "1.16.18",
     "@testcontainers/mysql": "10.16.0",
     "@testcontainers/postgresql": "10.16.0",
     "@testing-library/dom": "10.4.2",
