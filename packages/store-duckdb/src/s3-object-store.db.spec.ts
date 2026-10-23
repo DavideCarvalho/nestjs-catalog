@@ -12,22 +12,19 @@ import { ensureBucket, s3ObjectStore } from './s3-object-store';
  * mechanism the pointer swap rests on, and a fake that returned `undefined` on a losing race
  * would pass while proving nothing about `If-Match`.
  */
-// Chainguard's MinIO build: MinIO withdrew its public images, first `minio/minio` on Docker Hub
-// (now 404, which testcontainers surfaces as "pull access denied ... may require docker login") and
-// then the quay.io mirror (now "unauthorized"). Chainguard publishes a maintained build that still
-// pulls anonymously; its entrypoint is `minio` and it runs as a non-root user, so the data directory
-// lives under /tmp, which that user can write.
-const MINIO_IMAGE = 'cgr.dev/chainguard/minio:latest';
+// RustFS, an S3-compatible store that pulls anonymously from Docker Hub. MinIO withdrew its public
+// images (Docker Hub `minio/minio` answers 404, the quay.io mirror "unauthorized"). Pinned so a new
+// release can't change conditional-write behaviour under the test.
+const S3_IMAGE = 'rustfs/rustfs:1.0.3';
 
 let container: StartedTestContainer;
 let store: ObjectStore;
 
 beforeAll(async () => {
-  container = await new GenericContainer(MINIO_IMAGE)
-    .withCommand(['server', '/tmp/minio-data'])
-    .withEnvironment({ MINIO_ROOT_USER: 'catalog', MINIO_ROOT_PASSWORD: 'catalogsecret' })
+  container = await new GenericContainer(S3_IMAGE)
+    .withEnvironment({ RUSTFS_ACCESS_KEY: 'catalog', RUSTFS_SECRET_KEY: 'catalogsecret' })
     .withExposedPorts(9000)
-    .withWaitStrategy(Wait.forHttp('/minio/health/live', 9000).forStatusCode(200))
+    .withWaitStrategy(Wait.forHttp('/health', 9000).forStatusCode(200))
     .withStartupTimeout(240_000)
     .start();
 
