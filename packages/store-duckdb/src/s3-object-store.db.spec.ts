@@ -12,17 +12,19 @@ import { ensureBucket, s3ObjectStore } from './s3-object-store';
  * mechanism the pointer swap rests on, and a fake that returned `undefined` on a losing race
  * would pass while proving nothing about `If-Match`.
  */
-// quay.io, not Docker Hub: MinIO withdrew the `minio/minio` repository from Hub, which now
-// answers 404 there, and testcontainers surfaces that as "pull access denied ... may require
-// docker login". Same release, same digest — only the registry moved.
-const MINIO_IMAGE = 'quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z';
+// Chainguard's MinIO build: MinIO withdrew its public images, first `minio/minio` on Docker Hub
+// (now 404, which testcontainers surfaces as "pull access denied ... may require docker login") and
+// then the quay.io mirror (now "unauthorized"). Chainguard publishes a maintained build that still
+// pulls anonymously; its entrypoint is `minio` and it runs as a non-root user, so the data directory
+// lives under /tmp, which that user can write.
+const MINIO_IMAGE = 'cgr.dev/chainguard/minio:latest';
 
 let container: StartedTestContainer;
 let store: ObjectStore;
 
 beforeAll(async () => {
   container = await new GenericContainer(MINIO_IMAGE)
-    .withCommand(['server', '/data'])
+    .withCommand(['server', '/tmp/minio-data'])
     .withEnvironment({ MINIO_ROOT_USER: 'catalog', MINIO_ROOT_PASSWORD: 'catalogsecret' })
     .withExposedPorts(9000)
     .withWaitStrategy(Wait.forHttp('/minio/health/live', 9000).forStatusCode(200))
