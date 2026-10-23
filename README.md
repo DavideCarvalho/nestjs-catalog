@@ -22,7 +22,8 @@ pnpm lint         # biome
 ```
 
 Releases go through [changesets](https://github.com/changesets/changesets): add one with
-`pnpm changeset`, and merging to `main` opens a "Version Packages" PR whose merge publishes to npm.
+`pnpm changeset`, and merging the PR that carries it to `main` is the release: the release workflow
+versions it in place (a `chore: version packages` commit) and publishes to npm in the same run.
 
 ### Publishing: trusted publishing (OIDC), not a token
 
