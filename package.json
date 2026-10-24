@@ -29,7 +29,7 @@
     "@testing-library/dom": "10.4.2",
     "@testing-library/jest-dom": "6.9.1",
     "@testing-library/react": "16.3.3",
-    "@testing-library/user-event": "14.6.7",
+    "@testing-library/user-event": "14.6.8",
     "@types/node": "22.20.4",
     "@types/supertest": "6.0.3",
     "@vitest/coverage-v8": "2.1.9",
