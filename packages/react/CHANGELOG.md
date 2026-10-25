@@ -1,5 +1,11 @@
 # @dudousxd/nestjs-catalog-react
 
+## 0.34.1
+
+### Patch Changes
+
+- fix(deps): update dependency tailwind-merge to v3.7.0 ([#209](https://github.com/DavideCarvalho/nestjs-catalog/issues/209))
+
 ## 0.34.0
 
 ### Minor Changes
