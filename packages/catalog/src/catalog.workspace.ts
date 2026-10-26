@@ -684,6 +684,16 @@ export function embeddedVisualization(
 export interface CatalogWorkspaceStore {
   listSavedQueries(): Promise<SavedQuery[]>;
   getSavedQuery(id: string): Promise<SavedQuery | undefined>;
+  /**
+   * The saved queries with these ids, in one lookup. An id that names nothing
+   * is simply absent from the answer, and order is not promised.
+   *
+   * **Optional**, for the reason {@link listSavedQueryRevisions} is: a store
+   * written against the shape without it still implements this interface, and
+   * {@link supportsSavedQueryBatch} is how a caller asks. A caller without it
+   * reads them one {@link getSavedQuery} at a time.
+   */
+  getSavedQueries?(ids: readonly string[]): Promise<SavedQuery[]>;
   saveQuery(input: SaveQueryInput, createdBy: string): Promise<SavedQuery>;
   updateSavedQuery(id: string, input: Partial<SaveQueryInput>): Promise<SavedQuery | undefined>;
   /**
@@ -753,6 +763,13 @@ export function supportsSavedQueryRevisions(
 ): store is CatalogWorkspaceStore &
   Required<Pick<CatalogWorkspaceStore, 'listSavedQueryRevisions'>> {
   return typeof store.listSavedQueryRevisions === 'function';
+}
+
+/** Whether this store can read several saved queries in one lookup. */
+export function supportsSavedQueryBatch(
+  store: CatalogWorkspaceStore,
+): store is CatalogWorkspaceStore & Required<Pick<CatalogWorkspaceStore, 'getSavedQueries'>> {
+  return typeof store.getSavedQueries === 'function';
 }
 
 export function isWorkspaceStore(store: unknown): store is CatalogWorkspaceStore {

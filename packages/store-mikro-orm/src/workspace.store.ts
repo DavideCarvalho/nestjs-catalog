@@ -53,6 +53,14 @@ export class MySqlWorkspaceStore implements CatalogWorkspaceStore {
     return row ? toSavedQuery(row) : undefined;
   }
 
+  async getSavedQueries(ids: readonly string[]): Promise<SavedQuery[]> {
+    // `IN ()` is a syntax error on MySQL, and no ids is an empty answer anyway.
+    if (ids.length === 0) return [];
+    const em = this.em.fork();
+    const rows = await em.find(SavedQueryRow, { id: { $in: [...ids] } });
+    return rows.map(toSavedQuery);
+  }
+
   async saveQuery(input: SaveQueryInput, createdBy: string): Promise<SavedQuery> {
     const em = this.em.fork();
     const now = new Date();

@@ -387,6 +387,7 @@ export {
   type QueryVisualization,
   type SaveQueryInput,
   type SavedQuery,
+  supportsSavedQueryBatch,
   supportsSavedQueryRevisions,
   type TraceQuery,
   traceOutcomeFilter,

@@ -876,6 +876,10 @@ export class RoutingWorkspaceStore implements CatalogWorkspaceStore {
     return this.inner.getSavedQuery(id);
   }
 
+  getSavedQueries(ids: readonly string[]): Promise<SavedQuery[]> {
+    return this.inner.getSavedQueries(ids);
+  }
+
   saveQuery(input: SaveQueryInput, createdBy: string): Promise<SavedQuery> {
     return this.inner.saveQuery(input, createdBy);
   }
