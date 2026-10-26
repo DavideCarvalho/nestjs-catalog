@@ -188,8 +188,13 @@ describe('what a read still costs when it is unbounded', () => {
   });
 
   it('leaves no spool behind when a remote read fails', async () => {
-    const before = await readdir(tmpdir());
-    const spoolsBefore = before.filter((name) => name.startsWith('catalog-source-')).length;
+    // A temp root of this test's own. The shared one is also where other test
+    // workers, and anything else on the machine, create spools of their own.
+    const root = mkdtempSync(join(tmpdir(), 'spool-root-'));
+    const saved = { TMPDIR: process.env.TMPDIR, TMP: process.env.TMP, TEMP: process.env.TEMP };
+    process.env.TMPDIR = root;
+    process.env.TMP = root;
+    process.env.TEMP = root;
 
     const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response(
@@ -221,10 +226,17 @@ describe('what a read still costs when it is unbounded', () => {
       ).rejects.toThrow();
     } finally {
       fetchSpy.mockRestore();
+      for (const [name, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
     }
 
-    const after = await readdir(tmpdir());
-    expect(after.filter((name) => name.startsWith('catalog-source-')).length).toBe(spoolsBefore);
+    try {
+      expect(await readdir(root)).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 
