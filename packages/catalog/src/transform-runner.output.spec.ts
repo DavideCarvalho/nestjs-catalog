@@ -32,6 +32,52 @@ describe('the batch path decodes stdout as one stream', () => {
   });
 });
 
+/**
+ * A transform that writes `é` to stderr as two separate writes of one byte
+ * each, far enough apart that the parent reads them as two chunks, and then
+ * exits non-zero so stderr lands in the error.
+ */
+const SPLIT_STDERR = `
+  const bytes = Buffer.from("café ok", "utf8");
+  process.stderr.write(bytes.subarray(0, 4));
+  const until = Date.now() + 300;
+  while (Date.now() < until) {}
+  process.stderr.write(bytes.subarray(4));
+  process.exit(3);
+`;
+
+describe('stderr is decoded as one stream', () => {
+  it('keeps a character split across two chunks, on the batch path', async () => {
+    const error = await runner
+      .run({ language: 'javascript', code: SPLIT_STDERR }, [])
+      .then(() => undefined, (caught: unknown) => caught);
+
+    expect(String(error)).toContain('café ok');
+    expect(String(error)).not.toContain('\uFFFD');
+  });
+
+  it('keeps a character split across two chunks, on the streaming path', async () => {
+    const stream = await runner.runStream(
+      {
+        language: 'javascript',
+        mode: 'record',
+        code: `${SPLIT_STDERR}\nexport default function transform({ record }) { return record; }`,
+      },
+      (async function* () {
+        yield { n: 1 };
+      })(),
+    );
+    const error = await (async () => {
+      for await (const _ of stream.rows) {
+        // drained for the failure
+      }
+    })().then(() => undefined, (caught: unknown) => caught);
+
+    expect(String(error)).toContain('café ok');
+    expect(String(error)).not.toContain('\uFFFD');
+  });
+});
+
 describe('the streaming path reads a long line once', () => {
   afterEach(() => vi.restoreAllMocks());
 

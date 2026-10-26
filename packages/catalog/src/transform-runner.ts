@@ -590,21 +590,22 @@ export class SubprocessTransformRunner implements TransformRunner {
         reject(new Error(`The transform ran for longer than ${timeoutMs}ms and was stopped.`));
       }, timeoutMs);
 
-      // Decoded by the stream rather than per chunk, which holds back a
+      // Both decoded by the stream rather than per chunk, which holds back a
       // multi-byte character split across two chunks instead of turning each
       // half into a replacement character.
       child.stdout.setEncoding('utf8');
+      child.stderr.setEncoding('utf8');
       child.stdout.on('data', (chunk: string) => {
         stdout += chunk;
         if (stdout.length > MAX_OUTPUT_BYTES) stop(child);
       });
-      child.stderr.on('data', (chunk: Buffer) => {
+      child.stderr.on('data', (chunk: string) => {
         // Appended only while there is room, rather than appended and trimmed:
         // trimming after the fact still materialises the whole chunk into the
         // parent's heap, which is the thing being bounded. See
         // {@link MAX_CAPTURED_STDERR_BYTES} for why this bounds rather than kills.
         if (stderr.length >= MAX_CAPTURED_STDERR_BYTES) return;
-        stderr += chunk.toString().slice(0, MAX_CAPTURED_STDERR_BYTES - stderr.length);
+        stderr += chunk.slice(0, MAX_CAPTURED_STDERR_BYTES - stderr.length);
       });
 
       child.on('error', (error) => {
@@ -773,13 +774,14 @@ class RecordStreamPump {
       this.chunks.push(chunk);
       this.notify();
     });
-    child.stderr.on('data', (chunk: Buffer) => {
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk: string) => {
       // Bounded exactly as the batch path bounds it, and for the reason
       // {@link MAX_CAPTURED_STDERR_BYTES} gives at length: a transform looping on
       // writes to fd 2 grows the *parent's* heap, and a stream gives it longer to
       // do so.
       if (this.stderr.length >= MAX_CAPTURED_STDERR_BYTES) return;
-      this.stderr += chunk.toString().slice(0, MAX_CAPTURED_STDERR_BYTES - this.stderr.length);
+      this.stderr += chunk.slice(0, MAX_CAPTURED_STDERR_BYTES - this.stderr.length);
     });
     child.on('error', (error) => this.abort(error));
     child.on('close', (code) => {
