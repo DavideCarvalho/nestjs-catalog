@@ -1943,18 +1943,16 @@ export class MikroOrmWarehouseStore
   ): Promise<void> {
     if (this.hasIndex(table, SNAPSHOT_BATCH_INDEX, indexes)) return;
 
-    const statement = this.dialect.addIndex(
-      table,
-      this.dialect.indexName(table, SNAPSHOT_BATCH_INDEX),
-      [SNAPSHOT_COLUMN, BATCH_COLUMN],
-    );
+    const name = this.dialect.indexName(table, SNAPSHOT_BATCH_INDEX);
+    const columns = [SNAPSHOT_COLUMN, BATCH_COLUMN];
+    const statement = this.dialect.addIndex(table, name, columns);
     try {
       await this.em.getConnection().execute(statement);
     } catch (error) {
       this.logger.warn(
         `Could not add ${SNAPSHOT_BATCH_INDEX} to ${table}, so every batch this load replaces will scan the whole table: ${
           error instanceof Error ? error.message : String(error)
-        }. Run it by hand when you can — "${statement}" — it is online and does not block writes. The load itself is unaffected and is going ahead.`,
+        }. ${this.dialect.indexByHand(table, name, columns)} The load itself is unaffected and is going ahead.`,
       );
       return;
     }
@@ -1999,7 +1997,7 @@ export class MikroOrmWarehouseStore
    * snapshot first. With `(_snapshot_id, _row)` the page is an index walk.
    *
    * Added the way {@link ensureSnapshotBatchIndex} adds its own, and for the same
-   * reasons: from `ensureType`, online, and a failure is a warning naming the
+   * reasons: from `ensureType`, and a failure is a warning naming the
    * statement rather than a refused load, because a missing index makes reads
    * slow rather than wrong.
    */
@@ -2010,18 +2008,16 @@ export class MikroOrmWarehouseStore
   ): Promise<void> {
     if (this.hasIndex(table, SNAPSHOT_ROW_INDEX, indexes)) return;
 
-    const statement = this.dialect.addIndex(
-      table,
-      this.dialect.indexName(table, SNAPSHOT_ROW_INDEX),
-      [SNAPSHOT_COLUMN, ROW_COLUMN],
-    );
+    const name = this.dialect.indexName(table, SNAPSHOT_ROW_INDEX);
+    const columns = [SNAPSHOT_COLUMN, ROW_COLUMN];
+    const statement = this.dialect.addIndex(table, name, columns);
     try {
       await this.em.getConnection().execute(statement);
     } catch (error) {
       this.logger.warn(
         `Could not add ${SNAPSHOT_ROW_INDEX} to ${table}, so every page read of it will sort its whole snapshot: ${
           error instanceof Error ? error.message : String(error)
-        }. Run it by hand when you can — "${statement}" — it is online and does not block writes.`,
+        }. ${this.dialect.indexByHand(table, name, columns)}`,
       );
       return;
     }

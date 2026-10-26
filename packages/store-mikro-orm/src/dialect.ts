@@ -159,6 +159,19 @@ export interface CatalogSqlDialect {
   indexName(table: string, index: string): string;
 
   /**
+   * What to tell an operator when adding an index failed: the statement to run
+   * by hand, and what running it costs on this engine.
+   *
+   * MySQL's `ADD INDEX` is an online InnoDB operation, so the statement the
+   * store tried is the one to run. Postgres's plain `CREATE INDEX` blocks writes
+   * to the table while it builds, so it hands over the `CONCURRENTLY` form.
+   * The store does not build concurrently itself: that cannot run inside a
+   * transaction, waits out every open transaction on the table first, and a
+   * failed build leaves an invalid index under the name the store looks for.
+   */
+  indexByHand(table: string, index: string, columns: readonly string[]): string;
+
+  /**
    * The catalogue read that says which columns a table already has, and the key
    * its rows carry the name under.
    *
@@ -342,6 +355,10 @@ export const MYSQL_DIALECT: CatalogSqlDialect = {
 
   indexName(_table, index): string {
     return index;
+  },
+
+  indexByHand(table, index, columns): string {
+    return `Run it by hand when you can — "${MYSQL_DIALECT.addIndex(table, index, columns)}" — it is online and does not block writes.`;
   },
 
   existingColumnsQuery(): { sql: string; nameKey: string } {
@@ -540,6 +557,11 @@ export const POSTGRES_DIALECT: CatalogSqlDialect = {
     if (name.length <= POSTGRES_MAX_IDENTIFIER) return name;
     const hash = createHash('sha256').update(name).digest('hex').slice(0, 8);
     return `${name.slice(0, POSTGRES_MAX_IDENTIFIER - hash.length - 1)}_${hash}`;
+  },
+
+  indexByHand(table, index, columns): string {
+    const { ident } = POSTGRES_DIALECT;
+    return `Run it by hand when you can — "CREATE INDEX CONCURRENTLY IF NOT EXISTS ${ident(index)} ON ${ident(table)} (${columns.map(ident).join(', ')})" — which builds it without blocking writes, unlike the plain CREATE INDEX this store issues; see "Object tables" in the store's README. If a concurrent build fails, drop the invalid index it leaves before retrying.`;
   },
 
   existingColumnsQuery(): { sql: string; nameKey: string } {
