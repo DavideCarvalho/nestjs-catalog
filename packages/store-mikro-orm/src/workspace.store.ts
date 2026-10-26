@@ -6,9 +6,11 @@ import type {
   CatalogWorkspaceStore,
   Dashboard,
   DashboardCard,
+  DashboardSummary,
   QueryVisualization,
   SaveQueryInput,
   SavedQuery,
+  SavedQuerySummary,
 } from '@dudousxd/nestjs-catalog';
 import { CATALOG_REVISION_LIMIT } from '@dudousxd/nestjs-catalog';
 import type { EntityManager } from '@mikro-orm/sql';
@@ -45,6 +47,24 @@ export class MySqlWorkspaceStore implements CatalogWorkspaceStore {
     const em = this.em.fork();
     const rows = await em.find(SavedQueryRow, {}, { orderBy: { folder: 'asc', name: 'asc' } });
     return rows.map(toSavedQuery);
+  }
+
+  async listSavedQuerySummaries(): Promise<SavedQuerySummary[]> {
+    const em = this.em.fork();
+    const rows = await em.find(
+      SavedQueryRow,
+      {},
+      {
+        fields: ['id', 'name', 'description', 'folder'],
+        orderBy: { folder: 'asc', name: 'asc' },
+      },
+    );
+    return rows.map((row) => ({
+      id: row.id,
+      name: row.name,
+      description: row.description,
+      folder: row.folder,
+    }));
   }
 
   async getSavedQuery(id: string): Promise<SavedQuery | undefined> {
@@ -189,6 +209,16 @@ export class MySqlWorkspaceStore implements CatalogWorkspaceStore {
     const em = this.em.fork();
     const rows = await em.find(DashboardRow, {}, { orderBy: { name: 'asc' } });
     return rows.map(toDashboard);
+  }
+
+  async listDashboardSummaries(): Promise<DashboardSummary[]> {
+    const em = this.em.fork();
+    const rows = await em.find(
+      DashboardRow,
+      {},
+      { fields: ['id', 'name', 'description'], orderBy: { name: 'asc' } },
+    );
+    return rows.map((row) => ({ id: row.id, name: row.name, description: row.description }));
   }
 
   async getDashboard(id: string): Promise<Dashboard | undefined> {

@@ -45,11 +45,13 @@ import {
   type CatalogWorkspaceStore,
   type Dashboard,
   type DashboardCard,
+  type DashboardSummary,
   type EmbeddedChart,
   type EmbeddedChartPlacement,
   type EmbeddedDashboard,
   type SaveQueryInput,
   type SavedQuery,
+  type SavedQuerySummary,
   embeddedVisualization,
   supportsSavedQueryBatch,
 } from './catalog.workspace';
@@ -877,8 +879,8 @@ export class CatalogService {
     if (!maySearch(options.principal)) return emptySearch(trimmed);
 
     const [savedQueries, dashboards] = await Promise.all([
-      this.listSavedQueries(),
-      this.listDashboards(),
+      this.savedQuerySummaries(),
+      this.dashboardSummaries(),
     ]);
 
     return searchCatalog({
@@ -901,5 +903,17 @@ export class CatalogService {
       })),
       limit: options.limit,
     });
+  }
+
+  /** Saved queries without their SQL, read that way when the store can. */
+  private savedQuerySummaries(): Promise<SavedQuerySummary[]> {
+    if (this.workspace?.listSavedQuerySummaries) return this.workspace.listSavedQuerySummaries();
+    return this.listSavedQueries();
+  }
+
+  /** Dashboards without their cards, read that way when the store can. */
+  private dashboardSummaries(): Promise<DashboardSummary[]> {
+    if (this.workspace?.listDashboardSummaries) return this.workspace.listDashboardSummaries();
+    return this.listDashboards();
   }
 }

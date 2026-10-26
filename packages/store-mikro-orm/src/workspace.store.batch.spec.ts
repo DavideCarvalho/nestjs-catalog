@@ -77,3 +77,22 @@ describe('RoutingWorkspaceStore.getSavedQueries', () => {
     expect(getSavedQuery).not.toHaveBeenCalled();
   });
 });
+
+describe('RoutingWorkspaceStore summaries', () => {
+  it("forwards both to the environment's store", async () => {
+    const listSavedQuerySummaries = vi.fn(async () => [{ id: 'q', name: 'Q' }]);
+    const listDashboardSummaries = vi.fn(async () => [{ id: 'd', name: 'D' }]);
+    const inner = {
+      listSavedQuerySummaries,
+      listDashboardSummaries,
+    } as unknown as CatalogWorkspaceStore;
+    const routing = new RoutingWorkspaceStore();
+
+    const [queries, dashboards] = await runInEnvironment(bundleWith(inner), () =>
+      Promise.all([routing.listSavedQuerySummaries(), routing.listDashboardSummaries()]),
+    );
+
+    expect(queries).toEqual([{ id: 'q', name: 'Q' }]);
+    expect(dashboards).toEqual([{ id: 'd', name: 'D' }]);
+  });
+});

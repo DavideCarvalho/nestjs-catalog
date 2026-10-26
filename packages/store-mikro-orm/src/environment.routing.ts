@@ -63,9 +63,11 @@ import type {
   ConnectorRun,
   Dashboard,
   DashboardCard,
+  DashboardSummary,
   EnvironmentStampedAuditEvent,
   SaveQueryInput,
   SavedQuery,
+  SavedQuerySummary,
   SnapshotRef,
   StoredLoadExpectation,
   TransformMode,
@@ -878,6 +880,14 @@ export class RoutingWorkspaceStore implements CatalogWorkspaceStore {
 
   getSavedQueries(ids: readonly string[]): Promise<SavedQuery[]> {
     return this.inner.getSavedQueries(ids);
+  }
+
+  listSavedQuerySummaries(): Promise<SavedQuerySummary[]> {
+    return this.inner.listSavedQuerySummaries();
+  }
+
+  listDashboardSummaries(): Promise<DashboardSummary[]> {
+    return this.inner.listDashboardSummaries();
   }
 
   saveQuery(input: SaveQueryInput, createdBy: string): Promise<SavedQuery> {

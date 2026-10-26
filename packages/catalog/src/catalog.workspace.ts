@@ -681,6 +681,12 @@ export function embeddedVisualization(
   return cardLibrary ? { ...base, library: cardLibrary } : base;
 }
 
+/** What search reads of a saved query: never its SQL. */
+export type SavedQuerySummary = Pick<SavedQuery, 'id' | 'name' | 'description' | 'folder'>;
+
+/** What search reads of a dashboard: never its cards. */
+export type DashboardSummary = Pick<Dashboard, 'id' | 'name' | 'description'>;
+
 export interface CatalogWorkspaceStore {
   listSavedQueries(): Promise<SavedQuery[]>;
   getSavedQuery(id: string): Promise<SavedQuery | undefined>;
@@ -694,6 +700,13 @@ export interface CatalogWorkspaceStore {
    * reads them one {@link getSavedQuery} at a time.
    */
   getSavedQueries?(ids: readonly string[]): Promise<SavedQuery[]>;
+  /**
+   * Every saved query, as only the fields search ranks — in the order
+   * {@link listSavedQueries} returns them, so a search over these reads exactly
+   * as one over the full rows. **Optional**; without it, search lists the full
+   * rows and narrows them itself.
+   */
+  listSavedQuerySummaries?(): Promise<SavedQuerySummary[]>;
   saveQuery(input: SaveQueryInput, createdBy: string): Promise<SavedQuery>;
   updateSavedQuery(id: string, input: Partial<SaveQueryInput>): Promise<SavedQuery | undefined>;
   /**
@@ -726,6 +739,8 @@ export interface CatalogWorkspaceStore {
   listSavedQueryRevisions?(id: string): Promise<CatalogRevision[]>;
 
   listDashboards(): Promise<Dashboard[]>;
+  /** {@link listSavedQuerySummaries}, for dashboards: no cards. **Optional**. */
+  listDashboardSummaries?(): Promise<DashboardSummary[]>;
   getDashboard(id: string): Promise<Dashboard | undefined>;
   saveDashboard(
     input: {
