@@ -48,9 +48,10 @@ const SPLIT_STDERR = `
 
 describe('stderr is decoded as one stream', () => {
   it('keeps a character split across two chunks, on the batch path', async () => {
-    const error = await runner
-      .run({ language: 'javascript', code: SPLIT_STDERR }, [])
-      .then(() => undefined, (caught: unknown) => caught);
+    const error = await runner.run({ language: 'javascript', code: SPLIT_STDERR }, []).then(
+      () => undefined,
+      (caught: unknown) => caught,
+    );
 
     expect(String(error)).toContain('café ok');
     expect(String(error)).not.toContain('\uFFFD');
@@ -71,7 +72,10 @@ describe('stderr is decoded as one stream', () => {
       for await (const _ of stream.rows) {
         // drained for the failure
       }
-    })().then(() => undefined, (caught: unknown) => caught);
+    })().then(
+      () => undefined,
+      (caught: unknown) => caught,
+    );
 
     expect(String(error)).toContain('café ok');
     expect(String(error)).not.toContain('\uFFFD');
