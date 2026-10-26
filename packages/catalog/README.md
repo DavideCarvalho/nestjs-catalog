@@ -173,9 +173,12 @@ board.
 
 `GET /catalog/embed/dashboards/:id` is the same shape one level up — `id`,
 `name`, `description`, `generatedAt`, and `charts`, each entry exactly the
-object above, ordered by card position. Cards are resolved **sequentially**, not
-in parallel: every one is a database query, and a shared dashboard is precisely
-the thing a consumer will poll on a timer. A card whose query is unshared,
+object above, ordered by card position. The cards' saved queries are read in one
+lookup when the workspace store offers `getSavedQueries` (see
+[Writing a workspace store](#writing-a-workspace-store)), and one at a time when
+it does not. The cards then **run sequentially**, not in parallel: every one is a
+database query, and a shared dashboard is precisely the thing a consumer will
+poll on a timer. A card whose query is unshared,
 missing or failing is left out rather than failing the whole board — one bad
 card should not blank a page, and a consumer should therefore not assume
 `charts.length` matches the card count it saw at discovery.
@@ -310,6 +313,24 @@ Everything the built-in controller does is on that one service — the model, th
 graph, presentation edits, reads, and the snapshot list. The registry and the
 store stay injectable for anything more unusual, but an ordinary endpoint should
 not need them.
+
+### Writing a workspace store
+
+Saved queries and dashboards live in a `CatalogWorkspaceStore`
+(`@dudousxd/nestjs-catalog-store-mikro-orm` ships one). Besides the required
+reads and writes, three members are **optional**. A store without them is still a
+valid store and gets the same answers, at the cost of reading more:
+
+| method | what uses it | without it |
+|---|---|---|
+| `getSavedQueries(ids)` | `GET /catalog/embed/dashboards/:id`, to read every card's saved query at once. Return the queries that exist; an id that names nothing is left out, and order does not matter. | one `getSavedQuery` per card. The same fallback runs when the batch read throws, and a card whose lookup fails is skipped. |
+| `listSavedQuerySummaries()` | search, which ranks only `id`, `name`, `description` and `folder` | search calls `listSavedQueries()` and loads every saved query's SQL and visualization |
+| `listDashboardSummaries()` | search, which ranks only `id`, `name` and `description` | search calls `listDashboards()` and loads every dashboard's cards |
+
+Return the summaries in the same order as the matching full list, so search ranks
+and truncates them identically. `supportsSavedQueryBatch(store)` is the probe for the
+first one. A store that wraps another, like the environment-routing store, should
+forward all three.
 
 ## Build your own UI, or use ours
 

@@ -71,6 +71,35 @@ costs the database is at most one small statement per `staleAfterMs` per process
 traffic. Set `staleAfterMs: 0` on a deployment that genuinely runs one process and wants its query
 count exactly as it was.
 
+## Object tables
+
+Each published type's rows live in an `obj_*` table, one snapshot per load, and carry two indexes:
+
+| index | columns | what it serves |
+|---|---|---|
+| `ix_snapshot_batch` | `(_snapshot_id, _batch)` | replacing a retried batch, counting a snapshot |
+| `ix_snapshot_row` | `(_snapshot_id, _row)` | a page of `GET /catalog/objects/:name`, which is `ORDER BY _row LIMIT … OFFSET …` within one snapshot |
+
+A new table is created with both. An existing table that lacks one gets it from `ensureType`, which
+runs on the first write or publish of that type after boot. If adding it fails, the store logs a
+warning containing the exact statement and carries on: a missing index makes reads slow, not wrong.
+On MySQL `ADD INDEX` is an online InnoDB operation. On Postgres, `CREATE INDEX` blocks writes to
+that table while it builds, so on a large table you can build it yourself first with
+`CREATE INDEX CONCURRENTLY` under the name the store looks for, and `ensureType` will skip it.
+
+On MySQL an index name is scoped to its table, so the names are the bare ones above. On Postgres it
+is scoped to the schema, so each table's index is called `<table>_<index>` (for example
+`obj_vehicle_ix_snapshot_row`). When that is longer than 63 characters it is cut short and given an
+8-character hash suffix; `dialect.indexName(table, index)` gives the exact name. A Postgres table
+that already carries the bare name counts as having that index.
+
+**What a page read costs.** A read is three statements: the type, the total, and the page. When
+nothing narrows the read (no search, no filters) and the snapshot is committed, the total is the
+`rowCount` its snapshot record holds, read by primary key, so a page does not scan the snapshot to
+count it. `commit` records that count, and a `write()` into a snapshot that is already committed
+recounts it. A search, any filter, or an uncommitted snapshot still runs `COUNT(*)` over the rows
+it selects.
+
 ## Keeping the host's migration differ away
 
 The tables here belong to the library, so a host that runs its own migrations must be told to leave
@@ -95,7 +124,9 @@ data, not schema, and no differ should be allowed to reason about them at all.
   rather than reflected off entity classes.
 - **`MySqlWarehouseStore`** — reads and writes the `obj_*` snapshot tables.
 - **`MySqlWorkspaceStore`**, **`MySqlPipelineStore`** — saved queries and dashboards; connectors,
-  connections, transforms, runs, workflow graphs and stages.
+  connections, transforms, runs, workflow graphs and stages. The workspace store implements the
+  optional `getSavedQueries` (one `IN` lookup) and `listSavedQuerySummaries` /
+  `listDashboardSummaries` (only the columns search ranks), and the routing proxy forwards them.
 - **`CatalogAuditRecorder`**, **`MySqlCatalogTraceStore`** — the audit trail.
 - **Environment routing** — `runInEnvironment`, `currentEnvironment`, the `Routing*` proxies and
   `applyPromotion` / `readPromotable`, for serving several catalog environments from one process.
