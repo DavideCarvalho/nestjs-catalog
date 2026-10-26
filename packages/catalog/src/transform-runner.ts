@@ -590,8 +590,12 @@ export class SubprocessTransformRunner implements TransformRunner {
         reject(new Error(`The transform ran for longer than ${timeoutMs}ms and was stopped.`));
       }, timeoutMs);
 
-      child.stdout.on('data', (chunk: Buffer) => {
-        stdout += chunk.toString();
+      // Decoded by the stream rather than per chunk, which holds back a
+      // multi-byte character split across two chunks instead of turning each
+      // half into a replacement character.
+      child.stdout.setEncoding('utf8');
+      child.stdout.on('data', (chunk: string) => {
+        stdout += chunk;
         if (stdout.length > MAX_OUTPUT_BYTES) stop(child);
       });
       child.stderr.on('data', (chunk: Buffer) => {
@@ -741,7 +745,11 @@ interface RecordStreamMessage {
  */
 class RecordStreamPump {
   private readonly chunks: string[] = [];
+  /** The newest chunk, from where the last line ended. */
   private carry = '';
+  /** Earlier pieces of the line being read, none of which holds a newline. */
+  private partial: string[] = [];
+  private partialLength = 0;
   private stderr = '';
   /** How many records the writer has put on the wire. */
   private sent = 0;
@@ -873,30 +881,55 @@ class RecordStreamPump {
     };
   }
 
-  /** One complete line, or `undefined` when the child has closed for good. */
+  /**
+   * One complete line, or `undefined` when the child has closed for good.
+   *
+   * Only the newest chunk is searched for a newline. Everything before it is
+   * already known to have none and waits in {@link partial} as pieces, joined
+   * once when the line ends — so a line spanning many chunks costs its length
+   * rather than its length times the number of chunks.
+   */
   private async nextLine(): Promise<string | undefined> {
     for (;;) {
       const nl = this.carry.indexOf('\n');
       if (nl !== -1) {
-        const line = this.carry.slice(0, nl);
-        this.carry = this.carry.slice(nl + 1);
+        const line = this.takeLine(nl);
         if (line.length > 0) return line;
         continue;
       }
       if (this.chunks.length > 0) {
-        this.carry += this.chunks.shift();
-        if (this.carry.length > MAX_OUTPUT_BYTES) {
-          this.abort(
-            new Error(
-              `The transform wrote more than ${MAX_OUTPUT_BYTES} bytes without a line break, at record ${this.answered}. One record cannot fan out to more rows than the runner can hold.`,
-            ),
-          );
-        }
+        this.takeChunk(this.chunks.shift() ?? '');
         continue;
       }
       if (this.ended) return undefined;
       if (this.failure) throw this.failure;
       await this.awaitChunk();
+    }
+  }
+
+  /** The line ending at `nl` in {@link carry}, with whatever came before it. */
+  private takeLine(nl: number): string {
+    const tail = this.carry.slice(0, nl);
+    const line = this.partial.length > 0 ? this.partial.join('') + tail : tail;
+    this.partial = [];
+    this.partialLength = 0;
+    this.carry = this.carry.slice(nl + 1);
+    return line;
+  }
+
+  /** Make `chunk` the one searched next, keeping what is left of the last. */
+  private takeChunk(chunk: string): void {
+    if (this.carry.length > 0) {
+      this.partial.push(this.carry);
+      this.partialLength += this.carry.length;
+    }
+    this.carry = chunk;
+    if (this.partialLength + this.carry.length > MAX_OUTPUT_BYTES) {
+      this.abort(
+        new Error(
+          `The transform wrote more than ${MAX_OUTPUT_BYTES} bytes without a line break, at record ${this.answered}. One record cannot fan out to more rows than the runner can hold.`,
+        ),
+      );
     }
   }
 
