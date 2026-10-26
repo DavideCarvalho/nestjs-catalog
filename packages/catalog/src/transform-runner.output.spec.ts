@@ -115,3 +115,37 @@ describe('the streaming path reads a long line once', () => {
     expect(scanned).toBeLessThan(3 * size);
   });
 });
+
+describe('the streaming harness reads a long input line once', () => {
+  it('does not rescan the start of a record line for every chunk of it', async () => {
+    // The module's top level runs in the child before the harness reads stdin,
+    // so it can count what the harness asks `indexOf` to scan for a newline
+    // while it assembles the line carrying this one large record.
+    const code = `
+      const { indexOf } = String.prototype;
+      globalThis.scanned = 0;
+      String.prototype.indexOf = function (...args) {
+        if (args[0] === "\\n" && this.length >= 1000) {
+          globalThis.scanned += this.length - Number(args[1] ?? 0);
+        }
+        return Reflect.apply(indexOf, this, args);
+      };
+      export default function transform({ record }) {
+        return { length: record.text.length, scanned: globalThis.scanned };
+      }`;
+    const size = 8 * 1024 * 1024;
+    const stream = await runner.runStream(
+      { language: 'javascript', mode: 'record', code },
+      (async function* () {
+        yield { text: 'x'.repeat(size) };
+      })(),
+    );
+    const rows: Array<Record<string, unknown>> = [];
+    for await (const row of stream.rows) rows.push(row);
+
+    expect(rows[0]?.length).toBe(size);
+    // Searching the whole carried line after each 64 KiB chunk is ~128 passes
+    // over a line growing to 8 MB: over 500 million characters.
+    expect(rows[0]?.scanned).toBeLessThan(3 * size);
+  });
+});

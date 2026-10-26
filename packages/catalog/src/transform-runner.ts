@@ -1325,15 +1325,21 @@ const collect = (value) => {
 try {
   ${javascriptExportedFunction(moduleUrl)}
   let context = null;
-  let carry = "";
+  // Pieces of the line being read, none holding a newline, joined once it
+  // ends: only each new chunk is searched, so a long line costs its length.
+  const partial = [];
   process.stdin.setEncoding("utf8");
   for await (const chunk of process.stdin) {
-    carry += chunk;
-    let nl = carry.indexOf("\\n");
+    let start = 0;
+    let nl = chunk.indexOf("\\n");
+    if (nl === -1) partial.push(chunk);
     while (nl !== -1) {
-      const line = carry.slice(0, nl);
-      carry = carry.slice(nl + 1);
-      nl = carry.indexOf("\\n");
+      const tail = chunk.slice(start, nl);
+      const line = partial.length > 0 ? partial.join("") + tail : tail;
+      partial.length = 0;
+      start = nl + 1;
+      nl = chunk.indexOf("\\n", start);
+      if (nl === -1 && start < chunk.length) partial.push(chunk.slice(start));
       if (line.length === 0) continue;
       if (context === null) {
         const sent = JSON.parse(line);
