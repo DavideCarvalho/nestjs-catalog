@@ -3,6 +3,7 @@ import type { StartedMySqlContainer } from '@testcontainers/mysql';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { type CatalogDatabase, openCatalogDatabase, startMySql } from '../test/mysql-harness';
 import { SnapshotRow } from './entities/governance';
+import { SNAPSHOT_COLUMN, ident, tableFor } from './identifiers';
 
 /**
  * Where a snapshot's `rowCount` comes from, and how often it is paid for.
@@ -237,5 +238,71 @@ describe('snapshot row count', () => {
 
     const ref = await db.store.commit(TYPE, 'emptied');
     expect(ref.rowCount).toBe(0);
+  });
+});
+
+/**
+ * A page read's total, which an unfiltered read takes from the committed
+ * snapshot's record instead of counting the snapshot on every page.
+ *
+ * Only correct while that record is the table's answer, so these cases are about
+ * the one way rows reach a snapshot after its commit counted them: a batch
+ * written into it afterwards.
+ */
+describe('the total a page read reports', () => {
+  let container: StartedMySqlContainer;
+  let db: CatalogDatabase;
+  const log: string[] = [];
+
+  beforeAll(async () => {
+    container = await startMySql();
+    db = await openCatalogDatabase(container, 'paged', (sql) => log.push(sql));
+    await db.publish(TYPE);
+  }, 300_000);
+
+  afterAll(async () => {
+    await db?.close();
+    await container?.stop();
+  });
+
+  const total = async (query: Record<string, unknown> = {}): Promise<number> =>
+    (await db.store.read(TYPE, ['workOrderNumber', 'status'], { page: 2, size: 10, ...query }))
+      .total;
+
+  it('is the committed size, with no COUNT reaching the server', async () => {
+    await db.store.write(TYPE, rows(45), { snapshotId: 'served', principalId: 'l', batch: 0 });
+    await db.store.write(TYPE, rows(30, 45), { snapshotId: 'served', principalId: 'l', batch: 1 });
+    await db.store.commit(TYPE, 'served');
+
+    log.length = 0;
+    expect(await total()).toBe(75);
+    expect(log.filter((sql) => /count\(\*\)/i.test(sql))).toHaveLength(0);
+  });
+
+  it('still counts what a search or a filter leaves', async () => {
+    log.length = 0;
+    expect(await total({ search: 'WO-7' })).toBe(6);
+    expect(log.filter((sql) => /count\(\*\)/i.test(sql))).toHaveLength(1);
+  });
+
+  it('follows a batch written into the snapshot after its commit', async () => {
+    await db.store.write(TYPE, rows(20, 75), { snapshotId: 'served', principalId: 'l', batch: 2 });
+    expect(await total()).toBe(95);
+
+    // The same batch re-sent shorter replaces it, and the total follows.
+    await db.store.write(TYPE, rows(5, 75), { snapshotId: 'served', principalId: 'l', batch: 2 });
+    expect(await total()).toBe(80);
+
+    const [{ counted }] = await db.em
+      .getConnection()
+      .execute<Array<{ counted: number }>>(
+        `SELECT COUNT(*) AS counted FROM ${ident(tableFor(TYPE_NAME))} WHERE ${ident(SNAPSHOT_COLUMN)} = 'served'`,
+      );
+    expect(Number(counted)).toBe(80);
+  });
+
+  it('counts an uncommitted snapshot read by id, whose record is not maintained', async () => {
+    await db.store.write(TYPE, rows(12), { snapshotId: 'loading', principalId: 'l', batch: 0 });
+    expect(await total({ snapshot: 'loading' })).toBe(12);
   });
 });
