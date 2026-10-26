@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { createReadStream, readFileSync, statSync } from 'node:fs';
 import { basename, extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -56,6 +56,12 @@ const CONTENT_TYPES: Record<string, string> = {
 @Controller()
 export class CatalogUiController {
   private readonly dir = spaDir();
+  /**
+   * The rewritten index.html, with the file version it was rendered from. A
+   * rebuilt bundle changes the file's mtime or size, and the next request
+   * renders it again instead of pointing at hashed assets that are gone.
+   */
+  private rendered?: { mtimeMs: number; size: number; html: string };
 
   constructor(
     @Inject(DASHBOARD_BASE_PATH) private readonly basePath: string,
@@ -72,15 +78,21 @@ export class CatalogUiController {
   @Header('Cache-Control', 'no-store, must-revalidate')
   index(): string {
     const indexPath = join(this.dir, 'index.html');
-    if (!existsSync(indexPath)) {
+    const stat = statSync(indexPath, { throwIfNoEntry: false });
+    if (!stat) {
       throw new NotFoundException('Dashboard is not built. Run the package build.');
     }
+    const cached = this.rendered;
+    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.html;
+    const html = this.render(readFileSync(indexPath, 'utf8'));
+    this.rendered = { mtimeMs: stat.mtimeMs, size: stat.size, html };
+    return html;
+  }
+
+  private render(source: string): string {
     // The bundle was built with Vite base `/catalog/`; rewrite asset URLs to the configured base so
     // the SPA loads from `<base>/assets` wherever it's mounted, and tell the client its API base.
-    const html = readFileSync(indexPath, 'utf8').replaceAll(
-      `="${BUILD_BASE}/`,
-      `="${this.basePath}/`,
-    );
+    const html = source.replaceAll(`="${BUILD_BASE}/`, `="${this.basePath}/`);
     // __CATALOG_BASE__ = where assets load; __CATALOG_API__ = where the SPA fetches the JSON API;
     // __CATALOG_HOST_AUTH__ = whether the HOST authenticates, in which case the SPA must not show
     // its own sign-in. A console mounted inside an application that already knows who you are and
@@ -97,10 +109,10 @@ export class CatalogUiController {
     if (safe !== file) throw new NotFoundException();
     const root = resolve(this.dir, 'assets');
     const assetPath = resolve(root, safe);
-    if (!assetPath.startsWith(root + sep) || !existsSync(assetPath)) {
-      throw new NotFoundException();
-    }
+    if (!assetPath.startsWith(root + sep)) throw new NotFoundException();
+    const stat = statSync(assetPath, { throwIfNoEntry: false });
+    if (!stat?.isFile()) throw new NotFoundException();
     const type = CONTENT_TYPES[extname(safe)] ?? 'application/octet-stream';
-    return new StreamableFile(readFileSync(assetPath), { type });
+    return new StreamableFile(createReadStream(assetPath), { type, length: stat.size });
   }
 }
