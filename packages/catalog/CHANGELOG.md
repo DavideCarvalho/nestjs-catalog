@@ -1,5 +1,35 @@
 # @dudousxd/nestjs-catalog
 
+## 0.34.3
+
+### Patch Changes
+
+- [#247](https://github.com/DavideCarvalho/nestjs-catalog/pull/247) [`0be58c0`](https://github.com/DavideCarvalho/nestjs-catalog/commit/0be58c0e84b951579b3ec1ed9de91810536912f5) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Fix a transform's stderr losing non-ASCII characters in error messages: like stdout, it was decoded
+  one chunk at a time, so a multi-byte character split across two pipe reads became replacement
+  characters. Both the batch and the streaming path now decode it as one stream.
+
+- [#247](https://github.com/DavideCarvalho/nestjs-catalog/pull/247) [`841347d`](https://github.com/DavideCarvalho/nestjs-catalog/commit/841347d5bf332ee3db874db765c06faf82586009) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Read an embedded dashboard's saved queries in one lookup instead of one per card. Workspace stores
+  gain an optional `getSavedQueries(ids)` (implemented by the MikroORM store as one `IN` query, and
+  forwarded by the environment-routing store); a store without it, or a batch read that fails, falls
+  back to one lookup per card as before, and the cards that are skipped are the same.
+
+- [#247](https://github.com/DavideCarvalho/nestjs-catalog/pull/247) [`6e91f05`](https://github.com/DavideCarvalho/nestjs-catalog/commit/6e91f05c65bf8aabf55fc13d51bf4b6e4b7d5483) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The per-record JavaScript harness no longer rescans a long input line from its start for every
+  chunk of it that arrives on stdin, which was quadratic in the line's length (a single large record,
+  or a line of many records).
+
+- [#247](https://github.com/DavideCarvalho/nestjs-catalog/pull/247) [`b874b79`](https://github.com/DavideCarvalho/nestjs-catalog/commit/b874b793f897de75c3dcec1cf672e3f6750e78bd) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Search no longer loads every saved query's SQL and visualization and every dashboard's cards on
+  each request. Workspace stores gain optional `listSavedQuerySummaries()` and
+  `listDashboardSummaries()`, which return only the fields search ranks (in the same order as the
+  full lists); the MikroORM store selects just those columns and the environment-routing store
+  forwards them. A store without them is searched through the full lists exactly as before, and the
+  results are identical either way.
+
+- [#247](https://github.com/DavideCarvalho/nestjs-catalog/pull/247) [`d215b55`](https://github.com/DavideCarvalho/nestjs-catalog/commit/d215b555e2ef934cfb8fcfaea89ac2fabf4da7c3) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Fix batch transforms corrupting non-ASCII output: stdout was decoded one chunk at a time, so a
+  multi-byte UTF-8 character split across two pipe reads came back as replacement characters. It is
+  now decoded as one stream, as the streaming path already did. The streaming path also stops
+  rescanning a long output line from its start for every 64 KiB chunk of it, which was quadratic in
+  the line's length.
+
 ## 0.34.2
 
 ### Patch Changes

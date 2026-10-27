@@ -1,5 +1,14 @@
 # @dudousxd/nestjs-catalog-dashboard
 
+## 0.34.2
+
+### Patch Changes
+
+- [#247](https://github.com/DavideCarvalho/nestjs-catalog/pull/247) [`d4f379a`](https://github.com/DavideCarvalho/nestjs-catalog/commit/d4f379a74e744884ceeacecf5863e1367a69bc50) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Serve the console with less disk work: the rewritten `index.html` is kept between requests and
+  rendered again only when the file's mtime or size changes (so a rebuilt bundle is still picked up
+  without a restart), and assets are streamed from disk instead of read whole into memory on every
+  request.
+
 ## 0.34.1
 
 ## 0.34.0

@@ -1,5 +1,15 @@
 # @dudousxd/nestjs-catalog-pipeline
 
+## 0.30.2
+
+### Patch Changes
+
+- [#247](https://github.com/DavideCarvalho/nestjs-catalog/pull/247) [`9561ea8`](https://github.com/DavideCarvalho/nestjs-catalog/commit/9561ea8d67e0489607cf97dab149bb7969a52001) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Read CSV and NDJSON sources faster. The CSV scanner now jumps between quotes, delimiters and
+  newlines with `indexOf` and appends the text between them as one slice, instead of making a
+  function call and a string append per character; quoting, `""` escapes, `\r` stripping and every
+  other quirk read exactly as before. NDJSON no longer re-splits a long line from its start each time
+  another chunk of it arrives, which made a line spanning many chunks quadratic.
+
 ## 0.30.1
 
 ### Patch Changes
@@ -2552,9 +2562,9 @@ equals?}` or `{kind: 'rowCount', atLeast}` — where it used to carry `envVar` a
   Every scheduled connector in a deployment was silently inert. The worker said so
   at boot, once, and contradicted itself on the next line:
 
-                                              ERROR [ConnectorScheduler] No connector will run on a schedule:
-                                                    parser.parseExpression is not a function.
-                                              LOG   [ConnectorScheduler] Watching connector schedules every 30000ms.
+                                                ERROR [ConnectorScheduler] No connector will run on a schedule:
+                                                      parser.parseExpression is not a function.
+                                                LOG   [ConnectorScheduler] Watching connector schedules every 30000ms.
 
   `cron-parser` v4 exported `parseExpression`; v5 replaced it with
   `CronExpressionParser.parse`. The durable core read only the v4 shape, so

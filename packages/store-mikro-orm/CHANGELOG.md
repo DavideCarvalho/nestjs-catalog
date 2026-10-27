@@ -1,5 +1,38 @@
 # @dudousxd/nestjs-catalog-store-mikro-orm
 
+## 0.22.1
+
+### Patch Changes
+
+- [#247](https://github.com/DavideCarvalho/nestjs-catalog/pull/247) [`005a01b`](https://github.com/DavideCarvalho/nestjs-catalog/commit/005a01bbc5b137a96100d868758bf1c057ac3c3e) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - When an object-table index cannot be added, the warning's advice now matches the engine. MySQL is
+  still told to run the `ADD INDEX` it tried, which is online. Postgres is given the
+  `CREATE INDEX CONCURRENTLY` form instead of being told the plain `CREATE INDEX` does not block
+  writes, which it does.
+
+- [#247](https://github.com/DavideCarvalho/nestjs-catalog/pull/247) [`841347d`](https://github.com/DavideCarvalho/nestjs-catalog/commit/841347d5bf332ee3db874db765c06faf82586009) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Read an embedded dashboard's saved queries in one lookup instead of one per card. Workspace stores
+  gain an optional `getSavedQueries(ids)` (implemented by the MikroORM store as one `IN` query, and
+  forwarded by the environment-routing store); a store without it, or a batch read that fails, falls
+  back to one lookup per card as before, and the cards that are skipped are the same.
+
+- [#247](https://github.com/DavideCarvalho/nestjs-catalog/pull/247) [`b874b79`](https://github.com/DavideCarvalho/nestjs-catalog/commit/b874b793f897de75c3dcec1cf672e3f6750e78bd) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Search no longer loads every saved query's SQL and visualization and every dashboard's cards on
+  each request. Workspace stores gain optional `listSavedQuerySummaries()` and
+  `listDashboardSummaries()`, which return only the fields search ranks (in the same order as the
+  full lists); the MikroORM store selects just those columns and the environment-routing store
+  forwards them. A store without them is searched through the full lists exactly as before, and the
+  results are identical either way.
+
+- [#247](https://github.com/DavideCarvalho/nestjs-catalog/pull/247) [`b27457d`](https://github.com/DavideCarvalho/nestjs-catalog/commit/b27457de2a93a0a838533f9a4377257e81c0b82a) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Make paging through an object type cheap on large snapshots. An unfiltered page read now takes its
+  total from the committed snapshot's stored row count instead of running `COUNT(*)` over the whole
+  snapshot on every page; a search, a filter, or a read of an uncommitted snapshot still counts. A
+  batch written into a snapshot after its commit now updates that stored count, so the two stay equal.
+
+  Object tables also gain an `(_snapshot_id, _row)` index, so a page ordered by `_row` is an index walk
+  rather than a sort of the whole snapshot. New tables are created with it and existing ones get it
+  the next time `ensureType` runs (the first write or publish after boot), the same way the
+  `(_snapshot_id, _batch)` index is added. On Postgres both indexes are now named per table: index
+  names there are unique per schema, so a bare `ix_snapshot_batch` existed on only the first object
+  table and every other table went without it.
+
 ## 0.22.0
 
 ### Minor Changes
