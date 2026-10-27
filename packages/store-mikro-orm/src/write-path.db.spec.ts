@@ -4,8 +4,10 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { type CatalogDatabase, openCatalogDatabase, startMySql } from '../test/mysql-harness';
 import {
   BATCH_COLUMN,
+  ROW_COLUMN,
   SNAPSHOT_BATCH_INDEX,
   SNAPSHOT_COLUMN,
+  SNAPSHOT_ROW_INDEX,
   ident,
   tableFor,
 } from './identifiers';
@@ -197,6 +199,7 @@ beforeAll(async () => {
   // single-column index — and it is also the input the evolution path has to
   // handle, so putting it back is both halves of the measurement.
   await sql(`ALTER TABLE ${ident(table)} DROP INDEX ${ident(SNAPSHOT_BATCH_INDEX)}`);
+  await sql(`ALTER TABLE ${ident(table)} DROP INDEX ${ident(SNAPSHOT_ROW_INDEX)}`);
   await sql(`ALTER TABLE ${ident(table)} ADD INDEX \`ix_snapshot\` (${ident(SNAPSHOT_COLUMN)})`);
 
   for (let batch = 0; batch < BATCHES; batch += 1) await refillBatch(batch);
@@ -255,6 +258,7 @@ describe(`replacing one batch of a ${SNAPSHOT_ROWS.toLocaleString('en')}-row sna
     await timed('ensureType on an existing table (adds the index)', () => store.ensureType(SUBWO));
 
     expect(await indexesOf(table)).toContain(SNAPSHOT_BATCH_INDEX);
+    expect(await indexesOf(table)).toContain(SNAPSHOT_ROW_INDEX);
     // Left alone rather than dropped, and the log says it can go. See
     // `ensureSnapshotBatchIndex`: adding an index is recoverable and dropping
     // one is not, so the second is an operator's call.
@@ -308,9 +312,60 @@ describe(`replacing one batch of a ${SNAPSHOT_ROWS.toLocaleString('en')}-row sna
     const readPlan = await planOf(read, [SNAPSHOT]);
     console.log(`[write-path] a page of the snapshot, composite only: key=${readPlan.key}`);
 
-    // Both still reach an index, so nothing needs `ix_snapshot` to exist.
-    expect(count.key).toBe(SNAPSHOT_BATCH_INDEX);
-    expect(readPlan.key).toBe(SNAPSHOT_BATCH_INDEX);
+    // Both still reach an index, so nothing needs `ix_snapshot` to exist. Either
+    // composite will do: both lead on `_snapshot_id`.
+    expect([SNAPSHOT_BATCH_INDEX, SNAPSHOT_ROW_INDEX]).toContain(count.key);
+    expect([SNAPSHOT_BATCH_INDEX, SNAPSHOT_ROW_INDEX]).toContain(readPlan.key);
+  });
+
+  /**
+   * A page of the object browser: `read`'s own statement shape, against the
+   * newest of two snapshots, which is where the served one sits — the table
+   * keeps every load, so the current snapshot's rows come after all of theirs.
+   *
+   * `ix_snapshot_batch` finds the snapshot's rows in batch order, so ordering
+   * by `_row` means sorting all of them for every page; walking the primary key
+   * instead means stepping over every older snapshot first. `ix_snapshot_row`
+   * hands back the snapshot's rows already in order and stops after the page.
+   */
+  it('reads a page of the newest snapshot in row order from its index', async () => {
+    const LATEST = 'snap-latest';
+    const LATEST_ROWS = 20_000;
+    const store = new MySqlWarehouseStore(db.em);
+    for (let batch = 0; batch < 10; batch += 1) {
+      const rows = Array.from({ length: LATEST_ROWS / 10 }, (_, i) => ({
+        workOrderNumber: `WO-L-${batch}-${i}`,
+        status: 'open',
+      }));
+      await store.write(SUBWO, rows, { snapshotId: LATEST, principalId: 'measurement', batch });
+    }
+    await sql(`ANALYZE TABLE ${ident(table)}`);
+
+    const page = `SELECT ${ident('workOrderNumber')} FROM ${ident(table)} WHERE ${ident(SNAPSHOT_COLUMN)} = ? ORDER BY ${ident(ROW_COLUMN)} ASC LIMIT 25 OFFSET 2500`;
+    const explain = async (): Promise<string> => {
+      const rows = await sql<Record<string, unknown>>(`EXPLAIN ${page}`, [LATEST]);
+      const first = rows[0] ?? {};
+      return `key=${String(Reflect.get(first, 'key'))} rows≈${String(Reflect.get(first, 'rows'))} ${String(Reflect.get(first, 'Extra') ?? '')}`;
+    };
+
+    const withIndex = await planOf(page, [LATEST]);
+    const withPlan = await explain();
+    console.log(`[write-path] a page by _row, with ${SNAPSHOT_ROW_INDEX}: ${withPlan}`);
+    await timed(`a page by _row, with ${SNAPSHOT_ROW_INDEX}`, () => sql(page, [LATEST]));
+
+    await sql(`ALTER TABLE ${ident(table)} DROP INDEX ${ident(SNAPSHOT_ROW_INDEX)}`);
+    await sql(`ANALYZE TABLE ${ident(table)}`);
+    const withoutPlan = await explain();
+    console.log(`[write-path] a page by _row, without it: ${withoutPlan}`);
+    await timed('a page by _row, without it', () => sql(page, [LATEST]));
+
+    // And `ensureType` puts it back, on a table that already exists.
+    await new MySqlWarehouseStore(db.em).ensureType(SUBWO);
+    expect(await indexesOf(table)).toContain(SNAPSHOT_ROW_INDEX);
+
+    expect(withIndex.key).toBe(SNAPSHOT_ROW_INDEX);
+    expect(withPlan).not.toMatch(/filesort/i);
+    expect(withoutPlan).toMatch(/filesort/i);
   });
 });
 

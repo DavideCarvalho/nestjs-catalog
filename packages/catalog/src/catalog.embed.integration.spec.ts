@@ -944,4 +944,67 @@ describe('Embed endpoints (integration)', () => {
       }
     });
   });
+  // -------------------------------------------------------------------------
+  // 7. Lookups.
+  // -------------------------------------------------------------------------
+
+  describe("reading a dashboard's saved queries", () => {
+    /** The stub, plus the batch read, with every lookup counted. */
+    class CountingWorkspace extends StubWorkspace {
+      singles = 0;
+      batches: string[][] = [];
+
+      override getSavedQuery(id: string): Promise<SavedQuery | undefined> {
+        this.singles += 1;
+        return super.getSavedQuery(id);
+      }
+
+      getSavedQueries(ids: readonly string[]): Promise<SavedQuery[]> {
+        this.batches.push([...ids]);
+        return Promise.resolve(QUERIES.filter((query) => ids.includes(query.id)));
+      }
+    }
+
+    it("reads every card's query in one lookup, each id once", async () => {
+      const workspace = new CountingWorkspace(QUERIES, DASHBOARDS);
+      const server = (await embedApp(workspace)).getHttpServer();
+
+      const response = await request(server)
+        .get('/api/catalog/embed/dashboards/d-branded')
+        .set('x-catalog-key', 'embedder')
+        .expect(200);
+
+      expect(response.body.charts).toHaveLength(3);
+      expect(workspace.singles).toBe(0);
+      expect(workspace.batches).toHaveLength(1);
+      expect([...(workspace.batches[0] ?? [])].sort()).toEqual(['q-branded', 'q-sales']);
+    });
+
+    it('skips the same cards from a batch read as from one lookup per card', async () => {
+      const workspace = new CountingWorkspace(QUERIES, DASHBOARDS);
+      const server = (await embedApp(workspace)).getHttpServer();
+
+      const response = await request(server)
+        .get('/api/catalog/embed/dashboards/d-holes')
+        .set('x-catalog-key', 'embedder')
+        .expect(200);
+
+      expect(response.body.charts.map((chart: { id: string }) => chart.id)).toEqual(['q-sales']);
+      expect(workspace.batches).toHaveLength(1);
+    });
+
+    it('falls back to one lookup per card when the batch read fails', async () => {
+      const workspace = new CountingWorkspace(QUERIES, DASHBOARDS);
+      workspace.getSavedQueries = () => Promise.reject(new Error('connection reset'));
+      const server = (await embedApp(workspace)).getHttpServer();
+
+      const response = await request(server)
+        .get('/api/catalog/embed/dashboards/d-ops')
+        .set('x-catalog-key', 'embedder')
+        .expect(200);
+
+      expect(response.body.charts).toHaveLength(3);
+      expect(workspace.singles).toBe(3);
+    });
+  });
 });

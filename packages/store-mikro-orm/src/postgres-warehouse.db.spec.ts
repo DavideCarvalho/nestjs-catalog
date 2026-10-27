@@ -56,6 +56,11 @@ afterAll(async () => {
   await container?.stop();
 });
 
+/** The names of the indexes Postgres holds on one table. */
+async function indexesOf(table: string): Promise<unknown> {
+  return db.execute(`SELECT indexname FROM pg_indexes WHERE tablename = '${table}'`);
+}
+
 describe('PostgresWarehouseStore', () => {
   describeCatalogStoreContract(
     (): ContractStore => ({
@@ -231,17 +236,40 @@ describe('PostgresWarehouseStore', () => {
     // exists`, which would have surfaced as a failed publish on the second pod.
     const def = contractType('PgOldTable');
     await db.publish(def);
-    await db.execute('DROP INDEX IF EXISTS ix_snapshot_batch');
+    await db.execute('DROP INDEX IF EXISTS obj_pgoldtable_ix_snapshot_batch');
+    expect(JSON.stringify(await indexesOf('obj_pgoldtable'))).not.toContain('ix_snapshot_batch');
 
     await expect(db.store.ensureType(def)).resolves.toBeUndefined();
-    const indexes = await db.execute(
-      `SELECT indexname FROM pg_indexes WHERE tablename = 'obj_pgoldtable'`,
-    );
-    expect(JSON.stringify(indexes)).toContain('ix_snapshot_batch');
+    expect(JSON.stringify(await indexesOf('obj_pgoldtable'))).toContain('ix_snapshot_batch');
 
     // And again, which is what a second pod booting does. The `IF NOT EXISTS`
     // is what keeps this from throwing.
     await expect(db.store.ensureType(def)).resolves.toBeUndefined();
+  });
+
+  it('gives every object table its own indexes, though Postgres scopes index names to the schema', async () => {
+    // A bare `ix_snapshot_batch` exists once per schema, so every table after the
+    // first would be left without one by `CREATE INDEX IF NOT EXISTS`.
+    const first = contractType('PgIndexedOne');
+    const second = contractType('PgIndexedTwo');
+    await db.publish(first);
+    await db.publish(second);
+
+    for (const table of ['obj_pgindexedone', 'obj_pgindexedtwo']) {
+      const names = JSON.stringify(await indexesOf(table));
+      expect(names, table).toContain('ix_snapshot_batch');
+      expect(names, table).toContain('ix_snapshot_row');
+    }
+  });
+
+  it('adds the snapshot/row index a page is read from to a table without it', async () => {
+    const def = contractType('PgPagedTable');
+    await db.publish(def);
+    await db.execute('DROP INDEX IF EXISTS obj_pgpagedtable_ix_snapshot_row');
+    expect(JSON.stringify(await indexesOf('obj_pgpagedtable'))).not.toContain('ix_snapshot_row');
+
+    await expect(db.store.ensureType(def)).resolves.toBeUndefined();
+    expect(JSON.stringify(await indexesOf('obj_pgpagedtable'))).toContain('ix_snapshot_row');
   });
 
   it('refuses a write inside the read-only query path, and leaves no timeout behind', async () => {

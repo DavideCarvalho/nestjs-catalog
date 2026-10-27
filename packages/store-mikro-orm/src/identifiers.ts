@@ -113,6 +113,15 @@ export const ROW_COLUMN = '_row';
  */
 export const SNAPSHOT_BATCH_INDEX = 'ix_snapshot_batch';
 /**
+ * The index a page of one snapshot is read in order from.
+ *
+ * `(_snapshot_id, _row)`, which is `read`'s `WHERE _snapshot_id = ? ORDER BY
+ * _row LIMIT ? OFFSET ?` exactly. {@link SNAPSHOT_BATCH_INDEX} finds the
+ * snapshot's rows but in batch order, so without this every page sorts the
+ * whole snapshot to hand back twenty-five rows of it.
+ */
+export const SNAPSHOT_ROW_INDEX = 'ix_snapshot_row';
+/**
  * Taken from the core package rather than restated.
  *
  * These names are part of what the catalog promises a reader — the SQL console

@@ -50,6 +50,7 @@ import {
   ROW_COLUMN,
   SNAPSHOT_BATCH_INDEX,
   SNAPSHOT_COLUMN,
+  SNAPSHOT_ROW_INDEX,
   outputAlias,
   physicalColumn,
   tableFor,
@@ -272,7 +273,8 @@ export class MikroOrmWarehouseStore
         principalColumn: PRINCIPAL_COLUMN,
         loadedAtColumn: LOADED_AT_COLUMN,
         batchColumn: BATCH_COLUMN,
-        index: SNAPSHOT_BATCH_INDEX,
+        index: this.dialect.indexName(table, SNAPSHOT_BATCH_INDEX),
+        rowIndex: this.dialect.indexName(table, SNAPSHOT_ROW_INDEX),
       })) {
         await connection.execute(statement);
       }
@@ -300,7 +302,9 @@ export class MikroOrmWarehouseStore
     // And so do the indexes — which had no path at all, and that was the
     // expensive half. See {@link ensureSnapshotBatchIndex}. Strictly after the
     // reserved columns above, because the index it adds names one of them.
-    await this.ensureSnapshotBatchIndex(type.name, table);
+    const indexes = await this.existingIndexes(table);
+    await this.ensureSnapshotBatchIndex(type.name, table, indexes);
+    await this.ensureSnapshotRowIndex(type.name, table, indexes);
 
     const missing = type.properties.filter(
       (p) => !existing.has(this.foldName(physicalColumn(p.name))),
@@ -527,10 +531,17 @@ export class MikroOrmWarehouseStore
       };
     }
 
-    // No row count here. See {@link countBySnapshot} for where it moved to and
-    // why; the short version is that counting the whole snapshot once per batch
-    // makes a load quadratic in its own size, and nothing reads the number
+    // No row count here for a snapshot still loading. See {@link countBySnapshot}
+    // for why; the short version is that counting the whole snapshot once per
+    // batch makes a load quadratic in its own size, and nothing reads the number
     // between the first batch and the commit.
+    //
+    // A committed snapshot is the exception: its stored count is what `read`
+    // reports as the total, so a batch landing in one after its commit is
+    // counted again here. Counted rather than adjusted, so a replay converges.
+    if (snapshot.committed && !snapshot.droppedAt) {
+      snapshot.rowCount = await this.countRows(em, table, options.snapshotId);
+    }
     em.persist(snapshot);
     await em.flush();
 
@@ -1357,8 +1368,18 @@ export class MikroOrmWarehouseStore
    * ad-hoc query in the deployment silently answering about last Tuesday too,
    * until somebody committed again. The view moves on commit and only on commit.
    *
-   * Two statements per read, unchanged by any of this: one `COUNT`, one page.
-   * Filters and the snapshot are conjuncts in both.
+   * Three statements for an ordinary read: the type, the total, and one page.
+   * Filters and the snapshot are conjuncts in both the count and the page.
+   *
+   * The total is a `COUNT` only when a search or a filter narrows the read.
+   * Without one it is the snapshot's size, and a committed snapshot records
+   * that — so the total is a primary-key lookup of the snapshot record instead
+   * of a scan of every row in it, which for a multi-million-row snapshot is
+   * most of what a page view costs. See {@link storedTotal}.
+   *
+   * The page is ordered by `_row` unless the caller sorts, and
+   * `ix_snapshot_row` is what lets that be an index walk rather than a sort of
+   * the whole snapshot for every page.
    *
    * ## Reading a snapshot whose rows were dropped
    *
@@ -1367,11 +1388,11 @@ export class MikroOrmWarehouseStore
    * answer as a filter that excluded everything and as a load that collapsed, on
    * a screen that has no way to tell those apart.
    *
-   * The lookup that finds out costs a statement, so it is paid **only on the
-   * history path**. A read with no `snapshot` resolves the type's pointer, and
-   * {@link dropSnapshot} refuses to drop what that pointer names — so the
-   * ordinary read is two statements exactly as it was, and the third arrives
-   * only when a caller has explicitly asked for an older load.
+   * The lookup that finds out is the snapshot's record, fetched only when the
+   * caller named a snapshot — and when nothing narrows the read, that record is
+   * also its total. A read with no `snapshot` resolves the type's pointer, and
+   * {@link dropSnapshot} refuses to drop what that pointer names, so it never
+   * has to ask.
    */
   async read(
     type: CatalogObjectTypeDef,
@@ -1388,7 +1409,9 @@ export class MikroOrmWarehouseStore
     if (!snapshotId) return { rows: [], total: 0 };
     // Only when the caller named one. See the docblock: the pointer's own
     // snapshot cannot be a tombstone, so the ordinary read pays nothing.
-    if (query.snapshot) await this.assertNotDropped(em, type.name, query.snapshot);
+    const named = query.snapshot
+      ? await this.assertNotDropped(em, type.name, query.snapshot)
+      : undefined;
     // Answered from the row already fetched, so saying which load these rows are
     // costs no query at all. `current` is the comparison a reader cares about and
     // is the one thing they cannot work out for themselves.
@@ -1412,12 +1435,13 @@ export class MikroOrmWarehouseStore
       params.push(...values);
     }
 
-    const [{ total }] = await em
-      .getConnection()
-      .execute<Array<{ total: number }>>(
-        `SELECT COUNT(*) AS total FROM ${this.ident(table)} WHERE ${where}`,
-        params,
-      );
+    // With nothing narrowing the read, the total is the snapshot's size, which
+    // a committed snapshot already records. See {@link storedTotal}.
+    const count = () => this.countWhere(em, table, where, params);
+    const total =
+      search || query.filters?.length
+        ? await count()
+        : await this.snapshotTotal(em, type.name, snapshotId, named, count);
 
     const sortProperty = selected.find((p) => p.name === query.sort);
     const orderBy = sortProperty
@@ -1445,10 +1469,45 @@ export class MikroOrmWarehouseStore
     );
 
     return {
-      total: Number(total ?? 0),
+      total,
       rows: rows.map((row) => normalise(row, selected)),
       snapshot,
     };
+  }
+
+  /** `COUNT(*)` of the rows `where` selects. */
+  private async countWhere(
+    em: EntityManager,
+    table: string,
+    where: string,
+    params: unknown[],
+  ): Promise<number> {
+    const [first] = await em
+      .getConnection()
+      .execute<Array<{ total: number }>>(
+        `SELECT COUNT(*) AS total FROM ${this.ident(table)} WHERE ${where}`,
+        params,
+      );
+    return Number(first?.total ?? 0);
+  }
+
+  /**
+   * How many rows a snapshot holds: its record's count when that can be
+   * trusted, `count()` when not. `known` is the record when the caller already
+   * fetched it, `null` included.
+   */
+  private async snapshotTotal(
+    em: EntityManager,
+    typeName: string,
+    snapshotId: string,
+    known: SnapshotRow | null | undefined,
+    count: () => Promise<number>,
+  ): Promise<number> {
+    const record =
+      known === undefined
+        ? await em.findOne(SnapshotRow, { id: `${typeName}:${snapshotId}` })
+        : known;
+    return storedTotal(record) ?? count();
   }
 
   /**
@@ -1645,9 +1704,9 @@ export class MikroOrmWarehouseStore
     em: EntityManager,
     typeName: string,
     snapshotId: string,
-  ): Promise<void> {
+  ): Promise<SnapshotRow | null> {
     const row = await em.findOne(SnapshotRow, { id: `${typeName}:${snapshotId}` });
-    if (!row?.droppedAt) return;
+    if (!row?.droppedAt) return row;
     throw new BadRequestException(droppedMessage(typeName, row, row.droppedAt));
   }
 
@@ -1877,21 +1936,23 @@ export class MikroOrmWarehouseStore
    * index in place without blocking DML, so the load that triggers it pays the
    * build once — 906ms for 300,000 rows here — and every load after it is fast.
    */
-  private async ensureSnapshotBatchIndex(typeName: string, table: string): Promise<void> {
-    const indexes = await this.existingIndexes(table);
-    if (indexes.has(SNAPSHOT_BATCH_INDEX.toLowerCase())) return;
+  private async ensureSnapshotBatchIndex(
+    typeName: string,
+    table: string,
+    indexes: ReadonlySet<string>,
+  ): Promise<void> {
+    if (this.hasIndex(table, SNAPSHOT_BATCH_INDEX, indexes)) return;
 
-    const statement = this.dialect.addIndex(table, SNAPSHOT_BATCH_INDEX, [
-      SNAPSHOT_COLUMN,
-      BATCH_COLUMN,
-    ]);
+    const name = this.dialect.indexName(table, SNAPSHOT_BATCH_INDEX);
+    const columns = [SNAPSHOT_COLUMN, BATCH_COLUMN];
+    const statement = this.dialect.addIndex(table, name, columns);
     try {
       await this.em.getConnection().execute(statement);
     } catch (error) {
       this.logger.warn(
         `Could not add ${SNAPSHOT_BATCH_INDEX} to ${table}, so every batch this load replaces will scan the whole table: ${
           error instanceof Error ? error.message : String(error)
-        }. Run it by hand when you can — "${statement}" — it is online and does not block writes. The load itself is unaffected and is going ahead.`,
+        }. ${this.dialect.indexByHand(table, name, columns)} The load itself is unaffected and is going ahead.`,
       );
       return;
     }
@@ -1908,6 +1969,67 @@ export class MikroOrmWarehouseStore
       table,
       addedColumns: [],
       addedIndexes: [SNAPSHOT_BATCH_INDEX],
+      created: false,
+    });
+  }
+
+  /**
+   * Whether `table` carries one of the object-table indexes.
+   *
+   * Under either name: the one {@link CatalogSqlDialect.indexName} gives it on
+   * this table, or the bare constant, which a Postgres table carries when it
+   * took the schema-wide name. `indexes` lists this table's alone, so finding
+   * either there means this table has it.
+   */
+  private hasIndex(table: string, index: string, indexes: ReadonlySet<string>): boolean {
+    return (
+      indexes.has(this.dialect.indexName(table, index).toLowerCase()) ||
+      indexes.has(index.toLowerCase())
+    );
+  }
+
+  /**
+   * Give an already-existing object table the index its pages are read from.
+   *
+   * `read` asks for `WHERE _snapshot_id = ? ORDER BY _row LIMIT ? OFFSET ?`.
+   * {@link SNAPSHOT_BATCH_INDEX} narrows that to the snapshot but hands its rows
+   * back in batch order, so every page of the object browser sorted the whole
+   * snapshot first. With `(_snapshot_id, _row)` the page is an index walk.
+   *
+   * Added the way {@link ensureSnapshotBatchIndex} adds its own, and for the same
+   * reasons: from `ensureType`, and a failure is a warning naming the
+   * statement rather than a refused load, because a missing index makes reads
+   * slow rather than wrong.
+   */
+  private async ensureSnapshotRowIndex(
+    typeName: string,
+    table: string,
+    indexes: ReadonlySet<string>,
+  ): Promise<void> {
+    if (this.hasIndex(table, SNAPSHOT_ROW_INDEX, indexes)) return;
+
+    const name = this.dialect.indexName(table, SNAPSHOT_ROW_INDEX);
+    const columns = [SNAPSHOT_COLUMN, ROW_COLUMN];
+    const statement = this.dialect.addIndex(table, name, columns);
+    try {
+      await this.em.getConnection().execute(statement);
+    } catch (error) {
+      this.logger.warn(
+        `Could not add ${SNAPSHOT_ROW_INDEX} to ${table}, so every page read of it will sort its whole snapshot: ${
+          error instanceof Error ? error.message : String(error)
+        }. ${this.dialect.indexByHand(table, name, columns)}`,
+      );
+      return;
+    }
+
+    this.logger.log(
+      `Added ${SNAPSHOT_ROW_INDEX} to ${table}, so a page of a snapshot is read in order instead of sorted.`,
+    );
+    emitCatalog('schema.changed', {
+      typeName,
+      table,
+      addedColumns: [],
+      addedIndexes: [SNAPSHOT_ROW_INDEX],
       created: false,
     });
   }
@@ -2142,6 +2264,18 @@ function toScalar(value: string): ScalarType {
  * an archive beside a `droppedAt` would read the two as one ladder. They are a
  * grid; `SnapshotArchiveRef` sets out all four squares.
  */
+/**
+ * A snapshot's size as its record states it, when that is the table's answer.
+ *
+ * Only for a committed snapshot that still has its rows: `commit` counts the
+ * table in the same flush that sets the flag, and `write` counts again for a
+ * batch that lands after it. An uncommitted record's count is not maintained,
+ * and a tombstone's is what it held when dropped, so both are counted instead.
+ */
+function storedTotal(row: SnapshotRow | null | undefined): number | undefined {
+  return row?.committed && !row.droppedAt ? row.rowCount : undefined;
+}
+
 function toRef(row: SnapshotRow, rowCount: number): SnapshotRef {
   return {
     id: row.snapshotId,

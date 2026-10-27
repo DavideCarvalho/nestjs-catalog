@@ -40,6 +40,7 @@
  *   {@link POSTGRES_DIALECT} for why that mapping is kept rather than overridden.
  */
 
+import { createHash } from 'node:crypto';
 import { assertSafeIdentifier } from '@dudousxd/nestjs-catalog';
 import type { ScalarType } from '@dudousxd/nestjs-catalog';
 
@@ -129,13 +130,15 @@ export interface CatalogSqlDialect {
     loadedAtColumn: string;
     batchColumn: string;
     index: string;
+    /** `(snapshot, row)`, the order a page is read in. */
+    rowIndex: string;
   }): string[];
 
   /** `ALTER TABLE … ADD COLUMN`. Identical on both, kept here so nothing guesses. */
   addColumn(table: string, column: string, declaration: string): string;
 
   /**
-   * Add the `(_snapshot_id, _batch)` index to a table that already exists.
+   * Add one of the object-table indexes to a table that already exists.
    *
    * MySQL spells it `ALTER TABLE … ADD INDEX`, Postgres `CREATE INDEX`. Postgres
    * takes `IF NOT EXISTS`, which matters because `CREATE INDEX` is otherwise not
@@ -143,6 +146,30 @@ export interface CatalogSqlDialect {
    * once per table per process across however many pods a deployment has.
    */
   addIndex(table: string, index: string, columns: readonly string[]): string;
+
+  /**
+   * What one of the object-table indexes is called on `table`.
+   *
+   * MySQL scopes an index name to its table, so every object table can carry an
+   * `ix_snapshot_batch`. Postgres scopes it to the schema: the second table's
+   * `CREATE INDEX IF NOT EXISTS ix_snapshot_batch` finds the first table's and
+   * creates nothing. So Postgres prefixes the table, shortened with a hash when
+   * that would pass its 63-character limit.
+   */
+  indexName(table: string, index: string): string;
+
+  /**
+   * What to tell an operator when adding an index failed: the statement to run
+   * by hand, and what running it costs on this engine.
+   *
+   * MySQL's `ADD INDEX` is an online InnoDB operation, so the statement the
+   * store tried is the one to run. Postgres's plain `CREATE INDEX` blocks writes
+   * to the table while it builds, so it hands over the `CONCURRENTLY` form.
+   * The store does not build concurrently itself: that cannot run inside a
+   * transaction, waits out every open transaction on the table first, and a
+   * failed build leaves an invalid index under the name the store looks for.
+   */
+  indexByHand(table: string, index: string, columns: readonly string[]): string;
 
   /**
    * The catalogue read that says which columns a table already has, and the key
@@ -310,7 +337,8 @@ export const MYSQL_DIALECT: CatalogSqlDialect = {
            ${ident(input.loadedAtColumn)} DATETIME NOT NULL,
            ${ident(input.batchColumn)} INT NOT NULL DEFAULT 0,
            ${input.columns.map(([column, declaration]) => `${column} ${declaration}`).join(',\n           ')},
-           KEY ${ident(input.index)} (${ident(input.snapshotColumn)}, ${ident(input.batchColumn)})
+           KEY ${ident(input.index)} (${ident(input.snapshotColumn)}, ${ident(input.batchColumn)}),
+           KEY ${ident(input.rowIndex)} (${ident(input.snapshotColumn)}, ${ident(input.rowColumn)})
          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
     ];
   },
@@ -323,6 +351,14 @@ export const MYSQL_DIALECT: CatalogSqlDialect = {
   addIndex(table, index, columns): string {
     const { ident } = MYSQL_DIALECT;
     return `ALTER TABLE ${ident(table)} ADD INDEX ${ident(index)} (${columns.map(ident).join(', ')})`;
+  },
+
+  indexName(_table, index): string {
+    return index;
+  },
+
+  indexByHand(table, index, columns): string {
+    return `Run it by hand when you can — "${MYSQL_DIALECT.addIndex(table, index, columns)}" — it is online and does not block writes.`;
   },
 
   existingColumnsQuery(): { sql: string; nameKey: string } {
@@ -429,6 +465,9 @@ export const MYSQL_DIALECT: CatalogSqlDialect = {
  * folding them — see {@link CatalogSqlDialect.foldsColumnCase} and
  * {@link CatalogSqlDialect.likeOperator}.
  */
+/** Postgres truncates a longer identifier, so two long names could collide. */
+const POSTGRES_MAX_IDENTIFIER = 63;
+
 export const POSTGRES_DIALECT: CatalogSqlDialect = {
   name: 'postgres',
   // Quoted identifiers are case-sensitive here, and `ident` always quotes.
@@ -496,6 +535,10 @@ export const POSTGRES_DIALECT: CatalogSqlDialect = {
         input.snapshotColumn,
         input.batchColumn,
       ]),
+      POSTGRES_DIALECT.addIndex(input.table, input.rowIndex, [
+        input.snapshotColumn,
+        input.rowColumn,
+      ]),
     ];
   },
 
@@ -507,6 +550,18 @@ export const POSTGRES_DIALECT: CatalogSqlDialect = {
   addIndex(table, index, columns): string {
     const { ident } = POSTGRES_DIALECT;
     return `CREATE INDEX IF NOT EXISTS ${ident(index)} ON ${ident(table)} (${columns.map(ident).join(', ')})`;
+  },
+
+  indexName(table, index): string {
+    const name = `${table}_${index}`;
+    if (name.length <= POSTGRES_MAX_IDENTIFIER) return name;
+    const hash = createHash('sha256').update(name).digest('hex').slice(0, 8);
+    return `${name.slice(0, POSTGRES_MAX_IDENTIFIER - hash.length - 1)}_${hash}`;
+  },
+
+  indexByHand(table, index, columns): string {
+    const { ident } = POSTGRES_DIALECT;
+    return `Run it by hand when you can — "CREATE INDEX CONCURRENTLY IF NOT EXISTS ${ident(index)} ON ${ident(table)} (${columns.map(ident).join(', ')})" — which builds it without blocking writes, unlike the plain CREATE INDEX this store issues; see "Object tables" in the store's README. If a concurrent build fails, drop the invalid index it leaves before retrying.`;
   },
 
   existingColumnsQuery(): { sql: string; nameKey: string } {

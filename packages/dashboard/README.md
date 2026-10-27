@@ -79,3 +79,10 @@ pulls it in.
 
 When the host authenticates, the SPA skips its own sign-in entirely — a console embedded in an
 application that already knows who you are has no business asking again.
+
+## How the console is served
+
+`index.html` is rendered once (asset URLs rewritten to `path`, the API base filled in) and kept in
+memory. Each request checks the file's mtime and size, and renders it again when they change, so a
+rebuilt bundle is picked up without a restart. It is always sent `Cache-Control: no-store`. Files
+under `assets/` are streamed from disk with a `Content-Length`; a path that is not a file is a 404.

@@ -590,17 +590,22 @@ export class SubprocessTransformRunner implements TransformRunner {
         reject(new Error(`The transform ran for longer than ${timeoutMs}ms and was stopped.`));
       }, timeoutMs);
 
-      child.stdout.on('data', (chunk: Buffer) => {
-        stdout += chunk.toString();
+      // Both decoded by the stream rather than per chunk, which holds back a
+      // multi-byte character split across two chunks instead of turning each
+      // half into a replacement character.
+      child.stdout.setEncoding('utf8');
+      child.stderr.setEncoding('utf8');
+      child.stdout.on('data', (chunk: string) => {
+        stdout += chunk;
         if (stdout.length > MAX_OUTPUT_BYTES) stop(child);
       });
-      child.stderr.on('data', (chunk: Buffer) => {
+      child.stderr.on('data', (chunk: string) => {
         // Appended only while there is room, rather than appended and trimmed:
         // trimming after the fact still materialises the whole chunk into the
         // parent's heap, which is the thing being bounded. See
         // {@link MAX_CAPTURED_STDERR_BYTES} for why this bounds rather than kills.
         if (stderr.length >= MAX_CAPTURED_STDERR_BYTES) return;
-        stderr += chunk.toString().slice(0, MAX_CAPTURED_STDERR_BYTES - stderr.length);
+        stderr += chunk.slice(0, MAX_CAPTURED_STDERR_BYTES - stderr.length);
       });
 
       child.on('error', (error) => {
@@ -741,7 +746,11 @@ interface RecordStreamMessage {
  */
 class RecordStreamPump {
   private readonly chunks: string[] = [];
+  /** The newest chunk, from where the last line ended. */
   private carry = '';
+  /** Earlier pieces of the line being read, none of which holds a newline. */
+  private partial: string[] = [];
+  private partialLength = 0;
   private stderr = '';
   /** How many records the writer has put on the wire. */
   private sent = 0;
@@ -765,13 +774,14 @@ class RecordStreamPump {
       this.chunks.push(chunk);
       this.notify();
     });
-    child.stderr.on('data', (chunk: Buffer) => {
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk: string) => {
       // Bounded exactly as the batch path bounds it, and for the reason
       // {@link MAX_CAPTURED_STDERR_BYTES} gives at length: a transform looping on
       // writes to fd 2 grows the *parent's* heap, and a stream gives it longer to
       // do so.
       if (this.stderr.length >= MAX_CAPTURED_STDERR_BYTES) return;
-      this.stderr += chunk.toString().slice(0, MAX_CAPTURED_STDERR_BYTES - this.stderr.length);
+      this.stderr += chunk.slice(0, MAX_CAPTURED_STDERR_BYTES - this.stderr.length);
     });
     child.on('error', (error) => this.abort(error));
     child.on('close', (code) => {
@@ -873,30 +883,55 @@ class RecordStreamPump {
     };
   }
 
-  /** One complete line, or `undefined` when the child has closed for good. */
+  /**
+   * One complete line, or `undefined` when the child has closed for good.
+   *
+   * Only the newest chunk is searched for a newline. Everything before it is
+   * already known to have none and waits in {@link partial} as pieces, joined
+   * once when the line ends — so a line spanning many chunks costs its length
+   * rather than its length times the number of chunks.
+   */
   private async nextLine(): Promise<string | undefined> {
     for (;;) {
       const nl = this.carry.indexOf('\n');
       if (nl !== -1) {
-        const line = this.carry.slice(0, nl);
-        this.carry = this.carry.slice(nl + 1);
+        const line = this.takeLine(nl);
         if (line.length > 0) return line;
         continue;
       }
       if (this.chunks.length > 0) {
-        this.carry += this.chunks.shift();
-        if (this.carry.length > MAX_OUTPUT_BYTES) {
-          this.abort(
-            new Error(
-              `The transform wrote more than ${MAX_OUTPUT_BYTES} bytes without a line break, at record ${this.answered}. One record cannot fan out to more rows than the runner can hold.`,
-            ),
-          );
-        }
+        this.takeChunk(this.chunks.shift() ?? '');
         continue;
       }
       if (this.ended) return undefined;
       if (this.failure) throw this.failure;
       await this.awaitChunk();
+    }
+  }
+
+  /** The line ending at `nl` in {@link carry}, with whatever came before it. */
+  private takeLine(nl: number): string {
+    const tail = this.carry.slice(0, nl);
+    const line = this.partial.length > 0 ? this.partial.join('') + tail : tail;
+    this.partial = [];
+    this.partialLength = 0;
+    this.carry = this.carry.slice(nl + 1);
+    return line;
+  }
+
+  /** Make `chunk` the one searched next, keeping what is left of the last. */
+  private takeChunk(chunk: string): void {
+    if (this.carry.length > 0) {
+      this.partial.push(this.carry);
+      this.partialLength += this.carry.length;
+    }
+    this.carry = chunk;
+    if (this.partialLength + this.carry.length > MAX_OUTPUT_BYTES) {
+      this.abort(
+        new Error(
+          `The transform wrote more than ${MAX_OUTPUT_BYTES} bytes without a line break, at record ${this.answered}. One record cannot fan out to more rows than the runner can hold.`,
+        ),
+      );
     }
   }
 
@@ -1290,15 +1325,21 @@ const collect = (value) => {
 try {
   ${javascriptExportedFunction(moduleUrl)}
   let context = null;
-  let carry = "";
+  // Pieces of the line being read, none holding a newline, joined once it
+  // ends: only each new chunk is searched, so a long line costs its length.
+  const partial = [];
   process.stdin.setEncoding("utf8");
   for await (const chunk of process.stdin) {
-    carry += chunk;
-    let nl = carry.indexOf("\\n");
+    let start = 0;
+    let nl = chunk.indexOf("\\n");
+    if (nl === -1) partial.push(chunk);
     while (nl !== -1) {
-      const line = carry.slice(0, nl);
-      carry = carry.slice(nl + 1);
-      nl = carry.indexOf("\\n");
+      const tail = chunk.slice(start, nl);
+      const line = partial.length > 0 ? partial.join("") + tail : tail;
+      partial.length = 0;
+      start = nl + 1;
+      nl = chunk.indexOf("\\n", start);
+      if (nl === -1 && start < chunk.length) partial.push(chunk.slice(start));
       if (line.length === 0) continue;
       if (context === null) {
         const sent = JSON.parse(line);

@@ -62,53 +62,84 @@ export function csvScanner(delimiter: string): CsvScanner {
   let field = '';
   let row: string[] = [];
 
+  // The character the field state splits on, or none at all. A quote is tested
+  // before the delimiter, so a `"` delimiter never splits; a delimiter longer
+  // than one character never equals one character, so it never splits either.
+  const splitsOn = delimiter.length === 1 && delimiter !== '"' ? delimiter : undefined;
+  // The delimiter is tested before the newline, so a `\n` delimiter ends a
+  // field and nothing ever ends a row.
+  const newlineEndsRow = splitsOn !== '\n';
+  const splitsOnCode = splitsOn?.charCodeAt(0);
+
   /**
-   * One character in whichever state the scanner is in.
+   * Inside a quoted run, or just past a quote in one: up to the next quote in
+   * one slice. Returns where reading continues.
    *
-   * `quote-maybe` re-reads the character in `field` state rather than handling
-   * it twice, which is what makes `ab"c,d"ef` one field: the whole-text reader
-   * returns from its quoted run *at* the closing quote and lets the outer loop
-   * carry on appending to the same field, and this is that same handover.
+   * `quote-maybe` hands the character back to the field state unread, which is
+   * what makes `ab"c,d"ef` one field: the quoted run closes and the same field
+   * carries on.
    */
-  const consume = (char: string, rows: string[][]): void => {
-    if (state === 'quoted') {
-      if (char === '"') state = 'quote-maybe';
-      else field += char;
-      return;
-    }
+  const readQuoted = (text: string, index: number): number => {
     if (state === 'quote-maybe') {
       state = 'field';
+      if (text.charCodeAt(index) !== QUOTE) return index;
       // A doubled quote is one literal quote and the run continues.
-      if (char === '"') {
-        field += '"';
-        state = 'quoted';
-        return;
-      }
-      // Otherwise the run closed and this character belongs to the field.
-    }
-    if (char === '"') {
+      field += '"';
       state = 'quoted';
-    } else if (char === delimiter) {
+      return index + 1;
+    }
+    const close = text.indexOf('"', index);
+    if (close === -1) {
+      field += text.slice(index);
+      return text.length;
+    }
+    field += text.slice(index, close);
+    state = 'quote-maybe';
+    return close + 1;
+  };
+
+  /** Ordinary text: up to the next quote, delimiter or newline in one slice. */
+  const readField = (
+    text: string,
+    index: number,
+    nextStop: (from: number) => number,
+    rows: string[][],
+  ): number => {
+    const stop = nextStop(index);
+    if (stop === -1) {
+      field += text.slice(index);
+      return text.length;
+    }
+    field += text.slice(index, stop);
+    const char = text.charCodeAt(stop);
+    if (char === QUOTE) {
+      state = 'quoted';
+    } else if (char === splitsOnCode) {
       row.push(field);
       field = '';
-    } else if (char === '\n') {
-      row.push(field.replace(/\r$/, ''));
+    } else {
+      row.push(withoutTrailingCr(field));
       rows.push(row);
       row = [];
       field = '';
-    } else {
-      field += char;
     }
+    return stop + 1;
   };
 
   return {
+    /**
+     * Jumps from one character that matters to the next rather than visiting
+     * every character. Positions are UTF-16 code units, as `indexOf` and
+     * `slice` count them, so a surrogate pair is two characters like any other.
+     */
     push(text: string): string[][] {
       const rows: string[][] = [];
-      // Indexed rather than `for (const char of text)`, which iterates by code
-      // *point* and hands back a surrogate pair as one two-unit string. The
-      // whole-text reader this has to agree with indexed with `text[i]`, and
-      // "agrees with" is the only property here worth having.
-      for (let index = 0; index < text.length; index += 1) consume(text[index] ?? '', rows);
+      const nextStop = stopFinder(text, splitsOn, newlineEndsRow);
+      let index = 0;
+      while (index < text.length) {
+        index =
+          state === 'field' ? readField(text, index, nextStop, rows) : readQuoted(text, index);
+      }
       return rows;
     },
     end(): string[][] {
@@ -117,7 +148,7 @@ export function csvScanner(delimiter: string): CsvScanner {
       // reaches the same conclusion by running out of characters to look at.
       if (state === 'quote-maybe') state = 'field';
       if (field.length > 0 || row.length > 0) {
-        row.push(field.replace(/\r$/, ''));
+        row.push(withoutTrailingCr(field));
         const last = row;
         row = [];
         field = '';
@@ -126,6 +157,47 @@ export function csvScanner(delimiter: string): CsvScanner {
       return [];
     },
   };
+}
+
+const QUOTE = 34;
+const CARRIAGE_RETURN = 13;
+
+/**
+ * The position of the next quote, delimiter or newline at or after `from`, or
+ * -1 when there is none.
+ *
+ * Each of the three is searched for once per occurrence rather than once per
+ * call: a position at or after `from` is still the next one, and -1 stays -1
+ * for the rest of the text. `from` only grows.
+ */
+function stopFinder(
+  text: string,
+  splitsOn: string | undefined,
+  newlineEndsRow: boolean,
+): (from: number) => number {
+  let quoteAt = -2;
+  let delimiterAt = splitsOn === undefined ? -1 : -2;
+  let newlineAt = newlineEndsRow ? -2 : -1;
+  return (from) => {
+    if (quoteAt !== -1 && quoteAt < from) quoteAt = text.indexOf('"', from);
+    if (delimiterAt !== -1 && delimiterAt < from) {
+      delimiterAt = text.indexOf(splitsOn as string, from);
+    }
+    if (newlineAt !== -1 && newlineAt < from) newlineAt = text.indexOf('\n', from);
+    return earliest(quoteAt, earliest(delimiterAt, newlineAt));
+  };
+}
+
+/** The smaller of two positions, where -1 means "not found". */
+function earliest(a: number, b: number): number {
+  if (a === -1) return b;
+  if (b === -1) return a;
+  return a < b ? a : b;
+}
+
+/** One `\r` off the end of a row's last field, so CRLF reads like LF. */
+function withoutTrailingCr(value: string): string {
+  return value.charCodeAt(value.length - 1) === CARRIAGE_RETURN ? value.slice(0, -1) : value;
 }
 
 /**
@@ -275,7 +347,7 @@ export async function* ndjsonRecords(
   chunks: AsyncIterable<string>,
   source: string,
 ): AsyncGenerator<unknown> {
-  let pending = '';
+  let pending: string[] = [];
   let line = 0;
 
   const parse = (raw: string): unknown => {
@@ -290,18 +362,22 @@ export async function* ndjsonRecords(
   };
 
   for await (const chunk of chunks) {
-    pending += chunk;
-    const lines = pending.split('\n');
+    // A chunk with no newline only extends the partial line. Held as pieces and
+    // joined once its newline arrives, so a line spanning many chunks is not
+    // re-split from its start every time one more of them lands.
+    pending.push(chunk);
+    if (chunk.indexOf('\n') === -1) continue;
+    const lines = pending.join('').split('\n');
     // The last piece is either a partial line or the empty string after a
     // trailing newline. Either way it is not known to be complete yet.
-    pending = lines.pop() ?? '';
+    pending = [lines.pop() ?? ''];
     for (const raw of lines) {
       const trimmed = raw.trim();
       if (trimmed) yield parse(trimmed);
     }
   }
 
-  const last = pending.trim();
+  const last = pending.join('').trim();
   if (last) yield parse(last);
 }
 

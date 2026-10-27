@@ -45,12 +45,15 @@ import {
   type CatalogWorkspaceStore,
   type Dashboard,
   type DashboardCard,
+  type DashboardSummary,
   type EmbeddedChart,
   type EmbeddedChartPlacement,
   type EmbeddedDashboard,
   type SaveQueryInput,
   type SavedQuery,
+  type SavedQuerySummary,
   embeddedVisualization,
+  supportsSavedQueryBatch,
 } from './catalog.workspace';
 import { emptySearch, maySearch, searchCatalog, visibleToPrincipal } from './search';
 import type { CatalogSearchResult } from './search.types';
@@ -722,7 +725,14 @@ export class CatalogService {
     savedQueryId: string,
     placement?: EmbeddedChartPlacement,
   ): Promise<EmbeddedChart> {
-    const saved = await this.getSavedQuery(savedQueryId);
+    return this.embedSaved(await this.getSavedQuery(savedQueryId), placement);
+  }
+
+  /** {@link embedChart}, for a saved query already read. */
+  private async embedSaved(
+    saved: SavedQuery,
+    placement?: EmbeddedChartPlacement,
+  ): Promise<EmbeddedChart> {
     if (!saved.shared) {
       throw new ForbiddenException(
         `"${saved.name}" has not been shared. Mark it shared in the console to make it embeddable.`,
@@ -757,13 +767,17 @@ export class CatalogService {
     }
 
     const ordered = [...dashboard.cards].sort((a, b) => a.position - b.position);
+    const saved = await this.savedQueriesById(ordered.map((card) => card.savedQueryId));
     // Sequential, not parallel: every card is a database query, and a shared
     // dashboard is exactly the thing a consumer will poll on a timer.
     const charts: EmbeddedChart[] = [];
     for (const card of ordered) {
+      const query = saved.get(card.savedQueryId);
+      // A card whose query no longer exists is skipped like a broken one.
+      if (!query) continue;
       try {
         charts.push(
-          await this.embedChart(card.savedQueryId, {
+          await this.embedSaved(query, {
             width: card.width,
             position: card.position,
             // Everything the card says about this chart, not only where it
@@ -785,6 +799,30 @@ export class CatalogService {
       charts,
       generatedAt: new Date().toISOString(),
     };
+  }
+
+  /**
+   * Every saved query these ids name, keyed by id: in one lookup when the store
+   * offers one, and otherwise — or when that lookup fails — one id at a time,
+   * where a lookup that fails reads as nothing found, as it did for the card.
+   */
+  private async savedQueriesById(ids: readonly string[]): Promise<Map<string, SavedQuery>> {
+    const workspace = this.requireWorkspace();
+    const unique = [...new Set(ids)];
+    const found = new Map<string, SavedQuery>();
+    if (unique.length === 0) return found;
+    if (supportsSavedQueryBatch(workspace)) {
+      const queries = await workspace.getSavedQueries(unique).catch(() => undefined);
+      if (queries) {
+        for (const query of queries) found.set(query.id, query);
+        return found;
+      }
+    }
+    for (const id of unique) {
+      const query = await workspace.getSavedQuery(id).catch(() => undefined);
+      if (query) found.set(id, query);
+    }
+    return found;
   }
 
   listEvents(query: AuditQuery): Promise<CatalogAuditEvent[]> {
@@ -841,8 +879,8 @@ export class CatalogService {
     if (!maySearch(options.principal)) return emptySearch(trimmed);
 
     const [savedQueries, dashboards] = await Promise.all([
-      this.listSavedQueries(),
-      this.listDashboards(),
+      this.savedQuerySummaries(),
+      this.dashboardSummaries(),
     ]);
 
     return searchCatalog({
@@ -865,5 +903,17 @@ export class CatalogService {
       })),
       limit: options.limit,
     });
+  }
+
+  /** Saved queries without their SQL, read that way when the store can. */
+  private savedQuerySummaries(): Promise<SavedQuerySummary[]> {
+    if (this.workspace?.listSavedQuerySummaries) return this.workspace.listSavedQuerySummaries();
+    return this.listSavedQueries();
+  }
+
+  /** Dashboards without their cards, read that way when the store can. */
+  private dashboardSummaries(): Promise<DashboardSummary[]> {
+    if (this.workspace?.listDashboardSummaries) return this.workspace.listDashboardSummaries();
+    return this.listDashboards();
   }
 }

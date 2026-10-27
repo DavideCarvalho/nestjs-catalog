@@ -681,9 +681,32 @@ export function embeddedVisualization(
   return cardLibrary ? { ...base, library: cardLibrary } : base;
 }
 
+/** What search reads of a saved query: never its SQL. */
+export type SavedQuerySummary = Pick<SavedQuery, 'id' | 'name' | 'description' | 'folder'>;
+
+/** What search reads of a dashboard: never its cards. */
+export type DashboardSummary = Pick<Dashboard, 'id' | 'name' | 'description'>;
+
 export interface CatalogWorkspaceStore {
   listSavedQueries(): Promise<SavedQuery[]>;
   getSavedQuery(id: string): Promise<SavedQuery | undefined>;
+  /**
+   * The saved queries with these ids, in one lookup. An id that names nothing
+   * is simply absent from the answer, and order is not promised.
+   *
+   * **Optional**, for the reason {@link listSavedQueryRevisions} is: a store
+   * written against the shape without it still implements this interface, and
+   * {@link supportsSavedQueryBatch} is how a caller asks. A caller without it
+   * reads them one {@link getSavedQuery} at a time.
+   */
+  getSavedQueries?(ids: readonly string[]): Promise<SavedQuery[]>;
+  /**
+   * Every saved query, as only the fields search ranks — in the order
+   * {@link listSavedQueries} returns them, so a search over these reads exactly
+   * as one over the full rows. **Optional**; without it, search lists the full
+   * rows and narrows them itself.
+   */
+  listSavedQuerySummaries?(): Promise<SavedQuerySummary[]>;
   saveQuery(input: SaveQueryInput, createdBy: string): Promise<SavedQuery>;
   updateSavedQuery(id: string, input: Partial<SaveQueryInput>): Promise<SavedQuery | undefined>;
   /**
@@ -716,6 +739,8 @@ export interface CatalogWorkspaceStore {
   listSavedQueryRevisions?(id: string): Promise<CatalogRevision[]>;
 
   listDashboards(): Promise<Dashboard[]>;
+  /** {@link listSavedQuerySummaries}, for dashboards: no cards. **Optional**. */
+  listDashboardSummaries?(): Promise<DashboardSummary[]>;
   getDashboard(id: string): Promise<Dashboard | undefined>;
   saveDashboard(
     input: {
@@ -753,6 +778,13 @@ export function supportsSavedQueryRevisions(
 ): store is CatalogWorkspaceStore &
   Required<Pick<CatalogWorkspaceStore, 'listSavedQueryRevisions'>> {
   return typeof store.listSavedQueryRevisions === 'function';
+}
+
+/** Whether this store can read several saved queries in one lookup. */
+export function supportsSavedQueryBatch(
+  store: CatalogWorkspaceStore,
+): store is CatalogWorkspaceStore & Required<Pick<CatalogWorkspaceStore, 'getSavedQueries'>> {
+  return typeof store.getSavedQueries === 'function';
 }
 
 export function isWorkspaceStore(store: unknown): store is CatalogWorkspaceStore {
