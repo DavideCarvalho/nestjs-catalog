@@ -286,7 +286,9 @@ describe('GET /catalog/search (integration)', () => {
       ],
     }).compile();
     app = moduleRef.createNestApplication();
-    await app.init();
+    // Bound once here: given an unbound server, supertest calls listen(0) for every request,
+    // and two concurrent listen() calls on one server reset a connection on Node 26.
+    await app.listen(0, '127.0.0.1');
     return app.getHttpServer();
   }
 
