@@ -1,5 +1,15 @@
 # @dudousxd/nestjs-catalog-pipeline
 
+## 0.31.0
+
+### Minor Changes
+
+- [#248](https://github.com/DavideCarvalho/nestjs-catalog/pull/248) [`6110c71`](https://github.com/DavideCarvalho/nestjs-catalog/commit/6110c71a0aef0d24fc6cc97910c65d05a6cc3182) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - **Breaking:** require Node.js 24 or newer. Every package declares `engines.node >= 24` (most declared none before; `-secrets-vault` said `>=18`, `-telescope` `>=22`). CI tests on Node 24 and 26.
+
+  - `@dudousxd/nestjs-catalog-telescope`: removed the default export, a duplicate of `catalogTelescopeExtension` that broke default imports from ESM in some bundlers. Import it by name.
+  - `@dudousxd/nestjs-catalog-react`: relative imports in the published files now carry their `.js` extension, so the package and its types resolve under TypeScript's `node16`/`nodenext` resolution, not only under a bundler.
+  - Every CommonJS package now declares `"type": "commonjs"`.
+
 ## 0.30.2
 
 ### Patch Changes
@@ -2562,9 +2572,9 @@ equals?}` or `{kind: 'rowCount', atLeast}` — where it used to carry `envVar` a
   Every scheduled connector in a deployment was silently inert. The worker said so
   at boot, once, and contradicted itself on the next line:
 
-                                                ERROR [ConnectorScheduler] No connector will run on a schedule:
-                                                      parser.parseExpression is not a function.
-                                                LOG   [ConnectorScheduler] Watching connector schedules every 30000ms.
+                                                  ERROR [ConnectorScheduler] No connector will run on a schedule:
+                                                        parser.parseExpression is not a function.
+                                                  LOG   [ConnectorScheduler] Watching connector schedules every 30000ms.
 
   `cron-parser` v4 exported `parseExpression`; v5 replaced it with
   `CronExpressionParser.parse`. The durable core read only the v4 shape, so
