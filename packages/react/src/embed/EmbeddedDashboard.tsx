@@ -1,17 +1,17 @@
 import { useQuery } from '@tanstack/react-query';
 import type { ReactNode } from 'react';
-import { CHART_GRID, chartSpan } from '../charts/grid';
-import { cn } from '../cn';
-import { catalogQueryKeys, useCatalogClient } from '../context';
-import type { EmbedActions } from './actions';
-import { EmbeddedChartCard } from './chart-card';
-import { chartsInLayoutOrder } from './payload';
+import { CHART_GRID, chartSpan } from '../charts/grid.js';
+import { cn } from '../cn.js';
+import { catalogQueryKeys, useCatalogClient } from '../context.js';
+import type { EmbedActions } from './actions.js';
+import { EmbeddedChartCard } from './chart-card.js';
+import { chartsInLayoutOrder } from './payload.js';
 import {
   type EmbedFailureSlot,
   type EmbedLoadingSlot,
   renderFailure,
   renderLoading,
-} from './slots';
+} from './slots.js';
 
 /**
  * A whole shared dashboard, in a host application's own page.

@@ -8,7 +8,7 @@
  * with upstream stays a diff rather than a merge.
  */
 import type { Transition } from 'motion/react';
-import { DEFAULT_CHART_ENTER_TRANSITION } from './animation';
+import { DEFAULT_CHART_ENTER_TRANSITION } from './animation.js';
 
 export function transitionWithDelay(
   transition: Transition | undefined,

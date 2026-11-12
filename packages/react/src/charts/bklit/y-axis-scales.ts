@@ -8,7 +8,7 @@
  * with upstream stays a diff rather than a merge.
  */
 import { scaleLinear } from '@visx/scale';
-import type { LineConfig } from './chart-context';
+import type { LineConfig } from './chart-context.js';
 
 /** Default axis id when `yAxisId` is omitted (Recharts-style `0` / primary left axis). */
 export const DEFAULT_Y_AXIS_ID = 'left';

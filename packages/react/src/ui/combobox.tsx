@@ -1,7 +1,7 @@
 import { Autocomplete } from '@base-ui/react/autocomplete';
 import { Check, ChevronsUpDown } from 'lucide-react';
 import { type ReactNode, useState } from 'react';
-import { cn } from '../cn';
+import { cn } from '../cn.js';
 
 /**
  * A searchable select that is also a text box, vendored in the shadcn style on

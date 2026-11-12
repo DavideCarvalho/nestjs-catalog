@@ -5,8 +5,8 @@ import type {
   WorkflowSinkNode,
   WorkflowSourceNode,
 } from '@dudousxd/nestjs-catalog/client';
-import { nodeName } from './model';
-import type { WorkflowProblem } from './validate';
+import { nodeName } from './model.js';
+import type { WorkflowProblem } from './validate.js';
 
 /**
  * Whether what a source produces fits the type a sink writes, asked while the

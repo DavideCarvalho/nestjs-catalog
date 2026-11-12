@@ -25,11 +25,11 @@ import {
   useContext,
   useMemo,
 } from 'react';
-import type { ChartPhase, ChartStatus } from './chart-phase';
-import type { ReferenceAreaConfig } from './reference-area-config';
-import type { ChartSelection } from './use-chart-interaction';
-import { DEFAULT_Y_AXIS_ID } from './y-axis-scales';
-import type { YDomain } from './y-domain-utils';
+import type { ChartPhase, ChartStatus } from './chart-phase.js';
+import type { ReferenceAreaConfig } from './reference-area-config.js';
+import type { ChartSelection } from './use-chart-interaction.js';
+import { DEFAULT_Y_AXIS_ID } from './y-axis-scales.js';
+import type { YDomain } from './y-domain-utils.js';
 
 // CSS variable references for theming
 export const chartCssVars = {

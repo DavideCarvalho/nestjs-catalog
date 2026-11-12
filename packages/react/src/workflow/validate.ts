@@ -4,9 +4,9 @@ import {
   type WorkflowNode,
   validateWorkflow as validateCoreWorkflow,
 } from '@dudousxd/nestjs-catalog/client';
-import { nodeName } from './model';
-import { WORKFLOW_NAME } from './name';
-import { type ShapeKnowledge, checkShapes } from './shape';
+import { nodeName } from './model.js';
+import { WORKFLOW_NAME } from './name.js';
+import { type ShapeKnowledge, checkShapes } from './shape.js';
 
 /**
  * What is wrong with a graph, checked in the browser while it is being drawn.

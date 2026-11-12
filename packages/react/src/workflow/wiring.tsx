@@ -10,10 +10,10 @@ import {
 import { CircleAlert, Link2 } from 'lucide-react';
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Button } from '../ui/button';
-import { NODE_HEIGHT, NODE_WIDTH, type WorkflowFlowNode } from './graph';
-import { type WorkflowEdge, type WorkflowNode, nodeName } from './model';
-import { canConnect } from './validate';
+import { Button } from '../ui/button.js';
+import { NODE_HEIGHT, NODE_WIDTH, type WorkflowFlowNode } from './graph.js';
+import { type WorkflowEdge, type WorkflowNode, nodeName } from './model.js';
+import { canConnect } from './validate.js';
 
 /**
  * Wiring by clicking twice, and the line that shows what is being drawn.

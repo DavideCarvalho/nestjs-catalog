@@ -1,6 +1,6 @@
 import { Tabs as BaseTabs } from '@base-ui/react/tabs';
 import type { ReactNode, Ref } from 'react';
-import { cn } from '../cn';
+import { cn } from '../cn.js';
 
 /**
  * Tabs, vendored in the shadcn style on Base UI.

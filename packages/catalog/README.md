@@ -22,6 +22,8 @@ see it — is declared once and served to everything downstream.
 
 ## Mount it
 
+Requires **Node.js 24 or newer**, like every `@dudousxd/nestjs-catalog-*` package.
+
 ```ts
 import { CatalogModule } from "@dudousxd/nestjs-catalog";
 
@@ -341,6 +343,18 @@ whatever screens you want.
 If you would rather not, [`@dudousxd/nestjs-catalog-react`](../nestjs-catalog-react)
 ships a model manager and a generic object explorer that you drop into your own
 app shell.
+
+## Upgrading
+
+### Node.js 24
+
+Every `@dudousxd/nestjs-catalog-*` package now declares `engines.node >= 24`. Upgrade the Node.js
+version your app runs and builds on first. Two packages also changed in the same release:
+
+- `@dudousxd/nestjs-catalog-telescope` has no default export any more. Import it by name:
+  `import { catalogTelescopeExtension } from '@dudousxd/nestjs-catalog-telescope'`.
+- `@dudousxd/nestjs-catalog-react` now resolves under TypeScript's `node16`/`nodenext` module
+  resolution as well as under a bundler. Nothing to change in your code.
 
 ## License
 

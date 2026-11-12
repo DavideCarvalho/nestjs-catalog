@@ -18,7 +18,7 @@ export {
   collectCustomProperties,
   resolveCssVariables,
   THEME_CUSTOM_PROPERTIES,
-} from './css-variables';
+} from './css-variables.js';
 export {
   type ExportBackground,
   resolveAncestorBackground,
@@ -27,7 +27,7 @@ export {
   type SerializeSvgOptions,
   serializeSvg,
   svgToDataUri,
-} from './serialize';
+} from './serialize.js';
 export {
   defaultPngFilename,
   downloadSvgAsPng,
@@ -37,7 +37,7 @@ export {
   resolveScale,
   svgToPngBlob,
   triggerDownload,
-} from './png';
+} from './png.js';
 export {
   canRasterise,
   type PngExport,
@@ -45,7 +45,7 @@ export {
   useHasExportableSvg,
   usePngExport,
   type UsePngExportOptions,
-} from './use-png-export';
+} from './use-png-export.js';
 export {
   buildChartPdfSource,
   type ChartPdfExporter,
@@ -56,9 +56,9 @@ export {
   registerPdfExporter,
   subscribeToPdfExporter,
   type SvgRasteriser,
-} from './pdf';
+} from './pdf.js';
 export {
   type PdfExport,
   usePdfExport,
   type UsePdfExportOptions,
-} from './use-pdf-export';
+} from './use-pdf-export.js';

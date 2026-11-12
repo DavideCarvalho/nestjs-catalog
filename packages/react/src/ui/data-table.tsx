@@ -13,7 +13,7 @@ import {
 } from '@tanstack/react-table';
 import { ArrowDown, ArrowUp, ChevronsUpDown } from 'lucide-react';
 import { type ReactNode, useMemo } from 'react';
-import { cn } from '../cn';
+import { cn } from '../cn.js';
 
 /**
  * The console's data tables, on TanStack Table v9.

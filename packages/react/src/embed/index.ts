@@ -10,12 +10,12 @@ export {
   type EmbedAction,
   type EmbedActions,
   resolveEmbedActions,
-} from './actions';
-export { EmbeddedChart, type EmbeddedChartProps } from './EmbeddedChart';
-export { EmbeddedDashboard, type EmbeddedDashboardProps } from './EmbeddedDashboard';
+} from './actions.js';
+export { EmbeddedChart, type EmbeddedChartProps } from './EmbeddedChart.js';
+export { EmbeddedDashboard, type EmbeddedDashboardProps } from './EmbeddedDashboard.js';
 export {
   chartsInLayoutOrder,
   type EmbeddedChartPayload,
   type EmbeddedDashboardPayload,
-} from './payload';
-export type { EmbedFailureSlot, EmbedLoadingSlot } from './slots';
+} from './payload.js';
+export type { EmbedFailureSlot, EmbedLoadingSlot } from './slots.js';

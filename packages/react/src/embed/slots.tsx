@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react';
-import { ChartFailed } from '../charts/skeleton';
+import { ChartFailed } from '../charts/skeleton.js';
 
 /**
  * What an embed shows while it is fetching, and what it shows when it could not.

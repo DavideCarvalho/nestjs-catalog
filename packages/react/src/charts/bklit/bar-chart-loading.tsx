@@ -9,8 +9,8 @@
  * `cn`, which is the same function. Nothing else is modified, so re-syncing
  * with upstream stays a diff rather than a merge.
  */
-import { BarChart } from './bar-chart';
-import type { Margin } from './chart-context';
+import { BarChart } from './bar-chart.js';
+import type { Margin } from './chart-context.js';
 
 const EMPTY_DATA: Record<string, unknown>[] = [];
 

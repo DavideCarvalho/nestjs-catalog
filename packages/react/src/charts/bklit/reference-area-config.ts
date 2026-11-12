@@ -8,7 +8,7 @@
  * with upstream stays a diff rather than a merge.
  */
 import { Children, type ReactElement, type ReactNode, isValidElement } from 'react';
-import { normalizeYAxisId } from './y-axis-scales';
+import { normalizeYAxisId } from './y-axis-scales.js';
 
 export interface ReferenceAreaConfig {
   yAxisId: string;

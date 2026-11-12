@@ -17,6 +17,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm lint
       - run: pnpm build
+      - run: pnpm check:package
 
       # The third gate, and the reason the other two were not enough.
       #
@@ -35,7 +36,26 @@ jobs:
       # whole lesson of this file is what happens when that is allowed to be somebody's later.
       - run: pnpm typecheck
 
-      # The fourth gate, and the step the three above were standing in for.
+  # Tests run on every Node major the packages support; build and release stay on `.nvmrc`.
+  test:
+    name: test (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [24.22.2, 26.13.0]
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: pnpm/action-setup@v6.1.0
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+
+      # The fourth gate (after lint, build and typecheck in `build`), and the step those three were
+      # standing in for.
       #
       # `typecheck` above proves the specs COMPILE. It says nothing about whether they pass,
       # and until this step existed nothing in this repo ran them: 3,552 unit tests across 233

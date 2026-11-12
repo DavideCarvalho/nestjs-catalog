@@ -23,10 +23,10 @@ import {
   useRef,
   useState,
 } from 'react';
-import { cn } from '../../cn';
-import { DEFAULT_ANIMATION_EASING } from './animation';
-import type { BarProps } from './bar';
-import { topSquareCenterY } from './bar-squares-layout';
+import { cn } from '../../cn.js';
+import { DEFAULT_ANIMATION_EASING } from './animation.js';
+import { topSquareCenterY } from './bar-squares-layout.js';
+import type { BarProps } from './bar.js';
 import {
   forEachChartChild,
   isChartClipPassthrough,
@@ -35,25 +35,25 @@ import {
   isUnderlayComponent,
   renderKeyedChartLayers,
   resolveChartChildElement,
-} from './chart-child-passthrough';
-import { ChartProvider, type LineConfig, type Margin, type TooltipData } from './chart-context';
-import { isGradientDefComponent, isPatternDefComponent } from './chart-defs';
-import { shortDateFmt } from './chart-formatters';
+} from './chart-child-passthrough.js';
+import { ChartProvider, type LineConfig, type Margin, type TooltipData } from './chart-context.js';
+import { isGradientDefComponent, isPatternDefComponent } from './chart-defs.js';
+import { shortDateFmt } from './chart-formatters.js';
 import {
   type ChartPhase,
   type ChartStatus,
   DEFAULT_CHART_LIFECYCLE,
   resolveRestingChartPhase,
-} from './chart-phase';
-import { BarLoadingSkeleton } from './loading-sweep';
-import { extractReferenceAreaConfigs } from './reference-area-config';
-import { useScheduledTooltip } from './use-scheduled-tooltip';
+} from './chart-phase.js';
+import { BarLoadingSkeleton } from './loading-sweep.js';
+import { extractReferenceAreaConfigs } from './reference-area-config.js';
+import { useScheduledTooltip } from './use-scheduled-tooltip.js';
 import {
   buildYScalesForLines,
   getPrimaryYScale,
   normalizeYAxisId,
   wrapSingleYScale,
-} from './y-axis-scales';
+} from './y-axis-scales.js';
 
 /** Skeleton bars to show when `status="loading"` and `data` is empty. */
 const FALLBACK_LOADING_BARS = 12;

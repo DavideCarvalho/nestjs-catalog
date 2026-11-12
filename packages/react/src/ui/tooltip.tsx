@@ -1,6 +1,6 @@
 import { Tooltip as BaseTooltip } from '@base-ui/react/tooltip';
 import { type ReactNode, isValidElement } from 'react';
-import { cn } from '../cn';
+import { cn } from '../cn.js';
 
 /**
  * The shadcn/ui tooltip, vendored, on Base UI.

@@ -25,20 +25,20 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { CircleCheck, Clock, Loader2, Play, TriangleAlert, Undo2, Upload } from 'lucide-react';
 import { useState } from 'react';
-import { cn } from '../cn';
+import { cn } from '../cn.js';
 import {
   type ScheduledWorkflow,
   type WorkflowRunOptions,
   catalogQueryKeys,
   useCatalogClient,
-} from '../context';
-import { Button } from '../ui/button';
-import { ConfirmDialog } from '../ui/dialog';
-import { TextAreaField, TextField } from '../ui/field';
-import { Switch } from '../ui/switch';
-import { Tooltip } from '../ui/tooltip';
-import type { CatalogWorkflow, WorkflowRun } from './model';
-import { WORKFLOW_NAME } from './name';
+} from '../context.js';
+import { Button } from '../ui/button.js';
+import { ConfirmDialog } from '../ui/dialog.js';
+import { TextAreaField, TextField } from '../ui/field.js';
+import { Switch } from '../ui/switch.js';
+import { Tooltip } from '../ui/tooltip.js';
+import type { CatalogWorkflow, WorkflowRun } from './model.js';
+import { WORKFLOW_NAME } from './name.js';
 
 const MUTED = 'text-zinc-400 dark:text-zinc-500';
 const RULE = 'border-zinc-200 dark:border-zinc-800';

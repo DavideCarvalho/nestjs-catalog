@@ -1,5 +1,5 @@
-import { type PngExportOptions, rasteriseSerializedSvg } from './png';
-import { type SerializedSvg, serializeSvg } from './serialize';
+import { type PngExportOptions, rasteriseSerializedSvg } from './png.js';
+import { type SerializedSvg, serializeSvg } from './serialize.js';
 
 /**
  * PDF export, as a seam the host fills rather than a dependency this package takes.

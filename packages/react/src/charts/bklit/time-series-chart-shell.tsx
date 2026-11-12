@@ -24,49 +24,49 @@ import {
   useMemo,
   useState,
 } from 'react';
-import { DEFAULT_ANIMATION_EASING, DEFAULT_CHART_ENTER_TRANSITION } from './animation';
+import { DEFAULT_ANIMATION_EASING, DEFAULT_CHART_ENTER_TRANSITION } from './animation.js';
 import {
   isClipExcludedComponent,
   isPostOverlayComponent,
   isUnderlayComponent,
   resolveChartChildElement,
-} from './chart-child-passthrough';
-import { ChartProvider, type LineConfig, type Margin } from './chart-context';
-import { isGradientDefComponent, isPatternDefComponent } from './chart-defs';
-import { shortDateFmt } from './chart-formatters';
+} from './chart-child-passthrough.js';
+import { ChartProvider, type LineConfig, type Margin } from './chart-context.js';
+import { isGradientDefComponent, isPatternDefComponent } from './chart-defs.js';
+import { shortDateFmt } from './chart-formatters.js';
 import {
   type ChartPhase,
   type ChartStatus,
   DEFAULT_CHART_STATUS,
   DEFAULT_Y_DOMAIN_TWEEN_MS,
   isChartInteractionPhase,
-} from './chart-phase';
-import { ChartRevealClip } from './chart-reveal-clip';
-import { decimateTimeSeries, maxRenderPointsForWidth } from './decimate-time-series';
-import { filterDataByXDomain } from './filter-data-by-x-domain';
+} from './chart-phase.js';
+import { ChartRevealClip } from './chart-reveal-clip.js';
+import { decimateTimeSeries, maxRenderPointsForWidth } from './decimate-time-series.js';
+import { filterDataByXDomain } from './filter-data-by-x-domain.js';
 import {
   generateChartSkeletonData,
   generateChartSkeletonFromTarget,
-} from './generate-chart-skeleton-data';
+} from './generate-chart-skeleton-data.js';
 import {
   extractProjectionLineConfigs,
   mergeProjectionXDomainMax,
   mergeProjectionYDomain,
-} from './projection-config';
-import { type ReferenceAreaConfig, extractReferenceAreaConfigs } from './reference-area-config';
-import { ReferenceAreaRegistrationContext } from './reference-area-registration-context';
-import { computeSeriesBarRevealClipPadding, computeSeriesBarWidth } from './series-bar-layout';
-import { useStaticChartPreview } from './static-chart-preview-context';
-import { useAnimatedYDomains } from './use-animated-y-domains';
-import { useChartInteraction } from './use-chart-interaction';
-import { useChartPhaseOrchestrator } from './use-chart-phase-orchestrator';
+} from './projection-config.js';
+import { type ReferenceAreaConfig, extractReferenceAreaConfigs } from './reference-area-config.js';
+import { ReferenceAreaRegistrationContext } from './reference-area-registration-context.js';
+import { computeSeriesBarRevealClipPadding, computeSeriesBarWidth } from './series-bar-layout.js';
+import { useStaticChartPreview } from './static-chart-preview-context.js';
+import { useAnimatedYDomains } from './use-animated-y-domains.js';
+import { useChartInteraction } from './use-chart-interaction.js';
+import { useChartPhaseOrchestrator } from './use-chart-phase-orchestrator.js';
 import {
   DEFAULT_Y_AXIS_ID,
   buildYScalesFromDomains,
   getPrimaryYScale,
   groupLinesByYAxisId,
-} from './y-axis-scales';
-import { computeYDomainsByAxis } from './y-domain-utils';
+} from './y-axis-scales.js';
+import { computeYDomainsByAxis } from './y-domain-utils.js';
 
 function collectNumericExtents(data: Record<string, unknown>[], dataKeys: string[]) {
   let minValue = Number.POSITIVE_INFINITY;

@@ -1,8 +1,8 @@
 import { Dialog as BaseDialog } from '@base-ui/react/dialog';
 import { X } from 'lucide-react';
 import type { ReactNode } from 'react';
-import { cn } from '../cn';
-import { Tooltip } from './tooltip';
+import { cn } from '../cn.js';
+import { Tooltip } from './tooltip.js';
 
 /**
  * A panel that slides in from the right, on Base UI's Dialog.

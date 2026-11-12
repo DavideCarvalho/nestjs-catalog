@@ -11,15 +11,15 @@
  */
 import { animate, useReducedMotion } from 'motion/react';
 import { useEffect, useRef, useState } from 'react';
-import type { ChartPhase } from './chart-phase';
-import { LINE_LOADING_PULSE_EASE } from './line-loading-timing';
+import type { ChartPhase } from './chart-phase.js';
+import { LINE_LOADING_PULSE_EASE } from './line-loading-timing.js';
 import {
   type YDomain,
   domainsEqual,
   isYDomainTweenPhase,
   resolveAnimatedYDestinationDomains,
   shouldTweenYDomain,
-} from './y-domain-utils';
+} from './y-domain-utils.js';
 
 function lerpDomain(from: YDomain, to: YDomain, progress: number): YDomain {
   return [from[0] + (to[0] - from[0]) * progress, from[1] + (to[1] - from[1]) * progress];

@@ -13,10 +13,10 @@ import {
   Unplug,
   Waypoints,
 } from 'lucide-react';
-import { cn } from '../cn';
-import { Tooltip } from '../ui/tooltip';
-import type { CanvasMenuIcon, CanvasMenuItem, CanvasMenuSection } from './canvas-menu';
-import { type WorkflowNode, nodeName } from './model';
+import { cn } from '../cn.js';
+import { Tooltip } from '../ui/tooltip.js';
+import type { CanvasMenuIcon, CanvasMenuItem, CanvasMenuSection } from './canvas-menu.js';
+import { type WorkflowNode, nodeName } from './model.js';
 
 /**
  * The two surfaces that render {@link CanvasMenuSection}, and the way back from

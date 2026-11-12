@@ -1,4 +1,4 @@
-import { type WorkflowEdge, type WorkflowNode, nodeName } from './model';
+import { type WorkflowEdge, type WorkflowNode, nodeName } from './model.js';
 
 /**
  * Taking nodes out, and saying what went with them.

@@ -11,16 +11,16 @@
  */
 import { curveNatural } from '@visx/curve';
 import { useMemo } from 'react';
-import type { Margin } from './chart-context';
-import type { LoadingStyle } from './chart-phase';
+import type { Margin } from './chart-context.js';
+import type { LoadingStyle } from './chart-phase.js';
 import {
   DEFAULT_SKELETON_DATA_KEY,
   DEFAULT_SKELETON_POINT_COUNT,
   generateChartSkeletonData,
-} from './generate-chart-skeleton-data';
-import { Grid } from './grid';
-import { Line } from './line';
-import { LineChart } from './line-chart';
+} from './generate-chart-skeleton-data.js';
+import { Grid } from './grid.js';
+import { LineChart } from './line-chart.js';
+import { Line } from './line.js';
 
 const LOADING_DATA_KEY = DEFAULT_SKELETON_DATA_KEY;
 const DEFAULT_LOADING_STROKE = 'var(--foreground)';

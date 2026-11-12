@@ -13,11 +13,11 @@ import type { scaleBand } from '@visx/scale';
 import type { Transition } from 'motion/react';
 import { motion } from 'motion/react';
 import { memo, useId, useMemo } from 'react';
-import { computeSquareColumn } from './bar-squares-layout';
-import { chartCssVars, useChart, useChartStable, useYScale } from './chart-context';
-import { useChartLegendHover } from './chart-legend-hover';
-import { transitionWithDelay } from './motion-utils';
-import { type PatternPresetId, renderPatternPreset } from './pattern-preset';
+import { computeSquareColumn } from './bar-squares-layout.js';
+import { chartCssVars, useChart, useChartStable, useYScale } from './chart-context.js';
+import { useChartLegendHover } from './chart-legend-hover.js';
+import { transitionWithDelay } from './motion-utils.js';
+import { type PatternPresetId, renderPatternPreset } from './pattern-preset.js';
 
 type ScaleBand<Domain extends { toString(): string }> = ReturnType<typeof scaleBand<Domain>>;
 

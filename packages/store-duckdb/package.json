@@ -6,7 +6,7 @@
   "author": "Davide Carvalho",
   "repository": {
     "type": "git",
-    "url": "https://github.com/DavideCarvalho/nestjs-catalog.git",
+    "url": "git+https://github.com/DavideCarvalho/nestjs-catalog.git",
     "directory": "packages/store-duckdb"
   },
   "bugs": {
@@ -20,6 +20,7 @@
     "warehouse",
     "snapshots"
   ],
+  "type": "commonjs",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": {
@@ -54,5 +55,8 @@
     "@types/node": "25.9.9",
     "testcontainers": "10.16.0",
     "typescript": "5.9.3"
+  },
+  "engines": {
+    "node": ">=24"
   }
 }

@@ -12,12 +12,12 @@
 import { curveLinear } from '@visx/curve';
 import { LinePath } from '@visx/shape';
 import { useCallback, useId, useMemo } from 'react';
-import { useChartStable, useYScale } from './chart-context';
+import { useChartStable, useYScale } from './chart-context.js';
 import {
   type ProjectionCurveKind,
   type ProjectionPoint,
   buildHorizontalTangentBezierPath,
-} from './projection-utils';
+} from './projection-utils.js';
 
 // biome-ignore lint/suspicious/noExplicitAny: d3 curve factory type
 type CurveFactory = any;

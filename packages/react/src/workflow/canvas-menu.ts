@@ -1,13 +1,13 @@
-import { kindsBetween, newKindsFrom } from './create';
+import { kindsBetween, newKindsFrom } from './create.js';
 import {
   type WorkflowBranchLabel,
   type WorkflowEdge,
   type WorkflowNode,
   type WorkflowNodeKind,
   nodeName,
-} from './model';
-import { WORKFLOW_NAME } from './name';
-import { canConnect, edgeId } from './validate';
+} from './model.js';
+import { WORKFLOW_NAME } from './name.js';
+import { canConnect, edgeId } from './validate.js';
 
 /**
  * What right-clicking something on this canvas offers, worked out from the graph.

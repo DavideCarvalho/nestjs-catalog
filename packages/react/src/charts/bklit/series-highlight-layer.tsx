@@ -10,9 +10,9 @@
  * with upstream stays a diff rather than a merge.
  */
 import type { RefObject } from 'react';
-import { useChartStable } from './chart-context';
-import { HighlightSegment } from './highlight-segment';
-import { useHighlightSegment } from './use-highlight-segment';
+import { useChartStable } from './chart-context.js';
+import { HighlightSegment } from './highlight-segment.js';
+import { useHighlightSegment } from './use-highlight-segment.js';
 
 interface SeriesHighlightLayerProps {
   /** Caller already gated `showHighlight && showLine`; this just routes through. */

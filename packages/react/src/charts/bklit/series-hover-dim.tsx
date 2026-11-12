@@ -11,8 +11,8 @@
  */
 import { motion } from 'motion/react';
 import type { ReactNode } from 'react';
-import { useChartHover } from './chart-context';
-import { useChartLegendHover } from './chart-legend-hover';
+import { useChartHover } from './chart-context.js';
+import { useChartLegendHover } from './chart-legend-hover.js';
 
 interface SeriesHoverDimProps {
   /** Skip the dim entirely. */

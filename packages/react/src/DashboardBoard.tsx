@@ -32,16 +32,16 @@ import {
   Trash2,
 } from 'lucide-react';
 import { useEffect, useState } from 'react';
-import { paramFromLocation } from './ObjectExplorer';
-import { ChartBody } from './charts/body';
-import { CHART_GRID, chartSpan } from './charts/grid';
-import { registeredChartLibraries, visualizationFor } from './charts/registry';
-import { ChartFailed, ChartSkeleton } from './charts/skeleton';
-import { cn } from './cn';
-import { useCatalogClient } from './context';
-import { ShareControl } from './sharing';
-import { Select } from './ui/select';
-import { Tooltip, TooltipProvider } from './ui/tooltip';
+import { paramFromLocation } from './ObjectExplorer.js';
+import { ChartBody } from './charts/body.js';
+import { CHART_GRID, chartSpan } from './charts/grid.js';
+import { registeredChartLibraries, visualizationFor } from './charts/registry.js';
+import { ChartFailed, ChartSkeleton } from './charts/skeleton.js';
+import { cn } from './cn.js';
+import { useCatalogClient } from './context.js';
+import { ShareControl } from './sharing.js';
+import { Select } from './ui/select.js';
+import { Tooltip, TooltipProvider } from './ui/tooltip.js';
 
 const MUTED = 'text-zinc-400 dark:text-zinc-500';
 const RULE = 'border-zinc-200 dark:border-zinc-800';

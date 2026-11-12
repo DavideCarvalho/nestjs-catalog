@@ -11,13 +11,13 @@
  */
 import { motion, useSpring } from 'motion/react';
 import { useEffect } from 'react';
-import { type SpringConfig, useChartConfig } from '../chart-config-context';
-import { chartCssVars } from '../chart-context';
+import { type SpringConfig, useChartConfig } from '../chart-config-context.js';
+import { chartCssVars } from '../chart-context.js';
 import {
   type IndicatorFadeEdges,
   indicatorFadeGradientStops,
   resolveVerticalFadeSides,
-} from '../indicator-fade';
+} from '../indicator-fade.js';
 
 export type IndicatorWidth =
   | number // Pixel width

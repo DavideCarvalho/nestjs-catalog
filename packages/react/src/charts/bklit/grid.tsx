@@ -12,9 +12,9 @@
 import { GridColumns, GridRows } from '@visx/grid';
 import { motion } from 'motion/react';
 import { useId } from 'react';
-import { chartCssVars, useChartStable, useYScale } from './chart-context';
-import { useGridShimmer } from './use-grid-shimmer';
-import { isLoadingChromePhase, isLoadingGridChromePhase } from './y-domain-utils';
+import { chartCssVars, useChartStable, useYScale } from './chart-context.js';
+import { useGridShimmer } from './use-grid-shimmer.js';
+import { isLoadingChromePhase, isLoadingGridChromePhase } from './y-domain-utils.js';
 
 const DEFAULT_SHIMMER_LENGTH_PX = 140;
 const DEFAULT_SHIMMER_SPEED = 1;

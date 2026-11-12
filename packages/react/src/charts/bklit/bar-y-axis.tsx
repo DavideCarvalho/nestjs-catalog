@@ -12,8 +12,8 @@
 import { motion } from 'motion/react';
 import { memo, useEffect, useMemo, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { cn } from '../../cn';
-import { useChart, useChartStable } from './chart-context';
+import { cn } from '../../cn.js';
+import { useChart, useChartStable } from './chart-context.js';
 
 export interface BarYAxisProps {
   /** Whether to show all labels or skip some for dense data. Default: true */

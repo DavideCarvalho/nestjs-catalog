@@ -28,8 +28,8 @@ import type { ScalarType } from '@dudousxd/nestjs-catalog/client';
 import { useMutation } from '@tanstack/react-query';
 import { CircleCheck, Loader2, Save, ScanSearch, TriangleAlert } from 'lucide-react';
 import { useState } from 'react';
-import { cn } from './cn';
-import { Button } from './ui/button';
+import { cn } from './cn.js';
+import { Button } from './ui/button.js';
 
 const MUTED = 'text-zinc-400 dark:text-zinc-500';
 const RULE = 'border-zinc-200 dark:border-zinc-800';

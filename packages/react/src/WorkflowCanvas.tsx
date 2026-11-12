@@ -61,18 +61,18 @@ import {
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
 import type { MouseEvent as ReactMouseEvent, ReactNode } from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { connectionOptionsFor } from './ConnectionPanel';
-import { TransformEditor } from './TransformEditor';
-import { cn } from './cn';
-import { type WorkflowRunOptions, catalogQueryKeys, useCatalogClient } from './context';
+import { connectionOptionsFor } from './ConnectionPanel.js';
+import { TransformEditor } from './TransformEditor.js';
+import { cn } from './cn.js';
+import { type WorkflowRunOptions, catalogQueryKeys, useCatalogClient } from './context.js';
 import {
   type ConnectorSchemaDiscovery,
   type DiscoveredTypeDraft,
   type SchemaDiscoveryBridge,
   SchemaDiscoveryPanel,
   narrowDiscovery,
-} from './schema-discovery';
-import { SourceConnectionCreator } from './source-connection';
+} from './schema-discovery.js';
+import { SourceConnectionCreator } from './source-connection.js';
 import {
   INLINE_CONNECTION,
   KIND_OPTIONS,
@@ -84,15 +84,15 @@ import {
   sourceDraftFrom,
   toConnectorKind,
   usesConnection,
-} from './source-fields';
-import { Button } from './ui/button';
-import { type ComboOption, ComboboxField } from './ui/combobox';
-import { ConfirmDialog } from './ui/dialog';
-import { FieldGroup, TextAreaField, TextField } from './ui/field';
-import { Select, SelectField, type SelectOption } from './ui/select';
-import { Sheet } from './ui/sheet';
-import { Switch } from './ui/switch';
-import { Tooltip, TooltipProvider } from './ui/tooltip';
+} from './source-fields.js';
+import { Button } from './ui/button.js';
+import { type ComboOption, ComboboxField } from './ui/combobox.js';
+import { ConfirmDialog } from './ui/dialog.js';
+import { FieldGroup, TextAreaField, TextField } from './ui/field.js';
+import { Select, SelectField, type SelectOption } from './ui/select.js';
+import { Sheet } from './ui/sheet.js';
+import { Switch } from './ui/switch.js';
+import { Tooltip, TooltipProvider } from './ui/tooltip.js';
 import {
   type CanvasMenuActions,
   type CanvasMenuContext,
@@ -100,7 +100,7 @@ import {
   type CanvasMenuTarget,
   buildCanvasMenu,
   deleteCost,
-} from './workflow/canvas-menu';
+} from './workflow/canvas-menu.js';
 import {
   graphWithNodeBetween,
   newEdge,
@@ -108,8 +108,8 @@ import {
   newNodeOfKind,
   nodeBetween,
   uniqueName,
-} from './workflow/create';
-import { WorkflowEdgeProvider, workflowEdgeTypes } from './workflow/edges';
+} from './workflow/create.js';
+import { WorkflowEdgeProvider, workflowEdgeTypes } from './workflow/edges.js';
 import {
   NODE_HEIGHT,
   NODE_WIDTH,
@@ -124,7 +124,7 @@ import {
   nextPosition,
   toFlowEdges,
   toFlowNodes,
-} from './workflow/graph';
+} from './workflow/graph.js';
 import {
   type EditAction,
   type HistoricDraft,
@@ -138,15 +138,15 @@ import {
   useUndoShortcut,
   useUnsavedGuard,
   withEdit,
-} from './workflow/history';
+} from './workflow/history.js';
 import {
   PublishControls,
   RunControls,
   SchedulePanel,
   ShrinkRefusalNote,
   WorkflowStatusBadge,
-} from './workflow/lifecycle';
-import { CanvasContextMenu, type MenuAnchorRect, NodeActionsToolbar } from './workflow/menu';
+} from './workflow/lifecycle.js';
+import { CanvasContextMenu, type MenuAnchorRect, NodeActionsToolbar } from './workflow/menu.js';
 import {
   type CallableWorkflowBlock,
   type CallableWorkflowRef,
@@ -219,13 +219,13 @@ import {
   workflowLookupUnmatched,
   workflowNarrowedTypes,
   workflowRenameUnnamed,
-} from './workflow/model';
-import { WORKFLOW_NAME } from './workflow/name';
-import { WorkflowNodeProvider, workflowNodeTypes } from './workflow/nodes';
-import { freeSpot, placeNextTo } from './workflow/place';
-import { removeNodes, wiresOn } from './workflow/removal';
-import { RunsAsPanel } from './workflow/runs';
-import type { ShapeKnowledge, SourceShape } from './workflow/shape';
+} from './workflow/model.js';
+import { WORKFLOW_NAME } from './workflow/name.js';
+import { WorkflowNodeProvider, workflowNodeTypes } from './workflow/nodes.js';
+import { freeSpot, placeNextTo } from './workflow/place.js';
+import { removeNodes, wiresOn } from './workflow/removal.js';
+import { RunsAsPanel } from './workflow/runs.js';
+import type { ShapeKnowledge, SourceShape } from './workflow/shape.js';
 import {
   type WorkflowProblem,
   type WorkflowProblemCode,
@@ -234,13 +234,13 @@ import {
   hasBlockingProblem,
   problemsByNode,
   validateWorkflow,
-} from './workflow/validate';
+} from './workflow/validate.js';
 import {
   PendingWireLine,
   WiringHint,
   type WorkflowWiring,
   useClickWiring,
-} from './workflow/wiring';
+} from './workflow/wiring.js';
 
 const MUTED = 'text-zinc-400 dark:text-zinc-500';
 const RULE = 'border-zinc-200 dark:border-zinc-800';

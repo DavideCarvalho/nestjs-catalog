@@ -6,7 +6,7 @@
   "author": "Davide Carvalho",
   "repository": {
     "type": "git",
-    "url": "https://github.com/DavideCarvalho/nestjs-catalog.git",
+    "url": "git+https://github.com/DavideCarvalho/nestjs-catalog.git",
     "directory": "packages/store-mikro-orm"
   },
   "bugs": {
@@ -22,6 +22,7 @@
     "snapshots",
     "warehouse"
   ],
+  "type": "commonjs",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "files": [
@@ -59,5 +60,8 @@
     "@mikro-orm/postgresql": {
       "optional": true
     }
+  },
+  "engines": {
+    "node": ">=24"
   }
 }

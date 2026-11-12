@@ -22,18 +22,18 @@ import {
   useRef,
   useState,
 } from 'react';
-import { cn } from '../../cn';
-import type { LineConfig, Margin } from './chart-context';
-import { ChartLoadingLabel } from './chart-loading-label';
+import { cn } from '../../cn.js';
+import type { LineConfig, Margin } from './chart-context.js';
+import { ChartLoadingLabel } from './chart-loading-label.js';
 import {
   type ChartPhase,
   type ChartStatus,
   DEFAULT_CHART_STATUS,
   DEFAULT_Y_DOMAIN_TWEEN_MS,
   resolveRestingChartPhase,
-} from './chart-phase';
-import { Line, type LineProps } from './line';
-import { TimeSeriesChartInner } from './time-series-chart-shell';
+} from './chart-phase.js';
+import { Line, type LineProps } from './line.js';
+import { TimeSeriesChartInner } from './time-series-chart-shell.js';
 
 export interface LineChartProps {
   /** Data array - each item should have a date field and numeric values */
@@ -297,6 +297,6 @@ export function LineChart({
   );
 }
 
-export { Line, type LineProps } from './line';
+export { Line, type LineProps } from './line.js';
 
 export default LineChart;

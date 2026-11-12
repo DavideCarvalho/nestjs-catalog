@@ -6,7 +6,7 @@
   "author": "Davide Carvalho",
   "repository": {
     "type": "git",
-    "url": "https://github.com/DavideCarvalho/nestjs-catalog.git",
+    "url": "git+https://github.com/DavideCarvalho/nestjs-catalog.git",
     "directory": "packages/pipeline"
   },
   "bugs": {
@@ -20,6 +20,7 @@
     "connectors",
     "durable"
   ],
+  "type": "commonjs",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "files": [
@@ -53,5 +54,8 @@
     "hyparquet-writer": "0.16.9",
     "typescript": "5.9.3",
     "xlsx": "npm:@e965/xlsx@0.20.3"
+  },
+  "engines": {
+    "node": ">=24"
   }
 }

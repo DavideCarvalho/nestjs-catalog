@@ -18,7 +18,7 @@
  * anything mounting a node canvas is already installing a graph library, and a
  * host that wants neither wants the root entry point instead.
  */
-export { WorkflowCanvas, type WorkflowCanvasProps } from '../WorkflowCanvas';
+export { WorkflowCanvas, type WorkflowCanvasProps } from '../WorkflowCanvas.js';
 export {
   layout,
   layoutIfUnarranged,
@@ -27,7 +27,7 @@ export {
   type WorkflowFlowEdge,
   type WorkflowFlowNode,
   type WorkflowNodeData,
-} from './graph';
+} from './graph.js';
 // What happens to a graph once it is drawn. Here rather than on the root entry
 // because a host reaching for these is already mounting the canvas — and
 // `refusedForShrink` is here rather than nowhere because "was that failure the
@@ -39,5 +39,5 @@ export {
   SchedulePanel,
   ShrinkRefusalNote,
   WorkflowStatusBadge,
-} from './lifecycle';
-export { RunsAsPanel } from './runs';
+} from './lifecycle.js';
+export { RunsAsPanel } from './runs.js';

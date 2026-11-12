@@ -3,8 +3,8 @@ import StarterKit from '@tiptap/starter-kit';
 import { Bold, Check, Code, Italic, List, ListOrdered, X } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { Markdown, type MarkdownStorage } from 'tiptap-markdown';
-import { cn } from '../cn';
-import { Button } from './button';
+import { cn } from '../cn.js';
+import { Button } from './button.js';
 
 // `tiptap-markdown` exports its storage type but does not merge it into
 // TipTap's, so `editor.storage.markdown` is untyped without this. Declaration

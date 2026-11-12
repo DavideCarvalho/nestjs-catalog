@@ -7,17 +7,17 @@
  * `cn`, which is the same function. Nothing else is modified, so re-syncing
  * with upstream stays a diff rather than a merge.
  */
-export { ChartTooltip, type ChartTooltipProps } from './chart-tooltip';
-export { DateTicker, type DateTickerProps } from './date-ticker';
-export { TooltipBox, type TooltipBoxProps } from './tooltip-box';
+export { ChartTooltip, type ChartTooltipProps } from './chart-tooltip.js';
+export { DateTicker, type DateTickerProps } from './date-ticker.js';
+export { TooltipBox, type TooltipBoxProps } from './tooltip-box.js';
 export {
   TooltipContent,
   type TooltipContentProps,
   type TooltipRow,
-} from './tooltip-content';
-export { TooltipDot, type TooltipDotProps } from './tooltip-dot';
+} from './tooltip-content.js';
+export { TooltipDot, type TooltipDotProps } from './tooltip-dot.js';
 export {
   type IndicatorWidth,
   TooltipIndicator,
   type TooltipIndicatorProps,
-} from './tooltip-indicator';
+} from './tooltip-indicator.js';

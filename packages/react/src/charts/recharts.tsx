@@ -16,8 +16,8 @@ import {
   ChartLegendContent,
   ChartTooltip,
   ChartTooltipContent,
-} from '../ui/chart';
-import { type ChartRendererProps, seriesFrom } from './registry';
+} from '../ui/chart.js';
+import { type ChartRendererProps, seriesFrom } from './registry.js';
 
 /**
  * The shadcn/ui chart renderer.

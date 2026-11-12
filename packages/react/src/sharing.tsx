@@ -1,6 +1,6 @@
 import { Lock, Share2 } from 'lucide-react';
-import { cn } from './cn';
-import { Button } from './ui/button';
+import { cn } from './cn.js';
+import { Button } from './ui/button.js';
 
 const MUTED = 'text-zinc-400 dark:text-zinc-500';
 const RULE = 'border-zinc-200 dark:border-zinc-800';

@@ -5,15 +5,15 @@ import {
   exportSvgAsPdf,
   getPdfExporter,
   subscribeToPdfExporter,
-} from './pdf';
-import { findExportableSvg } from './png';
+} from './pdf.js';
+import { findExportableSvg } from './png.js';
 import {
   type PngExportTarget,
   canRasterise,
   toExportError,
   unwrapExportTarget,
   useHasExportableSvg,
-} from './use-png-export';
+} from './use-png-export.js';
 
 /**
  * The PDF action, as a toolbar actually needs it.

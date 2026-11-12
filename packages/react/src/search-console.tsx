@@ -6,9 +6,9 @@ import type {
 import { useQuery } from '@tanstack/react-query';
 import { ArrowUpRight, Search } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
-import { cn } from './cn';
-import { catalogQueryKeys, useCatalogClient } from './context';
-import { TextField } from './ui/field';
+import { cn } from './cn.js';
+import { catalogQueryKeys, useCatalogClient } from './context.js';
+import { TextField } from './ui/field.js';
 
 /**
  * One box that crosses the catalog.

@@ -6,9 +6,9 @@ import type {
 import { CONNECTOR_KINDS, REDACTED_SECRET } from '@dudousxd/nestjs-catalog/client';
 import { CircleCheck, CircleX } from 'lucide-react';
 import type { ReactNode } from 'react';
-import { cn } from './cn';
-import { FieldGroup, TextField } from './ui/field';
-import { Switch } from './ui/switch';
+import { cn } from './cn.js';
+import { FieldGroup, TextField } from './ui/field.js';
+import { Switch } from './ui/switch.js';
 
 /**
  * Describing where a *shared address* lives, in one place.

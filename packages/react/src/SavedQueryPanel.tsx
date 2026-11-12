@@ -2,13 +2,13 @@ import type { SaveQueryInput, SavedQuery } from '@dudousxd/nestjs-catalog/client
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Bookmark, Download, History, Timer, Trash2 } from 'lucide-react';
 import { useMemo, useState } from 'react';
-import { registeredChartLibraries } from './charts/registry';
-import { cn } from './cn';
-import { useCatalogClient } from './context';
-import { RevisionHistorySheet } from './diff/RevisionDiff';
-import { ShareBadge, ShareControl } from './sharing';
-import { Select } from './ui/select';
-import { Tooltip } from './ui/tooltip';
+import { registeredChartLibraries } from './charts/registry.js';
+import { cn } from './cn.js';
+import { useCatalogClient } from './context.js';
+import { RevisionHistorySheet } from './diff/RevisionDiff.js';
+import { ShareBadge, ShareControl } from './sharing.js';
+import { Select } from './ui/select.js';
+import { Tooltip } from './ui/tooltip.js';
 
 const MUTED = 'text-zinc-400 dark:text-zinc-500';
 const RULE = 'border-zinc-200 dark:border-zinc-800';

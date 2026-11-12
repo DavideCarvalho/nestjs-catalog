@@ -10,7 +10,7 @@
  * with upstream stays a diff rather than a merge.
  */
 import { createContext, useContext } from 'react';
-import type { ReferenceAreaConfig } from './reference-area-config';
+import type { ReferenceAreaConfig } from './reference-area-config.js';
 
 export interface ReferenceAreaRegistrationContextValue {
   registerReferenceArea: (id: string, config: ReferenceAreaConfig) => void;

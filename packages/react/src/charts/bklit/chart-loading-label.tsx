@@ -10,13 +10,13 @@
  * with upstream stays a diff rather than a merge.
  */
 import { motion } from 'motion/react';
-import { cn } from '../../cn';
-import { ShimmeringText } from '../components/shimmering-text';
+import { cn } from '../../cn.js';
+import { ShimmeringText } from '../components/shimmering-text.js';
 import {
   LINE_LOADING_PULSE_EASE,
   LOADING_LABEL_EXIT_S,
   LOADING_LABEL_EXIT_Y_PX,
-} from './line-loading-timing';
+} from './line-loading-timing.js';
 
 export interface ChartLoadingLabelProps {
   /** Label shown centered over the chart. */

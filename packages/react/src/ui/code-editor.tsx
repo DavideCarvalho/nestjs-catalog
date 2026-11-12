@@ -2,9 +2,9 @@ import { Editor } from '@pierre/diffs/edit';
 import { EditProvider, File } from '@pierre/diffs/react';
 import type { KeyboardEvent, Ref } from 'react';
 import { useImperativeHandle, useRef } from 'react';
-import { cn } from '../cn';
-import type { CatalogCodeLanguage } from './code-languages';
-import { type CodeThemeType, useCodeThemeType } from './code-theme';
+import { cn } from '../cn.js';
+import type { CatalogCodeLanguage } from './code-languages.js';
+import { type CodeThemeType, useCodeThemeType } from './code-theme.js';
 
 /**
  * A code editor: `@pierre/diffs` in edit mode, wrapped so the rest of this

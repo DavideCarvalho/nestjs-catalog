@@ -1,5 +1,5 @@
 import type { ButtonHTMLAttributes, ReactNode, Ref } from 'react';
-import { cn } from '../cn';
+import { cn } from '../cn.js';
 
 /**
  * Button, vendored in the shadcn style.

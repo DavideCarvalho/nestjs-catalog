@@ -14,14 +14,14 @@ import {
 import { useMutation } from '@tanstack/react-query';
 import { ArrowLeft, Play } from 'lucide-react';
 import { type KeyboardEvent, useState } from 'react';
-import { cn } from './cn';
-import { useCatalogClient } from './context';
-import { RevisionHistoryButton, RevisionHistorySheet } from './diff/RevisionDiff';
-import { CodeEditor } from './ui/code-editor';
-import { TRANSFORM_HIGHLIGHTED_AS } from './ui/code-languages';
-import { TextField } from './ui/field';
-import { SelectField } from './ui/select';
-import { Tooltip } from './ui/tooltip';
+import { cn } from './cn.js';
+import { useCatalogClient } from './context.js';
+import { RevisionHistoryButton, RevisionHistorySheet } from './diff/RevisionDiff.js';
+import { CodeEditor } from './ui/code-editor.js';
+import { TRANSFORM_HIGHLIGHTED_AS } from './ui/code-languages.js';
+import { TextField } from './ui/field.js';
+import { SelectField } from './ui/select.js';
+import { Tooltip } from './ui/tooltip.js';
 
 const MUTED = 'text-zinc-400 dark:text-zinc-500';
 const RULE = 'border-zinc-200 dark:border-zinc-800';

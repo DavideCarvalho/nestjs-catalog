@@ -1,10 +1,10 @@
 import { useQuery } from '@tanstack/react-query';
 import { ArrowUpRight, CalendarClock, PauseCircle } from 'lucide-react';
 import { useMemo } from 'react';
-import { cn } from './cn';
-import { catalogQueryKeys, useCatalogClient } from './context';
-import { type CatalogWorkflow, producedTypes } from './workflow/model';
-import { WORKFLOW_NAME } from './workflow/name';
+import { cn } from './cn.js';
+import { catalogQueryKeys, useCatalogClient } from './context.js';
+import { type CatalogWorkflow, producedTypes } from './workflow/model.js';
+import { WORKFLOW_NAME } from './workflow/name.js';
 
 /**
  * What loads this type — the answer the model screen could not give.

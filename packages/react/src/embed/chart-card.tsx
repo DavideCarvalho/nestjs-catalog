@@ -1,13 +1,13 @@
 import { Download, FileDown, ImageDown } from 'lucide-react';
 import { type RefObject, useRef } from 'react';
-import { ChartBody } from '../charts/body';
-import { cn } from '../cn';
-import { useCatalogClient } from '../context';
-import { usePdfExport } from '../export/use-pdf-export';
-import { usePngExport } from '../export/use-png-export';
-import { type EmbedAction, type EmbedActions, useAvailableEmbedActions } from './actions';
-import type { EmbeddedChartPayload } from './payload';
-import { resultFromEmbed } from './payload';
+import { ChartBody } from '../charts/body.js';
+import { cn } from '../cn.js';
+import { useCatalogClient } from '../context.js';
+import { usePdfExport } from '../export/use-pdf-export.js';
+import { usePngExport } from '../export/use-png-export.js';
+import { type EmbedAction, type EmbedActions, useAvailableEmbedActions } from './actions.js';
+import type { EmbeddedChartPayload } from './payload.js';
+import { resultFromEmbed } from './payload.js';
 
 const MUTED = 'text-zinc-400 dark:text-zinc-500';
 
