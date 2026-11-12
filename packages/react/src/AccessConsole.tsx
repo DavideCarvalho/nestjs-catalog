@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { KeyRound, LogOut, ShieldCheck, ShieldHalf, UserRound } from 'lucide-react';
 import { type ReactNode, useState } from 'react';
-import { cn } from './cn';
+import { cn } from './cn.js';
 import {
   type CatalogIdentity,
   type CatalogPeoplePage,
@@ -10,10 +10,10 @@ import {
   type CatalogPrincipalSummary,
   catalogQueryKeys,
   useCatalogClient,
-} from './context';
-import { TextField } from './ui/field';
-import { SelectField } from './ui/select';
-import { Tooltip, TooltipProvider } from './ui/tooltip';
+} from './context.js';
+import { TextField } from './ui/field.js';
+import { SelectField } from './ui/select.js';
+import { Tooltip, TooltipProvider } from './ui/tooltip.js';
 
 const MUTED = 'text-zinc-400 dark:text-zinc-500';
 const RULE = 'border-zinc-200 dark:border-zinc-800';

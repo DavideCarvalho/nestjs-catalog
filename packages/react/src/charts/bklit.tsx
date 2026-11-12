@@ -1,15 +1,15 @@
 import { useMemo } from 'react';
-import { Area } from './bklit/area';
-import { AreaChart } from './bklit/area-chart';
-import { Bar } from './bklit/bar';
-import { BarChart } from './bklit/bar-chart';
-import { Grid } from './bklit/grid';
-import { Line } from './bklit/line';
-import { LineChart } from './bklit/line-chart';
-import { ChartTooltip } from './bklit/tooltip';
-import { XAxis } from './bklit/x-axis';
-import { CssBarChart, looksLikeTimeSeries } from './css';
-import { CHART_COLORS, type ChartRendererProps, seriesFrom } from './registry';
+import { AreaChart } from './bklit/area-chart.js';
+import { Area } from './bklit/area.js';
+import { BarChart } from './bklit/bar-chart.js';
+import { Bar } from './bklit/bar.js';
+import { Grid } from './bklit/grid.js';
+import { LineChart } from './bklit/line-chart.js';
+import { Line } from './bklit/line.js';
+import { ChartTooltip } from './bklit/tooltip/index.js';
+import { XAxis } from './bklit/x-axis.js';
+import { CssBarChart, looksLikeTimeSeries } from './css.js';
+import { CHART_COLORS, type ChartRendererProps, seriesFrom } from './registry.js';
 
 /**
  * The bklit-ui renderer.

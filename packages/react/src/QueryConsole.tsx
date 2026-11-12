@@ -6,13 +6,13 @@ import type {
 import { useMutation, useQuery } from '@tanstack/react-query';
 import { AlertTriangle, History, Layers, Link2Off, Play, Sparkles, TableIcon } from 'lucide-react';
 import { type KeyboardEvent, useEffect, useMemo, useRef, useState } from 'react';
-import { paramFromLocation } from './ObjectExplorer';
-import { SavedQueryPanel, savedQueryKeys } from './SavedQueryPanel';
-import { cn } from './cn';
-import { useCatalogClient } from './context';
-import { CodeEditor, type CodeEditorHandle } from './ui/code-editor';
-import { DataTable, renderUnknown } from './ui/data-table';
-import { Tooltip, TooltipProvider } from './ui/tooltip';
+import { paramFromLocation } from './ObjectExplorer.js';
+import { SavedQueryPanel, savedQueryKeys } from './SavedQueryPanel.js';
+import { cn } from './cn.js';
+import { useCatalogClient } from './context.js';
+import { CodeEditor, type CodeEditorHandle } from './ui/code-editor.js';
+import { DataTable, renderUnknown } from './ui/data-table.js';
+import { Tooltip, TooltipProvider } from './ui/tooltip.js';
 
 const MUTED = 'text-zinc-400 dark:text-zinc-500';
 const PANEL = 'bg-white dark:bg-zinc-900';

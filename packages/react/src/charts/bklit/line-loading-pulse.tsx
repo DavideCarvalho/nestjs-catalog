@@ -11,10 +11,10 @@
  */
 import { animate, motion, useMotionValue, useTransform } from 'motion/react';
 import { useEffect, useId } from 'react';
-import { chartCssVars, useChartStable } from './chart-context';
-import type { ChartPhase } from './chart-phase';
-import { fadeGradientStops, resolveFadeSides, viewportFadeGradientAttrs } from './fade-edges';
-import { LINE_LOADING_PULSE_CYCLE_S, LINE_LOADING_PULSE_EASE } from './line-loading-timing';
+import { chartCssVars, useChartStable } from './chart-context.js';
+import type { ChartPhase } from './chart-phase.js';
+import { fadeGradientStops, resolveFadeSides, viewportFadeGradientAttrs } from './fade-edges.js';
+import { LINE_LOADING_PULSE_CYCLE_S, LINE_LOADING_PULSE_EASE } from './line-loading-timing.js';
 
 const CLIP_PADDING = 10;
 

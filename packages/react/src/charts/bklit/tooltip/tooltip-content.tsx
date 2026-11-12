@@ -10,7 +10,7 @@
  * with upstream stays a diff rather than a merge.
  */
 import type { ReactNode } from 'react';
-import { intFmt } from '../chart-formatters';
+import { intFmt } from '../chart-formatters.js';
 
 export interface TooltipRow {
   color: string;

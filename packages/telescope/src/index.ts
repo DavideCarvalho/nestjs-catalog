@@ -5,7 +5,6 @@ export {
   catalogLiveProviders,
 } from './catalog-live-providers.js';
 export {
-  default,
   catalogTelescopeExtension,
   type CatalogTelescopeOptions,
 } from './catalog-telescope.extension.js';

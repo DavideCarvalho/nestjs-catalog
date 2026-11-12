@@ -6,7 +6,7 @@
   "author": "Davide Carvalho",
   "repository": {
     "type": "git",
-    "url": "https://github.com/DavideCarvalho/nestjs-catalog.git",
+    "url": "git+https://github.com/DavideCarvalho/nestjs-catalog.git",
     "directory": "packages/secrets-aws"
   },
   "bugs": {
@@ -22,6 +22,7 @@
     "envelope-encryption",
     "govcloud"
   ],
+  "type": "commonjs",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": {
@@ -52,5 +53,8 @@
     "@nestjs/common": "11.2.7",
     "@types/node": "25.9.9",
     "typescript": "5.9.3"
+  },
+  "engines": {
+    "node": ">=24"
   }
 }

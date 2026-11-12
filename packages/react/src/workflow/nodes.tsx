@@ -24,11 +24,11 @@ import {
   createContext,
   useContext,
 } from 'react';
-import { cn } from '../cn';
-import { Tooltip } from '../ui/tooltip';
-import { NODE_WIDTH, type WorkflowFlowNode, type WorkflowNodeData, describeDrop } from './graph';
-import type { WorkflowNodeKind } from './model';
-import type { WiringHandleType, WorkflowWiring } from './wiring';
+import { cn } from '../cn.js';
+import { Tooltip } from '../ui/tooltip.js';
+import { NODE_WIDTH, type WorkflowFlowNode, type WorkflowNodeData, describeDrop } from './graph.js';
+import type { WorkflowNodeKind } from './model.js';
+import type { WiringHandleType, WorkflowWiring } from './wiring.js';
 
 const RULE = 'border-zinc-200 dark:border-zinc-800';
 const PANEL = 'bg-white dark:bg-zinc-900';

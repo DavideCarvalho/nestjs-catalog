@@ -31,11 +31,11 @@ import type {
 import { useQuery } from '@tanstack/react-query';
 import { CircleCheck, CircleX, Loader2, RefreshCw } from 'lucide-react';
 import { useMemo, useState } from 'react';
-import { cn } from '../cn';
-import { catalogQueryKeys, useCatalogClient } from '../context';
-import { RevisionHistorySheet } from '../diff/RevisionDiff';
-import { Tooltip } from '../ui/tooltip';
-import { WORKFLOW_NAME } from './name';
+import { cn } from '../cn.js';
+import { catalogQueryKeys, useCatalogClient } from '../context.js';
+import { RevisionHistorySheet } from '../diff/RevisionDiff.js';
+import { Tooltip } from '../ui/tooltip.js';
+import { WORKFLOW_NAME } from './name.js';
 
 const MUTED = 'text-zinc-400 dark:text-zinc-500';
 const RULE = 'border-zinc-200 dark:border-zinc-800';

@@ -1,6 +1,6 @@
 import type { CatalogQueryResult } from '@dudousxd/nestjs-catalog/client';
-import { seriesFrom } from './registry';
-import type { ChartRendererProps } from './registry';
+import { seriesFrom } from './registry.js';
+import type { ChartRendererProps } from './registry.js';
 
 /**
  * A bar chart in CSS, not a charting library.

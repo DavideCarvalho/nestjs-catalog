@@ -7,11 +7,11 @@ import {
   type CatalogTraceSource,
   TraceExplorer,
   eventMeta,
-} from './TraceExplorer';
-import { cn } from './cn';
-import { useCatalogClient } from './context';
-import { Select } from './ui/select';
-import { Tooltip, TooltipProvider } from './ui/tooltip';
+} from './TraceExplorer.js';
+import { cn } from './cn.js';
+import { useCatalogClient } from './context.js';
+import { Select } from './ui/select.js';
+import { Tooltip, TooltipProvider } from './ui/tooltip.js';
 
 const MUTED = 'text-zinc-400 dark:text-zinc-500';
 const RULE = 'border-zinc-200 dark:border-zinc-800';

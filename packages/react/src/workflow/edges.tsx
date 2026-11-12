@@ -8,8 +8,8 @@ import {
 import { X } from 'lucide-react';
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
 import { type ReactNode, createContext, useContext } from 'react';
-import { Button } from '../ui/button';
-import type { WorkflowEdge } from './model';
+import { Button } from '../ui/button.js';
+import type { WorkflowEdge } from './model.js';
 
 /**
  * The edge, and the one gesture it was missing.

@@ -64,5 +64,3 @@ export function catalogTelescopeExtension(options?: CatalogTelescopeOptions): Te
     dataProviders: () => [...catalogTraceProviders(), ...catalogLiveProviders()],
   };
 }
-
-export default catalogTelescopeExtension;

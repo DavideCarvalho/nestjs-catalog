@@ -10,7 +10,7 @@
  * with upstream stays a diff rather than a merge.
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { type ChartPhase, type ChartStatus, resolveRestingChartPhase } from './chart-phase';
+import { type ChartPhase, type ChartStatus, resolveRestingChartPhase } from './chart-phase.js';
 
 export interface UseChartPhaseOrchestratorOptions {
   chartStatus: ChartStatus;

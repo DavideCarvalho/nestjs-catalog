@@ -1,6 +1,6 @@
 import type { QueryVisualization } from '@dudousxd/nestjs-catalog/client';
 import type { ReactNode } from 'react';
-import { cn } from '../cn';
+import { cn } from '../cn.js';
 
 /**
  * The chart that is coming, drawn in grey.

@@ -1,5 +1,5 @@
-import { usePdfExport } from '../export/use-pdf-export';
-import { type PngExportTarget, useHasExportableSvg } from '../export/use-png-export';
+import { usePdfExport } from '../export/use-pdf-export.js';
+import { type PngExportTarget, useHasExportableSvg } from '../export/use-png-export.js';
 
 /**
  * What an embedded chart's toolbar may offer.

@@ -1,9 +1,9 @@
 import type { CatalogQueryResult, QueryVisualization } from '@dudousxd/nestjs-catalog/client';
 import { useMemo } from 'react';
-import { DataTable, renderUnknown } from '../ui/data-table';
-import { CssBarChart } from './css';
-import { getChartRenderer } from './registry';
-import { ChartEmpty } from './skeleton';
+import { DataTable, renderUnknown } from '../ui/data-table.js';
+import { CssBarChart } from './css.js';
+import { getChartRenderer } from './registry.js';
+import { ChartEmpty } from './skeleton.js';
 
 /**
  * A result plus a visualization, drawn.

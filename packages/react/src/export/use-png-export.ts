@@ -5,7 +5,7 @@ import {
   downloadSvgAsPng,
   findExportableSvg,
   svgToPngBlob,
-} from './png';
+} from './png.js';
 
 /**
  * The export action, as a component actually needs it.

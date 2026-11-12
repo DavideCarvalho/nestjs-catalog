@@ -1,5 +1,5 @@
-import { NODE_HEIGHT, NODE_WIDTH } from './graph';
-import type { WorkflowNode } from './model';
+import { NODE_HEIGHT, NODE_WIDTH } from './graph.js';
+import type { WorkflowNode } from './model.js';
 
 /**
  * Where a node goes when something other than the toolbar creates it.

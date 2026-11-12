@@ -1,14 +1,14 @@
 import { useQuery } from '@tanstack/react-query';
-import { cn } from '../cn';
-import { catalogQueryKeys, useCatalogClient } from '../context';
-import type { EmbedActions } from './actions';
-import { EmbeddedChartCard } from './chart-card';
+import { cn } from '../cn.js';
+import { catalogQueryKeys, useCatalogClient } from '../context.js';
+import type { EmbedActions } from './actions.js';
+import { EmbeddedChartCard } from './chart-card.js';
 import {
   type EmbedFailureSlot,
   type EmbedLoadingSlot,
   renderFailure,
   renderLoading,
-} from './slots';
+} from './slots.js';
 
 /**
  * One shared chart, for a host application's own page.

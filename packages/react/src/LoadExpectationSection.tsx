@@ -6,18 +6,18 @@ import {
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Lock } from 'lucide-react';
 import { useMemo, useState } from 'react';
-import { cn } from './cn';
+import { cn } from './cn.js';
 import {
   type DeleteReconciliation,
   type LoadExpectationInput,
   type ResolvedLoadExpectation,
   catalogQueryKeys,
   useCatalogClient,
-} from './context';
-import { Button } from './ui/button';
-import { DataTable } from './ui/data-table';
-import { TextAreaField, TextField } from './ui/field';
-import { SelectField } from './ui/select';
+} from './context.js';
+import { Button } from './ui/button.js';
+import { DataTable } from './ui/data-table.js';
+import { TextAreaField, TextField } from './ui/field.js';
+import { SelectField } from './ui/select.js';
 
 /**
  * What a type promises about deletes and row counts, and the form that sets it.

@@ -17,23 +17,23 @@ import { AreaClosed, LinePath } from '@visx/shape';
 type CurveFactory = any;
 
 import { useCallback, useId, useMemo, useRef, useState } from 'react';
-import { AreaGradientDefs } from './area-gradient-defs';
-import { chartCssVars, useChartStable, useYScale } from './chart-context';
-import type { ChartPhase, LoadingStyle } from './chart-phase';
-import { type FadeEdges, resolveFadeSides } from './fade-edges';
+import { AreaGradientDefs } from './area-gradient-defs.js';
+import { chartCssVars, useChartStable, useYScale } from './chart-context.js';
+import type { ChartPhase, LoadingStyle } from './chart-phase.js';
+import { type FadeEdges, resolveFadeSides } from './fade-edges.js';
 import {
   type LineLoadingPulseMode,
   LineLoadingPulseStroke,
   resolveLineLoadingPulseMode,
-} from './line-loading-pulse';
-import { LINE_LOADING_LOOP_PAUSE_MS } from './line-loading-timing';
-import { LineLoadingSweep } from './loading-sweep';
-import { resolveDashTailBounds, usePathStrokeMetrics } from './path-stroke-utils';
-import { SeriesDashTailOverlay } from './series-dash-tail-overlay';
-import { SeriesHighlightLayer } from './series-highlight-layer';
-import { SeriesHoverDim } from './series-hover-dim';
-import { SeriesMarkers } from './series-markers';
-import type { SeriesPointMarkerStyle } from './series-point-marker';
+} from './line-loading-pulse.js';
+import { LINE_LOADING_LOOP_PAUSE_MS } from './line-loading-timing.js';
+import { LineLoadingSweep } from './loading-sweep.js';
+import { resolveDashTailBounds, usePathStrokeMetrics } from './path-stroke-utils.js';
+import { SeriesDashTailOverlay } from './series-dash-tail-overlay.js';
+import { SeriesHighlightLayer } from './series-highlight-layer.js';
+import { SeriesHoverDim } from './series-hover-dim.js';
+import { SeriesMarkers } from './series-markers.js';
+import type { SeriesPointMarkerStyle } from './series-point-marker.js';
 
 export interface AreaProps {
   /** Key in data to use for y values */

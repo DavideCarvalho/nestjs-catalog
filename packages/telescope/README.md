@@ -18,8 +18,10 @@ loses nothing; a deployment with it gets the tab by installing one package.
 pnpm add @dudousxd/nestjs-catalog-telescope
 ```
 
-Peers: `@dudousxd/nestjs-telescope` (>= 1.18), `@dudousxd/nestjs-catalog` (>= 0.1),
-`@nestjs/common`, `@nestjs/core`.
+Requires Node.js 24 or newer. Peers: `@dudousxd/nestjs-telescope` (>= 1.18),
+`@dudousxd/nestjs-catalog` (>= 0.1), `@nestjs/common`, `@nestjs/core`.
+
+Import the extension by name (`catalogTelescopeExtension`); there is no default export.
 
 `@dudousxd/nestjs-catalog` **must** be a peer, never a nested copy. `CATALOG_TRACE_STORE` is a
 plain `Symbol()`, not `Symbol.for()`, so it is only equal to itself within one loaded copy of the

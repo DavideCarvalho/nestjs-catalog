@@ -12,7 +12,7 @@ import {
   fadeGradientStops,
   resolveFadeSides,
   viewportFadeGradientAttrs,
-} from './fade-edges';
+} from './fade-edges.js';
 
 interface AreaGradientDefsProps {
   gradientId: string;

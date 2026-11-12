@@ -37,7 +37,7 @@ import type {
 } from '@dudousxd/nestjs-catalog/client';
 import { catalogRoutes } from '@dudousxd/nestjs-catalog/client';
 import { type ReactNode, createContext, useContext, useMemo } from 'react';
-import type { EmbeddedChartPayload, EmbeddedDashboardPayload } from './embed/payload';
+import type { EmbeddedChartPayload, EmbeddedDashboardPayload } from './embed/payload.js';
 import {
   DEFAULT_ACCESS_BASE_PATH,
   DEFAULT_PIPELINE_BASE_PATH,
@@ -46,7 +46,7 @@ import {
   accessRoutes,
   embedRoutes,
   pipelineRoutes,
-} from './routes';
+} from './routes.js';
 // The graph itself comes from `@dudousxd/nestjs-catalog/client`; what is left in
 // this module is the handful of shapes only a console has an opinion about — the
 // input a form may send, the durability answer, and the run view. See
@@ -58,7 +58,7 @@ import type {
   WorkflowDurability,
   WorkflowInput,
   WorkflowRun,
-} from './workflow/model';
+} from './workflow/model.js';
 
 /**
  * How these screens talk to the server.

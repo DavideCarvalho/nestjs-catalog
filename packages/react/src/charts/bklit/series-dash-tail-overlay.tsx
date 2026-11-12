@@ -10,8 +10,8 @@
  * with upstream stays a diff rather than a merge.
  */
 import { memo, useMemo } from 'react';
-import { DashTailStroke } from './dash-tail-stroke';
-import { resolveDashStartX, resolveDashTailBounds } from './path-stroke-utils';
+import { DashTailStroke } from './dash-tail-stroke.js';
+import { resolveDashStartX, resolveDashTailBounds } from './path-stroke-utils.js';
 
 interface SeriesDashTailOverlayProps {
   dashFromIndex?: number;

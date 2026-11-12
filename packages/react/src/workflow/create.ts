@@ -1,4 +1,4 @@
-import { defaultLabel } from './graph';
+import { defaultLabel } from './graph.js';
 import {
   WORKFLOW_BRANCH_LABELS,
   WORKFLOW_NODE_KINDS,
@@ -9,9 +9,9 @@ import {
   newLocalId,
   nodeName,
   unreachableNodeKind,
-} from './model';
-import { placeBetween } from './place';
-import { canConnect, edgeId } from './validate';
+} from './model.js';
+import { placeBetween } from './place.js';
+import { canConnect, edgeId } from './validate.js';
 
 /**
  * Making nodes and wires, and deciding which of those the graph would accept.

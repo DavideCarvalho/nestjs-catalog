@@ -6,7 +6,7 @@
   "author": "Davide Carvalho",
   "repository": {
     "type": "git",
-    "url": "https://github.com/DavideCarvalho/nestjs-catalog.git",
+    "url": "git+https://github.com/DavideCarvalho/nestjs-catalog.git",
     "directory": "packages/react"
   },
   "bugs": {
@@ -163,5 +163,8 @@
     "@xyflow/react": {
       "optional": true
     }
+  },
+  "engines": {
+    "node": ">=24"
   }
 }

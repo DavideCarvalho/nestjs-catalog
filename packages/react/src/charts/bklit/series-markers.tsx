@@ -10,15 +10,15 @@
  * with upstream stays a diff rather than a merge.
  */
 import { type ReactNode, useCallback, useMemo } from 'react';
-import { clipRevealTransition } from './animation';
-import { defaultScatterColors, useChartHover, useChartStable, useYScale } from './chart-context';
-import { useChartLegendHover } from './chart-legend-hover';
+import { clipRevealTransition } from './animation.js';
+import { defaultScatterColors, useChartHover, useChartStable, useYScale } from './chart-context.js';
+import { useChartLegendHover } from './chart-legend-hover.js';
 import {
   SeriesPointMarker,
   type SeriesPointMarkerStyle,
   StaticSeriesPointMarker,
   getSeriesMarkerVisualExtent,
-} from './series-point-marker';
+} from './series-point-marker.js';
 
 export interface SeriesMarkersProps extends SeriesPointMarkerStyle {
   dataKey: string;

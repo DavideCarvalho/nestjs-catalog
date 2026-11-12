@@ -1,5 +1,5 @@
 import type { CatalogObjectTypeDef } from '@dudousxd/nestjs-catalog/client';
-import { cn } from './cn';
+import { cn } from './cn.js';
 
 interface CoverageLedgerProps {
   types: CatalogObjectTypeDef[];

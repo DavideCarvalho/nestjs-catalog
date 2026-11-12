@@ -13,7 +13,7 @@ import {
 } from 'lucide-react';
 import type { ReactNode } from 'react';
 import { useState } from 'react';
-import { cn } from './cn';
+import { cn } from './cn.js';
 import {
   CONNECTION_KIND_OPTIONS,
   type ConnectableKind,
@@ -26,19 +26,19 @@ import {
   connectionIsIncomplete,
   configString as text,
   toConnectableKind,
-} from './connection-form';
+} from './connection-form.js';
 import {
   type ConnectionInput,
   type ConnectionUse,
   catalogQueryKeys,
   useCatalogClient,
-} from './context';
-import { ConfirmDialog } from './ui/dialog';
-import { TextField } from './ui/field';
-import { SelectField } from './ui/select';
-import { Tooltip } from './ui/tooltip';
-import { type CatalogWorkflow, nodeName } from './workflow/model';
-import { WORKFLOW_NAME } from './workflow/name';
+} from './context.js';
+import { ConfirmDialog } from './ui/dialog.js';
+import { TextField } from './ui/field.js';
+import { SelectField } from './ui/select.js';
+import { Tooltip } from './ui/tooltip.js';
+import { type CatalogWorkflow, nodeName } from './workflow/model.js';
+import { WORKFLOW_NAME } from './workflow/name.js';
 
 const MUTED = 'text-zinc-400 dark:text-zinc-500';
 const RULE = 'border-zinc-200 dark:border-zinc-800';

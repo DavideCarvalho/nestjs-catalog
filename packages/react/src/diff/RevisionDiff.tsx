@@ -4,14 +4,14 @@ import { MultiFileDiff } from '@pierre/diffs/react';
 import { useQuery } from '@tanstack/react-query';
 import { GitCompare, History } from 'lucide-react';
 import { type ReactNode, useMemo, useState } from 'react';
-import { cn } from '../cn';
-import { type CatalogRevision, catalogQueryKeys, useCatalogClient } from '../context';
-import { Button } from '../ui/button';
-import { codeOptions } from '../ui/code-editor';
-import type { CatalogCodeLanguage } from '../ui/code-languages';
-import { useCodeThemeType } from '../ui/code-theme';
-import { SelectField } from '../ui/select';
-import { Sheet } from '../ui/sheet';
+import { cn } from '../cn.js';
+import { type CatalogRevision, catalogQueryKeys, useCatalogClient } from '../context.js';
+import { Button } from '../ui/button.js';
+import { codeOptions } from '../ui/code-editor.js';
+import type { CatalogCodeLanguage } from '../ui/code-languages.js';
+import { useCodeThemeType } from '../ui/code-theme.js';
+import { SelectField } from '../ui/select.js';
+import { Sheet } from '../ui/sheet.js';
 
 /**
  * Why a load came out different from the last one.

@@ -11,7 +11,7 @@
  */
 import { type Transition, animate, useMotionValue } from 'motion/react';
 import { useEffect, useRef } from 'react';
-import { DEFAULT_CHART_ENTER_TRANSITION } from './animation';
+import { DEFAULT_CHART_ENTER_TRANSITION } from './animation.js';
 
 /** Drives 0→1 enter progress using the studio motion transition (spring or tween). */
 export function useMountProgress(

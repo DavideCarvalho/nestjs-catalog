@@ -6,12 +6,12 @@ import {
   SOURCE_FORMATS,
   catalogSnapshotRefusal,
 } from '@dudousxd/nestjs-catalog/client';
-import { cn } from './cn';
-import { CONNECTION_KINDS, type ConnectableKind } from './connection-form';
-import { FieldGroup, TextAreaField, TextField } from './ui/field';
-import { SelectField } from './ui/select';
-import { Switch } from './ui/switch';
-import { type StorageAvailability, describeStorage } from './workflow/model';
+import { cn } from './cn.js';
+import { CONNECTION_KINDS, type ConnectableKind } from './connection-form.js';
+import { FieldGroup, TextAreaField, TextField } from './ui/field.js';
+import { SelectField } from './ui/select.js';
+import { Switch } from './ui/switch.js';
+import { type StorageAvailability, describeStorage } from './workflow/model.js';
 
 /**
  * Describing where records are read from, in one place.

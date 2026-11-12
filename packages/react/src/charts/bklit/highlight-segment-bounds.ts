@@ -7,8 +7,8 @@
  * `cn`, which is the same function. Nothing else is modified, so re-syncing
  * with upstream stays a diff rather than a merge.
  */
-import type { TooltipData } from './chart-context';
-import type { ChartSelection } from './use-chart-interaction';
+import type { TooltipData } from './chart-context.js';
+import type { ChartSelection } from './use-chart-interaction.js';
 
 // Pure geometry for the hover-highlight band, split out from the hook so it can
 // be unit-tested without React/motion (see __tests__).

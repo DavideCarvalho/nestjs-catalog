@@ -3,7 +3,7 @@ import {
   type SerializedSvg,
   serializeSvg,
   svgToDataUri,
-} from './serialize';
+} from './serialize.js';
 
 /**
  * SVG chart → PNG, in the browser, with no dependency.

@@ -17,17 +17,17 @@ import {
   Unlink,
 } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
-import { CoverageLedger } from './CoverageLedger';
-import { EditableField } from './EditableField';
-import { LoadExpectationSection } from './LoadExpectationSection';
-import { LoadedBySection } from './LoadedBySection';
-import { paramFromLocation } from './ObjectExplorer';
-import { cn } from './cn';
-import { catalogQueryKeys, useCatalogClient } from './context';
-import { type Freshness, freshnessOf, isWorthFlagging } from './freshness';
-import { DataTable } from './ui/data-table';
-import { RichTextField } from './ui/rich-text-field';
-import { Tooltip, TooltipProvider } from './ui/tooltip';
+import { CoverageLedger } from './CoverageLedger.js';
+import { EditableField } from './EditableField.js';
+import { LoadExpectationSection } from './LoadExpectationSection.js';
+import { LoadedBySection } from './LoadedBySection.js';
+import { paramFromLocation } from './ObjectExplorer.js';
+import { cn } from './cn.js';
+import { catalogQueryKeys, useCatalogClient } from './context.js';
+import { type Freshness, freshnessOf, isWorthFlagging } from './freshness.js';
+import { DataTable } from './ui/data-table.js';
+import { RichTextField } from './ui/rich-text-field.js';
+import { Tooltip, TooltipProvider } from './ui/tooltip.js';
 
 /**
  * Browse and label the model.

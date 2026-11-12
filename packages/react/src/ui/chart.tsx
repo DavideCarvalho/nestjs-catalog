@@ -1,6 +1,6 @@
 import * as React from 'react';
 import * as RechartsPrimitive from 'recharts';
-import { cn } from '../cn';
+import { cn } from '../cn.js';
 
 /**
  * shadcn/ui's chart primitives, vendored.

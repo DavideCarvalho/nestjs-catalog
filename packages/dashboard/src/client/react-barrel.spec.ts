@@ -62,12 +62,12 @@ const BARREL = read('index.ts');
  * and matching on the specifier catches both.
  */
 const SEAMS: Array<[specifier: string, file: string]> = [
-  ['./PipelineConsole', 'PipelineConsole.tsx'],
-  ['./schema-discovery', 'schema-discovery.tsx'],
-  ['./context', 'context.tsx'],
-  ['./routes', 'routes.ts'],
-  ['./workflow/model', 'workflow/model.ts'],
-  ['./workflow/validate', 'workflow/validate.ts'],
+  ['./PipelineConsole.js', 'PipelineConsole.tsx'],
+  ['./schema-discovery.js', 'schema-discovery.tsx'],
+  ['./context.js', 'context.tsx'],
+  ['./routes.js', 'routes.ts'],
+  ['./workflow/model.js', 'workflow/model.ts'],
+  ['./workflow/validate.js', 'workflow/validate.ts'],
 ];
 
 /** Every top-level declaration a module exports under its own name. */
@@ -125,7 +125,7 @@ describe('the React package barrel', () => {
     // because it imports React Flow — has to be able to mount the panel. So the module the barrel
     // must re-export these from moved with it, and this test moving is the point rather than
     // collateral.
-    const exported = reExportedFrom('./schema-discovery');
+    const exported = reExportedFrom('./schema-discovery.js');
 
     for (const name of [
       'SchemaDiscoveryBridge',
@@ -142,8 +142,8 @@ describe('the React package barrel', () => {
   it('carries the two types the access surface takes and answers with', () => {
     // `AccessRoutes.people(query)` and `CatalogClient.listPeople(query)` are both exported and
     // both were unnameable end to end: the argument lived in routes.ts, the reply in context.tsx.
-    expect(reExportedFrom('./routes')).toContain('PeopleQuery');
-    expect(reExportedFrom('./context')).toContain('CatalogPeoplePage');
+    expect(reExportedFrom('./routes.js')).toContain('PeopleQuery');
+    expect(reExportedFrom('./context.js')).toContain('CatalogPeoplePage');
   });
 
   it('resolves the value exports to the real things, not to a matching identifier', () => {

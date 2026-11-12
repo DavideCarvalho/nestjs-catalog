@@ -6,7 +6,7 @@
   "author": "Davide Carvalho",
   "repository": {
     "type": "git",
-    "url": "https://github.com/DavideCarvalho/nestjs-catalog.git",
+    "url": "git+https://github.com/DavideCarvalho/nestjs-catalog.git",
     "directory": "packages/store-fanout"
   },
   "bugs": {
@@ -20,6 +20,7 @@
     "snapshots",
     "warehouse"
   ],
+  "type": "commonjs",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": {
@@ -47,5 +48,8 @@
   },
   "dependencies": {
     "@dudousxd/nestjs-diagnostics": "0.7.2"
+  },
+  "engines": {
+    "node": ">=24"
   }
 }

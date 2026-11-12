@@ -1,6 +1,6 @@
 import { Check, Pencil, X } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
-import { cn } from './cn';
+import { cn } from './cn.js';
 
 interface EditableFieldProps {
   value: string;

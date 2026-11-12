@@ -32,8 +32,8 @@ import {
   workflowCallMode,
   workflowLookupUnmatched,
   workflowRenameUnnamed,
-} from './model';
-import { type WorkflowProblem, edgeId } from './validate';
+} from './model.js';
+import { type WorkflowProblem, edgeId } from './validate.js';
 
 /**
  * Turning the stored graph into what React Flow draws, and back.

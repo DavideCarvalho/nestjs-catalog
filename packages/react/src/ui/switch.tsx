@@ -1,6 +1,6 @@
 import { Switch as BaseSwitch } from '@base-ui/react/switch';
 import type { ReactNode } from 'react';
-import { cn } from '../cn';
+import { cn } from '../cn.js';
 
 /**
  * A switch, vendored in the shadcn style on Base UI.

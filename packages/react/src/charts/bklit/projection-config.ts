@@ -8,10 +8,10 @@
  * with upstream stays a diff rather than a merge.
  */
 import { Children, Fragment, type ReactElement, type ReactNode, isValidElement } from 'react';
-import { isChartClipPassthrough } from './chart-child-passthrough';
-import type { ProjectionPoint } from './projection-utils';
-import { projectionDateExtents, projectionValueExtents } from './projection-utils';
-import { normalizeYAxisId } from './y-axis-scales';
+import { isChartClipPassthrough } from './chart-child-passthrough.js';
+import type { ProjectionPoint } from './projection-utils.js';
+import { projectionDateExtents, projectionValueExtents } from './projection-utils.js';
+import { normalizeYAxisId } from './y-axis-scales.js';
 
 export interface ProjectionLineConfig {
   yAxisId: string;

@@ -37,13 +37,13 @@
 
 import { RotateCcw, Undo2 } from 'lucide-react';
 import { useEffect } from 'react';
-import { cn } from '../cn';
-import { Button } from '../ui/button';
-import { ConfirmDialog } from '../ui/dialog';
-import { Tooltip } from '../ui/tooltip';
-import type { WorkflowEdge, WorkflowNode } from './model';
-import { nodeName } from './model';
-import { WORKFLOW_NAME } from './name';
+import { cn } from '../cn.js';
+import { Button } from '../ui/button.js';
+import { ConfirmDialog } from '../ui/dialog.js';
+import { Tooltip } from '../ui/tooltip.js';
+import type { WorkflowEdge, WorkflowNode } from './model.js';
+import { nodeName } from './model.js';
+import { WORKFLOW_NAME } from './name.js';
 
 /**
  * How many actions can be taken back.

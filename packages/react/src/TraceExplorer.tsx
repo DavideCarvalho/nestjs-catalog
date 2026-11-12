@@ -31,9 +31,9 @@ import {
   Upload,
 } from 'lucide-react';
 import { useMemo, useState } from 'react';
-import { cn } from './cn';
-import { useCatalogClient } from './context';
-import { Tooltip, TooltipProvider } from './ui/tooltip';
+import { cn } from './cn.js';
+import { useCatalogClient } from './context.js';
+import { Tooltip, TooltipProvider } from './ui/tooltip.js';
 
 const MUTED = 'text-zinc-400 dark:text-zinc-500';
 const RULE = 'border-zinc-200 dark:border-zinc-800';

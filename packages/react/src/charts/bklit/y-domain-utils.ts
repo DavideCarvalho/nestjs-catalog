@@ -8,9 +8,9 @@
  * with upstream stays a diff rather than a merge.
  */
 import { scaleLinear } from '@visx/scale';
-import type { LineConfig } from './chart-context';
-import { type ChartPhase, Y_DOMAIN_TWEEN_SKIP_THRESHOLD } from './chart-phase';
-import { groupLinesByYAxisId, normalizeYAxisId } from './y-axis-scales';
+import type { LineConfig } from './chart-context.js';
+import { type ChartPhase, Y_DOMAIN_TWEEN_SKIP_THRESHOLD } from './chart-phase.js';
+import { groupLinesByYAxisId, normalizeYAxisId } from './y-axis-scales.js';
 
 export type YDomain = [number, number];
 

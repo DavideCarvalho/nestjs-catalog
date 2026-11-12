@@ -10,8 +10,8 @@
  * with upstream stays a diff rather than a merge.
  */
 import { useCallback } from 'react';
-import { useChartStable, useYScale } from './chart-context';
-import type { ProjectionPoint } from './projection-utils';
+import { useChartStable, useYScale } from './chart-context.js';
+import type { ProjectionPoint } from './projection-utils.js';
 
 export interface ProjectionLineEndMarkerProps {
   data: ProjectionPoint[];

@@ -16,15 +16,15 @@ import {
   type SpringConfig,
   resolveTooltipBoxMotion,
   useChartConfig,
-} from '../chart-config-context';
-import { type LineConfig, chartCssVars, useChart, useChartStable } from '../chart-context';
-import { weekdayDateFmt } from '../chart-formatters';
-import type { IndicatorFadeEdges } from '../indicator-fade';
-import { DateTicker } from './date-ticker';
-import { TooltipBox } from './tooltip-box';
-import { TooltipContent, type TooltipRow } from './tooltip-content';
-import { TooltipDot } from './tooltip-dot';
-import { TooltipIndicator } from './tooltip-indicator';
+} from '../chart-config-context.js';
+import { type LineConfig, chartCssVars, useChart, useChartStable } from '../chart-context.js';
+import { weekdayDateFmt } from '../chart-formatters.js';
+import type { IndicatorFadeEdges } from '../indicator-fade.js';
+import { DateTicker } from './date-ticker.js';
+import { TooltipBox } from './tooltip-box.js';
+import { TooltipContent, type TooltipRow } from './tooltip-content.js';
+import { TooltipDot } from './tooltip-dot.js';
+import { TooltipIndicator } from './tooltip-indicator.js';
 
 export interface ChartTooltipProps {
   /** Whether to show the date pill at bottom. Default: true */

@@ -10,8 +10,8 @@
  * with upstream stays a diff rather than a merge.
  */
 import { motion, useSpring, useTransform } from 'motion/react';
-import { type SpringConfig, useChartConfig } from '../chart-config-context';
-import { chartCssVars } from '../chart-context';
+import { type SpringConfig, useChartConfig } from '../chart-config-context.js';
+import { chartCssVars } from '../chart-context.js';
 
 export interface TooltipDotProps {
   x: number;

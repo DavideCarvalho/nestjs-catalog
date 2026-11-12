@@ -1,6 +1,6 @@
-export { CatalogManager, type CatalogManagerProps } from './CatalogManager';
-export { CoverageLedger } from './CoverageLedger';
-export { EditableField } from './EditableField';
+export { CatalogManager, type CatalogManagerProps } from './CatalogManager.js';
+export { CoverageLedger } from './CoverageLedger.js';
+export { EditableField } from './EditableField.js';
 // Mounted on the Model screen already. Exported because a host that builds its
 // own type panel out of this package's parts should not have to rebuild the one
 // section that can say an incremental load of a type is currently refused.
@@ -8,7 +8,7 @@ export {
   DELETE_STRATEGIES,
   LoadExpectationSection,
   type LoadExpectationSectionProps,
-} from './LoadExpectationSection';
+} from './LoadExpectationSection.js';
 // Mounted on the Model screen too, directly above the expectation section — the
 // two are one question in two halves: who loads this type, and what is checked
 // when they do. `loadersOf` is exported beside the component because it is the
@@ -18,10 +18,10 @@ export {
   LoadedBySection,
   type LoadedBySectionProps,
   loadersOf,
-} from './LoadedBySection';
-export { cn } from './cn';
-export { ObjectExplorer, type ObjectExplorerProps } from './ObjectExplorer';
-export { DashboardBoard } from './DashboardBoard';
+} from './LoadedBySection.js';
+export { cn } from './cn.js';
+export { ObjectExplorer, type ObjectExplorerProps } from './ObjectExplorer.js';
+export { DashboardBoard } from './DashboardBoard.js';
 export {
   CHART_COLORS,
   type ChartRenderer,
@@ -30,16 +30,16 @@ export {
   registerChartRenderer,
   registeredChartLibraries,
   seriesFrom,
-} from './charts/registry';
+} from './charts/registry.js';
 export {
   ChartEmpty,
   ChartFailed,
   ChartSkeleton,
   type ChartSkeletonProps,
-} from './charts/skeleton';
+} from './charts/skeleton.js';
 // The fallback every other renderer degrades to, and the guard that decides
 // when a time-scale chart cannot draw what a saved query asked for.
-export { CssBarChart, looksLikeTimeSeries } from './charts/css';
+export { CssBarChart, looksLikeTimeSeries } from './charts/css.js';
 // Embedding: the same charts, in an application that is not this one. Output
 // only — see src/embed/actions.ts for what an embed deliberately cannot do.
 export {
@@ -56,23 +56,23 @@ export {
   type EmbedLoadingSlot,
   chartsInLayoutOrder,
   resolveEmbedActions,
-} from './embed';
-export { FlowView } from './FlowView';
-export { GovernanceTimeline } from './GovernanceTimeline';
-export { QueryConsole, type QueryConsoleProps } from './QueryConsole';
+} from './embed/index.js';
+export { FlowView } from './FlowView.js';
+export { GovernanceTimeline } from './GovernanceTimeline.js';
+export { QueryConsole, type QueryConsoleProps } from './QueryConsole.js';
 // One box across the whole catalog: types, properties, saved queries, boards.
 // Not mounted anywhere by this package — a host places it wherever its shell
 // wants a search, and tells it where each kind of thing lives with the same
 // `explorerHref` shape `CatalogManager` takes.
-export { CatalogSearch, type CatalogSearchProps } from './search-console';
-export { SavedQueryPanel } from './SavedQueryPanel';
+export { CatalogSearch, type CatalogSearchProps } from './search-console.js';
+export { SavedQueryPanel } from './SavedQueryPanel.js';
 export {
   CATALOG_EVENT_META,
   type CatalogTraceSource,
   eventMeta,
   TraceExplorer,
   useTraceSource,
-} from './TraceExplorer';
+} from './TraceExplorer.js';
 
 // Getting data in: the addresses a pipeline reads through and the code that
 // reshapes what it fetches. These used to live in the consuming app, which meant
@@ -88,7 +88,7 @@ export {
   type ConnectionPanelProps,
   connectionOptionsFor,
   describeConnection,
-} from './ConnectionPanel';
+} from './ConnectionPanel.js';
 // What a connection IS, as data: which kinds can be one, what each needs, and
 // the two rules — completeness, and the redaction placeholder — that decide
 // whether a form may send one.
@@ -115,18 +115,18 @@ export {
   connectionIsIncomplete,
   redactedCredentialIn,
   toConnectableKind,
-} from './connection-form';
+} from './connection-form.js';
 // Creating a connection from wherever a source is being configured.
 //
 // On the root entry and not behind `/workflow`, for the reason
 // `SchemaDiscoveryPanel` is: it imports no React Flow, and it is the other half
 // of the same offer — the sink's panel makes the type, this makes the address. A
 // host assembling its own source inspector should be able to mount either.
-export { SourceConnectionCreator } from './source-connection';
+export { SourceConnectionCreator } from './source-connection.js';
 export {
   PipelineConsole,
   type PipelineConsoleProps,
-} from './PipelineConsole';
+} from './PipelineConsole.js';
 // The schema-discovery seam, whole.
 //
 // `SchemaDiscoveryBridge` is a bridge a HOST may implement — this package cannot
@@ -154,8 +154,8 @@ export {
   type SchemaDiscoveryBridge,
   SchemaDiscoveryPanel,
   type SchemaDrift,
-} from './schema-discovery';
-export { TransformEditor, type TransformEditorProps } from './TransformEditor';
+} from './schema-discovery.js';
+export { TransformEditor, type TransformEditorProps } from './TransformEditor.js';
 
 // Why one load came out different from the last one.
 //
@@ -180,8 +180,8 @@ export {
   type RevisionHistorySheetProps,
   type RevisionSubject,
   type RevisionSubjectKind,
-} from './diff/RevisionDiff';
-export { AccessConsole, type AccessConsoleProps } from './AccessConsole';
+} from './diff/RevisionDiff.js';
+export { AccessConsole, type AccessConsoleProps } from './AccessConsole.js';
 
 // The authored graph: sources wired through transforms into sinks.
 //
@@ -235,8 +235,8 @@ export {
   type WorkflowSinkNode,
   type WorkflowSourceNode,
   type WorkflowTransformNode,
-} from './workflow/model';
-export { WORKFLOW_NAME } from './workflow/name';
+} from './workflow/model.js';
+export { WORKFLOW_NAME } from './workflow/name.js';
 // Whether what a source reads fits the type its sink writes.
 //
 // The canvas answers this for itself now — it holds what `discoverSourceSchema`
@@ -252,7 +252,7 @@ export {
   type SourceShape,
   type TargetProperty,
   type TargetShape,
-} from './workflow/shape';
+} from './workflow/shape.js';
 // Core's rules, run in the browser, plus the questions core cannot answer:
 // whether a connection is legal mid-drag, whether a node names a transform that
 // still exists, and whether a source supplies the columns its sink writes.
@@ -271,7 +271,7 @@ export {
   type WorkflowProblemCode,
   type WorkflowProblemLevel,
   wouldCycle,
-} from './workflow/validate';
+} from './workflow/validate.js';
 // The prefilled graphs, on this entry point rather than on `/workflow` because
 // they import no React Flow: a template produces nodes, edges, transform bodies
 // and expectation payloads, and a host should be able to build one — or check
@@ -315,7 +315,7 @@ export {
   WORKFLOW_TEMPLATES,
   type WorkflowTemplateId,
   type WorkflowTemplateMeta,
-} from './workflow/templates';
+} from './workflow/templates.js';
 
 export {
   type CatalogClient,
@@ -385,7 +385,7 @@ export {
   type WorkflowRunOptions,
   type WorkflowScheduleInput,
   useCatalogClient,
-} from './context';
+} from './context.js';
 
 // The paths behind the pipeline and access screens, exported so a host can
 // mount those endpoints wherever it likes and tell the provider where they are.
@@ -407,16 +407,16 @@ export {
   type PeopleQuery,
   type PipelineRoutes,
   pipelineRoutes,
-} from './routes';
+} from './routes.js';
 
 // The vendored primitives. Exported because a host composing its own screen out
 // of this package's parts should not have to rebuild a tooltip to match.
-export { ConfirmDialog } from './ui/dialog';
-export { FieldGroup, TextAreaField, TextField } from './ui/field';
-export { Select, SelectField, type SelectOption } from './ui/select';
-export { Combobox, ComboboxField, type ComboOption, type ComboboxProps } from './ui/combobox';
-export { Switch } from './ui/switch';
-export { Sheet } from './ui/sheet';
+export { ConfirmDialog } from './ui/dialog.js';
+export { FieldGroup, TextAreaField, TextField } from './ui/field.js';
+export { Select, SelectField, type SelectOption } from './ui/select.js';
+export { Combobox, ComboboxField, type ComboOption, type ComboboxProps } from './ui/combobox.js';
+export { Switch } from './ui/switch.js';
+export { Sheet } from './ui/sheet.js';
 // `codeEditorRoot` and `codeEditorText` come with it because the editor renders
 // into a shadow root: without them a host cannot assert on its own screen, and
 // every consumer would rediscover the tag name by reading our source.
@@ -426,7 +426,7 @@ export {
   type CodeEditorProps,
   codeEditorRoot,
   codeEditorText,
-} from './ui/code-editor';
+} from './ui/code-editor.js';
 // The grammars and themes the editor above can be given, which is a shorter list
 // than Shiki's and is the reason `dist/spa` is not nine tenths grammar files. A
 // host reads `CatalogCodeLanguage` off `CodeEditorProps` anyway; it is named here
@@ -438,15 +438,15 @@ export {
   type CatalogCodeLanguage,
   type CatalogCodeTheme,
   TRANSFORM_HIGHLIGHTED_AS,
-} from './ui/code-languages';
+} from './ui/code-languages.js';
 export {
   RichTextField,
   RichTextView,
   type RichTextFieldProps,
-} from './ui/rich-text-field';
-export { Button, type ButtonProps, type ButtonSize, type ButtonVariant } from './ui/button';
-export { Tabs, TabsList, TabsPanel, TabsTab } from './ui/tabs';
-export { Tooltip, TooltipProvider } from './ui/tooltip';
+} from './ui/rich-text-field.js';
+export { Button, type ButtonProps, type ButtonSize, type ButtonVariant } from './ui/button.js';
+export { Tabs, TabsList, TabsPanel, TabsTab } from './ui/tabs.js';
+export { Tooltip, TooltipProvider } from './ui/tooltip.js';
 
 // Getting a chart out of the console as a file.
 //
@@ -486,4 +486,4 @@ export {
   useHasExportableSvg,
   usePdfExport,
   usePngExport,
-} from './export';
+} from './export/index.js';

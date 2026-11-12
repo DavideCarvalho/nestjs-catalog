@@ -11,9 +11,9 @@
  */
 import { useSpring } from 'motion/react';
 import { useMemo, useRef } from 'react';
-import { useChartConfig } from './chart-config-context';
-import { useChartHover, useChartStable } from './chart-context';
-import { INACTIVE_SEGMENT, computeSegmentBounds } from './highlight-segment-bounds';
+import { useChartConfig } from './chart-config-context.js';
+import { useChartHover, useChartStable } from './chart-context.js';
+import { INACTIVE_SEGMENT, computeSegmentBounds } from './highlight-segment-bounds.js';
 
 // Hover-highlight band for `line.tsx` and `area.tsx`. Computes the segment
 // bounds and springs its x/width; `<HighlightSegment>` renders the clipped

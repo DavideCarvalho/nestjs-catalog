@@ -2,7 +2,7 @@ import type { CatalogConnection } from '@dudousxd/nestjs-catalog/client';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { Loader2, Plug, Plus } from 'lucide-react';
 import { useState } from 'react';
-import { cn } from './cn';
+import { cn } from './cn.js';
 import {
   type ConnectableKind,
   ConnectionCheckResult,
@@ -14,11 +14,11 @@ import {
   connectionDraftFrom,
   connectionIsIncomplete,
   redactedCredentialIn,
-} from './connection-form';
-import { type ConnectionInput, catalogQueryKeys, useCatalogClient } from './context';
-import { Button } from './ui/button';
-import { TextField } from './ui/field';
-import { WORKFLOW_NAME } from './workflow/name';
+} from './connection-form.js';
+import { type ConnectionInput, catalogQueryKeys, useCatalogClient } from './context.js';
+import { Button } from './ui/button.js';
+import { TextField } from './ui/field.js';
+import { WORKFLOW_NAME } from './workflow/name.js';
 
 const MUTED = 'text-zinc-400 dark:text-zinc-500';
 const RULE = 'border-zinc-200 dark:border-zinc-800';

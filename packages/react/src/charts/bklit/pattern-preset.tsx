@@ -10,7 +10,7 @@
  * with upstream stays a diff rather than a merge.
  */
 import type { ReactNode } from 'react';
-import { PatternCircles, PatternLines } from './visx-pattern';
+import { PatternCircles, PatternLines } from './visx-pattern.js';
 
 export const PATTERN_PRESET_IDS = [
   'none',

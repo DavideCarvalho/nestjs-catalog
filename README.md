@@ -35,8 +35,9 @@ long-lived token to leak or rotate. Two things make it work, and both are easy t
   package on npmjs.com (Settings -> Trusted Publisher). A package without it fails the publish with
   `E404 - PUT https://registry.npmjs.org/<pkg>`: npm answers 404 rather than 403 for an
   unauthorized package, so the error reads as "no such package" rather than "not authenticated".
-- **npm must be >= 11.5.1**, which is where OIDC landed. `.nvmrc` pins Node 22, which ships npm
-  10.9.x, so the workflow upgrades npm explicitly before publishing.
+- **npm must be >= 11.5.1**, which is where OIDC landed. `.nvmrc` pins Node 24, whose npm 11 is
+  new enough, but the workflow still upgrades npm explicitly before publishing so the publish
+  does not depend on whichever npm the pinned Node happens to bundle.
 
 The workflow also passes **no `NODE_AUTH_TOKEN`**, deliberately. `setup-node` writes
 `//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}` into `~/.npmrc`, so wiring an unset secret

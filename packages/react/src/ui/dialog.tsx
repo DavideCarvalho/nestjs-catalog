@@ -1,7 +1,7 @@
 import { Dialog as BaseDialog } from '@base-ui/react/dialog';
 import { Loader2 } from 'lucide-react';
 import type { ReactNode } from 'react';
-import { cn } from '../cn';
+import { cn } from '../cn.js';
 
 /**
  * A confirmation dialog, vendored in the shadcn style on Base UI.

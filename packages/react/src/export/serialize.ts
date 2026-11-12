@@ -2,7 +2,7 @@ import {
   THEME_CUSTOM_PROPERTIES,
   collectCustomProperties,
   resolveCssVariables,
-} from './css-variables';
+} from './css-variables.js';
 
 /**
  * Turning a live chart `<svg>` into standalone markup that renders the same.

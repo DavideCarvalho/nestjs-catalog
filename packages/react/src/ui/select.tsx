@@ -1,7 +1,7 @@
 import { Select as BaseSelect } from '@base-ui/react/select';
 import { Check, ChevronsUpDown } from 'lucide-react';
 import type { ReactNode } from 'react';
-import { cn } from '../cn';
+import { cn } from '../cn.js';
 
 /**
  * A select, vendored in the shadcn style on Base UI.

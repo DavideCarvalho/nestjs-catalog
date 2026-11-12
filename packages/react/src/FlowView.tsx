@@ -2,9 +2,9 @@ import type { CatalogAuditEvent, CatalogObjectTypeDef } from '@dudousxd/nestjs-c
 import { useQuery } from '@tanstack/react-query';
 import { ArrowRight, CircleAlert, CircleCheck, CircleDot, Link2 } from 'lucide-react';
 import { useMemo } from 'react';
-import { cn } from './cn';
-import { catalogQueryKeys, useCatalogClient } from './context';
-import { Tooltip, TooltipProvider } from './ui/tooltip';
+import { cn } from './cn.js';
+import { catalogQueryKeys, useCatalogClient } from './context.js';
+import { Tooltip, TooltipProvider } from './ui/tooltip.js';
 
 const MUTED = 'text-zinc-400 dark:text-zinc-500';
 const RULE = 'border-zinc-200 dark:border-zinc-800';

@@ -6,7 +6,7 @@
   "author": "Davide Carvalho",
   "repository": {
     "type": "git",
-    "url": "https://github.com/DavideCarvalho/nestjs-catalog.git",
+    "url": "git+https://github.com/DavideCarvalho/nestjs-catalog.git",
     "directory": "packages/telescope"
   },
   "bugs": {
@@ -21,6 +21,7 @@
     "diagnostics",
     "lineage"
   ],
+  "type": "commonjs",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": {
@@ -56,8 +57,8 @@
     "@types/node": "25.9.9",
     "typescript": "5.9.3"
   },
-  "//engines": "22, not 20. This package emits CommonJS (matching @dudousxd/nestjs-catalog's tsconfig, so both compile identically inside a host) while @dudousxd/nestjs-telescope and @dudousxd/nestjs-diagnostics are ESM-only, so loading it needs require(esm) — stable from Node 22.",
+  "//engines": "24, like every package in this repo. It must be at least 22 anyway: this package emits CommonJS (matching @dudousxd/nestjs-catalog's tsconfig, so both compile identically inside a host) while @dudousxd/nestjs-telescope and @dudousxd/nestjs-diagnostics are ESM-only, so loading it needs require(esm) — stable from Node 22.",
   "engines": {
-    "node": ">=22"
+    "node": ">=24"
   }
 }

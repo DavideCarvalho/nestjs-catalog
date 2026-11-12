@@ -22,11 +22,11 @@ import {
   X,
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { cn } from './cn';
-import { catalogQueryKeys, useCatalogClient } from './context';
-import { Button } from './ui/button';
-import { DataTable } from './ui/data-table';
-import { Select } from './ui/select';
+import { cn } from './cn.js';
+import { catalogQueryKeys, useCatalogClient } from './context.js';
+import { Button } from './ui/button.js';
+import { DataTable } from './ui/data-table.js';
+import { Select } from './ui/select.js';
 
 /**
  * One table for every object type in the catalog.
