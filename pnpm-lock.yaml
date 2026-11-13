@@ -305,8 +305,8 @@ importers:
         specifier: 12.11.6
         version: 12.11.6(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1)
       d3-array:
-        specifier: 3.2.4
-        version: 3.2.4
+        specifier: 3.2.5
+        version: 3.2.5
       d3-shape:
         specifier: 3.2.0
         version: 3.2.0
@@ -3035,6 +3035,10 @@ packages:
 
   d3-array@3.2.4:
     resolution: {integrity: sha512-tdQAmyA18i4J7wprpYq8ClcxZy3SC31QMeByyCFyRt7BVHdREQZ5lpzoe5mFEYZUWe+oq8HBvk9JjpibyEV4Jg==}
+    engines: {node: '>=12'}
+
+  d3-array@3.2.5:
+    resolution: {integrity: sha512-Th8qGXoBalmWsstpkuhmBuTsBQIFqYOJtjlBvNVvBfJ8E3uYusBUwUR8HU20U0qKKQkgCvKyR1YjiozWadk5QA==}
     engines: {node: '>=12'}
 
   d3-color@3.1.0:
@@ -7767,6 +7771,10 @@ snapshots:
       internmap: 2.0.3
 
   d3-array@3.2.4:
+    dependencies:
+      internmap: 2.0.3
+
+  d3-array@3.2.5:
     dependencies:
       internmap: 2.0.3
 
