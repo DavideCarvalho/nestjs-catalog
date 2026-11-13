@@ -308,8 +308,8 @@ importers:
         specifier: 3.2.5
         version: 3.2.5
       d3-shape:
-        specifier: 3.2.0
-        version: 3.2.0
+        specifier: 3.2.1
+        version: 3.2.1
       lucide-react:
         specifier: 0.577.0
         version: 0.577.0(react@19.3.1)
@@ -3077,6 +3077,10 @@ packages:
     resolution: {integrity: sha512-p3KP5HCf/bvjBSSKuXid6Zqijx7wIfNW+J/maPs+iwR35at5JCbLUT0LzF1cnjbCHWhqzQTIN2Jpe8pRebIEFQ==}
     engines: {node: '>=12'}
 
+  d3-path@3.1.1:
+    resolution: {integrity: sha512-jsbgV8zIT38ReB9O7X7gcLndTQRONSqNNd+oGIaTBdUug4r5jFmp0N6RY9R5GWbdUDucn0qoTGyfjapT4tDhcg==}
+    engines: {node: '>=12'}
+
   d3-scale@4.0.2:
     resolution: {integrity: sha512-GZW464g1SH7ag3Y7hXjf8RoUuAFIqklOAq3MRl4OaWabTFJY9PN/E1YklhXLh+OQ3fM9yS2nOkCoS+WLZ6kvxQ==}
     engines: {node: '>=12'}
@@ -3087,6 +3091,10 @@ packages:
 
   d3-shape@3.2.0:
     resolution: {integrity: sha512-SaLBuwGm3MOViRq2ABk3eLoxwZELpH6zhl3FbAoJ7Vm1gofKx6El1Ib5z23NUEhF9AsGl7y+dzLe5Cw2AArGTA==}
+    engines: {node: '>=12'}
+
+  d3-shape@3.2.1:
+    resolution: {integrity: sha512-dm2o+lbKdzg9tY7GEag/dB9hcbodLfwkE/DkvqbELJXaMz0yKzWWhZqhbI7CKubukA7HnRyz0avdtvi7EPxPvw==}
     engines: {node: '>=12'}
 
   d3-time-format@4.1.0:
@@ -7805,6 +7813,8 @@ snapshots:
 
   d3-path@3.1.0: {}
 
+  d3-path@3.1.1: {}
+
   d3-scale@4.0.2:
     dependencies:
       d3-array: 3.2.4
@@ -7818,6 +7828,10 @@ snapshots:
   d3-shape@3.2.0:
     dependencies:
       d3-path: 3.1.0
+
+  d3-shape@3.2.1:
+    dependencies:
+      d3-path: 3.1.1
 
   d3-time-format@4.1.0:
     dependencies:
