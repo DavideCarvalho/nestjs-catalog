@@ -29,7 +29,7 @@
  * scrolling strip is checked structurally, as containment, which is the part that is actually
  * true regardless of viewport.
  */
-import type { CatalogSearchResult } from '@dudousxd/nestjs-catalog/client';
+import type { CatalogSearchResponse } from '@dudousxd/nestjs-catalog/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -76,11 +76,11 @@ Object.assign(window, { __CATALOG_HOST_AUTH__: true });
 const { App } = await import('./App');
 
 /** One hit of each kind, which is the only shape that can catch a missing href. */
-const RESULT: CatalogSearchResult = {
+const RESULT: CatalogSearchResponse = {
   term: 'risk',
   total: 4,
   truncated: false,
-  hits: [
+  data: [
     {
       kind: 'objectType',
       id: 'Mvr',
@@ -124,7 +124,12 @@ function stubFetch() {
       // the answer before it has a row to draw, so a bare `[]` crashes the screen a search link
       // is supposed to arrive at — and a crashed destination looks exactly like a bad href.
       if (url.pathname.startsWith('/api/catalog/objects/')) {
-        return { type: 'Mvr', page: 1, size: 25, total: 0, pages: 0, columns: [], rows: [] };
+        return {
+          type: 'Mvr',
+          data: [],
+          meta: { total: 0, perPage: 25, currentPage: 1, lastPage: 1, firstPage: 1 },
+          columns: [],
+        };
       }
       return [];
     })();

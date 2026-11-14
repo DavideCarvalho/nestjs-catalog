@@ -18,8 +18,16 @@ import {
   type CatalogDirectory,
   type CatalogPersonInput,
   type CatalogPersonRole,
+  type CatalogPersonSummary,
 } from './catalog.access';
 import { RequireScopes } from './catalog.route-auth';
+import {
+  ListQueryError,
+  type OffsetPage,
+  offsetPage,
+  parsePageParams,
+  rejectUnknownParams,
+} from './list-api';
 
 const ROLES: readonly CatalogPersonRole[] = ['viewer', 'curator', 'administrator'];
 
@@ -88,13 +96,15 @@ export function createAccessController(
       return this.require().listApplications();
     }
 
+    /**
+     * One page of people, in the Aviary offset list envelope: `search`, `page`
+     * and `size` in, `{ data, meta }` out.
+     */
     @Get('people')
     @RequireScopes('catalog:admin')
-    people(
-      @Query('search') search?: string,
-      @Query('limit') limit?: string,
-      @Query('offset') offset?: string,
-    ) {
+    async people(
+      @Query() query: Record<string, unknown> = {},
+    ): Promise<OffsetPage<CatalogPersonSummary>> {
       const directory = this.require();
       if (!directory.listPeople) {
         // 501, not 200-with-nothing. The screen renders a failed read and an
@@ -107,12 +117,23 @@ export function createAccessController(
       }
       // Bounded HERE, not left to each implementation. A host's user table is
       // its whole directory, and the seam would otherwise invite exactly the
-      // unbounded read this endpoint would then serve to a browser.
-      return directory.listPeople({
-        ...(search ? { search } : {}),
-        limit: boundedPage(limit),
-        offset: nonNegative(offset),
+      // unbounded read this endpoint would then serve to a browser. Over the
+      // cap is clamped; junk (`size=all`) is a 400 rather than "no limit".
+      rejectUnknownParams(query, ['page', 'size', 'search']);
+      const { page, size, offset } = parsePageParams(query, {
+        defaultSize: CATALOG_DIRECTORY_PAGE,
+        maxSize: CATALOG_DIRECTORY_MAX_PAGE,
       });
+      if (query.search !== undefined && typeof query.search !== 'string') {
+        throw new ListQueryError('Invalid "search": send it once.');
+      }
+      const search = typeof query.search === 'string' ? query.search : '';
+      const result = await directory.listPeople({
+        ...(search ? { search } : {}),
+        limit: size,
+        offset,
+      });
+      return offsetPage(result.people, { total: result.total, page, size });
     }
 
     @Post('people')
@@ -133,23 +154,6 @@ export function createAccessController(
   for (const decorate of decorators) decorate(AccessController);
 
   return AccessController;
-}
-
-/**
- * A page size that cannot be talked out of its ceiling.
- *
- * Anything unparseable falls back to the default rather than to "no limit" —
- * `?limit=all` must not be the one string that turns the bound off.
- */
-function boundedPage(raw: string | undefined): number {
-  const asked = Number.parseInt(raw ?? '', 10);
-  if (!Number.isFinite(asked) || asked <= 0) return CATALOG_DIRECTORY_PAGE;
-  return Math.min(asked, CATALOG_DIRECTORY_MAX_PAGE);
-}
-
-function nonNegative(raw: string | undefined): number {
-  const asked = Number.parseInt(raw ?? '', 10);
-  return Number.isFinite(asked) && asked > 0 ? asked : 0;
 }
 
 /**

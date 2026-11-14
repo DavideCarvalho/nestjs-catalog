@@ -331,6 +331,12 @@ export {
   // the state as `CatalogPersonSummary[]`, is the exact mistake that method's
   // docblock warns about: it drops `total` and under-reports who has access.
   type CatalogPeoplePage,
+  // The list-query shapes of the audit feed and the trace list, and the
+  // `filter[...]` params they become.
+  type AuditEventFilters,
+  auditFilterParams,
+  type EventListQuery,
+  type TraceListQuery,
   type CatalogPersonRole,
   type CatalogPersonSummary,
   type CatalogPrincipalSummary,

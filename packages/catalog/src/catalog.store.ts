@@ -292,8 +292,8 @@ export function isCatalogStoreCapabilities(value: unknown): value is CatalogStor
  * What a store is asked for, once the service has vetted it.
  *
  * `Omit<..., 'filters'>` and not a plain extension, and the omission is the
- * point: `CatalogObjectQuery.filters` is the caller's raw
- * `property:operator:value` text, and a store must never be handed one. What
+ * point: `CatalogObjectQuery.filters` is what the caller sent, unresolved
+ * (`{ property, op, value }` as text), and a store must never be handed one. What
  * arrives here instead is {@link CatalogResolvedFilter}, whose property is the
  * type's own definition — so the column a predicate is built from came off the
  * type rather than off the request, and the type system says so rather than a

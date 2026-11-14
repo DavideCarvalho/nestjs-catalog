@@ -94,7 +94,7 @@ export interface CatalogSearchProps {
   /** Where a dashboard opens. Omit to render dashboard rows as plain rows. */
   dashboardHref?: (id: string) => string;
   /** How many rows to ask for. The server caps whatever this says. */
-  limit?: number;
+  size?: number;
   placeholder?: string;
   /** Heading copy, so the host can call this whatever its users call it. */
   title?: string;
@@ -105,7 +105,7 @@ export function CatalogSearch({
   explorerHref,
   savedQueryHref,
   dashboardHref,
-  limit,
+  size,
   placeholder = 'A type, a column, a report — whatever you remember',
   title = 'Search',
   eyebrow = 'Across the catalog',
@@ -121,8 +121,8 @@ export function CatalogSearch({
 
   const trimmed = debounced.trim();
   const { data, isFetching, isError } = useQuery({
-    queryKey: catalogQueryKeys.search(trimmed, limit),
-    queryFn: () => client.search(trimmed, limit),
+    queryKey: catalogQueryKeys.search(trimmed, size),
+    queryFn: () => client.search(trimmed, size),
     // An empty box asks nothing. The route answers an empty term with an empty
     // result rather than a 400, so this is politeness rather than protection —
     // but a request fired on mount, before anybody has typed, is a request the
@@ -135,7 +135,7 @@ export function CatalogSearch({
   });
 
   const grouped = useMemo(() => {
-    const hits = data?.hits ?? [];
+    const hits = data?.data ?? [];
     return KIND_ORDER.map(
       (kind) => [kind, hits.filter((hit) => hit.kind === kind)] as const,
     ).filter(([, rows]) => rows.length > 0);
@@ -178,7 +178,7 @@ export function CatalogSearch({
           isError={isError}
           isFetching={isFetching}
           total={data?.total}
-          shown={data?.hits.length}
+          shown={data?.data.length}
           truncated={data?.truncated}
         />
 

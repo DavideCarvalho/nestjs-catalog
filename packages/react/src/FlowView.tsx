@@ -31,7 +31,7 @@ export function FlowView() {
   });
   const { data: events = [], isLoading } = useQuery({
     queryKey: ['catalog', 'flow-events'],
-    queryFn: () => client.listEvents({ limit: 500 }),
+    queryFn: () => client.listEvents({ size: 500 }).then((page) => page.data),
     refetchInterval: 20_000,
   });
 

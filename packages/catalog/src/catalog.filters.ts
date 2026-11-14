@@ -179,26 +179,59 @@ export function offeredFilterOperators(
 }
 
 /**
- * `property:op:value`, repeated once per filter.
+ * The query parameter one filter travels as: `filter[property][op]=value`.
  *
- * The value is everything after the second colon, so it may contain colons — a
- * timestamp does. A property name containing one cannot be addressed by this
- * form; that is refused by name in {@link resolveObjectFilters} rather than
- * silently mis-parsed, because a filter that quietly does not apply is a screen
- * showing every row as though it had been filtered.
+ * The Aviary list wire. A valueless operator (`empty`, `notEmpty`) still sends a
+ * value, `true`, because a transport that drops empty parameters would otherwise
+ * drop the whole filter — and a filter that silently does not apply is a screen
+ * showing every row as though it had been filtered. The server ignores it.
+ *
+ * One condition per property and operator: the key is the pair, so a second
+ * `contains` on the same property would overwrite the first. {@link
+ * objectQueryParams} refuses that rather than sending one of them.
  */
-export function encodeObjectFilter(filter: CatalogObjectFilter): string {
-  if (!filterOperatorTakesValue(filter.op)) return `${filter.property}:${filter.op}`;
-  return `${filter.property}:${filter.op}:${filter.value ?? ''}`;
+export function objectFilterParam(filter: CatalogObjectFilter): [name: string, value: string] {
+  const name = `filter[${filter.property}][${filter.op}]`;
+  return [name, filterOperatorTakesValue(filter.op) ? (filter.value ?? '') : 'true'];
 }
 
-export function parseObjectFilter(raw: string): CatalogObjectFilter | undefined {
-  const parts = raw.split(':');
-  if (parts.length < 2) return undefined;
-  const [property, op, ...rest] = parts;
-  if (!property || !isCatalogFilterOperator(op)) return undefined;
-  if (!filterOperatorTakesValue(op)) return { property, op };
-  return { property, op, value: rest.join(':') };
+/** What a client asks `GET objects/:name` for, before it becomes a query string. */
+export interface CatalogObjectListParams {
+  page?: number;
+  size?: number;
+  search?: string;
+  /** One column; `-column` for descending. */
+  sort?: string;
+  filters?: readonly CatalogObjectFilter[];
+  /** Read the type as of an earlier load. */
+  snapshot?: string;
+}
+
+/**
+ * The flat query parameters for one object read: `page`, `size`, `search`,
+ * `sort`, `snapshot` and one `filter[property][op]` per filter. Flat keys so any
+ * transport that serialises a plain record (`URLSearchParams`, axios) sends the
+ * wire as-is. Absent and empty values are left out.
+ */
+export function objectQueryParams(
+  params: CatalogObjectListParams,
+): Record<string, string | number> {
+  const out: Record<string, string | number> = {};
+  if (params.page !== undefined) out.page = params.page;
+  if (params.size !== undefined) out.size = params.size;
+  if (params.search) out.search = params.search;
+  if (params.sort) out.sort = params.sort;
+  if (params.snapshot) out.snapshot = params.snapshot;
+  for (const filter of params.filters ?? []) {
+    const [name, value] = objectFilterParam(filter);
+    if (name in out) {
+      throw new Error(
+        `Two filters use ${filter.op} on ${filter.property}; the wire carries one per property and operator.`,
+      );
+    }
+    out[name] = value;
+  }
+  return out;
 }
 
 /**
@@ -252,7 +285,7 @@ export const CATALOG_FILTER_LIMIT = 20;
  */
 export function resolveObjectFilters(
   columns: readonly CatalogPropertyDef[],
-  raw: readonly string[],
+  raw: readonly CatalogObjectFilter[],
 ): CatalogFilterResolution {
   const filters: CatalogResolvedFilter[] = [];
   const problems: string[] = [];
@@ -276,12 +309,11 @@ export function resolveObjectFilters(
 /** One entry: the filter it names, or the sentence explaining why it is not one. */
 function resolveOne(
   columns: readonly CatalogPropertyDef[],
-  entry: string,
+  parsed: CatalogObjectFilter,
 ): { filter: CatalogResolvedFilter } | { problem: string } {
-  const parsed = parseObjectFilter(entry);
-  if (!parsed) {
+  if (!isCatalogFilterOperator(parsed.op)) {
     return {
-      problem: `"${entry}" is not a filter. The form is property:operator:value, and the operator is one of ${CATALOG_FILTER_OPERATORS.join(', ')}.`,
+      problem: `${parsed.op} is not a filter operator. It is one of ${CATALOG_FILTER_OPERATORS.join(', ')}.`,
     };
   }
 

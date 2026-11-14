@@ -6,11 +6,7 @@ import type {
   ScalarType,
   SnapshotRef,
 } from '@dudousxd/nestjs-catalog/client';
-import {
-  coerceFilterValue,
-  encodeObjectFilter,
-  filterOperatorTakesValue,
-} from '@dudousxd/nestjs-catalog/client';
+import { coerceFilterValue, filterOperatorTakesValue } from '@dudousxd/nestjs-catalog/client';
 import { useQuery } from '@tanstack/react-query';
 import {
   ArrowLeft,
@@ -181,13 +177,13 @@ export function ObjectExplorer({
    * character. The columns it needs to check a value against come from the read
    * below, which is why the hook is fed twice — see {@link useAppliedFilters}.
    */
-  const [applied, setApplied] = useState<string[]>([]);
+  const [applied, setApplied] = useState<CatalogObjectFilter[]>([]);
   // Stable, so the debounce inside the hook can depend on it honestly rather
   // than restarting its timer on every render. Back to page one whenever the
   // filters change: page 7 of an unfiltered table is very often past the end of
   // a filtered one, and a page past the end reads as "nothing matches".
-  const apply = useCallback((encoded: string[]) => {
-    setApplied(encoded);
+  const apply = useCallback((ready: CatalogObjectFilter[]) => {
+    setApplied(ready);
     setPage(1);
   }, []);
 
@@ -196,11 +192,11 @@ export function ObjectExplorer({
       page,
       size: pageSize,
       search: debouncedSearch || undefined,
-      sort,
-      dir,
+      // The list API's sort: one column, `-` for descending.
+      sort: sort ? `${dir === 'desc' ? '-' : ''}${sort}` : undefined,
       // Omitted rather than sent empty, so a screen with no filters asks the
       // same question it always did.
-      filter: applied.length > 0 ? applied : undefined,
+      filters: applied.length > 0 ? applied : undefined,
       snapshot: snapshotId || undefined,
     }),
     [page, pageSize, debouncedSearch, sort, dir, applied, snapshotId],
@@ -375,14 +371,14 @@ export function ObjectExplorer({
               — sorting them here would reorder the window and present it as the
               whole answer, which looks right and is not. `toggleSort` refetches. */}
             <DataTable
-              data={data?.rows ?? []}
+              data={data?.data ?? []}
               columns={columns}
               getRowId={(row, index) => String(row[selectedType?.primaryKey[0] ?? 'id'] ?? index)}
               sort={{ by: sort ?? null, dir, onSort: toggleSort }}
               numeric={(id) => numericColumns.has(id)}
             />
 
-            {data && data.rows.length === 0 && (
+            {data && data.data.length === 0 && (
               <EmptyState
                 type={selectedType}
                 search={debouncedSearch}
@@ -396,7 +392,7 @@ export function ObjectExplorer({
           </div>
         )}
 
-        {data && <Pager page={data.page} pages={data.pages} onPage={setPage} />}
+        {data && <Pager page={data.meta.currentPage} pages={data.meta.lastPage} onPage={setPage} />}
       </div>
     </div>
   );
@@ -411,7 +407,7 @@ export function ObjectExplorer({
  * different facts and only one of them is worth reacting to.
  */
 function tableCaption(type: CatalogObjectTypeDef | undefined, data: CatalogObjectPage | undefined) {
-  const rows = data ? `${data.total.toLocaleString()} rows` : '…';
+  const rows = data ? `${data.meta.total.toLocaleString()} rows` : '…';
   return `${type?.tableName} · ${rows} · ${data?.columns.length ?? 0} columns from the catalog`;
 }
 
@@ -524,21 +520,25 @@ function useSelectedType(
 function useAppliedFilters(
   filters: CatalogObjectFilter[],
   columns: PageColumn[] | undefined,
-  onApplied: (encoded: string[]) => void,
+  onApplied: (ready: CatalogObjectFilter[]) => void,
 ): void {
-  const encoded = useMemo(() => {
+  const ready = useMemo(() => {
     const byName = new Map((columns ?? []).map((column) => [column.name, column]));
     return filters
       .filter((filter) => filterIsReady(filter, byName.get(filter.property)))
-      .map((filter) => encodeObjectFilter(filter));
+      .map((filter) =>
+        filterOperatorTakesValue(filter.op)
+          ? { property: filter.property, op: filter.op, value: filter.value ?? '' }
+          : { property: filter.property, op: filter.op },
+      );
   }, [filters, columns]);
 
   // One string, so the debounce below depends on a value rather than on an array
   // identity that is new on every render.
-  const key = encoded.join('\n');
+  const key = JSON.stringify(ready);
 
   useEffect(() => {
-    const timer = setTimeout(() => onApplied(key ? key.split('\n') : []), 250);
+    const timer = setTimeout(() => onApplied(JSON.parse(key) as CatalogObjectFilter[]), 250);
     return () => clearTimeout(timer);
     // `onApplied` has to be stable — a callback with a new identity every render
     // would restart this timer on every render and never fire. The caller wraps it

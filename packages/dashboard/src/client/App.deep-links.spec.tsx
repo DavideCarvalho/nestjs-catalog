@@ -32,7 +32,7 @@ import { codeEditorText } from '@dudousxd/nestjs-catalog-react';
  * `toBeChecked` / `toBeDisabled` are NOT available — this repo registers no jest-dom setup, and
  * they throw rather than fail. `toHaveProperty` is the equivalent that works.
  */
-import type { CatalogSearchResult, Dashboard, SavedQuery } from '@dudousxd/nestjs-catalog/client';
+import type { CatalogSearchResponse, Dashboard, SavedQuery } from '@dudousxd/nestjs-catalog/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -98,11 +98,11 @@ const QUERIES = [
 const BOARDS = [board('d-1', 'Fleet overview'), board('d-3', 'Risk overview')];
 
 /** One hit of each kind that carries an id, which is what the two broken links were. */
-const RESULT: CatalogSearchResult = {
+const RESULT: CatalogSearchResponse = {
   term: 'risk',
   total: 2,
   truncated: false,
-  hits: [
+  data: [
     { kind: 'savedQuery', id: 'q-7', label: 'Risk by base', rank: 'name', field: 'name' },
     { kind: 'dashboard', id: 'd-3', label: 'Risk overview', rank: 'name', field: 'name' },
   ],

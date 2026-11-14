@@ -86,31 +86,31 @@ function PeopleSearch({
  */
 function PageBar({
   page,
-  onOffset,
+  onPage,
   busy,
 }: {
   page: CatalogPeoplePage;
-  onOffset: (next: number) => void;
+  onPage: (next: number) => void;
   busy: boolean;
 }) {
-  const shown = page.people.length;
-  const first = page.total === 0 ? 0 : page.offset + 1;
-  const last = page.offset + shown;
-  const hasMore = last < page.total;
+  const { total, perPage, currentPage, lastPage } = page.meta;
+  const offset = (currentPage - 1) * perPage;
+  const shown = page.data.length;
+  const first = total === 0 ? 0 : offset + 1;
+  const last = offset + shown;
+  const hasMore = currentPage < lastPage;
 
   return (
     <div className={cn('mt-3 flex items-center justify-between text-xs', MUTED)}>
       <span>
-        {page.total === 0
-          ? 'No people'
-          : `Showing ${first}–${last} of ${page.total.toLocaleString()}`}
+        {total === 0 ? 'No people' : `Showing ${first}–${last} of ${total.toLocaleString()}`}
       </span>
-      {(page.offset > 0 || hasMore) && (
+      {(currentPage > 1 || hasMore) && (
         <span className="flex gap-2">
           <button
             type="button"
-            disabled={page.offset === 0 || busy}
-            onClick={() => onOffset(Math.max(0, page.offset - page.limit))}
+            disabled={currentPage <= 1 || busy}
+            onClick={() => onPage(Math.max(1, currentPage - 1))}
             className="disabled:opacity-40"
           >
             Previous
@@ -118,7 +118,7 @@ function PageBar({
           <button
             type="button"
             disabled={!hasMore || busy}
-            onClick={() => onOffset(page.offset + page.limit)}
+            onClick={() => onPage(currentPage + 1)}
             className="disabled:opacity-40"
           >
             Next
@@ -160,10 +160,10 @@ export function AccessConsole({
   // what it will return regardless of what is asked for. The key carries the
   // query so a search does not read a previous search's page from the cache.
   const [search, setSearch] = useState('');
-  const [offset, setOffset] = useState(0);
+  const [page, setPage] = useState(1);
   const people = useQuery({
-    queryKey: [...catalogQueryKeys.people, { search, offset }],
-    queryFn: () => client.listPeople({ ...(search ? { search } : {}), offset }),
+    queryKey: [...catalogQueryKeys.people, { search, page }],
+    queryFn: () => client.listPeople({ ...(search ? { search } : {}), page }),
     staleTime: 30_000,
     // The count and the page it describes must not be shown apart. Without
     // this, typing into the search blanks the list to a spinner and then shows
@@ -194,7 +194,7 @@ export function AccessConsole({
               setSearch(next);
               // Back to the first page. Staying on page 3 of the previous
               // search shows an empty list for a search that has matches.
-              setOffset(0);
+              setPage(1);
             }}
           />
           {mayAdminister && <AddPerson />}
@@ -213,14 +213,14 @@ export function AccessConsole({
               onRetry={() => people.refetch()}
             />
           )}
-          {people.data?.people.map((person) => (
+          {people.data?.data.map((person) => (
             <PersonCard key={person.email} person={person} />
           ))}
           {/* Two different empty lists, and conflating them is the bug this
               splits: with a search typed, "no matches" is a fact about the
               search. Without one it is a fact about the directory, and the
               advice below only makes sense for the second. */}
-          {people.data?.people.length === 0 &&
+          {people.data?.data.length === 0 &&
             (search ? (
               <Placeholder>Nobody matches “{search}”.</Placeholder>
             ) : (
@@ -229,9 +229,7 @@ export function AccessConsole({
                 anybody can reach this console as a person.
               </Placeholder>
             ))}
-          {people.data && (
-            <PageBar page={people.data} onOffset={setOffset} busy={people.isFetching} />
-          )}
+          {people.data && <PageBar page={people.data} onPage={setPage} busy={people.isFetching} />}
         </Section>
 
         <Section

@@ -29,7 +29,7 @@ import {
   type SaveQueryInput,
   type SavedQuery,
 } from './catalog.workspace';
-import type { CatalogSearchHit, CatalogSearchResult } from './search.types';
+import type { CatalogSearchHit, CatalogSearchResponse } from './search.types';
 
 /**
  * `GET /catalog/search`, through a real application, with a real guard putting a
@@ -299,7 +299,7 @@ describe('GET /catalog/search (integration)', () => {
     server: Parameters<typeof request>[0],
     key: string | undefined,
     query: Record<string, string>,
-  ): Promise<CatalogSearchResult> {
+  ): Promise<CatalogSearchResponse> {
     const call = request(server).get('/api/catalog/search').query(query);
     const response = await (key ? call.set('x-catalog-key', key) : call);
     expect(response.status).toBe(200);
@@ -311,9 +311,9 @@ describe('GET /catalog/search (integration)', () => {
     // the term is a word somebody half-remembers.
     const server = await boot();
 
-    const result = await search(server, 'analyst', { q: 'dispute' });
+    const result = await search(server, 'analyst', { search: 'dispute' });
 
-    expect(new Set(result.hits.map((hit) => hit.kind))).toEqual(
+    expect(new Set(result.data.map((hit) => hit.kind))).toEqual(
       new Set(['objectType', 'savedQuery', 'dashboard']),
     );
   });
@@ -321,13 +321,13 @@ describe('GET /catalog/search (integration)', () => {
   it('reads both the registry and the workspace store, without a second request', async () => {
     const server = await boot();
 
-    const result = await search(server, 'analyst', { q: 'settlement' });
+    const result = await search(server, 'analyst', { search: 'settlement' });
 
     // A property from the in-memory snapshot AND a saved query from the store,
     // in one answer. If the fan-out were ever split, this is the assertion that
     // notices.
-    expect(identify(result.hits)).toContain('property:Dispute.settlementAmount');
-    expect(identify(result.hits)).toContain('savedQuery:q-1');
+    expect(identify(result.data)).toContain('property:Dispute.settlementAmount');
+    expect(identify(result.data)).toContain('savedQuery:q-1');
   });
 
   it('does not return the NAME of a type this caller may not read', async () => {
@@ -335,14 +335,14 @@ describe('GET /catalog/search (integration)', () => {
     // Dispute" is the disclosure, even though not one row came back with it.
     const server = await boot();
 
-    const result = await search(server, 'fleet', { q: 'dispute' });
+    const result = await search(server, 'fleet', { search: 'dispute' });
 
-    expect(identify(result.hits)).toEqual(['savedQuery:q-1', 'dashboard:d-1']);
+    expect(identify(result.data)).toEqual(['savedQuery:q-1', 'dashboard:d-1']);
     // Asserted on `typeName` rather than on the serialised body: a saved query
     // legitimately CALLED "Dispute settlements by quarter" comes back, because
     // a saved query has no per-type grant to check and `GET saved-queries`
     // would return it to this same caller. What must not appear is the type.
-    expect(result.hits.some((hit) => hit.typeName === 'Dispute')).toBe(false);
+    expect(result.data.some((hit) => hit.typeName === 'Dispute')).toBe(false);
   });
 
   it('does not return the properties of a type this caller may not read either', async () => {
@@ -351,9 +351,9 @@ describe('GET /catalog/search (integration)', () => {
     // itself is correctly absent — which looks MORE correct, not less.
     const server = await boot();
 
-    const result = await search(server, 'fleet', { q: 'settlement' });
+    const result = await search(server, 'fleet', { search: 'settlement' });
 
-    expect(identify(result.hits)).toEqual(['savedQuery:q-1']);
+    expect(identify(result.data)).toEqual(['savedQuery:q-1']);
   });
 
   it('does not surface a classified property to a caller without the classification', async () => {
@@ -363,9 +363,9 @@ describe('GET /catalog/search (integration)', () => {
     // about before any value is fetched.
     const server = await boot();
 
-    const result = await search(server, 'cleared-for-nothing', { q: 'settlement' });
+    const result = await search(server, 'cleared-for-nothing', { search: 'settlement' });
 
-    expect(identify(result.hits)).toEqual(['savedQuery:q-1']);
+    expect(identify(result.data)).toEqual(['savedQuery:q-1']);
     expect(JSON.stringify(result)).not.toContain('settlementAmount');
   });
 
@@ -374,9 +374,9 @@ describe('GET /catalog/search (integration)', () => {
     // above and make the feature useless.
     const server = await boot();
 
-    const result = await search(server, 'analyst', { q: 'settlement' });
+    const result = await search(server, 'analyst', { search: 'settlement' });
 
-    expect(identify(result.hits)).toContain('property:Dispute.settlementAmount');
+    expect(identify(result.data)).toContain('property:Dispute.settlementAmount');
   });
 
   it('counts the total after the filter, not before it', async () => {
@@ -385,19 +385,19 @@ describe('GET /catalog/search (integration)', () => {
     const server = await boot();
 
     const [everything, restricted] = await Promise.all([
-      search(server, 'analyst', { q: 'dispute' }),
-      search(server, 'fleet', { q: 'dispute' }),
+      search(server, 'analyst', { search: 'dispute' }),
+      search(server, 'fleet', { search: 'dispute' }),
     ]);
 
-    expect(everything.total).toBe(everything.hits.length);
-    expect(restricted.total).toBe(restricted.hits.length);
+    expect(everything.total).toBe(everything.data.length);
+    expect(restricted.total).toBe(restricted.data.length);
     expect(restricted.total).toBeLessThan(everything.total);
   });
 
   it('never returns the SQL behind a saved query', async () => {
     const server = await boot();
 
-    const result = await search(server, 'analyst', { q: 'dispute settlements' });
+    const result = await search(server, 'analyst', { search: 'dispute settlements' });
 
     expect(JSON.stringify(result)).not.toContain('select');
   });
@@ -408,18 +408,29 @@ describe('GET /catalog/search (integration)', () => {
     // argues against — and would put a fragment of one in a dropdown.
     const server = await boot();
 
-    const result = await search(server, 'analyst', { q: 'settlement_amount' });
+    const result = await search(server, 'analyst', { search: 'settlement_amount' });
 
-    expect(result.hits.filter((hit) => hit.kind === 'savedQuery')).toEqual([]);
+    expect(result.data.filter((hit) => hit.kind === 'savedQuery')).toEqual([]);
   });
 
-  it('honours the limit parameter off the query string', async () => {
+  it('honours the size parameter off the query string', async () => {
     const server = await boot();
 
-    const result = await search(server, 'analyst', { q: 'dispute', limit: '1' });
+    const result = await search(server, 'analyst', { search: 'dispute', size: '1' });
 
-    expect(result.hits).toHaveLength(1);
+    expect(result.data).toHaveLength(1);
     expect(result.truncated).toBe(true);
+  });
+
+  it('refuses the old q and a page, which a ranked top-N does not have, with a 400', async () => {
+    const server = await boot();
+
+    for (const qs of ['q=dispute', 'search=dispute&page=2']) {
+      const response = await request(server)
+        .get(`/api/catalog/search?${qs}`)
+        .set('x-catalog-key', 'analyst');
+      expect([qs, response.status]).toEqual([qs, 400]);
+    }
   });
 
   it('answers a missing term with an empty result rather than a 400', async () => {
@@ -431,7 +442,7 @@ describe('GET /catalog/search (integration)', () => {
       .set('x-catalog-key', 'analyst');
 
     expect(response.status).toBe(200);
-    expect(response.body).toEqual({ term: '', total: 0, truncated: false, hits: [] });
+    expect(response.body).toEqual({ data: [], term: '', total: 0, truncated: false });
   });
 
   it('answers a caller the guard let through without the read scope with nothing', async () => {
@@ -441,9 +452,9 @@ describe('GET /catalog/search (integration)', () => {
     // every board name (nothing per-object to check) would otherwise come back.
     const server = await boot();
 
-    const result = await search(server, 'embed-only', { q: 'dispute' });
+    const result = await search(server, 'embed-only', { search: 'dispute' });
 
-    expect(result).toEqual({ term: 'dispute', total: 0, truncated: false, hits: [] });
+    expect(result).toEqual({ data: [], term: 'dispute', total: 0, truncated: false });
   });
 
   it('filters nothing for a caller it could not resolve at all', async () => {
@@ -454,8 +465,8 @@ describe('GET /catalog/search (integration)', () => {
     // rather than a drift.
     const server = await boot();
 
-    const result = await search(server, undefined, { q: 'dispute' });
+    const result = await search(server, undefined, { search: 'dispute' });
 
-    expect(identify(result.hits)).toContain('objectType:Dispute.Dispute');
+    expect(identify(result.data)).toContain('objectType:Dispute.Dispute');
   });
 });

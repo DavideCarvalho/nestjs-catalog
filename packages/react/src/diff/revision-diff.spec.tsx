@@ -416,20 +416,22 @@ describe('the ways in', () => {
     // `code v3`; making that the control means the number does not have to be carried anywhere.
     const { transport, paths } = fakeTransport({
       '/pipeline/connectors': [CONNECTOR],
-      '/pipeline/runs': [
-        {
-          id: 'run-1',
-          connectorId: 'c1',
-          snapshotId: 'snap-1',
-          principalId: 'ana',
-          status: 'succeeded',
-          fetched: 10,
-          written: 10,
-          logs: [],
-          startedAt: '2026-01-02T00:00:00.000Z',
-          transformVersion: 3,
-        },
-      ],
+      '/pipeline/runs': {
+        data: [
+          {
+            id: 'run-1',
+            connectorId: 'c1',
+            snapshotId: 'snap-1',
+            principalId: 'ana',
+            status: 'succeeded',
+            fetched: 10,
+            written: 10,
+            logs: [],
+            startedAt: '2026-01-02T00:00:00.000Z',
+            transformVersion: 3,
+          },
+        ],
+      },
       '/pipeline/transforms/t1/revisions': [
         revision(5, 'return records.map(toRow)\n// current'),
         revision(3, 'return records.map(oldRow)\n// three'),

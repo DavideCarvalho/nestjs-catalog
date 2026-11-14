@@ -454,7 +454,7 @@ export function readableObjectPage(
   return {
     ...page,
     columns: page.columns.filter((column) => !hidden.includes(column.name)),
-    rows: page.rows.map((row) => {
+    data: page.data.map((row) => {
       const visible = { ...row };
       for (const name of hidden) delete visible[name];
       return visible;

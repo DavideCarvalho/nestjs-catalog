@@ -217,7 +217,7 @@ function answersFor(
     '/pipeline/transforms': [],
     '/pipeline/connections': [],
     '/pipeline/connectors': [],
-    '/pipeline/runs': [],
+    '/pipeline/runs': { data: [] },
     '/pipeline/capabilities': {
       languages: ['javascript'],
       pythonPackages: [],
@@ -538,7 +538,7 @@ describe('what a published graph runs as', () => {
         '/pipeline/connectors': [
           connector({ config: { url: 'https://svc:REDACTED@vendor.test' } }),
         ],
-        '/pipeline/runs': [run({ transformVersion: 3 })],
+        '/pipeline/runs': { data: [run({ transformVersion: 3 })] },
       }),
     );
     await openCanvas(transport);
@@ -569,7 +569,7 @@ describe('what a published graph runs as', () => {
     const { transport } = fakeTransport(
       answersFor([workflow()], {
         '/pipeline/connectors': [connector()],
-        '/pipeline/runs': [run()],
+        '/pipeline/runs': { data: [run()] },
       }),
     );
     await openCanvas(transport);

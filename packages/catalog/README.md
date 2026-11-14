@@ -86,6 +86,26 @@ overlay store (a JSON file by default; bring your own via `overlayStore`).
 searched columns against the catalog before anything reaches SQL, selects only
 the columns the catalog says are visible, and caps the page size.
 
+### List endpoints
+
+Every list route speaks the Aviary list wire: `filter[field]=v` or
+`filter[field][op]=v`, `search`, `sort=-field`, and **one** paging style. An
+unknown filter field, an unsupported operator or an unknown sort field is a
+**400**; `size` over the cap is clamped. `limit`, `offset`, `q`, `dir` and the old
+`filter=prop:op:value` form are gone, not aliased.
+
+| Route | Request | Response |
+|---|---|---|
+| `GET /catalog/objects/:name` | `page`, `size` (default 25, capped by `maxPageSize`, 200), `search`, `sort=-column` (one column), `filter[property][op]=value` (ANDed; `eq ne contains gte lte gt lt empty notEmpty`), `snapshot` | `{ data, meta: { total, perPage, currentPage, lastPage, firstPage }, type, columns, snapshot? }` |
+| `GET /catalog/search` | `search`, `size` (default 50, max 200) | `{ data: hits, term, total, truncated }` — a ranked top-N, not paged |
+| `GET /catalog/events` | `filter[event]`, `filter[type]`, `filter[principal]`, `filter[occurredAt][gte]`, `size` (default 100, max 500) | `{ data }`, newest first — the trail store has no cursor or count |
+| `GET /catalog/events/traces` | the same filters plus `filter[outcome]=failed,incomplete`, `page`, `size` (default 25, max 200) | `{ data, meta, unlinked, unlinkedTotal, clockResolutionMs }` |
+| `GET /access/people` | `search`, `page`, `size` (default 50, max 500) | `{ data, meta }` |
+
+`@dudousxd/nestjs-catalog/client` exports `objectQueryParams()`, which turns
+`{ page, size, search, sort, filters, snapshot }` into those flat query params,
+and the `OffsetPage` / `CursorPageResponse` envelope types.
+
 ## Who may reach it
 
 The console's Access screen asks two questions with different owners, and the
@@ -103,7 +123,10 @@ about who was offboarded. So implement `listPeople` over what you already have:
 
 ```ts
 class MyDirectory extends MikroOrmCatalogDirectory {   // applications, inherited
-  async listPeople() { return this.users.findAll().map(toPersonSummary); }
+  async listPeople({ search, limit, offset }: CatalogDirectoryQuery) {
+    const [rows, total] = await this.users.findAndCount({ search, limit, offset });
+    return { people: rows.map(toPersonSummary), total, limit, offset };
+  }
 }
 
 CatalogModule.forRoot({

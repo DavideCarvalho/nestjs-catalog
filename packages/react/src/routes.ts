@@ -408,10 +408,11 @@ export interface AccessRoutes {
   people(query?: PeopleQuery): string;
 }
 
+/** `search`, plus the Aviary offset paging params `page` (1-based) and `size`. */
 export interface PeopleQuery {
   search?: string;
-  limit?: number;
-  offset?: number;
+  page?: number;
+  size?: number;
 }
 
 export function accessRoutes(basePath: string = DEFAULT_ACCESS_BASE_PATH): AccessRoutes {
@@ -421,8 +422,8 @@ export function accessRoutes(basePath: string = DEFAULT_ACCESS_BASE_PATH): Acces
     people: (query) => {
       const params = new URLSearchParams();
       if (query?.search) params.set('search', query.search);
-      if (query?.limit !== undefined) params.set('limit', String(query.limit));
-      if (query?.offset !== undefined) params.set('offset', String(query.offset));
+      if (query?.page !== undefined) params.set('page', String(query.page));
+      if (query?.size !== undefined) params.set('size', String(query.size));
       const search = params.toString();
       return search ? `${base}/people?${search}` : `${base}/people`;
     },

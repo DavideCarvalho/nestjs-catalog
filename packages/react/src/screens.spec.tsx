@@ -306,15 +306,12 @@ describe('CatalogManager', () => {
 describe('ObjectExplorer', () => {
   const page = (rows: Array<Record<string, unknown>>): CatalogObjectPage => ({
     type: 'Mvr',
-    page: 1,
-    size: 25,
-    total: rows.length,
-    pages: 1,
+    data: rows,
+    meta: { total: rows.length, perPage: 25, currentPage: 1, lastPage: 1, firstPage: 1 },
     columns: [
       { name: 'id', displayName: 'Identifier', type: 'string' },
       { name: 'tailNumber', displayName: 'Tail number', type: 'string' },
     ],
-    rows,
   });
 
   it('asks for the type it was given, with the paging parameters the API names', async () => {
@@ -329,15 +326,9 @@ describe('ObjectExplorer', () => {
     expect(screen.getByText('Tail number')).toBeDefined();
 
     // The parameter names are the contract with the server and are easy to rename by accident:
-    // `size` is not `limit`, `dir` is not `order`. Send the wrong ones and a full unsorted first
-    // page comes back with no error to notice.
-    expect(lastCallTo('/catalog/objects/Mvr')?.params).toEqual({
-      page: 1,
-      size: 25,
-      search: undefined,
-      sort: undefined,
-      dir: 'asc',
-    });
+    // `size` is not `limit`, and there is no `dir` — the list API's `sort` carries the direction.
+    // Send the wrong ones and a full unsorted first page comes back with no error to notice.
+    expect(lastCallTo('/catalog/objects/Mvr')?.params).toEqual({ page: 1, size: 25 });
   });
 
   it('honours a caller-supplied page size', async () => {
@@ -380,20 +371,14 @@ describe('ObjectExplorer', () => {
     fireEvent.click(await screen.findByText('Tail number'));
 
     await waitFor(() =>
-      expect(lastCallTo('/catalog/objects/Mvr')?.params).toMatchObject({
-        sort: 'tailNumber',
-        dir: 'asc',
-      }),
+      expect(lastCallTo('/catalog/objects/Mvr')?.params).toMatchObject({ sort: 'tailNumber' }),
     );
 
     // …and clicking the same column again reverses it rather than re-sorting ascending.
     fireEvent.click(screen.getByText('Tail number'));
 
     await waitFor(() =>
-      expect(lastCallTo('/catalog/objects/Mvr')?.params).toMatchObject({
-        sort: 'tailNumber',
-        dir: 'desc',
-      }),
+      expect(lastCallTo('/catalog/objects/Mvr')?.params).toMatchObject({ sort: '-tailNumber' }),
     );
   });
 
@@ -415,7 +400,7 @@ describe('ObjectExplorer', () => {
   });
 
   it('does not offer paging for a single page of results', async () => {
-    // The pager reads `pages` from the answer rather than counting rows; a screen that always
+    // The pager reads `meta.lastPage` from the answer rather than counting rows; a screen that always
     // showed it would offer a "next page" that returns the same rows.
     const { transport } = fakeTransport({
       '/catalog': snapshot([objectType()]),
@@ -433,8 +418,7 @@ describe('ObjectExplorer', () => {
       '/catalog': snapshot([objectType()]),
       '/catalog/objects/Mvr': {
         ...page([{ id: '1', tailNumber: 'AF-101' }]),
-        total: 40,
-        pages: 2,
+        meta: { total: 40, perPage: 25, currentPage: 1, lastPage: 2, firstPage: 1 },
       },
     });
 

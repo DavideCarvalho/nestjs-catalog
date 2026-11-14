@@ -78,11 +78,13 @@ export function GovernanceTimeline({
   const { data: events = [], isLoading } = useQuery({
     queryKey: ['catalog', 'events', event, principal],
     queryFn: () =>
-      client.listEvents({
-        event: event || undefined,
-        principalId: principal || undefined,
-        limit: 200,
-      }),
+      client
+        .listEvents({
+          event: event || undefined,
+          principalId: principal || undefined,
+          size: 200,
+        })
+        .then((page) => page.data),
     refetchInterval: 15_000,
   });
 

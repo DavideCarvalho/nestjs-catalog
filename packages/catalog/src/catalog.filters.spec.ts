@@ -3,11 +3,12 @@ import {
   CATALOG_FILTER_LIMIT,
   CATALOG_FILTER_OPERATORS,
   type CatalogFilterOperator,
+  type CatalogObjectFilter,
   coerceFilterValue,
-  encodeObjectFilter,
   filterOperatorsFor,
+  objectFilterParam,
+  objectQueryParams,
   offeredFilterOperators,
-  parseObjectFilter,
   resolveObjectFilters,
 } from './catalog.filters';
 import type { CatalogPropertyDef, ScalarType } from './catalog.types';
@@ -91,28 +92,54 @@ describe('what a column may be filtered with', () => {
 });
 
 describe('the wire form', () => {
-  it('round-trips a value containing colons', () => {
-    // A timestamp has two of them, and the value is everything after the second.
-    const encoded = encodeObjectFilter({
-      property: 'loadedAt',
-      op: 'gte',
-      value: '2026-03-04T11:30:00Z',
-    });
-    expect(parseObjectFilter(encoded)).toEqual({
-      property: 'loadedAt',
-      op: 'gte',
-      value: '2026-03-04T11:30:00Z',
+  it('sends a value containing colons and commas verbatim', () => {
+    // A timestamp has colons; the bracket form needs no escaping for either.
+    expect(
+      objectFilterParam({ property: 'loadedAt', op: 'gte', value: '2026-03-04T11:30:00Z' }),
+    ).toEqual(['filter[loadedAt][gte]', '2026-03-04T11:30:00Z']);
+  });
+
+  it('still sends a value for the operators that take none', () => {
+    // A transport that drops empty params would otherwise drop the filter.
+    expect(objectFilterParam({ property: 'plate', op: 'empty' })).toEqual([
+      'filter[plate][empty]',
+      'true',
+    ]);
+  });
+
+  it('builds the whole query, sort and paging included, as flat keys', () => {
+    expect(
+      objectQueryParams({
+        page: 2,
+        size: 50,
+        search: 'van',
+        sort: '-miles',
+        snapshot: 'run-4',
+        filters: [
+          { property: 'miles', op: 'gte', value: '1000' },
+          { property: 'miles', op: 'lte', value: '5000' },
+        ],
+      }),
+    ).toEqual({
+      page: 2,
+      size: 50,
+      search: 'van',
+      sort: '-miles',
+      snapshot: 'run-4',
+      'filter[miles][gte]': '1000',
+      'filter[miles][lte]': '5000',
     });
   });
 
-  it('carries no value for the operators that take none', () => {
-    expect(encodeObjectFilter({ property: 'plate', op: 'empty' })).toBe('plate:empty');
-    expect(parseObjectFilter('plate:empty')).toEqual({ property: 'plate', op: 'empty' });
-  });
-
-  it('rejects an unparseable entry rather than guessing at it', () => {
-    expect(parseObjectFilter('plate')).toBeUndefined();
-    expect(parseObjectFilter('plate:nonsense:x')).toBeUndefined();
+  it('refuses two filters the wire cannot tell apart', () => {
+    expect(() =>
+      objectQueryParams({
+        filters: [
+          { property: 'plate', op: 'contains', value: 'a' },
+          { property: 'plate', op: 'contains', value: 'b' },
+        ],
+      }),
+    ).toThrow(/one per property and operator/);
   });
 });
 
@@ -127,11 +154,15 @@ describe('resolving what arrived against the type', () => {
     // THE case this codebase keeps paying for: the property is `Asset_Id` and the
     // source column is `Asset Id`, and only one of the two is what a predicate is
     // built from.
-    const byProperty = resolveObjectFilters(columns, ['Asset_Id:contains:71']);
+    const byProperty = resolveObjectFilters(columns, [
+      { property: 'Asset_Id', op: 'contains', value: '71' },
+    ]);
     expect(byProperty.problems).toEqual([]);
     expect(byProperty.filters[0].property.name).toBe('Asset_Id');
 
-    const bySourceColumn = resolveObjectFilters(columns, ['Asset Id:contains:71']);
+    const bySourceColumn = resolveObjectFilters(columns, [
+      { property: 'Asset Id', op: 'contains', value: '71' },
+    ]);
     expect(bySourceColumn.filters).toEqual([]);
     expect(bySourceColumn.problems[0]).toContain('Asset Id');
   });
@@ -139,36 +170,49 @@ describe('resolving what arrived against the type', () => {
   it('hands the store the type’s own property rather than the caller’s string', () => {
     // What keeps a caller-supplied name out of SQL: the resolved filter carries
     // the definition, so a store has nothing else to build a column from.
-    const { filters } = resolveObjectFilters(columns, ['miles:gte:1000']);
+    const { filters } = resolveObjectFilters(columns, [
+      { property: 'miles', op: 'gte', value: '1000' },
+    ]);
     expect(filters[0].property).toBe(columns[1]);
   });
 
   it('coerces the value to the property’s type', () => {
-    const { filters } = resolveObjectFilters(columns, ['miles:gte:1000']);
+    const { filters } = resolveObjectFilters(columns, [
+      { property: 'miles', op: 'gte', value: '1000' },
+    ]);
     expect(filters[0].value).toBe(1000);
   });
 
   it('refuses a value that is not of the property’s type', () => {
     // MySQL would coerce `abc` to 0 and answer `miles >= 0` — a full page that
     // looks filtered. Nothing about that answer says it was not.
-    const { filters, problems } = resolveObjectFilters(columns, ['miles:gte:abc']);
+    const { filters, problems } = resolveObjectFilters(columns, [
+      { property: 'miles', op: 'gte', value: 'abc' },
+    ]);
     expect(filters).toEqual([]);
     expect(problems[0]).toContain('not a number');
   });
 
   it('refuses an operator the column does not offer', () => {
-    const { problems } = resolveObjectFilters(columns, ['miles:contains:10']);
+    const { problems } = resolveObjectFilters(columns, [
+      { property: 'miles', op: 'contains', value: '10' },
+    ]);
     expect(problems[0]).toContain('contains');
   });
 
   it('refuses a classified column by name', () => {
-    const { filters, problems } = resolveObjectFilters(columns, ['secret:eq:x']);
+    const { filters, problems } = resolveObjectFilters(columns, [
+      { property: 'secret', op: 'eq', value: 'x' },
+    ]);
     expect(filters).toEqual([]);
     expect(problems[0]).toContain('secret');
   });
 
   it('reports every problem at once rather than the first', () => {
-    const { problems } = resolveObjectFilters(columns, ['miles:gte:abc', 'nope:eq:1']);
+    const { problems } = resolveObjectFilters(columns, [
+      { property: 'miles', op: 'gte', value: 'abc' },
+      { property: 'nope', op: 'eq', value: '1' },
+    ]);
     expect(problems).toHaveLength(2);
   });
 
@@ -177,15 +221,22 @@ describe('resolving what arrived against the type', () => {
     // page presented as the matching rows; every unhonourable entry has to end up
     // in `problems`, where the service turns it into a refusal.
     const { filters, problems } = resolveObjectFilters(columns, [
-      'miles:gte:1000',
-      'miles:lte:oops',
+      { property: 'miles', op: 'gte', value: '1000' },
+      { property: 'miles', op: 'lte', value: 'oops' },
     ]);
     expect(filters).toHaveLength(1);
     expect(problems).toHaveLength(1);
   });
 
   it('caps how many filters one read may carry', () => {
-    const many = Array.from({ length: CATALOG_FILTER_LIMIT + 1 }, () => 'miles:gte:1');
+    const many = Array.from(
+      { length: CATALOG_FILTER_LIMIT + 1 },
+      (): CatalogObjectFilter => ({
+        property: 'miles',
+        op: 'gte',
+        value: '1',
+      }),
+    );
     const { filters, problems } = resolveObjectFilters(columns, many);
     expect(filters).toEqual([]);
     expect(problems[0]).toContain(String(CATALOG_FILTER_LIMIT));
@@ -218,7 +269,9 @@ describe('coercion', () => {
     // The list is the contract: a name added to it and to nothing else would be
     // parseable and unapplied.
     for (const operator of CATALOG_FILTER_OPERATORS) {
-      expect(parseObjectFilter(`col:${operator}:1`)?.op).toBe(operator);
+      expect(objectFilterParam({ property: 'col', op: operator, value: '1' })[0]).toBe(
+        `filter[col][${operator}]`,
+      );
     }
   });
 });

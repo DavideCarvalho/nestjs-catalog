@@ -316,9 +316,11 @@ describe('Curating leaves an audit trail that names who (integration)', () => {
       .send({ displayName: 'Work Order' })
       .expect(200);
 
-    const listed = await request(server).get('/api/catalog/events?event=type.curated').expect(200);
-    expect(listed.body).toHaveLength(1);
-    expect(listed.body[0].principalId).toBe('catalog-console#ana@example.com');
+    const listed = await request(server)
+      .get('/api/catalog/events?filter[event]=type.curated')
+      .expect(200);
+    expect(listed.body.data).toHaveLength(1);
+    expect(listed.body.data[0].principalId).toBe('catalog-console#ana@example.com');
   });
 
   // -------------------------------------------------------------------------

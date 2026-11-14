@@ -174,7 +174,6 @@ export const api = {
     }),
   logout: () => request<{ signedOut: boolean }>('/auth/logout', { method: 'POST' }),
   principals: () => request<PrincipalSummary[]>('/access/principals'),
-  people: () => request<PersonSummary[]>('/access/people'),
   upsertPerson: (input: {
     email: string;
     displayName: string;
@@ -230,24 +229,6 @@ export interface PrincipalSummary {
   authMethod: 'key' | 'token' | 'session';
   lastSeenAt: string | null;
   ownedTypes: string[];
-}
-
-export interface PersonSummary {
-  email: string;
-  displayName: string;
-  role: PersonRole;
-  active: boolean;
-  principalId: string;
-  hasPassword: boolean;
-  createdAt: string;
-  lastLoginAt: string | null;
-  liveSessions: number;
-  effective: {
-    scopes: string[];
-    writeTypes: string[];
-    readTypes: string[] | null;
-    classifications: string[];
-  };
 }
 
 export interface SnapshotSummary {

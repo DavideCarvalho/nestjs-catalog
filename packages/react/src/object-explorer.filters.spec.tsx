@@ -104,13 +104,17 @@ const CATALOG: CatalogSnapshot = {
  * pair this screen has to keep straight, and the reason the two are separate
  * fields at all.
  */
+/** Just the `filter[...]` keys of a request, which is how filters travel on the wire. */
+function filterParams(params: Record<string, unknown> | undefined): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(params ?? {}).filter(([key]) => key.startsWith('filter[')),
+  );
+}
+
 function page(overrides: Partial<CatalogObjectPage> = {}): CatalogObjectPage {
   return {
     type: 'Mvr',
-    page: 1,
-    size: 25,
-    total: 1,
-    pages: 1,
+    meta: { total: 1, perPage: 25, currentPage: 1, lastPage: 1, firstPage: 1 },
     columns: [
       {
         name: 'Asset_Id',
@@ -135,7 +139,7 @@ function page(overrides: Partial<CatalogObjectPage> = {}): CatalogObjectPage {
         filterOperators: [],
       },
     ],
-    rows: [{ Asset_Id: 'A-71', miles: 1200, operator: 'redacted' }],
+    data: [{ Asset_Id: 'A-71', miles: 1200, operator: 'redacted' }],
     snapshot: { id: 'run-9', current: true },
     ...overrides,
   };
@@ -215,7 +219,7 @@ describe('filters derived from the type', () => {
     // source column, and what the reader recognises — resolves to nothing.
     await waitFor(() =>
       expect(lastCallTo('/catalog/objects/Mvr')?.params).toMatchObject({
-        filter: ['Asset_Id:contains:A-7'],
+        'filter[Asset_Id][contains]': 'A-7',
       }),
     );
   });
@@ -249,7 +253,7 @@ describe('filters derived from the type', () => {
 
     await waitFor(() =>
       expect(lastCallTo('/catalog/objects/Mvr')?.params).toMatchObject({
-        filter: ['miles:gte:1000'],
+        'filter[miles][gte]': '1000',
       }),
     );
   });
@@ -275,7 +279,9 @@ describe('filters derived from the type', () => {
     // sending it would come back as a full page that looks filtered.
     expect(await screen.findByText(/Not applied/)).toBeDefined();
     await waitFor(() =>
-      expect(lastCallTo('/catalog/objects/Mvr')?.params?.filter).toEqual(['Asset_Id:contains:A-7']),
+      expect(filterParams(lastCallTo('/catalog/objects/Mvr')?.params)).toEqual({
+        'filter[Asset_Id][contains]': 'A-7',
+      }),
     );
   });
 
@@ -291,7 +297,7 @@ describe('filters derived from the type', () => {
     await choose('Add a filter', 'Asset');
 
     // A row with an empty box is a filter somebody is in the middle of building.
-    expect(lastCallTo('/catalog/objects/Mvr')?.params?.filter).toBeUndefined();
+    expect(filterParams(lastCallTo('/catalog/objects/Mvr')?.params)).toEqual({});
   });
 
   it('drops the filters when the type changes', async () => {
@@ -320,7 +326,9 @@ describe('filters derived from the type', () => {
     await screen.findByText('A-71');
     await choose('Add a filter', 'Asset');
     fireEvent.change(screen.getByLabelText('Value for Asset'), { target: { value: 'A-7' } });
-    await waitFor(() => expect(lastCallTo('/catalog/objects/Mvr')?.params?.filter).toBeDefined());
+    await waitFor(() =>
+      expect(filterParams(lastCallTo('/catalog/objects/Mvr')?.params)).not.toEqual({}),
+    );
 
     fireEvent.click(screen.getByText('Vehicles'));
     fireEvent.click(await screen.findByText('Work orders'));
@@ -329,7 +337,7 @@ describe('filters derived from the type', () => {
     // refused by the read, and the refusal would be about a type the reader is no
     // longer looking at.
     await waitFor(() => expect(lastCallTo('/catalog/objects/Wo')).toBeDefined());
-    expect(lastCallTo('/catalog/objects/Wo')?.params?.filter).toBeUndefined();
+    expect(filterParams(lastCallTo('/catalog/objects/Wo')?.params)).toEqual({});
   });
 
   it('offers no controls at all when the server sends no operators', async () => {

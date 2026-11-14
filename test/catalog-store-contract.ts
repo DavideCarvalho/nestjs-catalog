@@ -1,5 +1,6 @@
 import { subscribe, unsubscribe } from 'node:diagnostics_channel';
 import type {
+  CatalogObjectFilter,
   CatalogObjectTypeDef,
   CatalogPropertyDef,
   CatalogQueryStore,
@@ -278,6 +279,20 @@ function idsOf(result: CatalogReadResult): string[] {
 }
 
 /**
+ * `property:op:value` → a filter, as test shorthand only. The HTTP wire is
+ * `filter[property][op]=value`; these cases are about the store, not the wire.
+ * The value is everything after the second colon, so a timestamp survives.
+ */
+function shorthand(raw: string): CatalogObjectFilter {
+  const [property = '', op = '', ...rest] = raw.split(':');
+  return {
+    property,
+    op: op as CatalogObjectFilter['op'],
+    ...(rest.length > 0 ? { value: rest.join(':') } : {}),
+  };
+}
+
+/**
  * Read through the filters the *service* would have built, and hand back the ids.
  *
  * `resolveObjectFilters` rather than hand-written `CatalogResolvedFilter`
@@ -292,7 +307,7 @@ async function filteredIds(
   type: CatalogObjectTypeDef,
   raw: string[],
 ): Promise<string[]> {
-  const { filters, problems } = resolveObjectFilters(type.properties, raw);
+  const { filters, problems } = resolveObjectFilters(type.properties, raw.map(shorthand));
   expect(problems).toEqual([]);
   expect(filters).toHaveLength(raw.length);
 
@@ -853,7 +868,7 @@ export function describeCatalogStoreContract(boot: () => ContractStore): void {
       // requests as it takes. The service resolves filters against the visible
       // columns, so only a caller building the query itself gets here, and it
       // has to be a refusal rather than an unfiltered page.
-      const { filters } = resolveObjectFilters(def.properties, ['label:eq:alpha']);
+      const { filters } = resolveObjectFilters(def.properties, [shorthand('label:eq:alpha')]);
       await expect(
         store.read(def, ['id'], { page: 1, size: 200, sort: 'id', dir: 'asc', filters }),
       ).rejects.toThrow(/label/i);
