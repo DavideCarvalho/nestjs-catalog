@@ -1,5 +1,18 @@
 # @dudousxd/nestjs-catalog-dashboard
 
+## 0.36.0
+
+### Minor Changes
+
+- [#256](https://github.com/DavideCarvalho/nestjs-catalog/pull/256) [`b608ea8`](https://github.com/DavideCarvalho/nestjs-catalog/commit/b608ea84915bfa16af12416828402091a274a419) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The console speaks the Aviary list API. Requires `@dudousxd/nestjs-catalog` >= 0.36.0.
+
+  - `CatalogClient.objects` sends `objectQueryParams()` (`sort=-column`, `filter[property][op]=value`) and returns `{ data, meta, type, columns }`.
+  - `CatalogClient.search(term, size)` returns `CatalogSearchResponse` (`data` instead of `hits`); `<CatalogSearch limit>` is now `size`.
+  - `listEvents(query)` takes `{ event, typeName, principalId, since, size }` and returns `{ data }`; `listTraces(query)` takes `TraceListQuery` (`page`/`size`) and returns `CatalogTracePage`; `listRuns(connectorId, size)` returns `{ data }`. `auditFilterParams` builds the `filter[...]` params.
+  - `listPeople` and `accessRoutes().people()` take `{ search, page, size }`; `CatalogPeoplePage` is now `OffsetPage<CatalogPersonSummary>`.
+  - `CatalogTraceSource.listTraces` takes `TraceListQuery` and returns `CatalogTracePage`.
+  - Dashboard: removes the unused, stale `api.people()` (it typed the paged response as an array) and its `PersonSummary` type.
+
 ## 0.35.0
 
 ### Minor Changes

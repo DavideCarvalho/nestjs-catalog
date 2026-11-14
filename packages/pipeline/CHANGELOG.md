@@ -1,5 +1,13 @@
 # @dudousxd/nestjs-catalog-pipeline
 
+## 0.32.0
+
+### Minor Changes
+
+- [#256](https://github.com/DavideCarvalho/nestjs-catalog/pull/256) [`b608ea8`](https://github.com/DavideCarvalho/nestjs-catalog/commit/b608ea84915bfa16af12416828402091a274a419) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - `GET runs` moves to the Aviary list API: `filter[connector]=id` and `size` (default 50, capped at 200) replace `connector` and `limit`, and it answers `{ data }` instead of a bare array. An unknown filter, a `sort` other than `-startedAt`, or a non-numeric `size` is a 400. The run store has no count or cursor, so the endpoint stays a newest-N list rather than a paged one.
+
+  Every list endpoint answers 400 for a query param it does not read — the removed forms (`limit`, `offset`, `dir`, `q`, a bare filter field such as `?connector=` or `?outcome=`) and `page` on a top-N — naming the replacement, instead of ignoring it and answering with defaults.
+
 ## 0.31.0
 
 ### Minor Changes
@@ -2572,9 +2580,9 @@ equals?}` or `{kind: 'rowCount', atLeast}` — where it used to carry `envVar` a
   Every scheduled connector in a deployment was silently inert. The worker said so
   at boot, once, and contradicted itself on the next line:
 
-                                                  ERROR [ConnectorScheduler] No connector will run on a schedule:
-                                                        parser.parseExpression is not a function.
-                                                  LOG   [ConnectorScheduler] Watching connector schedules every 30000ms.
+                                                    ERROR [ConnectorScheduler] No connector will run on a schedule:
+                                                          parser.parseExpression is not a function.
+                                                    LOG   [ConnectorScheduler] Watching connector schedules every 30000ms.
 
   `cron-parser` v4 exported `parseExpression`; v5 replaced it with
   `CronExpressionParser.parse`. The durable core read only the v4 shape, so
