@@ -43,15 +43,15 @@
   },
   "devDependencies": {
     "@dudousxd/nestjs-catalog": "workspace:*",
-    "@mikro-orm/core": "7.0.17",
-    "@mikro-orm/decorators": "7.0.17",
-    "@mikro-orm/mysql": "7.0.17",
-    "@mikro-orm/postgresql": "7.0.17",
+    "@mikro-orm/core": "7.2.8",
+    "@mikro-orm/decorators": "7.2.8",
+    "@mikro-orm/mysql": "7.2.8",
+    "@mikro-orm/postgresql": "7.2.8",
     "@nestjs/common": "11.2.7",
     "@types/node": "25.9.9",
     "pg": "8.23.1",
     "typescript": "5.9.3",
-    "@mikro-orm/sql": "7.0.17"
+    "@mikro-orm/sql": "7.2.8"
   },
   "peerDependenciesMeta": {
     "@mikro-orm/mysql": {
