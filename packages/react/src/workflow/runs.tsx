@@ -169,7 +169,7 @@ function RecentRuns({
 
   const { data: runs = [] } = useQuery({
     queryKey: catalogQueryKeys.runs(connectorId),
-    queryFn: () => client.listRuns(connectorId),
+    queryFn: () => client.listRuns(connectorId).then((page) => page.data),
   });
 
   const only = transforms.length === 1 ? transforms[0] : undefined;

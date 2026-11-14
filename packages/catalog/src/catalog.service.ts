@@ -10,6 +10,7 @@ import {
 import { emitCatalog } from './catalog.events';
 import {
   type CatalogFilterOperator,
+  type CatalogObjectFilter,
   offeredFilterOperators,
   resolveObjectFilters,
 } from './catalog.filters';
@@ -55,6 +56,7 @@ import {
   embeddedVisualization,
   supportsSavedQueryBatch,
 } from './catalog.workspace';
+import { offsetPage } from './list-api';
 import { emptySearch, maySearch, searchCatalog, visibleToPrincipal } from './search';
 import type { CatalogSearchResult } from './search.types';
 
@@ -207,13 +209,19 @@ export class CatalogService {
     }
 
     // Sort is validated here rather than in the store: an unrecognised column
-    // must never reach a query builder, whatever the engine.
-    const sort = columns.some((c) => c.name === query.sort) ? query.sort : undefined;
+    // must never reach a query builder, whatever the engine. A column that is not
+    // readable is refused rather than quietly replaced by the primary key — the
+    // list API's rule, and a caller asking for an order should learn it did not
+    // get one.
+    const sort = query.sort || undefined;
+    if (sort !== undefined && !columns.some((c) => c.name === sort)) {
+      throw new BadRequestException(
+        `Unknown sort field "${sort}". Sortable fields: ${columns.map((c) => c.name).join(', ')}.`,
+      );
+    }
 
     // Filters, against the same `columns` a sort is checked against and for the
-    // same reason — with one difference in what a failure means. An unrecognised
-    // sort falls back to the primary key, because the rows are the same rows in a
-    // different order. An unrecognised filter cannot fall back to anything: the
+    // same reason: an unrecognised filter cannot fall back to anything — the
     // read would come back holding rows the caller asked to exclude, and neither
     // the caller nor the screen has any way to tell.
     const filters = this.resolveFilters(columns, query.filters ?? []);
@@ -231,11 +239,8 @@ export class CatalogService {
 
     const storeOperators = this.filterOperators();
     return {
+      ...offsetPage(rows, { total, page, size }),
       type: type.name,
-      page,
-      size,
-      total,
-      pages: Math.max(Math.ceil(total / size), 1),
       columns: columns.map((c) => ({
         name: c.name,
         displayName: c.displayName,
@@ -250,7 +255,6 @@ export class CatalogService {
         // failure mode being avoided.
         filterOperators: offeredFilterOperators(c, storeOperators),
       })),
-      rows,
       ...(result.snapshot ? { snapshot: result.snapshot } : {}),
     };
   }
@@ -272,7 +276,10 @@ export class CatalogService {
    * offers what `filterOperators` reported, so a caller reaching this branch is
    * one that built the request itself.
    */
-  private resolveFilters(columns: CatalogObjectTypeDef['properties'], raw: string[]) {
+  private resolveFilters(
+    columns: CatalogObjectTypeDef['properties'],
+    raw: readonly CatalogObjectFilter[],
+  ) {
     if (raw.length === 0) return [];
 
     const { filters, problems } = resolveObjectFilters(columns, raw);

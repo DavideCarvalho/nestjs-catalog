@@ -19,14 +19,18 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { csvLines } from './catalog.csv';
+import { CATALOG_FILTER_OPERATORS, type CatalogFilterOperator } from './catalog.filters';
 import type { CatalogPrincipal } from './catalog.principal';
 import { CatalogRegistry } from './catalog.registry.base';
 import { RequireScopes } from './catalog.route-auth';
 import { CatalogService } from './catalog.service';
 import {
+  type AuditQuery,
   CATALOG_TRACE_STORE,
   CATALOG_WORKSPACE_STORE,
+  type CatalogAuditEvent,
   type CatalogTraceOutcome,
+  type CatalogTracePage,
   type CatalogTraceStore,
   type CatalogWorkspaceStore,
   type DashboardCard,
@@ -34,6 +38,15 @@ import {
   isCatalogTraceOutcome,
   supportsSavedQueryRevisions,
 } from './catalog.workspace';
+import {
+  ListQueryError,
+  offsetPage,
+  parseFilterParams,
+  parsePageParams,
+  resolveSort,
+} from './list-api';
+import { DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT } from './search';
+import type { CatalogSearchResponse } from './search.types';
 
 /**
  * Built as a factory rather than a plain class because the route prefix and the
@@ -178,15 +191,28 @@ export function createCatalogController(
      */
     @Get('search')
     @RequireScopes('catalog:read')
-    search(
-      @Query('q') q?: string,
-      @Query('limit') limit?: string,
+    async search(
+      @Query() query: Record<string, unknown> = {},
       @Req() request?: { principal?: CatalogPrincipal },
-    ) {
-      return this.service.search(q ?? '', {
-        principal: request?.principal,
-        limit: limit ? Number(limit) : undefined,
+    ): Promise<CatalogSearchResponse> {
+      // A ranked top-N widget rather than a paged list: the ranking is computed
+      // over every candidate and cut at `size`, so there is no page 2 to ask
+      // for. `size` is the one paging knob, as the list API allows for widgets.
+      const { size } = parsePageParams(query, {
+        defaultSize: DEFAULT_SEARCH_LIMIT,
+        maxSize: MAX_SEARCH_LIMIT,
       });
+      const term = typeof query.search === 'string' ? query.search : '';
+      const result = await this.service.search(term, {
+        principal: request?.principal,
+        limit: size,
+      });
+      return {
+        data: result.hits,
+        term: result.term,
+        total: result.total,
+        truncated: result.truncated,
+      };
     }
 
     @Get('types/:name')
@@ -273,40 +299,56 @@ export function createCatalogController(
       return this.registry.getSnapshot();
     }
 
-    /** One generic read endpoint for every type in the catalog. */
+    /**
+     * One generic read endpoint for every type in the catalog.
+     *
+     * The Aviary list wire: `page`/`size`, `search`, `sort=-column` (one column —
+     * every store reads with a single order), `filter[property][op]=value`
+     * (ANDed) and `snapshot`. Answers `{ data, meta }` with `type` and `columns`
+     * beside them as page-wide side data.
+     *
+     * A property named in a filter or a sort that the type does not have is a
+     * 400 here; whether the property may be filtered or sorted at all — hidden,
+     * classified, a blob — is the service's call, and is a 400 too.
+     */
     @Get('objects/:name')
     @RequireScopes('catalog:read')
-    objects(
-      @Param('name') name: string,
-      @Query('page') page?: string,
-      @Query('size') size?: string,
-      @Query('search') search?: string,
-      @Query('sort') sort?: string,
-      @Query('dir') dir?: string,
-      // Reads as of an earlier load. Stores that keep no history reject this
-      // rather than quietly answering with current state — a reader who thinks
-      // they are looking at last Tuesday and is not would rather be told.
-      @Query('snapshot') snapshot?: string,
-      // `?filter=Asset_Id:contains:71&filter=miles:gte:1000`, ANDed.
-      //
-      // Repeated rather than one packed value, so a value containing a comma
-      // needs no escaping scheme of its own. Express hands back a string for one
-      // and an array for several — the same shape `events/traces` deals with one
-      // route up — so both have to be accepted whatever this parameter declares.
-      //
-      // Passed through as text: what a filter is allowed to name is a question
-      // about the type, and the type is what the service has. Nothing here tries
-      // to be the guard.
-      @Query('filter') filter?: string | string[],
-    ) {
+    objects(@Param('name') name: string, @Query() query: Record<string, unknown> = {}) {
+      const type = this.registry.getType(name);
+      if (!type) throw new NotFoundException(`Unknown object type: ${name}`);
+      const propertyNames = type.properties.map((property) => property.name);
+
+      // The service clamps to the deployment's `maxPageSize`; this only refuses
+      // junk, so `size=abc` is a 400 instead of quietly becoming the default.
+      const { page, size } = parsePageParams(query, {
+        defaultSize: DEFAULT_OBJECT_PAGE_SIZE,
+        maxSize: Number.MAX_SAFE_INTEGER,
+      });
+      const sort = resolveSort(query.sort, { sortable: propertyNames });
+      if (sort.length > 1) {
+        throw new ListQueryError('Objects sort by one column at a time, e.g. sort=-createdAt.');
+      }
+      const filters = parseFilterParams(query, {
+        fields: Object.fromEntries(
+          propertyNames.map((property) => [property, CATALOG_FILTER_OPERATORS]),
+        ),
+      }).map((filter) => ({
+        property: filter.field,
+        op: filter.op as CatalogFilterOperator,
+        // Valueless operators (`empty`, `notEmpty`) ignore whatever was sent.
+        ...(typeof filter.value === 'string' ? { value: filter.value } : {}),
+      }));
+
       return this.service.readObjects(name, {
-        page: page ? Number(page) : undefined,
-        size: size ? Number(size) : undefined,
-        search,
-        sort,
-        dir: dir === 'desc' ? 'desc' : 'asc',
-        snapshot,
-        filters: repeatable(filter),
+        page,
+        size,
+        search: typeof query.search === 'string' && query.search ? query.search : undefined,
+        ...(sort[0] ? { sort: sort[0].field, dir: sort[0].direction } : {}),
+        // Reads as of an earlier load. Stores that keep no history reject this
+        // rather than quietly answering with current state — a reader who thinks
+        // they are looking at last Tuesday and is not would rather be told.
+        snapshot: typeof query.snapshot === 'string' && query.snapshot ? query.snapshot : undefined,
+        ...(filters.length > 0 ? { filters } : {}),
       });
     }
 
@@ -621,20 +663,19 @@ export function createCatalogController(
      */
     @Get('events')
     @RequireScopes('catalog:read')
-    events(
-      @Query('event') event?: string,
-      @Query('type') typeName?: string,
-      @Query('principal') principalId?: string,
-      @Query('since') since?: string,
-      @Query('limit') limit?: string,
-    ) {
-      return this.service.listEvents({
-        event,
-        typeName,
-        principalId,
-        since,
-        limit: limit ? Number(limit) : undefined,
+    async events(@Query() query: Record<string, unknown> = {}): Promise<{
+      data: CatalogAuditEvent[];
+    }> {
+      // A newest-first feed with no cursor in the store SPI, so `{ data }` and a
+      // single `size` rather than a paging style the store could not honour.
+      const filters = auditFilters(query, AUDIT_EVENT_FILTERS);
+      rejectSortOtherThan(query.sort, '-occurredAt');
+      const { size } = parsePageParams(query, {
+        defaultSize: DEFAULT_EVENT_PAGE,
+        maxSize: MAX_EVENT_PAGE,
       });
+      const data = await this.service.listEvents({ ...filters, limit: size });
+      return { data };
     }
 
     /**
@@ -646,33 +687,39 @@ export function createCatalogController(
      * swallow this path and answer it with a lookup for an event named
      * "traces" — a 404 nobody could explain.
      *
-     * `event` and `outcome` pick *which traces* come back, never which spans:
-     * a trace returned with only its matching events would be a story with
-     * pages missing that still looked complete.
+     * `filter[event]` and `filter[outcome]` pick *which traces* come back, never
+     * which spans: a trace returned with only its matching events would be a
+     * story with pages missing that still looked complete.
+     *
+     * Offset-paged, because the trace store counts the matching traces. The
+     * unlinked events and the clock resolution are page-wide side data.
      */
     @Get('events/traces')
     @RequireScopes('catalog:read')
-    traceList(
-      @Query('type') typeName?: string,
-      @Query('principal') principalId?: string,
-      @Query('event') event?: string,
-      // `?outcome=failed&outcome=incomplete`, or one comma-separated value, or
-      // one plain value. Express hands back a string for one and an array for
-      // repeats, so both forms have to be accepted whatever this declares.
-      @Query('outcome') outcome?: string | string[],
-      @Query('since') since?: string,
-      @Query('limit') limit?: string,
-      @Query('offset') offset?: string,
-    ) {
-      return this.requireTraces().listTraces({
-        typeName,
-        principalId,
-        event,
-        outcome: parseOutcomes(outcome),
-        since,
-        limit: limit ? Number(limit) : undefined,
-        offset: offset ? Number(offset) : undefined,
+    async traceList(@Query() query: Record<string, unknown> = {}): Promise<CatalogTracePage> {
+      const store = this.requireTraces();
+      const parsed = parseFilterParams(query, {
+        fields: { ...AUDIT_EVENT_FILTERS, outcome: ['eq', 'in'] },
       });
+      const filters = auditFilters(query, AUDIT_EVENT_FILTERS, parsed);
+      const outcomeFilter = parsed.find((filter) => filter.field === 'outcome');
+      rejectSortOtherThan(query.sort, '-startedAt');
+      const { page, size, offset } = parsePageParams(query, {
+        defaultSize: DEFAULT_TRACE_PAGE,
+        maxSize: MAX_TRACE_PAGE,
+      });
+      const list = await store.listTraces({
+        ...filters,
+        ...(outcomeFilter ? { outcome: parseOutcomes(outcomeFilter.value) } : {}),
+        limit: size,
+        offset,
+      });
+      return {
+        ...offsetPage(list.traces, { total: list.total, page, size }),
+        unlinked: list.unlinked,
+        unlinkedTotal: list.unlinkedTotal,
+        clockResolutionMs: list.clockResolutionMs,
+      };
     }
 
     /** One story in full, by correlation id. */
@@ -732,22 +779,64 @@ function actorOf(request: { principal?: CatalogPrincipal } | undefined, claimed?
   return claimed?.trim() || 'console';
 }
 
+/** The audit-trail filters `events` and `events/traces` share, each with its one operator. */
+const AUDIT_EVENT_FILTERS = {
+  event: ['eq'],
+  type: ['eq'],
+  principal: ['eq'],
+  occurredAt: ['gte'],
+} as const satisfies Record<string, readonly string[]>;
+
+const DEFAULT_OBJECT_PAGE_SIZE = 25;
+const DEFAULT_EVENT_PAGE = 100;
+const MAX_EVENT_PAGE = 500;
+const DEFAULT_TRACE_PAGE = 25;
+const MAX_TRACE_PAGE = 200;
+
 /**
- * A query parameter that may appear once or many times, as a list either way.
+ * `filter[event]`, `filter[type]`, `filter[principal]`, `filter[occurredAt][gte]`
+ * into the store's {@link AuditQuery} fields.
  *
- * Unlike {@link parseOutcomes} below, nothing is split on commas and nothing is
- * dropped. A filter's value is free text that may contain a comma — a
- * description, a date range written by hand — and an unrecognised filter must
- * reach the service so it can be refused by name rather than vanish into an
- * unfiltered page.
+ * The date is checked here: `new Date('junk')` would otherwise reach the store as
+ * an invalid date, which a SQL driver either throws on or compares as nothing.
  */
-function repeatable(raw: string | string[] | undefined): string[] | undefined {
-  if (raw === undefined) return undefined;
-  return Array.isArray(raw) ? raw : [raw];
+function auditFilters(
+  query: Record<string, unknown>,
+  fields: Record<string, readonly string[]>,
+  parsed = parseFilterParams(query, { fields }),
+): Pick<AuditQuery, 'event' | 'typeName' | 'principalId' | 'since'> {
+  const out: Pick<AuditQuery, 'event' | 'typeName' | 'principalId' | 'since'> = {};
+  for (const filter of parsed) {
+    if (typeof filter.value !== 'string') continue;
+    if (filter.field === 'event') out.event = filter.value;
+    else if (filter.field === 'type') out.typeName = filter.value;
+    else if (filter.field === 'principal') out.principalId = filter.value;
+    else if (filter.field === 'occurredAt') {
+      if (Number.isNaN(new Date(filter.value).getTime())) {
+        throw new ListQueryError(`Invalid filter: "${filter.value}" is not a date.`);
+      }
+      out.since = filter.value;
+    }
+  }
+  return out;
 }
 
 /**
- * `?outcome=failed`, `?outcome=failed,incomplete`, `?outcome=a&outcome=b`.
+ * A list whose store reads in one fixed order accepts only that order — sending
+ * it is allowed, asking for anything else is a 400 rather than a silent no-op.
+ */
+function rejectSortOtherThan(raw: unknown, only: string): void {
+  const field = only.replace(/^-/, '');
+  const sort = resolveSort(raw, { sortable: [field] });
+  const direction = only.startsWith('-') ? 'desc' : 'asc';
+  if (sort.length > 1 || (sort[0] && sort[0].direction !== direction)) {
+    throw new ListQueryError(`This list has one order: sort=${only}.`);
+  }
+}
+
+/**
+ * `filter[outcome]=failed`, `filter[outcome]=failed,incomplete`,
+ * `filter[outcome][]=a&filter[outcome][]=b`.
  *
  * Two behaviours here are load-bearing and neither is obvious.
  *

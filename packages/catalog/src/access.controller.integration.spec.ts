@@ -257,13 +257,17 @@ describe('Access endpoints (integration)', () => {
 
     const listed = await request(app.getHttpServer()).get('/api/access/people').expect(200);
     expect(listed.body).toEqual({
-      people: [PERSON],
-      // Reported, not implied. A page that cannot say what it is a page OF is
-      // indistinguishable from the whole list, and an operator reading it as
-      // whole concludes somebody has no access when they were merely not on it.
-      total: 1_340,
-      limit: CATALOG_DIRECTORY_PAGE,
-      offset: 0,
+      data: [PERSON],
+      meta: {
+        // Reported, not implied. A page that cannot say what it is a page OF is
+        // indistinguishable from the whole list, and an operator reading it as
+        // whole concludes somebody has no access when they were merely not on it.
+        total: 1_340,
+        perPage: CATALOG_DIRECTORY_PAGE,
+        currentPage: 1,
+        lastPage: Math.ceil(1_340 / CATALOG_DIRECTORY_PAGE),
+        firstPage: 1,
+      },
     });
 
     await request(app.getHttpServer())
@@ -343,7 +347,7 @@ describe('Access endpoints (integration)', () => {
 
     // The imported one has no `listPeople` and would answer 501 here.
     const people = await request(app.getHttpServer()).get('/api/access/people').expect(200);
-    expect(people.body.people).toEqual([PERSON]);
+    expect(people.body.data).toEqual([PERSON]);
   });
 
   it('bounds the people read before the directory is asked', async () => {
@@ -361,7 +365,7 @@ describe('Access endpoints (integration)', () => {
     });
 
     await request(app.getHttpServer())
-      .get('/api/access/people?search=ana&limit=10&offset=20')
+      .get('/api/access/people?search=ana&page=3&size=10')
       .expect(200);
     expect(directory.people).toHaveBeenLastCalledWith({
       search: 'ana',
@@ -370,19 +374,18 @@ describe('Access endpoints (integration)', () => {
     });
 
     // The ceiling, and the two ways a caller tries to get past it: asking for
-    // more than the cap, and sending something that does not parse in the hope
-    // that "no number" reads as "no limit".
-    await request(app.getHttpServer()).get('/api/access/people?limit=100000').expect(200);
+    // more than the cap (clamped), and sending something that does not parse in
+    // the hope that "no number" reads as "no limit" (refused).
+    await request(app.getHttpServer()).get('/api/access/people?size=100000').expect(200);
     expect(directory.people).toHaveBeenLastCalledWith({
       limit: CATALOG_DIRECTORY_MAX_PAGE,
       offset: 0,
     });
 
-    await request(app.getHttpServer()).get('/api/access/people?limit=all&offset=-5').expect(200);
-    expect(directory.people).toHaveBeenLastCalledWith({
-      limit: CATALOG_DIRECTORY_PAGE,
-      offset: 0,
-    });
+    directory.people.mockClear();
+    await request(app.getHttpServer()).get('/api/access/people?size=all').expect(400);
+    await request(app.getHttpServer()).get('/api/access/people?page=-5').expect(400);
+    expect(directory.people).not.toHaveBeenCalled();
   });
 
   it('mounts nothing when the host takes over the HTTP surface', async () => {

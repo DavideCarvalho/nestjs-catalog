@@ -361,10 +361,12 @@ describe('Sharing leaves an audit trail (integration)', () => {
     // Read back through the endpoint a governance screen actually calls: the
     // claim is "it shows up in the audit trail", and the trail is what `/events`
     // answers with, not what a spy saw.
-    const listed = await request(server).get('/api/catalog/events?event=query.shared').expect(200);
+    const listed = await request(server)
+      .get('/api/catalog/events?filter[event]=query.shared')
+      .expect(200);
 
-    expect(listed.body).toHaveLength(1);
-    expect(listed.body[0].detail).toMatchObject({
+    expect(listed.body.data).toHaveLength(1);
+    expect(listed.body.data[0].detail).toMatchObject({
       savedQueryId: created.body.id,
       name: 'Sales',
       shared: true,
@@ -482,8 +484,10 @@ describe('Sharing leaves an audit trail (integration)', () => {
 
     await request(server).delete(`/api/catalog/saved-queries/${created.body.id}`).expect(200);
 
-    const listed = await request(server).get('/api/catalog/events?event=query.shared').expect(200);
-    expect(listed.body.map((event: CatalogAuditEvent) => event.detail.shared)).toEqual([
+    const listed = await request(server)
+      .get('/api/catalog/events?filter[event]=query.shared')
+      .expect(200);
+    expect(listed.body.data.map((event: CatalogAuditEvent) => event.detail.shared)).toEqual([
       true,
       false,
     ]);

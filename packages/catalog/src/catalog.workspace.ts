@@ -8,6 +8,8 @@
  * mount the catalog without any of this and notice nothing missing.
  */
 
+import type { OffsetPage } from './list-api';
+
 export interface SavedQuery {
   id: string;
   name: string;
@@ -507,6 +509,20 @@ export interface CatalogTraceList {
    * store keeps microseconds and another keeps whole seconds, and a renderer
    * that guesses wrong either throws away detail or draws noise.
    */
+  clockResolutionMs: number;
+}
+
+/**
+ * What `GET events/traces` answers: one offset page of traces in the Aviary list
+ * envelope, with the trail-wide side data beside it.
+ *
+ * The store still answers {@link CatalogTraceList}; the HTTP layer translates.
+ */
+export interface CatalogTracePage extends OffsetPage<CatalogTrace> {
+  /** See {@link CatalogTraceList.unlinked}. */
+  unlinked: CatalogAuditEvent[];
+  unlinkedTotal: number;
+  /** See {@link CatalogTraceList.clockResolutionMs}. */
   clockResolutionMs: number;
 }
 

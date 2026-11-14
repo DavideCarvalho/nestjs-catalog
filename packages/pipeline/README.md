@@ -280,6 +280,11 @@ that needs a source should have an edge from one.
 
 ## Notes
 
+**`GET runs` speaks the Aviary list wire.** `filter[connector]=id` narrows it to one connector,
+`size` (default 50, capped at 200) bounds it, and it answers `{ data }`, newest first. It is not
+paged: the run store reads the newest N by `startedAt` and has neither a count nor a cursor. An
+unknown filter, or a `sort` other than `-startedAt`, is a 400; `connector=` and `limit=` are gone.
+
 **Credentials are redacted at the HTTP boundary, including inside a graph.** `GET connections`,
 `GET connectors` and `GET workflows` replace the password in any top-level config URL with
 `REDACTED` — a workflow's source nodes carry the same `config.url` a connector does, so a graph is a

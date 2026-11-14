@@ -96,3 +96,17 @@ export interface CatalogSearchResult {
   truncated: boolean;
   hits: CatalogSearchHit[];
 }
+
+/**
+ * What `GET search` answers on the wire.
+ *
+ * A ranked top-N widget, not a paged list: the hits are in `data` (Aviary list
+ * envelope, `size` caps them) and the rest of {@link CatalogSearchResult} rides
+ * beside them as side data.
+ */
+export interface CatalogSearchResponse {
+  data: CatalogSearchHit[];
+  term: string;
+  total: number;
+  truncated: boolean;
+}

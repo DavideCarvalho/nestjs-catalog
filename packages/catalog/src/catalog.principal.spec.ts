@@ -351,16 +351,13 @@ describe('readableObjectPage', () => {
   function page(overrides: Partial<CatalogObjectPage> = {}): CatalogObjectPage {
     return {
       type: 'Person',
-      page: 1,
-      size: 25,
-      total: 1,
-      pages: 1,
+      meta: { total: 1, perPage: 25, currentPage: 1, lastPage: 1, firstPage: 1 },
       columns: [
         { name: 'id', displayName: 'Id', type: 'uuid' },
         { name: 'name', displayName: 'Name', type: 'string', classification: 'cui' },
         { name: 'ssn', displayName: 'SSN', type: 'string', classification: 'secret' },
       ],
-      rows: [{ id: 'p-1', name: 'Ana', ssn: '000-00-0000' }],
+      data: [{ id: 'p-1', name: 'Ana', ssn: '000-00-0000' }],
       ...overrides,
     };
   }
@@ -388,8 +385,8 @@ describe('readableObjectPage', () => {
     // for a classified column is the disclosure this is meant to prevent.
     const visible = readableObjectPage(reader, page());
 
-    expect(visible?.rows[0]).toEqual({ id: 'p-1', name: 'Ana' });
-    expect(Object.hasOwn(visible?.rows[0] ?? {}, 'ssn')).toBe(false);
+    expect(visible?.data[0]).toEqual({ id: 'p-1', name: 'Ana' });
+    expect(Object.hasOwn(visible?.data[0] ?? {}, 'ssn')).toBe(false);
   });
 
   it('does not mutate the page it was given', () => {
@@ -400,13 +397,13 @@ describe('readableObjectPage', () => {
     readableObjectPage(reader, original);
 
     expect(original.columns).toHaveLength(3);
-    expect(original.rows[0]).toEqual({ id: 'p-1', name: 'Ana', ssn: '000-00-0000' });
+    expect(original.data[0]).toEqual({ id: 'p-1', name: 'Ana', ssn: '000-00-0000' });
   });
 
   it('leaves a page alone when every column is readable', () => {
     const cleared = principal({ scopes: ['catalog:read'], classifications: ['cui', 'secret'] });
 
-    expect(readableObjectPage(cleared, page())?.rows[0]).toEqual({
+    expect(readableObjectPage(cleared, page())?.data[0]).toEqual({
       id: 'p-1',
       name: 'Ana',
       ssn: '000-00-0000',
@@ -419,7 +416,7 @@ describe('readableObjectPage', () => {
     const visible = readableObjectPage(principal({ scopes: ['catalog:read'] }), page());
 
     expect(visible?.columns.map((column) => column.name)).toEqual(['id']);
-    expect(visible?.rows[0]).toEqual({ id: 'p-1' });
+    expect(visible?.data[0]).toEqual({ id: 'p-1' });
   });
 });
 

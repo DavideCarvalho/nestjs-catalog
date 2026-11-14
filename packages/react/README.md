@@ -132,6 +132,7 @@ These routes on top of the pipeline base path, listed by `pipelineRoutes()`:
 | `POST {base}/workflows/:id/run` | execute, optionally carrying `expectShrink` |
 | `PUT {base}/workflows/:id/schedule` | set the cron and whether it runs at all |
 | `POST {base}/workflows/:id/nodes/:nodeId/discover` | ask one source what its columns are |
+| `GET {base}/runs` | the newest runs, `filter[connector]=id` and `size`; answers `{ data }` |
 
 **A connector is not one of them.** It is what a published graph runs as: minted
 by `publish`, disabled by `unpublish`, removed with the graph, and there is no

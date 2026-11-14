@@ -27,7 +27,7 @@
  * jest-dom setup, and they throw rather than fail. `toHaveProperty` is the
  * equivalent that works.
  */
-import type { CatalogSearchHit, CatalogSearchResult } from '@dudousxd/nestjs-catalog/client';
+import type { CatalogSearchHit, CatalogSearchResponse } from '@dudousxd/nestjs-catalog/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import type { ReactNode } from 'react';
@@ -109,14 +109,14 @@ function hit(overrides: Partial<CatalogSearchHit> = {}): CatalogSearchHit {
   };
 }
 
-function result(hits: CatalogSearchHit[], overrides: Partial<CatalogSearchResult> = {}) {
+function result(hits: CatalogSearchHit[], overrides: Partial<CatalogSearchResponse> = {}) {
   return {
+    data: hits,
     term: 'vehicle',
     total: hits.length,
     truncated: false,
-    hits,
     ...overrides,
-  } satisfies CatalogSearchResult;
+  } satisfies CatalogSearchResponse;
 }
 
 /** Types into the box and lets the 200ms debounce elapse. */
@@ -143,7 +143,7 @@ describe('CatalogSearch', () => {
     // term, which answers 200 with an empty result — a screen that says "nothing
     // matches" for every search anybody ever runs.
     await waitFor(() =>
-      expect(calls).toEqual([{ path: '/catalog/search', params: { q: 'vehicle' } }]),
+      expect(calls).toEqual([{ path: '/catalog/search', params: { search: 'vehicle' } }]),
     );
   });
 
@@ -180,29 +180,27 @@ describe('CatalogSearch', () => {
     });
 
     await waitFor(() => expect(calls).toHaveLength(1));
-    expect(calls[0]?.params).toEqual({ q: 'vehicle' });
+    expect(calls[0]?.params).toEqual({ search: 'vehicle' });
   });
 
-  it('omits limit entirely when the host named none', async () => {
-    // A transport that serialises `limit=` hands the route an empty string, and
-    // `Number('')` is 0 — floored back to 1, which answers with a single row
-    // that reads as "there is only one match".
+  it('omits size entirely when the host named none', async () => {
+    // A transport that serialises `size=` hands the route an empty string.
     const { transport, calls } = fakeTransport(() => result([hit()]));
 
     render(withCatalog(transport, <CatalogSearch />));
     await type('vehicle');
 
     await waitFor(() => expect(calls).toHaveLength(1));
-    expect(Object.hasOwn(calls[0]?.params ?? {}, 'limit')).toBe(false);
+    expect(Object.hasOwn(calls[0]?.params ?? {}, 'size')).toBe(false);
   });
 
-  it('passes a limit the host did name', async () => {
+  it('passes a size the host did name', async () => {
     const { transport, calls } = fakeTransport(() => result([hit()]));
 
-    render(withCatalog(transport, <CatalogSearch limit={5} />));
+    render(withCatalog(transport, <CatalogSearch size={5} />));
     await type('vehicle');
 
-    await waitFor(() => expect(calls[0]?.params).toEqual({ q: 'vehicle', limit: 5 }));
+    await waitFor(() => expect(calls[0]?.params).toEqual({ search: 'vehicle', size: 5 }));
   });
 
   it('groups by kind, in the order the server ranks them', async () => {

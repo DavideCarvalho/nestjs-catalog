@@ -11,6 +11,7 @@ import {
   type CatalogReusableNodeStore,
   type CatalogWorkflow,
   type CatalogWorkflowRelease,
+  type ConnectorRun,
   REUSABLE_NODE_KINDS,
   RequireHuman,
   RequireScopes,
@@ -75,6 +76,7 @@ import {
   restoreRedactedSecrets,
 } from './config-secrets';
 import { ConnectionChecker } from './connection-checker.service';
+import { ListQueryError, parseFilterParams, parsePageParams, resolveSort } from './list-api';
 import {
   CATALOG_LOAD_EXPECTATIONS,
   type CatalogLoadExpectations,
@@ -672,10 +674,29 @@ export function createPipelineController(
       return (await this.pipeline.listConnectors()).map(redactConnector);
     }
 
+    /**
+     * The newest runs, optionally of one connector: `filter[connector]=id` and
+     * `size`, answered as `{ data }`.
+     *
+     * Not paged: the run store reads the newest N by `startedAt` and has neither
+     * a count nor a cursor, so this is the list API's top-N shape rather than a
+     * paging style the store could not honour.
+     */
     @Get('runs')
     @RequireScopes('catalog:read')
-    runs(@Query('connector') connectorId?: string, @Query('limit') limit?: string) {
-      return this.pipeline.listRuns(connectorId, limit ? Number(limit) : undefined);
+    async runs(@Query() query: Record<string, unknown> = {}): Promise<{ data: ConnectorRun[] }> {
+      const filters = parseFilterParams(query, { fields: { connector: ['eq'] } });
+      const connector = filters.find((filter) => filter.field === 'connector')?.value;
+      const sort = resolveSort(query.sort, { sortable: ['startedAt'] });
+      if (sort.length > 1 || (sort[0] && sort[0].direction !== 'desc')) {
+        throw new ListQueryError('Runs have one order: sort=-startedAt.');
+      }
+      const { size } = parsePageParams(query, { defaultSize: 50, maxSize: 200 });
+      const data = await this.pipeline.listRuns(
+        typeof connector === 'string' ? connector : undefined,
+        size,
+      );
+      return { data };
     }
 
     @Get('transforms')

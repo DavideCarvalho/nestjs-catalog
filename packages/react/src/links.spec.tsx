@@ -347,7 +347,7 @@ describe('the flow screen’s view of a link', () => {
     types[1] = { ...(types[1] as CatalogObjectTypeDef), lastPrincipalId: 'flip-nestjs' };
     const { transport } = fakeTransport({
       '/catalog': snapshot(types),
-      '/catalog/events': [event({ id: '1' })],
+      '/catalog/events': { data: [event({ id: '1' })] },
     });
 
     render(withCatalog(transport, <FlowView />));
@@ -360,7 +360,7 @@ describe('the flow screen’s view of a link', () => {
     // "somebody else loads it".
     const { transport } = fakeTransport({
       '/catalog': snapshot(fleet()),
-      '/catalog/events': [event({ id: '1' })],
+      '/catalog/events': { data: [event({ id: '1' })] },
     });
 
     render(withCatalog(transport, <FlowView />));
@@ -374,7 +374,7 @@ describe('the flow screen’s view of a link', () => {
     const types = fleet().map((type) => ({ ...type, lastPrincipalId: 'flip-nestjs' }));
     const { transport } = fakeTransport({
       '/catalog': snapshot(types),
-      '/catalog/events': [event({ id: '1' })],
+      '/catalog/events': { data: [event({ id: '1' })] },
     });
 
     render(withCatalog(transport, <FlowView />));

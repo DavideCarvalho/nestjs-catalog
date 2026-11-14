@@ -20,8 +20,8 @@ import type { CatalogGraph, CatalogObjectTypeDef, CatalogSnapshot } from './cata
  * `GET objects/:name` with filters and a snapshot, over real HTTP.
  *
  * Over HTTP rather than against the service, because half of what is under test
- * is the route: `?filter=` may appear once or many times, Express hands back a
- * string for the first case and an array for the second, and a parameter that
+ * is the route: `filter[property][op]=value` arrives as a nested object from
+ * Express's query parser, several of them must all apply, and a parameter that
  * arrives as the wrong shape is a filter that silently does not apply.
  *
  * The store records what it was asked for. That is the assertion that matters
@@ -209,7 +209,7 @@ describe('reading objects with filters', () => {
     app = await boot(FilteringStore);
 
     await request(app.getHttpServer())
-      .get('/api/catalog/objects/Mvr?filter=Asset_Id:contains:71')
+      .get('/api/catalog/objects/Mvr?filter[Asset_Id][contains]=71')
       .expect(200);
 
     expect(lastQuery?.filters).toHaveLength(1);
@@ -225,11 +225,11 @@ describe('reading objects with filters', () => {
     app = await boot(FilteringStore);
 
     await request(app.getHttpServer())
-      .get('/api/catalog/objects/Mvr?filter=miles:gte:1000&filter=miles:lte:5000')
+      .get('/api/catalog/objects/Mvr?filter[miles][gte]=1000&filter[miles][lte]=5000')
       .expect(200);
 
-    // Express hands back an array here and a bare string above. Both have to
-    // arrive as filters or the second one silently does nothing.
+    // Two operators on one property. Both have to arrive as filters or the
+    // second one silently does nothing.
     expect(lastQuery?.filters?.map((filter) => [filter.op, filter.value])).toEqual([
       ['gte', 1000],
       ['lte', 5000],
@@ -240,7 +240,7 @@ describe('reading objects with filters', () => {
     app = await boot(FilteringStore);
 
     const response = await request(app.getHttpServer())
-      .get('/api/catalog/objects/Mvr?filter=operator:eq:Smith')
+      .get('/api/catalog/objects/Mvr?filter[operator][eq]=Smith')
       .expect(400);
 
     expect(response.body.message).toContain('operator');
@@ -252,7 +252,7 @@ describe('reading objects with filters', () => {
     app = await boot(FilteringStore);
 
     const response = await request(app.getHttpServer())
-      .get('/api/catalog/objects/Mvr?filter=miles:gte:abc')
+      .get('/api/catalog/objects/Mvr?filter[miles][gte]=abc')
       .expect(400);
 
     expect(response.body.message).toContain('not a number');
@@ -263,12 +263,60 @@ describe('reading objects with filters', () => {
     app = await boot(PlainStore);
 
     const response = await request(app.getHttpServer())
-      .get('/api/catalog/objects/Mvr?filter=miles:gte:1000')
+      .get('/api/catalog/objects/Mvr?filter[miles][gte]=1000')
       .expect(400);
 
     // The failure being prevented: this store ignores `filters`, so the read
     // would have come back whole and been drawn as the matching rows.
     expect(response.body.message).toContain('does not filter');
+    expect(lastQuery).toBeUndefined();
+  });
+
+  it('refuses a property the type does not have, and an unknown operator', async () => {
+    app = await boot(FilteringStore);
+
+    await request(app.getHttpServer())
+      .get('/api/catalog/objects/Mvr?filter[nope][eq]=1')
+      .expect(400);
+    await request(app.getHttpServer())
+      .get('/api/catalog/objects/Mvr?filter[miles][between]=1')
+      .expect(400);
+    // The pre-list-API wire is gone, not aliased.
+    await request(app.getHttpServer())
+      .get('/api/catalog/objects/Mvr?filter=miles:gte:1000')
+      .expect(400);
+    expect(lastQuery).toBeUndefined();
+  });
+
+  it('answers in the offset list envelope, with the columns as side data', async () => {
+    app = await boot(FilteringStore);
+
+    const response = await request(app.getHttpServer())
+      .get('/api/catalog/objects/Mvr?page=2&size=10')
+      .expect(200);
+
+    expect(response.body).toMatchObject({
+      type: 'Mvr',
+      data: expect.any(Array),
+      meta: { perPage: 10, currentPage: 2, firstPage: 1 },
+    });
+    expect(response.body.columns).toEqual(expect.any(Array));
+    expect(response.body).not.toHaveProperty('rows');
+    expect(lastQuery).toMatchObject({ page: 2, size: 10 });
+  });
+
+  it('sorts by `sort=-column`, and refuses a column it cannot sort by', async () => {
+    app = await boot(FilteringStore);
+
+    await request(app.getHttpServer()).get('/api/catalog/objects/Mvr?sort=-miles').expect(200);
+    expect(lastQuery).toMatchObject({ sort: 'miles', dir: 'desc' });
+
+    lastQuery = undefined;
+    // An unknown column is a 400 now, not a quiet fall back to the primary key.
+    await request(app.getHttpServer()).get('/api/catalog/objects/Mvr?sort=nope').expect(400);
+    await request(app.getHttpServer())
+      .get('/api/catalog/objects/Mvr?sort=miles,Asset_Id')
+      .expect(400);
     expect(lastQuery).toBeUndefined();
   });
 

@@ -351,6 +351,7 @@ export type {
   CatalogSearchHit,
   CatalogSearchKind,
   CatalogSearchRank,
+  CatalogSearchResponse,
   CatalogSearchResult,
 } from './search.types';
 export {
@@ -366,6 +367,7 @@ export {
   type CatalogRevision,
   type CatalogTrace,
   type CatalogTraceList,
+  type CatalogTracePage,
   type CatalogTraceOutcome,
   type CatalogTraceSpan,
   type CatalogTraceStore,
@@ -487,3 +489,11 @@ export {
   RequireHuman,
   RequireScopes,
 } from './catalog.route-auth';
+
+// The Aviary list envelope the list routes answer with.
+export type {
+  CursorPageMeta,
+  CursorPageResponse,
+  OffsetPage,
+  OffsetPageMeta,
+} from './list-api';

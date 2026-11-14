@@ -16,7 +16,8 @@
  *    it safe to hand the editor to a non-engineer.
  */
 
-import type { CatalogFilterOperator } from './catalog.filters';
+import type { CatalogFilterOperator, CatalogObjectFilter } from './catalog.filters';
+import type { OffsetPageMeta } from './list-api';
 
 export type ScalarType = 'string' | 'number' | 'boolean' | 'date' | 'json' | 'uuid' | 'unknown';
 
@@ -308,26 +309,32 @@ export interface CatalogObjectQuery {
   page?: number;
   size?: number;
   search?: string;
+  /** One property name; `dir` says which way. */
   sort?: string;
   dir?: 'asc' | 'desc';
   /**
-   * Column filters, as they arrived: `property:operator:value`, one string each.
+   * Column filters, ANDed. On the wire each is `filter[property][op]=value`.
    *
    * Unvalidated, exactly like `sort` and `search` beside it — these are what a
-   * caller typed. `CatalogService.readObjects` resolves them against the type
+   * caller sent. `CatalogService.readObjects` resolves them against the type
    * before any store sees them, and refuses the read if any of them cannot be
    * honoured. See `catalog.filters.ts`, which owns both halves of that rule and
    * is also what a console derives its controls from.
    */
-  filters?: string[];
+  filters?: CatalogObjectFilter[];
 }
 
+/**
+ * One page of rows of one type, in the Aviary offset list envelope: `data` and
+ * `meta` (`total`, `perPage`, `currentPage`, `lastPage`, `firstPage`), with the
+ * type's name, its columns and the snapshot read beside them as page-wide side
+ * data.
+ */
 export interface CatalogObjectPage {
   type: string;
-  page: number;
-  size: number;
-  total: number;
-  pages: number;
+  /** The rows. */
+  data: Array<Record<string, unknown>>;
+  meta: OffsetPageMeta;
   /**
    * The visible, non-blob columns, in overlay order.
    *
@@ -379,7 +386,6 @@ export interface CatalogObjectPage {
      */
     filterOperators?: CatalogFilterOperator[];
   }>;
-  rows: Array<Record<string, unknown>>;
 
   /**
    * Which load these rows came from, when the store keeps history.

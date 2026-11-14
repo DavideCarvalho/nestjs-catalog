@@ -5,10 +5,9 @@
 // entry carries them, so browser consumers have one place to learn the shapes.
 import type {
   CatalogTrace,
-  CatalogTraceList,
   CatalogTraceOutcome,
+  CatalogTracePage,
   CatalogTraceSpan,
-  TraceQuery,
 } from '@dudousxd/nestjs-catalog';
 import type { CatalogAuditEvent } from '@dudousxd/nestjs-catalog/client';
 import { useQuery } from '@tanstack/react-query';
@@ -32,7 +31,7 @@ import {
 } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import { cn } from './cn.js';
-import { useCatalogClient } from './context.js';
+import { type TraceListQuery, useCatalogClient } from './context.js';
 import { Tooltip, TooltipProvider } from './ui/tooltip.js';
 
 const MUTED = 'text-zinc-400 dark:text-zinc-500';
@@ -48,7 +47,7 @@ const PANEL = 'bg-white dark:bg-zinc-900';
  * differently from the app around it is a console nobody trusts.
  */
 export interface CatalogTraceSource {
-  listTraces(query: TraceQuery): Promise<CatalogTraceList>;
+  listTraces(query: TraceListQuery): Promise<CatalogTracePage>;
   /**
    * One trace, with the payloads the list leaves in the database.
    *
@@ -86,7 +85,7 @@ export function useTraceSource(explicit?: CatalogTraceSource): CatalogTraceSourc
     const one = Reflect.get(client, 'getTrace');
 
     return {
-      listTraces: (query: TraceQuery) =>
+      listTraces: (query: TraceListQuery) =>
         Promise.resolve(candidate.call(client, query)).then(toTraceList),
       // Discovered separately from `listTraces`, because the two arrived in
       // different versions: a host pinned to a client that has the list and not
@@ -100,26 +99,35 @@ export function useTraceSource(explicit?: CatalogTraceSource): CatalogTraceSourc
   }, [client, explicit]);
 }
 
-function toTraceList(value: unknown): CatalogTraceList {
+function toTraceList(value: unknown): CatalogTracePage {
   if (typeof value !== 'object' || value === null) {
     throw new Error('The trace endpoint answered with something that is not a trace list.');
   }
-  const rawTraces: unknown = Reflect.get(value, 'traces');
+  const rawTraces: unknown = Reflect.get(value, 'data');
   if (!Array.isArray(rawTraces)) {
     throw new Error('The trace endpoint answered without a list of traces.');
   }
   const rawUnlinked: unknown = Reflect.get(value, 'unlinked');
   const traces = rawTraces.filter(isTrace);
 
+  const rawMeta: unknown = Reflect.get(value, 'meta');
+  const meta = typeof rawMeta === 'object' && rawMeta !== null ? rawMeta : {};
+  // The server's own count when it sent one. Falling back to the page length
+  // is a deliberate under-claim: "showing 25 of 25" is wrong but harmless,
+  // where a fabricated larger total would put a page nobody can reach behind
+  // a control that promises one.
+  const total = numberOr(Reflect.get(meta, 'total'), traces.length);
+  const perPage = Math.max(1, numberOr(Reflect.get(meta, 'perPage'), traces.length || 1));
+
   return {
-    traces,
-    // The server's own count when it sent one. Falling back to the page length
-    // is a deliberate under-claim: "showing 25 of 25" is wrong but harmless,
-    // where a fabricated larger total would put a page nobody can reach behind
-    // a control that promises one.
-    total: numberOr(Reflect.get(value, 'total'), traces.length),
-    limit: numberOr(Reflect.get(value, 'limit'), traces.length),
-    offset: numberOr(Reflect.get(value, 'offset'), 0),
+    data: traces,
+    meta: {
+      total,
+      perPage,
+      currentPage: numberOr(Reflect.get(meta, 'currentPage'), 1),
+      lastPage: numberOr(Reflect.get(meta, 'lastPage'), Math.max(1, Math.ceil(total / perPage))),
+      firstPage: 1,
+    },
     unlinked: Array.isArray(rawUnlinked) ? rawUnlinked.filter(isAuditEvent) : [],
     unlinkedTotal: numberOr(Reflect.get(value, 'unlinkedTotal'), 0),
     clockResolutionMs: numberOr(Reflect.get(value, 'clockResolutionMs'), 1),
@@ -320,7 +328,7 @@ export function TraceExplorer({ source }: { source?: CatalogTraceSource } = {}) 
     queryKey: ['catalog', 'traces', outcome],
     queryFn: () =>
       traces
-        ? traces.listTraces({ outcome: outcome || undefined, limit: 50 })
+        ? traces.listTraces({ outcome: outcome || undefined, size: 50 })
         : Promise.reject(new Error('No trace source')),
     enabled: traces !== undefined,
     // Short, because a running trace is the case this screen exists for and a
@@ -386,7 +394,7 @@ export function TraceExplorer({ source }: { source?: CatalogTraceSource } = {}) 
           </p>
         )}
 
-        {data && data.traces.length === 0 && (
+        {data && data.data.length === 0 && (
           <p
             className={cn(
               'rounded-lg border border-dashed px-4 py-12 text-center text-sm',
@@ -400,7 +408,7 @@ export function TraceExplorer({ source }: { source?: CatalogTraceSource } = {}) 
         )}
 
         <div className="space-y-2">
-          {(data?.traces ?? []).map((trace) => (
+          {(data?.data ?? []).map((trace) => (
             <TraceCard
               key={trace.id}
               trace={trace}
@@ -411,9 +419,9 @@ export function TraceExplorer({ source }: { source?: CatalogTraceSource } = {}) 
           ))}
         </div>
 
-        {data && data.total > data.traces.length && (
+        {data && data.meta.total > data.data.length && (
           <p className={cn('text-center font-mono text-[10px]', MUTED)}>
-            Showing {data.traces.length} of {data.total} traces.
+            Showing {data.data.length} of {data.meta.total} traces.
           </p>
         )}
 

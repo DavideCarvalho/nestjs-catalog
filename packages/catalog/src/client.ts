@@ -13,6 +13,7 @@
 // Type-only, and re-exported again further down: `export … from` creates no
 // local binding, and the load-expectation declarations at the foot of this file
 // need to refer to these shapes by name.
+import type { CatalogObjectListParams } from './catalog.filters';
 import type {
   DeleteReconciliation,
   LoadExpectation,
@@ -58,6 +59,7 @@ export type {
   CatalogSearchHit,
   CatalogSearchKind,
   CatalogSearchRank,
+  CatalogSearchResponse,
   CatalogSearchResult,
 } from './search.types';
 
@@ -93,18 +95,19 @@ export {
   CATALOG_FILTER_LIMIT,
   CATALOG_FILTER_OPERATORS,
   coerceFilterValue,
-  encodeObjectFilter,
   filterOperatorTakesValue,
   filterOperatorsFor,
   isCatalogFilterOperator,
   offeredFilterOperators,
-  parseObjectFilter,
+  objectFilterParam,
+  objectQueryParams,
   resolveObjectFilters,
   VALUELESS_FILTER_OPERATORS,
 } from './catalog.filters';
 export type {
   CatalogFilterableColumn,
   CatalogFilterOperator,
+  CatalogObjectListParams,
   CatalogFilterResolution,
   CatalogObjectFilter,
   CatalogResolvedFilter,
@@ -167,33 +170,12 @@ export interface PropertyPatch {
   unit?: string;
 }
 
-export interface ObjectQueryParams {
-  page?: number;
-  size?: number;
-  search?: string;
-  sort?: string;
-  dir?: 'asc' | 'desc';
-  /**
-   * `property:operator:value`, one entry per filter, ANDed by the server.
-   *
-   * Named `filter` rather than `filters` because that is the query parameter the
-   * route reads, and this object is handed to a transport that serialises it
-   * verbatim — a name that disagreed with the route would be a filter that is
-   * sent, ignored, and reported by the screen as applied.
-   *
-   * Build entries with `encodeObjectFilter` rather than by hand: it is what the
-   * server parses with, and the two colons are load-bearing.
-   */
-  filter?: string[];
-  /**
-   * Read the type as of an earlier load. Omit for the current one, which is what
-   * every reader must get by default.
-   *
-   * Ids come from `GET objects/:name/snapshots`. A store that keeps no history
-   * refuses this rather than answering with current state.
-   */
-  snapshot?: string;
-}
+/**
+ * What a client asks `GET objects/:name` for. Turn it into query parameters with
+ * `objectQueryParams`, which writes the Aviary list wire (`sort=-column`,
+ * `filter[property][op]=value`) as flat keys any transport can send verbatim.
+ */
+export type ObjectQueryParams = CatalogObjectListParams;
 
 /**
  * Builds the paths the catalog controller serves, relative to wherever it was
@@ -206,8 +188,8 @@ export const catalogRoutes = {
   /**
    * One term across types, properties, saved queries and dashboards.
    *
-   * No arguments, unlike `type(name)` and friends: `q` and `limit` are a query
-   * string, and every route here that takes one — `objects`, `events`, `traces`
+   * No arguments, unlike `type(name)` and friends: `search` and `size` are a
+   * query string, and every route here that takes one — `objects`, `events`, `traces`
    * — leaves it to the caller's HTTP client, because that is the layer that
    * already knows how to serialise and encode one. `accessRoutes.people` in the
    * React package does it the other way and is the odd one out.
@@ -620,6 +602,7 @@ export type {
 export type {
   CatalogTrace,
   CatalogTraceList,
+  CatalogTracePage,
   CatalogTraceOutcome,
   CatalogTraceSpan,
   TraceQuery,
@@ -773,3 +756,12 @@ export function pipelineExpectationRoutes(basePath = '/pipeline') {
     expectation: (typeName: string) => `${base}/expectations/${encodeURIComponent(typeName)}`,
   } as const;
 }
+
+// The Aviary list envelope every list route answers with. Type-only: the helpers
+// that build these run on the server.
+export type {
+  CursorPageMeta,
+  CursorPageResponse,
+  OffsetPage,
+  OffsetPageMeta,
+} from './list-api';

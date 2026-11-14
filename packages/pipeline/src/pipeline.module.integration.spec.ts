@@ -114,7 +114,9 @@ class FakePipelineStore implements CatalogPipelineStore {
   finishRun(): Promise<ConnectorRun | undefined> {
     return Promise.resolve(undefined);
   }
-  listRuns(): Promise<ConnectorRun[]> {
+  readonly runQueries: Array<[string | undefined, number | undefined]> = [];
+  listRuns(connectorId?: string, limit?: number): Promise<ConnectorRun[]> {
+    this.runQueries.push([connectorId, limit]);
     return Promise.resolve([]);
   }
 }
@@ -347,6 +349,27 @@ describe('CatalogPipelineModule.forRoot (integration)', () => {
     );
 
     await request(app.getHttpServer()).get('/api/catalog-service/pipeline/connections').expect(200);
+  });
+
+  it('lists runs on the list API wire: filter[connector] and size in, { data } out', async () => {
+    app = await boot([pipelineHost({ path: 'api' })]);
+    const server = app.getHttpServer();
+
+    const listed = await request(server)
+      .get('/api/pipeline/runs?filter[connector]=c1&size=10')
+      .expect(200);
+    expect(listed.body).toEqual({ data: [] });
+    const store = app.get<FakePipelineStore>(CATALOG_PIPELINE_STORE, { strict: false });
+    expect(store.runQueries.at(-1)).toEqual(['c1', 10]);
+
+    // The removed params are not aliased, and an order the store cannot give is
+    // refused rather than ignored.
+    await request(server).get('/api/pipeline/runs?filter[status]=failed').expect(400);
+    await request(server).get('/api/pipeline/runs?sort=startedAt').expect(400);
+    await request(server).get('/api/pipeline/runs?size=all').expect(400);
+    await request(server).get('/api/pipeline/runs?size=9999').expect(200);
+    // Clamped to the cap rather than refused.
+    expect(store.runQueries.at(-1)).toEqual([undefined, 200]);
   });
 
   it('honours a path with no leading slash exactly as written', async () => {

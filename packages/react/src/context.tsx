@@ -8,10 +8,11 @@ import type {
   CatalogQueryResult,
   CatalogReusableNode,
   CatalogRevision,
-  CatalogSearchResult,
+  CatalogSearchResponse,
   CatalogSnapshot,
   CatalogTrace,
-  CatalogTraceList,
+  CatalogTraceOutcome,
+  CatalogTracePage,
   CatalogTransform,
   ConnectionCheck,
   ConnectorRun,
@@ -21,6 +22,7 @@ import type {
   LoadExpectation,
   LoadExpectationInput,
   ObjectQueryParams,
+  OffsetPage,
   PropertyPatch,
   ResolvedLoadExpectation,
   ReusableNodeBody,
@@ -29,13 +31,12 @@ import type {
   SavedQuery,
   SnapshotRef,
   StoredLoadExpectation,
-  TraceQuery,
   TransformLanguage,
   TransformMode,
   TransformResult,
   TypePatch,
 } from '@dudousxd/nestjs-catalog/client';
-import { catalogRoutes } from '@dudousxd/nestjs-catalog/client';
+import { catalogRoutes, objectQueryParams } from '@dudousxd/nestjs-catalog/client';
 import { type ReactNode, createContext, useContext, useMemo } from 'react';
 import type { EmbeddedChartPayload, EmbeddedDashboardPayload } from './embed/payload.js';
 import {
@@ -476,12 +477,62 @@ export interface CatalogPrincipalSummary {
   ownedTypes: string[];
 }
 
-export interface CatalogPeoplePage {
-  people: CatalogPersonSummary[];
-  /** How many match, ignoring the page. */
-  total: number;
-  limit: number;
-  offset: number;
+/**
+ * One page of people, in the Aviary offset list envelope. `meta.total` is how
+ * many match, ignoring the page.
+ */
+export type CatalogPeoplePage = OffsetPage<CatalogPersonSummary>;
+
+/**
+ * What the audit feed can be narrowed by. Sent as `filter[event]`,
+ * `filter[type]`, `filter[principal]` and `filter[occurredAt][gte]`.
+ */
+export interface AuditEventFilters {
+  event?: string;
+  typeName?: string;
+  principalId?: string;
+  /** ISO timestamp; events at or after it. */
+  since?: string;
+}
+
+/** `GET events`: the newest `size` events, newest first. */
+export interface EventListQuery extends AuditEventFilters {
+  size?: number;
+}
+
+/** `GET events/traces`: one offset page of traces. */
+export interface TraceListQuery extends AuditEventFilters {
+  /** One outcome, or any of several. Sent as `filter[outcome]=a,b`. */
+  outcome?: CatalogTraceOutcome | CatalogTraceOutcome[];
+  page?: number;
+  size?: number;
+}
+
+/** The `filter[...]` query parameters for the audit filters. Empty values are left out. */
+export function auditFilterParams(
+  query: AuditEventFilters & { outcome?: TraceListQuery['outcome'] },
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (query.event) out['filter[event]'] = query.event;
+  if (query.typeName) out['filter[type]'] = query.typeName;
+  if (query.principalId) out['filter[principal]'] = query.principalId;
+  if (query.since) out['filter[occurredAt][gte]'] = query.since;
+  const outcomes =
+    query.outcome === undefined
+      ? []
+      : Array.isArray(query.outcome)
+        ? query.outcome
+        : [query.outcome];
+  if (outcomes.length > 0) out['filter[outcome]'] = outcomes.join(',');
+  return out;
+}
+
+/** Page params, omitted when unset so a transport never sends `size=`. */
+function pageParams(query: { page?: number; size?: number }): Record<string, number> {
+  return {
+    ...(query.page === undefined ? {} : { page: query.page }),
+    ...(query.size === undefined ? {} : { size: query.size }),
+  };
 }
 
 /** A person: signs in, and acts through an application that caps them. */
@@ -556,11 +607,12 @@ export interface CatalogClient {
    * would live in whichever screen was written last — see the block above
    * `CatalogService.search`, which makes the argument where the code is.
    *
-   * `limit` is the caller's request and the server's decision: it caps whatever
-   * is asked for, and the answer carries `total` and `truncated` so a screen can
-   * say "50 of 312" rather than implying the list it drew is the list.
+   * `size` is the caller's request and the server's decision: it caps whatever
+   * is asked for, and the answer carries `total` and `truncated` beside the hits
+   * in `data`, so a screen can say "50 of 312" rather than implying the list it
+   * drew is the list.
    */
-  search(term: string, limit?: number): Promise<CatalogSearchResult>;
+  search(term: string, size?: number): Promise<CatalogSearchResponse>;
 
   workspaceCapabilities(): Promise<{ workspace: boolean; query: boolean }>;
   listSavedQueries(): Promise<SavedQuery[]>;
@@ -641,12 +693,8 @@ export interface CatalogClient {
   embedChart(id: string): Promise<EmbeddedChartPayload>;
   embedDashboard(id: string): Promise<EmbeddedDashboardPayload>;
 
-  listEvents(query: {
-    event?: string;
-    typeName?: string;
-    principalId?: string;
-    limit?: number;
-  }): Promise<CatalogAuditEvent[]>;
+  /** The newest events, newest first, as `{ data }` — the feed has no pages. */
+  listEvents(query: EventListQuery): Promise<{ data: CatalogAuditEvent[] }>;
   /**
    * The same events, grouped into one causal story each.
    *
@@ -654,7 +702,7 @@ export interface CatalogClient {
    * happened recently" and a trace answers "what happened during that load",
    * and collapsing the two would cost the first question its answer.
    */
-  listTraces(query: TraceQuery): Promise<CatalogTraceList>;
+  listTraces(query: TraceListQuery): Promise<CatalogTracePage>;
 
   /**
    * One trace, with the event payloads `listTraces` leaves behind.
@@ -769,7 +817,8 @@ export interface CatalogClient {
    * having done nothing.
    */
   publishType(name: string, schema: unknown): Promise<unknown>;
-  listRuns(connectorId?: string): Promise<ConnectorRun[]>;
+  /** The newest runs, optionally of one connector, as `{ data }`. */
+  listRuns(connectorId?: string, size?: number): Promise<{ data: ConnectorRun[] }>;
 
   /**
    * What one type promises about deletes and row counts, resolved.
@@ -1053,9 +1102,7 @@ export function CatalogProvider({
     return {
       snapshot: () => transport.get<CatalogSnapshot>(catalogRoutes.snapshot()),
       objects: (type, params) =>
-        transport.get<CatalogObjectPage>(catalogRoutes.objects(type), {
-          ...params,
-        }),
+        transport.get<CatalogObjectPage>(catalogRoutes.objects(type), objectQueryParams(params)),
       snapshots: (type) => transport.get<SnapshotRef[]>(catalogRoutes.snapshots(type)),
       patchType: (name, patch) => transport.patch(catalogRoutes.type(name), patch),
       patchProperty: (name, property, patch) =>
@@ -1063,15 +1110,13 @@ export function CatalogProvider({
       reset: () => transport.post<CatalogSnapshot>(catalogRoutes.reset()),
       queryRelations: () => transport.get<CatalogQueryRelation[]>(catalogRoutes.queryRelations()),
       runQuery: (input) => transport.post<CatalogQueryResult>(catalogRoutes.query(), input),
-      // `limit` is omitted rather than sent undefined when nobody asked for
+      // `size` is omitted rather than sent undefined when nobody asked for
       // one, for the reason `listRuns` states below: a transport that
-      // serialises `limit=` hands the server an empty string, and `Number('')`
-      // is 0 — which the route would floor back to 1 and answer with a single
-      // row that reads as "there is only one match".
-      search: (term, limit) =>
-        transport.get<CatalogSearchResult>(catalogRoutes.search(), {
-          q: term,
-          ...(limit === undefined ? {} : { limit }),
+      // serialises `size=` hands the server an empty string.
+      search: (term, size) =>
+        transport.get<CatalogSearchResponse>(catalogRoutes.search(), {
+          search: term,
+          ...pageParams({ size }),
         }),
 
       workspaceCapabilities: () => transport.get(catalogRoutes.workspaceCapabilities()),
@@ -1102,8 +1147,16 @@ export function CatalogProvider({
       embedChart: (id) => transport.get<EmbeddedChartPayload>(embedRoutes.chart(id)),
       embedDashboard: (id) => transport.get<EmbeddedDashboardPayload>(embedRoutes.dashboard(id)),
 
-      listEvents: (query) => transport.get(catalogRoutes.events(), { ...query }),
-      listTraces: (query) => transport.get(catalogRoutes.traces(), { ...query }),
+      listEvents: (query) =>
+        transport.get(catalogRoutes.events(), {
+          ...auditFilterParams(query),
+          ...pageParams(query),
+        }),
+      listTraces: (query) =>
+        transport.get(catalogRoutes.traces(), {
+          ...auditFilterParams(query),
+          ...pageParams(query),
+        }),
       getTrace: (id) => transport.get(catalogRoutes.trace(id)),
 
       pipelineCapabilities: () => transport.get(pipeline.capabilities()),
@@ -1135,8 +1188,11 @@ export function CatalogProvider({
       // named, because a transport that serialises `connector=` turns "every
       // run" into "runs of the connector whose id is the empty string", which
       // is an empty list that looks like a system that has never run anything.
-      listRuns: (connectorId) =>
-        transport.get(pipeline.runs(), connectorId ? { connector: connectorId } : undefined),
+      listRuns: (connectorId, size) =>
+        transport.get(pipeline.runs(), {
+          ...(connectorId ? { 'filter[connector]': connectorId } : {}),
+          ...pageParams({ size }),
+        }),
 
       loadExpectation: (typeName) =>
         transport.get<ResolvedLoadExpectation>(pipeline.loadExpectation(typeName)),
@@ -1269,8 +1325,8 @@ export const catalogQueryKeys = {
    * reload should invalidate `catalogQueryKeys.all`, which is what that prefix
    * is for.
    */
-  search: (term: string, limit?: number) =>
-    ['nestjs-catalog', 'search', term, limit ?? null] as const,
+  search: (term: string, size?: number) =>
+    ['nestjs-catalog', 'search', term, size ?? null] as const,
 
   /**
    * The pipeline keys are nested under one prefix so a host — or a screen that

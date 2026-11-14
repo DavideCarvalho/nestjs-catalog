@@ -1,3 +1,5 @@
+import { pipelineExpectationRoutes } from '@dudousxd/nestjs-catalog/client';
+import { describe, expect, it } from 'vitest';
 /**
  * The paths behind the pipeline and access screens.
  *
@@ -7,8 +9,7 @@
  * the single place a mistake can be made, and the mistake is always silent: a wrong path is a 404
  * at runtime, with no compile error and nothing on screen but an empty list.
  */
-import { pipelineExpectationRoutes } from '@dudousxd/nestjs-catalog/client';
-import { describe, expect, it } from 'vitest';
+import { auditFilterParams } from './context';
 import {
   DEFAULT_ACCESS_BASE_PATH,
   DEFAULT_PIPELINE_BASE_PATH,
@@ -173,5 +174,33 @@ describe('accessRoutes', () => {
   it('moves with the base it was given, trailing slash or not', () => {
     expect(accessRoutes('/admin/access').people()).toBe('/admin/access/people');
     expect(accessRoutes('/admin/access/').people()).toBe('/admin/access/people');
+  });
+
+  it('pages people with the list API params, page and size, never limit and offset', () => {
+    expect(accessRoutes().people({ search: 'ana', page: 3, size: 10 })).toBe(
+      '/access/people?search=ana&page=3&size=10',
+    );
+    expect(accessRoutes().people({ page: 1 })).toBe('/access/people?page=1');
+  });
+});
+
+describe('auditFilterParams', () => {
+  it('writes the audit filters as filter[...] params, and nothing for unset ones', () => {
+    expect(
+      auditFilterParams({
+        event: 'snapshot.committed',
+        typeName: 'Mvr',
+        principalId: 'ana',
+        since: '2026-03-01',
+        outcome: ['failed', 'incomplete'],
+      }),
+    ).toEqual({
+      'filter[event]': 'snapshot.committed',
+      'filter[type]': 'Mvr',
+      'filter[principal]': 'ana',
+      'filter[occurredAt][gte]': '2026-03-01',
+      'filter[outcome]': 'failed,incomplete',
+    });
+    expect(auditFilterParams({ event: '', outcome: [] })).toEqual({});
   });
 });
