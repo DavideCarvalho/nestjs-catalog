@@ -255,6 +255,10 @@ describe('Access endpoints (integration)', () => {
     const directory = new FullDirectory();
     app = await boot([host({ path: 'api/catalog', directory })]);
 
+    // The removed `limit` / `offset` are a 400 naming `size` / `page`, never ignored.
+    await request(app.getHttpServer()).get('/api/access/people?limit=5').expect(400);
+    await request(app.getHttpServer()).get('/api/access/people?offset=5').expect(400);
+
     const listed = await request(app.getHttpServer()).get('/api/access/people').expect(200);
     expect(listed.body).toEqual({
       data: [PERSON],

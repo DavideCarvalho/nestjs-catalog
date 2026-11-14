@@ -367,6 +367,10 @@ describe('CatalogPipelineModule.forRoot (integration)', () => {
     await request(server).get('/api/pipeline/runs?filter[status]=failed').expect(400);
     await request(server).get('/api/pipeline/runs?sort=startedAt').expect(400);
     await request(server).get('/api/pipeline/runs?size=all').expect(400);
+    // The removed forms and a page a top-N does not have are refused, not ignored.
+    await request(server).get('/api/pipeline/runs?connector=c1').expect(400);
+    await request(server).get('/api/pipeline/runs?limit=10').expect(400);
+    await request(server).get('/api/pipeline/runs?page=2').expect(400);
     await request(server).get('/api/pipeline/runs?size=9999').expect(200);
     // Clamped to the cap rather than refused.
     expect(store.runQueries.at(-1)).toEqual([undefined, 200]);

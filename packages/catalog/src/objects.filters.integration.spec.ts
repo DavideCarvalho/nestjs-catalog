@@ -320,6 +320,22 @@ describe('reading objects with filters', () => {
     expect(lastQuery).toBeUndefined();
   });
 
+  it('refuses the removed dir / limit and a bare property instead of ignoring them', async () => {
+    app = await boot(FilteringStore);
+
+    for (const [qs, hint] of [
+      ['sort=miles&dir=desc', '"sort"'],
+      ['limit=10', '"size"'],
+      ['miles=3', 'filter[miles]'],
+      ['search=a&search=b', 'send it once'],
+    ] as const) {
+      const res = await request(app.getHttpServer()).get(`/api/catalog/objects/Mvr?${qs}`);
+      expect([qs, res.status]).toEqual([qs, 400]);
+      expect(res.body.message).toContain(hint);
+    }
+    expect(lastQuery).toBeUndefined();
+  });
+
   it('offers no filter controls at all on a store that cannot filter', async () => {
     app = await boot(PlainStore);
 

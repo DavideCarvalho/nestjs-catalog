@@ -21,7 +21,13 @@ import {
   type CatalogPersonSummary,
 } from './catalog.access';
 import { RequireScopes } from './catalog.route-auth';
-import { type OffsetPage, offsetPage, parsePageParams } from './list-api';
+import {
+  ListQueryError,
+  type OffsetPage,
+  offsetPage,
+  parsePageParams,
+  rejectUnknownParams,
+} from './list-api';
 
 const ROLES: readonly CatalogPersonRole[] = ['viewer', 'curator', 'administrator'];
 
@@ -113,10 +119,14 @@ export function createAccessController(
       // its whole directory, and the seam would otherwise invite exactly the
       // unbounded read this endpoint would then serve to a browser. Over the
       // cap is clamped; junk (`size=all`) is a 400 rather than "no limit".
+      rejectUnknownParams(query, ['page', 'size', 'search']);
       const { page, size, offset } = parsePageParams(query, {
         defaultSize: CATALOG_DIRECTORY_PAGE,
         maxSize: CATALOG_DIRECTORY_MAX_PAGE,
       });
+      if (query.search !== undefined && typeof query.search !== 'string') {
+        throw new ListQueryError('Invalid "search": send it once.');
+      }
       const search = typeof query.search === 'string' ? query.search : '';
       const result = await directory.listPeople({
         ...(search ? { search } : {}),

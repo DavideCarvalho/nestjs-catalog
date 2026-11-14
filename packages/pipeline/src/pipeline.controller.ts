@@ -76,7 +76,13 @@ import {
   restoreRedactedSecrets,
 } from './config-secrets';
 import { ConnectionChecker } from './connection-checker.service';
-import { ListQueryError, parseFilterParams, parsePageParams, resolveSort } from './list-api';
+import {
+  ListQueryError,
+  parseFilterParams,
+  parsePageParams,
+  rejectUnknownParams,
+  resolveSort,
+} from './list-api';
 import {
   CATALOG_LOAD_EXPECTATIONS,
   type CatalogLoadExpectations,
@@ -685,6 +691,8 @@ export function createPipelineController(
     @Get('runs')
     @RequireScopes('catalog:read')
     async runs(@Query() query: Record<string, unknown> = {}): Promise<{ data: ConnectorRun[] }> {
+      // The old `?connector=` / `limit` (and `page`, which a top-N has none of) are a 400.
+      rejectUnknownParams(query, ['filter', 'sort', 'size']);
       const filters = parseFilterParams(query, { fields: { connector: ['eq'] } });
       const connector = filters.find((filter) => filter.field === 'connector')?.value;
       const sort = resolveSort(query.sort, { sortable: ['startedAt'] });

@@ -177,8 +177,19 @@ describe('the audit trail on the list API wire', () => {
     const server = await boot();
 
     await request(server).get('/api/catalog/events/traces?filter[status]=failed').expect(400);
-    await request(server).get('/api/catalog/events/traces?limit=5&offset=10').expect(200);
-    // `limit`/`offset` are not list API params: ignored, so the defaults apply.
-    expect(listTraces).toHaveBeenLastCalledWith({ limit: 25, offset: 0 });
+    expect(listTraces).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['/api/catalog/events/traces?limit=5&offset=10', '"size"'],
+    ['/api/catalog/events/traces?outcome=failed', 'filter[outcome]'],
+    ['/api/catalog/events?event=type.curated', 'filter[event]'],
+    ['/api/catalog/events?page=2', '"page"'],
+  ])('refuses the removed or unknown param in %s, naming the replacement', async (path, hint) => {
+    const server = await boot();
+
+    const res = await request(server).get(path).expect(400);
+    expect(res.body.message).toContain(hint);
+    expect(listTraces).not.toHaveBeenCalled();
   });
 });

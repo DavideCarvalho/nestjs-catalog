@@ -422,6 +422,17 @@ describe('GET /catalog/search (integration)', () => {
     expect(result.truncated).toBe(true);
   });
 
+  it('refuses the old q and a page, which a ranked top-N does not have, with a 400', async () => {
+    const server = await boot();
+
+    for (const qs of ['q=dispute', 'search=dispute&page=2']) {
+      const response = await request(server)
+        .get(`/api/catalog/search?${qs}`)
+        .set('x-catalog-key', 'analyst');
+      expect([qs, response.status]).toEqual([qs, 400]);
+    }
+  });
+
   it('answers a missing term with an empty result rather than a 400', async () => {
     // A search screen mounts before anybody types.
     const server = await boot();

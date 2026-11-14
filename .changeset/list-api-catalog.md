@@ -12,3 +12,5 @@ Move the HTTP list endpoints to the Aviary unified list API. No aliases for the 
 - `/client`: `objectQueryParams()` and `objectFilterParam()` build the new wire; `encodeObjectFilter` and `parseObjectFilter` are removed. `ObjectQueryParams` is now `{ page, size, search, sort, filters, snapshot }`. `CatalogObjectQuery.filters` and `resolveObjectFilters` take `CatalogObjectFilter` objects instead of strings. The `OffsetPage`/`CursorPageResponse` envelope types are exported.
 
 Store SPIs (`listEvents`, `listTraces`, `listPeople`, `read`) are unchanged; the HTTP layer translates.
+
+Every list endpoint answers 400 for a query param it does not read — the removed forms (`limit`, `offset`, `dir`, `q`, a bare filter field such as `?connector=` or `?outcome=`) and `page` on a top-N — naming the replacement, instead of ignoring it and answering with defaults.

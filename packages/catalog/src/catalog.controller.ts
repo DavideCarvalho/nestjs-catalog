@@ -43,6 +43,7 @@ import {
   offsetPage,
   parseFilterParams,
   parsePageParams,
+  rejectUnknownParams,
   resolveSort,
 } from './list-api';
 import { DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT } from './search';
@@ -198,11 +199,13 @@ export function createCatalogController(
       // A ranked top-N widget rather than a paged list: the ranking is computed
       // over every candidate and cut at `size`, so there is no page 2 to ask
       // for. `size` is the one paging knob, as the list API allows for widgets.
+      // Anything else (`page`, the old `q`) is a 400, never a silent default.
+      rejectUnknownParams(query, ['search', 'size']);
       const { size } = parsePageParams(query, {
         defaultSize: DEFAULT_SEARCH_LIMIT,
         maxSize: MAX_SEARCH_LIMIT,
       });
-      const term = typeof query.search === 'string' ? query.search : '';
+      const term = readSearch(query) ?? '';
       const result = await this.service.search(term, {
         principal: request?.principal,
         limit: size,
@@ -317,6 +320,9 @@ export function createCatalogController(
       const type = this.registry.getType(name);
       if (!type) throw new NotFoundException(`Unknown object type: ${name}`);
       const propertyNames = type.properties.map((property) => property.name);
+      // The old `dir`, `limit`, a bare `?<property>=` and the like are a 400 naming the
+      // replacement: a filter or an order that silently does not apply is a wrong answer.
+      rejectUnknownParams(query, ['page', 'size', 'search', 'sort', 'filter', 'snapshot']);
 
       // The service clamps to the deployment's `maxPageSize`; this only refuses
       // junk, so `size=abc` is a 400 instead of quietly becoming the default.
@@ -342,12 +348,12 @@ export function createCatalogController(
       return this.service.readObjects(name, {
         page,
         size,
-        search: typeof query.search === 'string' && query.search ? query.search : undefined,
+        search: readSearch(query) || undefined,
         ...(sort[0] ? { sort: sort[0].field, dir: sort[0].direction } : {}),
         // Reads as of an earlier load. Stores that keep no history reject this
         // rather than quietly answering with current state — a reader who thinks
         // they are looking at last Tuesday and is not would rather be told.
-        snapshot: typeof query.snapshot === 'string' && query.snapshot ? query.snapshot : undefined,
+        snapshot: readSingle(query, 'snapshot') || undefined,
         ...(filters.length > 0 ? { filters } : {}),
       });
     }
@@ -668,6 +674,7 @@ export function createCatalogController(
     }> {
       // A newest-first feed with no cursor in the store SPI, so `{ data }` and a
       // single `size` rather than a paging style the store could not honour.
+      rejectUnknownParams(query, ['filter', 'sort', 'size']);
       const filters = auditFilters(query, AUDIT_EVENT_FILTERS);
       rejectSortOtherThan(query.sort, '-occurredAt');
       const { size } = parsePageParams(query, {
@@ -698,6 +705,7 @@ export function createCatalogController(
     @RequireScopes('catalog:read')
     async traceList(@Query() query: Record<string, unknown> = {}): Promise<CatalogTracePage> {
       const store = this.requireTraces();
+      rejectUnknownParams(query, ['filter', 'sort', 'page', 'size']);
       const parsed = parseFilterParams(query, {
         fields: { ...AUDIT_EVENT_FILTERS, outcome: ['eq', 'in'] },
       });
@@ -819,6 +827,22 @@ function auditFilters(
     }
   }
   return out;
+}
+
+/**
+ * A single-valued query param (`search`, `snapshot`): absent → `undefined`, a repeated one
+ * (`?search=a&search=b`) → 400 rather than quietly reading as absent.
+ */
+function readSingle(query: Record<string, unknown>, key: string): string | undefined {
+  const raw = query[key];
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== 'string') throw new ListQueryError(`Invalid "${key}": send it once.`);
+  return raw;
+}
+
+/** `search`, read with {@link readSingle}. */
+function readSearch(query: Record<string, unknown>): string | undefined {
+  return readSingle(query, 'search');
 }
 
 /**
