@@ -1,5 +1,5 @@
-import { EntityManager } from '@mikro-orm/core';
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import type { EntityManager } from '@mikro-orm/core';
+import { BadRequestException, Inject, Injectable, NotFoundException } from '@nestjs/common';
 import { CATALOG_FILTER_OPERATORS, type CatalogResolvedFilter } from '../catalog.filters';
 import { MikroOrmCatalogRegistry } from '../catalog.registry';
 import type {
@@ -9,6 +9,7 @@ import type {
   CatalogStoreCapabilities,
 } from '../catalog.store';
 import type { CatalogObjectTypeDef } from '../catalog.types';
+import { MIKRO_ORM_ENTITY_MANAGER } from '../mikro-orm.lazy';
 
 /**
  * Reads objects straight out of the application's own tables, through the ORM
@@ -36,7 +37,7 @@ export class MikroOrmReadStore implements CatalogFilteringReadStore {
 
   constructor(
     private readonly registry: MikroOrmCatalogRegistry,
-    private readonly em: EntityManager,
+    @Inject(MIKRO_ORM_ENTITY_MANAGER) private readonly em: EntityManager,
   ) {}
 
   async read(

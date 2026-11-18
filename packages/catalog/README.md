@@ -45,6 +45,24 @@ export class AppModule {}
 that *declares* the controller, and this library generates its own. Whatever
 your guards inject has to be resolvable from there.
 
+### Without MikroORM
+
+`@mikro-orm/core` is an optional peer. Only the defaults use it: the registry
+that reads your entities and the store that reads their tables. A host on
+Drizzle, Prisma or anything else binds its own and never loads MikroORM:
+
+```ts
+CatalogModule.forRoot({
+  registry: { provide: CatalogRegistry, useClass: MyRegistry },
+  store: { provide: CATALOG_STORE, useClass: MyReadStore },
+});
+```
+
+`MyRegistry` extends `CatalogRegistry` and returns a snapshot of your types.
+The graph, the HTTP routes and the console are built from that snapshot, so
+they work unchanged. Leave either option out without MikroORM installed and
+boot fails with an error naming the option to pass.
+
 ## Declare what the database cannot know
 
 ```ts
