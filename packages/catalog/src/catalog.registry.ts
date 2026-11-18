@@ -1,7 +1,4 @@
-import type { EntityClass, EntityMetadata, EntityProperty } from '@mikro-orm/core';
-// Value import, not type-only: Nest resolves this constructor parameter from
-// the emitted `design:paramtypes`, which a type-only import erases.
-import { MikroORM } from '@mikro-orm/core';
+import type { EntityClass, EntityMetadata, EntityProperty, MikroORM } from '@mikro-orm/core';
 import { Inject, Injectable, Logger, type OnModuleInit } from '@nestjs/common';
 import {
   type CatalogPropertyOptions,
@@ -27,6 +24,7 @@ import type {
 // copy — three copies of a closed set, and the one here needed a cast to check
 // against it.
 import { isRelationKind } from './catalog.types';
+import { MIKRO_ORM } from './mikro-orm.lazy';
 
 /**
  * Which end of the link holds the key.
@@ -146,7 +144,8 @@ export class MikroOrmCatalogRegistry extends CatalogRegistry implements OnModule
   private readonly entityClasses = new Map<string, EntityClass<Record<string, unknown>>>();
 
   constructor(
-    private readonly orm: MikroORM,
+    // Type-only, with the token deferred: see `mikro-orm.lazy.ts`.
+    @Inject(MIKRO_ORM) private readonly orm: MikroORM,
     @Inject(CATALOG_OPTIONS) private readonly options: CatalogModuleOptions,
     @Inject(CATALOG_OVERLAY_STORE)
     private readonly overlayStore: CatalogOverlayStore,
