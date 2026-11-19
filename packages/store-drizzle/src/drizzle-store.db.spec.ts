@@ -2,7 +2,7 @@ import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testconta
 import { sql } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/node-postgres';
 import { getTableConfig } from 'drizzle-orm/pg-core';
-import { Pool } from 'pg';
+import { Pool, type PoolClient } from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   describeOverlayStoreContract,
@@ -101,10 +101,52 @@ const gatedRun: CatalogDrizzleRun = (work) => {
   });
 };
 
+/** Set while the forced-interleaving case holds the saved query's `UPDATE`. */
+let hold: (() => Promise<void>) | undefined;
+
+/**
+ * The app pool, with every pooled client's `query` able to wait on {@link hold}
+ * before it sends an `UPDATE` of a saved query: the last statement of an edit,
+ * after the row has been read (and locked) and its revisions written.
+ */
+function holdingPool(pool: Pool): Pool {
+  const wrapClient = (client: PoolClient): PoolClient =>
+    new Proxy(client, {
+      get(target, key, receiver) {
+        if (key === 'query') {
+          return async (...args: unknown[]) => {
+            const first = args[0];
+            const text =
+              typeof first === 'string' ? first : (first as { text?: string } | null)?.text;
+            if (hold && text && /^update "[a-z_]*saved_query"/.test(text)) await hold();
+            return (target.query as (...a: unknown[]) => unknown)(...args);
+          };
+        }
+        const value = Reflect.get(target, key, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+  return new Proxy(pool, {
+    get(target, key, receiver) {
+      if (key === 'connect') {
+        return async () => wrapClient(await target.connect());
+      }
+      const value = Reflect.get(target, key, receiver);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+}
+
 describe('Drizzle stores, given a database', () => {
   describeWorkspaceStoreContract(() => ({
     name: 'drizzle (db)',
-    store: new DrizzleWorkspaceStore({ db: drizzle(appPool) }),
+    store: new DrizzleWorkspaceStore({ db: drizzle(holdingPool(appPool)) }),
+    holdWrites: (arrive) => {
+      hold = arrive;
+      return () => {
+        hold = undefined;
+      };
+    },
   }));
   describeOverlayStoreContract(
     () => new DrizzleCatalogOverlayStore({ db: drizzle(appPool), key: 'db-contract' }),
@@ -247,11 +289,16 @@ describe('the shipped SQL', () => {
   it('adds no index to a database MikroORM already created', async () => {
     // Applied as the superuser the harness connects with: the point is the
     // statements, and `IF NOT EXISTS` matching MikroORM's names.
+    const count = async () =>
+      (
+        (await mikro.execute(
+          `SELECT count(*)::int AS n FROM pg_indexes WHERE schemaname = 'public' AND tablename = ANY(ARRAY[${MIKRO_TABLES.map((t) => `'${t}'`).join(',')}])`,
+        )) as Array<{ n: number }>
+      )[0]?.n;
+    const before = await count();
     await mikro.execute(catalogDrizzleSql());
-    const after = (await mikro.execute(
-      `SELECT count(*)::int AS n FROM pg_indexes WHERE schemaname = 'public' AND tablename = ANY(ARRAY[${MIKRO_TABLES.map((t) => `'${t}'`).join(',')}])`,
-    )) as Array<{ n: number }>;
-    expect(after[0]?.n).toBe(10);
+    expect(before).toBeGreaterThan(0);
+    expect(await count()).toBe(before);
   });
 
   it('can be applied twice', async () => {

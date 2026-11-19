@@ -40,7 +40,7 @@
     "dev": "tsc -p tsconfig.json --watch"
   },
   "peerDependencies": {
-    "@dudousxd/nestjs-catalog": ">=0.37.0",
+    "@dudousxd/nestjs-catalog": ">=0.38.0",
     "@nestjs/common": ">=10",
     "drizzle-orm": ">=0.44.0 <1"
   },

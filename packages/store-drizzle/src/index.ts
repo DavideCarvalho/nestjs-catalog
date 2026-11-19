@@ -21,7 +21,9 @@ export {
   CATALOG_DRIZZLE_STORE_OPTIONS,
   type CatalogDrizzleStoreAsyncOptions,
   CatalogDrizzleStoreModule,
+  type CatalogDrizzleStoreModuleFlags,
 } from './store.module';
+export { DrizzleCatalogTraceStore } from './trace.store';
 export {
   type CatalogDrizzleStoreOptions,
   DrizzleWorkspaceStore,

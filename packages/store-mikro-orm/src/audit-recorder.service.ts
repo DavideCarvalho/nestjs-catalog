@@ -1,10 +1,7 @@
-import { subscribe, unsubscribe } from 'node:diagnostics_channel';
 import {
-  CATALOG_EVENTS,
   CATALOG_EVENT_PHASE,
   CATALOG_EVENT_PHASE_FALLBACK,
   CATALOG_LIB,
-  CATALOG_WORKSPACE_STORE,
   type CatalogAuditEvent,
   type CatalogTrace,
   type CatalogTraceList,
@@ -12,95 +9,20 @@ import {
   type CatalogTraceStore,
   type CatalogTraceTotals,
   type CatalogUnlinkedList,
-  type CatalogWorkspaceStore,
   type TraceQuery,
-  channelNameFor,
   isCatalogTraceOutcome,
   traceOutcomeFilter,
 } from '@dudousxd/nestjs-catalog';
 import type { EntityManager } from '@mikro-orm/sql';
-import {
-  Inject,
-  Injectable,
-  Logger,
-  type OnModuleDestroy,
-  type OnModuleInit,
-} from '@nestjs/common';
+import { Inject, Injectable } from '@nestjs/common';
 import { CATALOG_STORE_ENTITY_MANAGER } from './context';
 
-type Handler = (message: unknown) => void;
-
 /**
- * Writes the diagnostics stream into the audit table.
- *
- * The library emits on `aviary:catalog:*` and depends on nothing to do it,
- * which is right — but a channel only reaches observers that were listening at
- * the time. Governance asks "who changed this, and when" months later, so
- * something has to keep the answer. This is that something, and it is a
- * separate class so a deployment that wants the events in its own tracing and
- * nowhere else can simply not provide it.
+ * The recorder writes through `CATALOG_WORKSPACE_STORE` alone, so it lives in
+ * the core package where any store can use it. Re-exported here so existing
+ * imports from this package keep working.
  */
-@Injectable()
-export class CatalogAuditRecorder implements OnModuleInit, OnModuleDestroy {
-  private readonly logger = new Logger(CatalogAuditRecorder.name);
-  private readonly handlers = new Map<string, Handler>();
-
-  constructor(
-    // By token, never positionally — and here for a second reason on top of the
-    // one its siblings give. Asking for `MySqlWorkspaceStore` by class pins this
-    // recorder to one connection for the life of the process, and
-    // `RoutingWorkspaceStore` *implements* the interface rather than extending
-    // the class, so it could never be substituted however a host wired its
-    // module. Every event in a multi-environment deployment would have landed in
-    // whichever single database the recorder happened to be constructed
-    // against, filed under no environment at all — a dev event sitting in the
-    // production audit table, reading exactly like a production one.
-    @Inject(CATALOG_WORKSPACE_STORE)
-    private readonly workspace: CatalogWorkspaceStore,
-  ) {}
-
-  onModuleInit(): void {
-    for (const event of CATALOG_EVENTS) {
-      const channel = channelNameFor(event);
-      const handler: Handler = (message) => {
-        void this.record(event, message);
-      };
-      subscribe(channel, handler);
-      this.handlers.set(channel, handler);
-    }
-    this.logger.log(`Recording ${CATALOG_EVENTS.length} catalog event types to the audit trail`);
-  }
-
-  onModuleDestroy(): void {
-    for (const [channel, handler] of this.handlers) {
-      unsubscribe(channel, handler);
-    }
-    this.handlers.clear();
-  }
-
-  private async record(event: string, message: unknown): Promise<void> {
-    const envelope = (message ?? {}) as Record<string, unknown>;
-    const payload = (envelope.payload ?? envelope) as Record<string, unknown>;
-
-    await this.workspace.recordEvent({
-      event,
-      typeName: asString(payload.typeName),
-      principalId: asString(payload.principalId),
-      snapshotId: asString(payload.snapshotId),
-      detail: payload,
-      // The envelope's own timestamp when there is one: the write happens on a
-      // background tick, and "when it was persisted" is a different fact from
-      // "when it happened".
-      occurredAt: new Date(
-        typeof envelope.ts === 'number' ? envelope.ts : Date.now(),
-      ).toISOString(),
-    });
-  }
-}
-
-function asString(value: unknown): string | undefined {
-  return typeof value === 'string' && value.length > 0 ? value : undefined;
-}
+export { CatalogAuditRecorder } from '@dudousxd/nestjs-catalog';
 
 export { CATALOG_LIB };
 
@@ -314,19 +236,22 @@ export class MySqlCatalogTraceStore implements CatalogTraceStore {
     ]);
 
     const traces = assembleTraces(rows);
+    // A graded page that came back empty (an offset past the last trace)
+    // carries no `COUNT(*) OVER ()` row, so the total is counted on its own,
+    // over the same graded set `traceTotals` counts.
+    const gradedTotal = graded
+      ? rows.length > 0
+        ? toNumber(rows[0].total)
+        : (await this.traceTotals(query)).traces
+      : undefined;
     return {
       traces,
-      // Two truthful answers, from whichever statement was in a position to
-      // give one.
-      //
       // When grading came first, `COUNT(*) OVER ()` is evaluated before the
-      // LIMIT, so it is the real number of matching traces — but it only
-      // reaches us on a row, so an empty page carries no total and zero is all
-      // that can be claimed. When paging came first the count is its own
-      // statement over the same filter, which is strictly better: a page past
-      // the end of the list now still reports how many traces there are,
-      // instead of answering an out-of-range offset with "there are none".
-      total: graded ? (rows.length > 0 ? toNumber(rows[0].total) : 0) : (counted ?? 0),
+      // LIMIT, so it is the real number of matching traces, but it reaches us
+      // only on a row; an empty page is counted separately above. When paging
+      // came first the count is its own statement over the same filter. Either
+      // way a page past the end still reports how many traces there are.
+      total: gradedTotal ?? counted ?? 0,
       limit,
       offset,
       unlinked: unlinked.map(toAuditEvent),

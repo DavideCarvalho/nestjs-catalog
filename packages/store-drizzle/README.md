@@ -18,7 +18,9 @@ shared contract (`test/workspace-store-contract.ts`) on a real Postgres.
 |---|---|---|
 | Saved queries, dashboards, revisions, audit events | `CatalogWorkspaceStore` (`CATALOG_WORKSPACE_STORE`) | `DrizzleWorkspaceStore` |
 | Curation overlay | `CatalogOverlayStore` (`CatalogModule.forRoot({ overlayStore })`) | `DrizzleCatalogOverlayStore` |
-| Traces (`CATALOG_TRACE_STORE`), directory (`CATALOG_DIRECTORY`), stored registry, warehouse, pipeline | | Not yet. Later releases add them |
+| Traces: the audit trail grouped by load, graded and paged | `CatalogTraceStore` (`CATALOG_TRACE_STORE`) | `DrizzleCatalogTraceStore` |
+| Recording catalog events into the audit table | | `CatalogAuditRecorder` (from the core package), registered unless `audit: false` |
+| Directory (`CATALOG_DIRECTORY`), stored registry, warehouse, pipeline | | Not yet. Later releases add them |
 
 ## Connecting: your database or your transaction
 
@@ -57,8 +59,27 @@ CatalogModule.forRoot({
 });
 ```
 
-The module registers `DrizzleWorkspaceStore` under `CATALOG_WORKSPACE_STORE` and
-exports `DrizzleCatalogOverlayStore` as a provider.
+The module registers `DrizzleWorkspaceStore` under `CATALOG_WORKSPACE_STORE`,
+`DrizzleCatalogTraceStore` under `CATALOG_TRACE_STORE` and the core
+`CatalogAuditRecorder`, which writes every catalog diagnostics event into the audit
+table (pass `audit: false` to leave it out). It exports `DrizzleCatalogOverlayStore`
+as a provider.
+
+## Traces
+
+`DrizzleCatalogTraceStore` groups the audit table into one trace per snapshot id in
+a single Postgres statement, using `jsonb` operators and an ordered `string_agg`.
+It passes the same contract (`test/trace-store-contract.ts`) the MikroORM trace store
+passes on MySQL, on a trail of 30,000 loads:
+
+- events within one millisecond keep their lifecycle order;
+- a trace's outcome comes from its last terminal event;
+- pages neither repeat nor lose a trace, and a filter still pages by when a load
+  began;
+- `listTraces` and `traceTotals` agree.
+
+One difference: under an outcome filter, a page past the end reports the real total.
+The MikroORM store reports 0 there.
 
 ## Tables and migrations
 
