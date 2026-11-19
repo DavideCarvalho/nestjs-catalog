@@ -13,6 +13,7 @@ export {
   type CatalogRevisionSubject,
   DEFAULT_CATALOG_TABLE_PREFIX,
   DEFAULT_OVERLAY_KEY,
+  MAX_CATALOG_TABLE_PREFIX_LENGTH,
   catalogDrizzleTables,
   catalogRevisionKey,
 } from './schema';

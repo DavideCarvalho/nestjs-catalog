@@ -110,6 +110,27 @@ export function describeWorkspaceStoreContract(boot: () => WorkspaceContractStor
       expect(await store.getSavedQueries([])).toEqual([]);
     });
 
+    it('leaves updatedAt alone when an edit changes nothing', async () => {
+      const { store } = boot();
+      const name = unique('q');
+      const saved = await store.saveQuery(
+        { name, sql: 'SELECT 1', cacheTtlSeconds: 5, visualization: { kind: 'bar' } },
+        'a',
+      );
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const same = await store.updateSavedQuery(saved.id, {
+        name,
+        sql: 'SELECT 1',
+        cacheTtlSeconds: 5,
+        visualization: { kind: 'bar' },
+      });
+      expect(same?.updatedAt).toBe(saved.updatedAt);
+      expect((await store.getSavedQuery(saved.id))?.updatedAt).toBe(saved.updatedAt);
+
+      const renamed = await store.updateSavedQuery(saved.id, { name: unique('renamed') });
+      expect(Date.parse(renamed?.updatedAt ?? '')).toBeGreaterThan(Date.parse(saved.updatedAt));
+    });
+
     it('deletes a query', async () => {
       const { store } = boot();
       const saved = await store.saveQuery({ name: unique('q'), sql: 'SELECT 1' }, 'a');
@@ -184,6 +205,21 @@ export function describeWorkspaceStoreContract(boot: () => WorkspaceContractStor
       expect(revisions.at(-1)?.version).toBe(4);
     });
 
+    it('gives two concurrent edits of one query two versions, losing neither', async () => {
+      const { store } = boot();
+      if (!supportsSavedQueryRevisions(store)) return;
+      const saved = await store.saveQuery({ name: unique('q'), sql: 'SELECT 0' }, 'a');
+      await Promise.all([
+        store.updateSavedQuery(saved.id, { sql: 'SELECT 1' }),
+        store.updateSavedQuery(saved.id, { sql: 'SELECT 2' }),
+      ]);
+      const revisions = await store.listSavedQueryRevisions(saved.id);
+      expect(revisions.map((r) => r.version)).toEqual([3, 2, 1]);
+      expect(revisions.map((r) => r.body).sort()).toEqual(['SELECT 0', 'SELECT 1', 'SELECT 2']);
+      const live = await store.getSavedQuery(saved.id);
+      expect(live?.sql).toBe(revisions[0]?.body);
+    });
+
     it('answers an empty history for an id that names nothing', async () => {
       const { store } = boot();
       if (!supportsSavedQueryRevisions(store)) return;
@@ -212,13 +248,22 @@ export function describeWorkspaceStoreContract(boot: () => WorkspaceContractStor
       ]);
       expect(await store.getDashboard(saved.id)).toEqual(saved);
 
-      const updated = await store.updateDashboard(saved.id, {
-        cards: [{ id: 'c2', savedQueryId: 'q2', width: 9 as 1, position: 4 }],
-      });
+      const cards = [{ id: 'c2', savedQueryId: 'q2', width: 9 as 1, position: 4 }];
+      const updated = await store.updateDashboard(saved.id, { cards });
       expect(updated?.name).toBe(name);
       expect(updated?.cards).toMatchObject([
         { id: 'c2', savedQueryId: 'q2', width: 2, position: 4 },
       ]);
+
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const unchanged = await store.updateDashboard(saved.id, {
+        name,
+        shared: true,
+        // The cards as they were sent, not as they read back: the stored width
+        // is 9, and the read normalises it to 2.
+        cards: cards.map((card) => ({ ...card })),
+      });
+      expect(unchanged?.updatedAt).toBe(updated?.updatedAt);
 
       expect(await store.deleteDashboard(saved.id)).toBe(true);
       expect(await store.getDashboard(saved.id)).toBeUndefined();
@@ -270,6 +315,22 @@ export function describeWorkspaceStoreContract(boot: () => WorkspaceContractStor
 
       expect(await store.listEvents({ typeName, limit: 1 })).toHaveLength(1);
       expect(await store.listEvents({ typeName, limit: 0 })).toHaveLength(1);
+    });
+
+    it('returns at most 500 events, whatever limit is asked for', async () => {
+      const { store } = boot();
+      const typeName = unique('many');
+      const at = Date.parse('2026-02-01T00:00:00.000Z');
+      for (let i = 0; i < 501; i += 1) {
+        await store.recordEvent({
+          event: 'snapshot.committed',
+          typeName,
+          detail: { i },
+          occurredAt: new Date(at + i).toISOString(),
+        });
+      }
+      expect(await store.listEvents({ typeName, limit: 10_000 })).toHaveLength(500);
+      expect(await store.listEvents({ typeName })).toHaveLength(100);
     });
 
     it('never throws when an event cannot be stored', async () => {

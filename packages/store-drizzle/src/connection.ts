@@ -20,6 +20,25 @@ export type CatalogDrizzleDatabase = PgDatabase<PgQueryResultHKT, any, any>;
  * call, and every statement of that method runs on the handle the callback is
  * given, so a method is never split across two transactions the host did not
  * open.
+ *
+ * **Each call must get exactly one transaction of its own, or a savepoint.**
+ * Open a transaction per call (`db.transaction(work)`), or, inside a
+ * transaction the host already holds, a savepoint (`tx.transaction(work)`),
+ * and commit or roll it back when `work` settles. Two store guarantees rest on
+ * that:
+ *
+ * - **Atomicity.** A saved query and the revision it records are written by
+ *   separate statements in one call. They commit together, or neither does,
+ *   only if the call is one transaction or savepoint. Handing `work` a bare
+ *   connection in autocommit mode commits each statement on its own.
+ * - **The edit lock.** An edit reads the row `FOR UPDATE` so two concurrent edits
+ *   of one query cannot both write the same next version. The lock is held until
+ *   the transaction ends, so in autocommit mode it is released before the update
+ *   runs and protects nothing.
+ *
+ * A `run` that hands every call the same open transaction, with no savepoint,
+ * keeps both guarantees only until something rolls back: the rollback then takes
+ * every earlier call's writes with it.
  */
 export type CatalogDrizzleRun = <T>(work: (db: CatalogDrizzleDatabase) => Promise<T>) => Promise<T>;
 

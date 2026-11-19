@@ -8,7 +8,12 @@ import {
   describeOverlayStoreContract,
   describeWorkspaceStoreContract,
 } from '../../../test/workspace-store-contract';
-import type { CatalogDrizzleRun } from './connection';
+// The MikroORM store's own Postgres harness, to compare the two schemas.
+import {
+  type PostgresCatalogDatabase,
+  openPostgresCatalogDatabase,
+} from '../../store-mikro-orm/test/postgres-harness';
+import type { CatalogDrizzleDatabase, CatalogDrizzleRun } from './connection';
 import { catalogDrizzleSql } from './ddl';
 import { DrizzleCatalogOverlayStore } from './overlay.store';
 import { catalogDrizzleTables } from './schema';
@@ -31,6 +36,7 @@ import { DrizzleWorkspaceStore } from './workspace.store';
 let container: StartedPostgreSqlContainer;
 let ownerPool: Pool;
 let appPool: Pool;
+let mikro: PostgresCatalogDatabase;
 
 const RLS_PREFIX = 'rls_catalog_';
 
@@ -79,6 +85,7 @@ beforeAll(async () => {
 }, 300_000);
 
 afterAll(async () => {
+  await mikro?.close();
   await ownerPool?.end();
   await appPool?.end();
   await container?.stop();
@@ -152,7 +159,61 @@ describe('Drizzle stores, through a host transaction wrapper under row security'
   });
 });
 
+describe('recordEvent inside a transaction the host shares', () => {
+  const tooLong = () => ({
+    event: 'x'.repeat(10_000),
+    detail: {},
+    occurredAt: new Date().toISOString(),
+  });
+
+  async function survivesFailedAudit(
+    label: string,
+    runIn: (tx: CatalogDrizzleDatabase) => CatalogDrizzleRun,
+  ): Promise<void> {
+    const marker = `SELECT 'after-failed-audit-${label}-${Date.now()}'`;
+    await drizzle(appPool).transaction(async (tx) => {
+      const store = new DrizzleWorkspaceStore({ run: runIn(tx) });
+      await expect(store.recordEvent(tooLong())).resolves.toBeUndefined();
+      // Without the savepoint Postgres answers "current transaction is aborted".
+      await store.saveQuery({ name: 'after-failed-audit', sql: marker }, 'a');
+    });
+    const committed = await appPool.query(
+      'SELECT count(*) AS n FROM catalog_saved_query WHERE sql = $1',
+      [marker],
+    );
+    expect(committed.rows[0]).toEqual({ n: '1' });
+  }
+
+  it('leaves it usable when run opens a savepoint per call', () =>
+    survivesFailedAudit('savepoint', (tx) => (work) => tx.transaction((sp) => work(sp))));
+
+  it('leaves it usable when run hands every call the shared transaction', () =>
+    survivesFailedAudit('shared', (tx) => (work) => work(tx)));
+});
+
 describe('the shipped SQL', () => {
+  const MIKRO_TABLES = [
+    'catalog_saved_query',
+    'catalog_dashboard',
+    'catalog_audit_event',
+    'catalog_revision',
+  ];
+
+  const columnsSql = `SELECT table_name, column_name, data_type, datetime_precision,
+      character_maximum_length, column_default, is_nullable
+    FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = ANY($1)
+    ORDER BY table_name, ordinal_position`;
+
+  const indexesSql = `SELECT tablename, indexname,
+      regexp_replace(indexdef, '^.* USING ', '') AS definition
+    FROM pg_indexes WHERE schemaname = 'public' AND tablename = ANY($1)
+    ORDER BY tablename, indexname`;
+
+  beforeAll(async () => {
+    mikro = await openPostgresCatalogDatabase(container, 'mikro_reference');
+  }, 300_000);
+
   it('creates exactly the columns the Drizzle tables define', async () => {
     for (const table of Object.values(catalogDrizzleTables())) {
       const config = getTableConfig(table);
@@ -165,6 +226,32 @@ describe('the shipped SQL', () => {
         config.columns.map((column) => [column.name, column.notNull]),
       );
     }
+  });
+
+  it('gives every shared table the types, precisions, defaults and nullability MikroORM gives it', async () => {
+    const mikroColumns = await mikro.execute(
+      columnsSql.replace('ANY($1)', `ANY(ARRAY[${MIKRO_TABLES.map((t) => `'${t}'`).join(',')}])`),
+    );
+    const ours = await ownerPool.query(columnsSql, [MIKRO_TABLES]);
+    expect(ours.rows).toEqual(mikroColumns);
+  });
+
+  it('names and defines every index on a shared table as MikroORM does', async () => {
+    const mikroIndexes = await mikro.execute(
+      indexesSql.replace('ANY($1)', `ANY(ARRAY[${MIKRO_TABLES.map((t) => `'${t}'`).join(',')}])`),
+    );
+    const ours = await ownerPool.query(indexesSql, [MIKRO_TABLES]);
+    expect(ours.rows).toEqual(mikroIndexes);
+  });
+
+  it('adds no index to a database MikroORM already created', async () => {
+    // Applied as the superuser the harness connects with: the point is the
+    // statements, and `IF NOT EXISTS` matching MikroORM's names.
+    await mikro.execute(catalogDrizzleSql());
+    const after = (await mikro.execute(
+      `SELECT count(*)::int AS n FROM pg_indexes WHERE schemaname = 'public' AND tablename = ANY(ARRAY[${MIKRO_TABLES.map((t) => `'${t}'`).join(',')}])`,
+    )) as Array<{ n: number }>;
+    expect(after[0]?.n).toBe(10);
   });
 
   it('can be applied twice', async () => {

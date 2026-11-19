@@ -30,6 +30,14 @@ A store takes **one** of:
   store call issues goes through it, so a host can set row-security settings,
   tenant context or its own guards first.
 
+**`run` must give each call exactly one transaction of its own, or a savepoint**
+(`db.transaction(work)`, or `tx.transaction(work)` inside a transaction you already
+hold). The store relies on it twice. A saved query and its revision are written by
+separate statements and are atomic only inside one transaction. An edit locks the
+row `FOR UPDATE`, and that lock lasts only until the transaction ends, so in
+autocommit mode it protects nothing. `recordEvent`, which never throws, writes in a
+savepoint of its own, so a failed audit insert does not abort your transaction.
+
 ```ts
 import { CatalogDrizzleStoreModule, DrizzleCatalogOverlayStore } from '@dudousxd/nestjs-catalog-store-drizzle';
 
@@ -57,8 +65,14 @@ exports `DrizzleCatalogOverlayStore` as a provider.
 `catalogDrizzleTables({ prefix, schema })` returns the Drizzle table definitions.
 `prefix` defaults to `catalog_`, which gives the MikroORM store's table names
 (`catalog_saved_query`, `catalog_dashboard`, `catalog_revision`,
-`catalog_audit_event`), plus `catalog_overlay`. `schema` puts them in a named Postgres
-schema.
+`catalog_audit_event`), plus `catalog_overlay`. A prefix is at most 17 characters, so
+every index name fits in Postgres's 63-byte limit. `schema` puts the tables in a
+named Postgres schema; `public` is the same as leaving it out.
+
+The column types, precisions, defaults and index names are the ones the MikroORM
+store creates on Postgres, and a database test compares the two. A database the
+MikroORM store already set up can therefore move to this store without a migration
+and without duplicate indexes.
 
 Two ways to create them:
 

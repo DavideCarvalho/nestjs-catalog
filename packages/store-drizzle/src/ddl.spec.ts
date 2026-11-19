@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { catalogDrizzleRunner } from './connection';
 import { catalogDrizzleSql } from './ddl';
-import { catalogDrizzleTables } from './schema';
+import { MAX_CATALOG_TABLE_PREFIX_LENGTH, catalogDrizzleTables } from './schema';
 
 describe('catalogDrizzleSql', () => {
   it('matches the SQL file the package ships', () => {
@@ -29,6 +29,26 @@ describe('catalogDrizzleSql', () => {
   it('grants, owns and creates nothing beyond tables and indexes', () => {
     const ddl = catalogDrizzleSql();
     expect(ddl).not.toMatch(/\b(GRANT|OWNER|EXTENSION|ROLE|SCHEMA|SECURITY DEFINER)\b/i);
+  });
+
+  it('knows its longest derived name', () => {
+    const names = [
+      ...catalogDrizzleSql({ prefix: '' }).matchAll(/(?:TABLE|INDEX) IF NOT EXISTS "([^"]+)"/g),
+    ];
+    const longest = Math.max(...names.map((m) => Buffer.byteLength(m[1] ?? '')));
+    expect(longest + MAX_CATALOG_TABLE_PREFIX_LENGTH).toBe(63);
+  });
+
+  it('treats the public schema as no schema', () => {
+    expect(catalogDrizzleSql({ schema: 'public' })).toBe(catalogDrizzleSql());
+  });
+
+  it('keeps every name within 63 bytes at the longest prefix it accepts', () => {
+    const prefix = 'p'.repeat(MAX_CATALOG_TABLE_PREFIX_LENGTH);
+    const ddl = catalogDrizzleSql({ prefix });
+    const names = [...ddl.matchAll(/(?:TABLE|INDEX) IF NOT EXISTS "([^"]+)"/g)].map((m) => m[1]);
+    expect(Math.max(...names.map((name) => Buffer.byteLength(name ?? '')))).toBe(63);
+    expect(() => catalogDrizzleTables({ prefix: `${prefix}p` })).toThrow(/at most 17/);
   });
 
   it('refuses a prefix that would need quoting', () => {

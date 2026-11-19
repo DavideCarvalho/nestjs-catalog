@@ -147,15 +147,18 @@ export class DrizzleWorkspaceStore implements CatalogWorkspaceStore {
       const row = await this.findSavedQuery(db, id, true);
       if (!row) return undefined;
 
-      const patch = savedQueryPatch(input);
+      // Only what differs from the row. An edit that changes nothing writes
+      // nothing, so `updatedAt` keeps meaning "last changed", as it does in the
+      // MikroORM store, whose unit of work skips an unchanged entity.
+      const patch = savedQueryPatch(input, row);
       if (Object.keys(patch).length === 0) return toSavedQuery(row);
 
-      const sqlChanged = input.sql !== undefined && input.sql !== row.sql;
+      const sqlChanged = patch.sql !== undefined;
       const now = new Date();
       if (sqlChanged) patch.version = row.version + 1;
       patch.updatedAt = now;
 
-      if (sqlChanged && input.sql !== undefined) {
+      if (patch.sql !== undefined) {
         await recordRevision(db, this.t, {
           subject: 'saved-query',
           subjectId: row.id,
@@ -168,7 +171,7 @@ export class DrizzleWorkspaceStore implements CatalogWorkspaceStore {
           subject: 'saved-query',
           subjectId: row.id,
           version: row.version + 1,
-          body: input.sql,
+          body: patch.sql,
           authoredBy: row.createdBy,
           authoredAt: now,
         });
@@ -266,18 +269,13 @@ export class DrizzleWorkspaceStore implements CatalogWorkspaceStore {
   ): Promise<Dashboard | undefined> {
     const d = this.t.dashboard;
     return this.run(async (db) => {
-      const patch: Partial<DashboardRow> = {};
-      if (input.name !== undefined) patch.name = input.name;
-      if (input.description !== undefined) patch.description = input.description;
-      if (input.cards !== undefined) patch.cards = input.cards.map((card) => ({ ...card }));
-      if (input.shared !== undefined) patch.shared = input.shared;
-      if (Object.keys(patch).length === 0) {
-        const [row] = await db.select().from(d).where(eq(d.id, id)).limit(1);
-        return row ? toDashboard(row) : undefined;
-      }
+      const [row] = await db.select().from(d).where(eq(d.id, id)).limit(1).for('update');
+      if (!row) return undefined;
+      const patch = dashboardPatch(input, row);
+      if (Object.keys(patch).length === 0) return toDashboard(row);
       patch.updatedAt = new Date();
-      const [row] = await db.update(d).set(patch).where(eq(d.id, id)).returning();
-      return row ? toDashboard(row) : undefined;
+      const [updated] = await db.update(d).set(patch).where(eq(d.id, id)).returning();
+      return updated ? toDashboard(updated) : undefined;
     });
   }
 
@@ -293,22 +291,35 @@ export class DrizzleWorkspaceStore implements CatalogWorkspaceStore {
    * Never throws. It is called on the path of a real load, and an audit write
    * that could fail a commit would make the trail the least reliable part of
    * the system while looking like the most.
+   *
+   * The insert runs in its own nested transaction, which Drizzle issues as a
+   * savepoint inside the runner's transaction. On Postgres a failed statement
+   * aborts the whole transaction it is in, so swallowing the error without a
+   * savepoint would leave a host transaction shared with other work unable to
+   * run anything else, and the host would see that failure somewhere unrelated.
+   * Rolling back to the savepoint undoes the insert alone.
    */
   async recordEvent(event: Omit<CatalogAuditEvent, 'id'>): Promise<void> {
     try {
       await this.run(async (db) => {
-        await db.insert(this.t.auditEvent).values({
-          id: randomUUID(),
-          event: event.event,
-          typeName: event.typeName ?? null,
-          principalId: event.principalId ?? null,
-          snapshotId: event.snapshotId ?? null,
-          detail: event.detail ?? {},
-          occurredAt: new Date(event.occurredAt),
-        });
+        try {
+          await db.transaction(async (tx) => {
+            await tx.insert(this.t.auditEvent).values({
+              id: randomUUID(),
+              event: event.event,
+              typeName: event.typeName ?? null,
+              principalId: event.principalId ?? null,
+              snapshotId: event.snapshotId ?? null,
+              detail: event.detail ?? {},
+              occurredAt: new Date(event.occurredAt),
+            });
+          });
+        } catch {
+          // Rolled back to the savepoint; the runner's transaction is intact.
+        }
       });
     } catch {
-      // Swallowed deliberately, see the docblock.
+      // The runner itself failed (no connection, the host refused): swallowed too.
     }
   }
 
@@ -346,7 +357,9 @@ export class DrizzleWorkspaceStore implements CatalogWorkspaceStore {
     const q = this.t.savedQuery;
     const select = db.select().from(q).where(eq(q.id, id)).limit(1);
     // Locked on the edit path, so two concurrent edits of one query cannot both
-    // read version N and both write N + 1 with different text.
+    // read version N and both write N + 1 with different text. The lock lasts
+    // until the runner's transaction ends, which is why `run` must give each call
+    // its own transaction or savepoint (see `CatalogDrizzleRun`).
     const [row] = forUpdate ? await select.for('update') : await select;
     return row;
   }
@@ -451,17 +464,61 @@ export async function readRevisions(
   ];
 }
 
-/** The columns an edit sets: only the fields the input names. */
-function savedQueryPatch(input: Partial<SaveQueryInput>): Partial<SavedQueryRow> {
+/** The columns an edit changes: the fields the input names whose value differs from the row. */
+function savedQueryPatch(
+  input: Partial<SaveQueryInput>,
+  row: SavedQueryRow,
+): Partial<SavedQueryRow> {
   const patch: Partial<SavedQueryRow> = {};
-  if (input.name !== undefined) patch.name = input.name;
-  if (input.description !== undefined) patch.description = input.description;
-  if (input.sql !== undefined) patch.sql = input.sql;
-  if (input.folder !== undefined) patch.folder = input.folder;
-  if (input.cacheTtlSeconds !== undefined) patch.cacheTtlSeconds = input.cacheTtlSeconds;
-  if (input.visualization !== undefined) patch.visualization = { ...input.visualization };
-  if (input.shared !== undefined) patch.shared = input.shared;
+  if (input.name !== undefined && input.name !== row.name) patch.name = input.name;
+  if (input.description !== undefined && input.description !== row.description) {
+    patch.description = input.description;
+  }
+  if (input.sql !== undefined && input.sql !== row.sql) patch.sql = input.sql;
+  if (input.folder !== undefined && input.folder !== row.folder) patch.folder = input.folder;
+  if (input.cacheTtlSeconds !== undefined && input.cacheTtlSeconds !== row.cacheTtlSeconds) {
+    patch.cacheTtlSeconds = input.cacheTtlSeconds;
+  }
+  if (input.visualization !== undefined && !sameJson(input.visualization, row.visualization)) {
+    patch.visualization = { ...input.visualization };
+  }
+  if (input.shared !== undefined && input.shared !== row.shared) patch.shared = input.shared;
   return patch;
+}
+
+function dashboardPatch(
+  input: Partial<{ name: string; description: string; cards: DashboardCard[]; shared: boolean }>,
+  row: DashboardRow,
+): Partial<DashboardRow> {
+  const patch: Partial<DashboardRow> = {};
+  if (input.name !== undefined && input.name !== row.name) patch.name = input.name;
+  if (input.description !== undefined && input.description !== row.description) {
+    patch.description = input.description;
+  }
+  if (input.cards !== undefined && !sameJson(input.cards, row.cards)) {
+    patch.cards = input.cards.map((card) => ({ ...card }));
+  }
+  if (input.shared !== undefined && input.shared !== row.shared) patch.shared = input.shared;
+  return patch;
+}
+
+/**
+ * Whether two JSON values are equal as `jsonb` would store them: key order does
+ * not matter and an `undefined` member is absent.
+ */
+function sameJson(a: unknown, b: unknown): boolean {
+  return canonicalJson(a) === canonicalJson(b);
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    const entries = Object.entries(value)
+      .filter(([, member]) => member !== undefined)
+      .sort(([x], [y]) => (x < y ? -1 : x > y ? 1 : 0));
+    return `{${entries.map(([key, member]) => `${JSON.stringify(key)}:${canonicalJson(member)}`).join(',')}}`;
+  }
+  return JSON.stringify(value ?? null);
 }
 
 function toRevision(row: RevisionRow): CatalogRevision {

@@ -29,6 +29,19 @@ export const DEFAULT_CATALOG_TABLE_PREFIX = 'catalog_';
 const PREFIX_SHAPE = /^[a-z_][a-z0-9_]*$/;
 
 /**
+ * The longest name the tables derive from the prefix, without it:
+ * `revision_subject_kind_subject_id_version_index`. A unit test checks it
+ * against every name the tables derive.
+ */
+const LONGEST_DERIVED_NAME = 46;
+
+/** Postgres truncates identifiers past 63 bytes, so two long index names could collide silently. */
+const POSTGRES_IDENTIFIER_LIMIT = 63;
+
+/** How long a prefix may be. Every derived table and index name then fits in 63 bytes. */
+export const MAX_CATALOG_TABLE_PREFIX_LENGTH = POSTGRES_IDENTIFIER_LIMIT - LONGEST_DERIVED_NAME;
+
+/**
  * Checked rather than quoted around: a prefix ends up in table, index and
  * constraint names, and a name that needs quoting in one of those places is a
  * name some operator will one day type unquoted.
@@ -39,15 +52,22 @@ function checkedPrefix(prefix: string): string {
       `@dudousxd/nestjs-catalog-store-drizzle: table prefix "${prefix}" must be lower-case letters, digits and underscores, starting with a letter or underscore.`,
     );
   }
+  if (prefix.length > MAX_CATALOG_TABLE_PREFIX_LENGTH) {
+    throw new Error(
+      `@dudousxd/nestjs-catalog-store-drizzle: table prefix "${prefix}" is ${prefix.length} characters; at most ${MAX_CATALOG_TABLE_PREFIX_LENGTH} keep every index name within Postgres's 63-byte identifier limit.`,
+    );
+  }
   return prefix;
 }
 
 /**
- * Millisecond precision with a time zone, everywhere. The MikroORM store had to
- * add `length: 3` after events recorded in one second came back in insertion
- * order; starting there costs nothing.
+ * A time zone everywhere, and the precision the MikroORM store gives the same
+ * column, so a database either store created is the database the other expects:
+ * milliseconds (3) on the audit and revision times, which MikroORM declares with
+ * `length: 3`, and Postgres's default microseconds (6) on the row times.
  */
-const at = (name: string) => timestamp(name, { precision: 3, withTimezone: true, mode: 'date' });
+const at = (name: string, precision: 3 | 6 = 3) =>
+  timestamp(name, { precision, withTimezone: true, mode: 'date' });
 
 /**
  * The catalog's tables, as Drizzle definitions.
@@ -59,9 +79,14 @@ const at = (name: string) => timestamp(name, { precision: 3, withTimezone: true,
  */
 export function catalogDrizzleTables(options: CatalogDrizzleTableOptions = {}) {
   const prefix = checkedPrefix(options.prefix ?? DEFAULT_CATALOG_TABLE_PREFIX);
-  // One signature for both: a schema's `table` builds the same table, only qualified.
-  const table = (options.schema ? pgSchema(options.schema).table : pgTable) as typeof pgTable;
+  // `public` is what an unqualified table is already in, and drizzle-kit refuses
+  // `pgSchema('public')`, so it is the plain table. Any other schema builds the
+  // same table, only qualified: one signature for both.
+  const schema = options.schema && options.schema !== 'public' ? options.schema : undefined;
+  const table = (schema ? pgSchema(schema).table : pgTable) as typeof pgTable;
   const n = (name: string) => `${prefix}${name}`;
+  // Index names follow MikroORM's `<table>_<columns>_index`, so a database the
+  // MikroORM store already created gets no second copy of any index.
 
   const savedQuery = table(
     n('saved_query'),
@@ -77,10 +102,10 @@ export function catalogDrizzleTables(options: CatalogDrizzleTableOptions = {}) {
       cacheTtlSeconds: integer('cache_ttl_seconds').notNull().default(0),
       visualization: jsonb('visualization').$type<Record<string, unknown>>().notNull(),
       shared: boolean('shared').notNull().default(false),
-      createdAt: at('created_at').notNull(),
-      updatedAt: at('updated_at').notNull(),
+      createdAt: at('created_at', 6).notNull(),
+      updatedAt: at('updated_at', 6).notNull(),
     },
-    (t) => [index(n('saved_query_folder_idx')).on(t.folder)],
+    (t) => [index(n('saved_query_folder_index')).on(t.folder)],
   );
 
   const dashboard = table(n('dashboard'), {
@@ -91,8 +116,8 @@ export function catalogDrizzleTables(options: CatalogDrizzleTableOptions = {}) {
     /** Cards as one JSON value: they are only ever read and written whole. */
     cards: jsonb('cards').$type<Array<Record<string, unknown>>>().notNull(),
     shared: boolean('shared').notNull().default(false),
-    createdAt: at('created_at').notNull(),
-    updatedAt: at('updated_at').notNull(),
+    createdAt: at('created_at', 6).notNull(),
+    updatedAt: at('updated_at', 6).notNull(),
   });
 
   const auditEvent = table(
@@ -107,10 +132,10 @@ export function catalogDrizzleTables(options: CatalogDrizzleTableOptions = {}) {
       occurredAt: at('occurred_at').notNull(),
     },
     (t) => [
-      index(n('audit_event_occurred_at_idx')).on(t.occurredAt),
-      index(n('audit_event_type_name_idx')).on(t.typeName, t.occurredAt),
-      index(n('audit_event_principal_id_idx')).on(t.principalId, t.occurredAt),
-      index(n('audit_event_snapshot_id_idx')).on(t.snapshotId, t.occurredAt),
+      index(n('audit_event_occurred_at_index')).on(t.occurredAt),
+      index(n('audit_event_type_name_occurred_at_index')).on(t.typeName, t.occurredAt),
+      index(n('audit_event_principal_id_occurred_at_index')).on(t.principalId, t.occurredAt),
+      index(n('audit_event_snapshot_id_occurred_at_index')).on(t.snapshotId, t.occurredAt),
     ],
   );
 
@@ -126,7 +151,13 @@ export function catalogDrizzleTables(options: CatalogDrizzleTableOptions = {}) {
       authoredBy: varchar('authored_by', { length: 128 }).notNull(),
       authoredAt: at('authored_at').notNull(),
     },
-    (t) => [index(n('revision_subject_idx')).on(t.subjectKind, t.subjectId, t.version)],
+    (t) => [
+      index(n('revision_subject_kind_subject_id_version_index')).on(
+        t.subjectKind,
+        t.subjectId,
+        t.version,
+      ),
+    ],
   );
 
   /**

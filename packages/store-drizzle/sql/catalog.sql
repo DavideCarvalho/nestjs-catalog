@@ -9,11 +9,11 @@ CREATE TABLE IF NOT EXISTS "catalog_saved_query" (
   "cache_ttl_seconds" integer NOT NULL DEFAULT 0,
   "visualization" jsonb NOT NULL,
   "shared" boolean NOT NULL DEFAULT false,
-  "created_at" timestamp (3) with time zone NOT NULL,
-  "updated_at" timestamp (3) with time zone NOT NULL
+  "created_at" timestamp (6) with time zone NOT NULL,
+  "updated_at" timestamp (6) with time zone NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS "catalog_saved_query_folder_idx" ON "catalog_saved_query" ("folder");
+CREATE INDEX IF NOT EXISTS "catalog_saved_query_folder_index" ON "catalog_saved_query" ("folder");
 
 CREATE TABLE IF NOT EXISTS "catalog_dashboard" (
   "id" varchar(64) PRIMARY KEY,
@@ -22,8 +22,8 @@ CREATE TABLE IF NOT EXISTS "catalog_dashboard" (
   "created_by" varchar(128) NOT NULL,
   "cards" jsonb NOT NULL,
   "shared" boolean NOT NULL DEFAULT false,
-  "created_at" timestamp (3) with time zone NOT NULL,
-  "updated_at" timestamp (3) with time zone NOT NULL
+  "created_at" timestamp (6) with time zone NOT NULL,
+  "updated_at" timestamp (6) with time zone NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS "catalog_audit_event" (
@@ -36,13 +36,13 @@ CREATE TABLE IF NOT EXISTS "catalog_audit_event" (
   "occurred_at" timestamp (3) with time zone NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS "catalog_audit_event_occurred_at_idx" ON "catalog_audit_event" ("occurred_at");
+CREATE INDEX IF NOT EXISTS "catalog_audit_event_occurred_at_index" ON "catalog_audit_event" ("occurred_at");
 
-CREATE INDEX IF NOT EXISTS "catalog_audit_event_type_name_idx" ON "catalog_audit_event" ("type_name", "occurred_at");
+CREATE INDEX IF NOT EXISTS "catalog_audit_event_type_name_occurred_at_index" ON "catalog_audit_event" ("type_name", "occurred_at");
 
-CREATE INDEX IF NOT EXISTS "catalog_audit_event_principal_id_idx" ON "catalog_audit_event" ("principal_id", "occurred_at");
+CREATE INDEX IF NOT EXISTS "catalog_audit_event_principal_id_occurred_at_index" ON "catalog_audit_event" ("principal_id", "occurred_at");
 
-CREATE INDEX IF NOT EXISTS "catalog_audit_event_snapshot_id_idx" ON "catalog_audit_event" ("snapshot_id", "occurred_at");
+CREATE INDEX IF NOT EXISTS "catalog_audit_event_snapshot_id_occurred_at_index" ON "catalog_audit_event" ("snapshot_id", "occurred_at");
 
 CREATE TABLE IF NOT EXISTS "catalog_revision" (
   "id" varchar(160) PRIMARY KEY,
@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS "catalog_revision" (
   "authored_at" timestamp (3) with time zone NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS "catalog_revision_subject_idx" ON "catalog_revision" ("subject_kind", "subject_id", "version");
+CREATE INDEX IF NOT EXISTS "catalog_revision_subject_kind_subject_id_version_index" ON "catalog_revision" ("subject_kind", "subject_id", "version");
 
 CREATE TABLE IF NOT EXISTS "catalog_overlay" (
   "id" varchar(64) PRIMARY KEY,
