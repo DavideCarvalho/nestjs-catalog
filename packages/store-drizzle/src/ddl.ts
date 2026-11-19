@@ -41,7 +41,23 @@ function tableStatements(table: AnyPgTable): string[] {
     return `  ${parts.join(' ')}`;
   });
 
-  const statements = [`CREATE TABLE IF NOT EXISTS ${qualified} (\n${columns.join(',\n')}\n);`];
+  const constraints = config.foreignKeys.map((key) => {
+    const reference = key.reference();
+    const foreign = getTableConfig(reference.foreignTable);
+    const target = foreign.schema
+      ? `${ident(foreign.schema)}.${ident(foreign.name)}`
+      : ident(foreign.name);
+    const onDelete = key.onDelete ? ` ON DELETE ${key.onDelete.toUpperCase()}` : '';
+    return `  CONSTRAINT ${ident(key.getName())} FOREIGN KEY (${reference.columns
+      .map((column) => ident(column.name))
+      .join(', ')}) REFERENCES ${target} (${reference.foreignColumns
+      .map((column) => ident(column.name))
+      .join(', ')})${onDelete}`;
+  });
+
+  const statements = [
+    `CREATE TABLE IF NOT EXISTS ${qualified} (\n${[...columns, ...constraints].join(',\n')}\n);`,
+  ];
   for (const index of config.indexes) {
     const name = index.config.name;
     if (!name) throw new Error(`An index on ${config.name} has no name.`);

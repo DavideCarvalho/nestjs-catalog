@@ -239,6 +239,10 @@ describe('the shipped SQL', () => {
     'catalog_dashboard',
     'catalog_audit_event',
     'catalog_revision',
+    'catalog_object_type',
+    'catalog_property',
+    'catalog_snapshot',
+    'catalog_principal',
   ];
 
   const columnsSql = `SELECT table_name, column_name, data_type, datetime_precision,
@@ -284,6 +288,23 @@ describe('the shipped SQL', () => {
     );
     const ours = await ownerPool.query(indexesSql, [MIKRO_TABLES]);
     expect(ours.rows).toEqual(mikroIndexes);
+  });
+
+  it('names and defines every foreign key and check as MikroORM does', async () => {
+    const constraintsSql = `SELECT conrelid::regclass::text AS table_name, conname,
+        pg_get_constraintdef(oid) AS definition
+      FROM pg_constraint
+      WHERE contype IN ('f', 'u', 'c') AND conrelid::regclass::text = ANY($1)
+      ORDER BY 1, 2`;
+    const mikroConstraints = await mikro.execute(
+      constraintsSql.replace(
+        'ANY($1)',
+        `ANY(ARRAY[${MIKRO_TABLES.map((t) => `'${t}'`).join(',')}])`,
+      ),
+    );
+    const ours = await ownerPool.query(constraintsSql, [MIKRO_TABLES]);
+    expect(ours.rows).toEqual(mikroConstraints);
+    expect(ours.rows.length).toBeGreaterThan(0);
   });
 
   it('adds no index to a database MikroORM already created', async () => {
