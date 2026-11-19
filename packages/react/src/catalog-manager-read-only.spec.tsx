@@ -25,7 +25,7 @@
 import type { CatalogObjectTypeDef, CatalogSnapshot } from '@dudousxd/nestjs-catalog/client';
 import { catalogRoutes } from '@dudousxd/nestjs-catalog/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { afterEach, describe, expect, it } from 'vitest';
 import { CatalogManager } from './CatalogManager';
@@ -134,13 +134,30 @@ const TYPE: CatalogObjectTypeDef = {
       description: 'Distance driven.',
     },
   ],
-  relations: [],
+  // One link this type declares, so its label is on screen to be (not) edited. Its target is
+  // unpublished on purpose: a published one is a navigate button, and the "click everything" case
+  // below would then move the detail pane to another type halfway through its loop.
+  relations: [
+    {
+      name: 'base',
+      displayName: 'Home base',
+      kind: 'm:1',
+      targetType: 'Base',
+      nullable: true,
+      hidden: false,
+      order: 0,
+      owner: true,
+      localKey: 'base_id',
+      targetPublished: false,
+      enriched: true,
+    },
+  ],
 };
 
 const SNAPSHOT: CatalogSnapshot = {
   version: 3,
   generatedAt: '2026-01-01T00:00:00.000Z',
-  stats: { types: 1, properties: 2, relations: 0, enrichedTypes: 1 },
+  stats: { types: 1, properties: 2, relations: 1, enrichedTypes: 1 },
   types: [TYPE],
 };
 
@@ -168,6 +185,18 @@ const ALL_ANSWERS = {
   [WORKFLOWS_PATH]: [],
 };
 
+/**
+ * Lets every write a click may have started reach the transport before a "no writes" assertion.
+ *
+ * TanStack Query runs a mutation's `mutationFn` after the click returns, not inside it, so a
+ * synchronous `writes()` straight after the clicks is empty whatever the screen did. Waiting a
+ * real 50 ms inside `act` lets those calls land and any state they set flush, so an empty list
+ * then means nothing was asked for.
+ */
+async function settle() {
+  await act(() => new Promise((resolve) => setTimeout(resolve, 50)));
+}
+
 /** The detail pane, once the type has loaded. */
 async function detail() {
   return within(await screen.findByRole('main'));
@@ -186,6 +215,7 @@ describe('CatalogManager canEdit={false}', () => {
     expect(pane.getByText('Vehicles')).toBeDefined();
     expect(pane.getByText('Identifier')).toBeDefined();
     expect(pane.getByText('km')).toBeDefined();
+    expect(pane.getByText('Home base')).toBeDefined();
     expect(await pane.findByText('Distance driven.')).toBeDefined();
 
     // …and none of them is a control. Every editor in the screen is named "Edit <field>".
@@ -203,7 +233,7 @@ describe('CatalogManager canEdit={false}', () => {
     // Wait for the pipeline sections too, so their controls (if any) are on screen to click.
     await pane.findByText('The fleet ledger only ever appends rows.');
 
-    for (const text of ['Vehicle', 'Fleet', 'Vehicles', 'Identifier', 'km']) {
+    for (const text of ['Vehicle', 'Fleet', 'Vehicles', 'Identifier', 'km', 'Home base']) {
       fireEvent.click(pane.getByText(text));
     }
     for (const button of screen.queryAllByRole('button')) fireEvent.click(button);
@@ -211,6 +241,7 @@ describe('CatalogManager canEdit={false}', () => {
     // A click that opened an editor would have put a textbox on screen; none should exist in the
     // detail pane (the sidebar's filter is the screen's one input, and it is not in `main`).
     expect(pane.queryAllByRole('textbox')).toEqual([]);
+    await settle();
     expect(writes()).toEqual([]);
   });
 
@@ -271,6 +302,7 @@ describe('CatalogManager edits', () => {
     expect(screen.getByRole('button', { name: 'Edit display name' })).toBeDefined();
     expect(screen.getByRole('button', { name: 'Edit Group' })).toBeDefined();
     expect(screen.getByRole('button', { name: 'Hide Identifier' })).toBeDefined();
+    expect(screen.getByRole('button', { name: 'Edit label for base' })).toBeDefined();
     expect(screen.getByText('Reset edits')).toBeDefined();
   });
 
@@ -326,6 +358,8 @@ describe('LoadExpectationSection canEdit={false}', () => {
     expect(await screen.findByText('The fleet ledger only ever appends rows.')).toBeDefined();
     expect(document.querySelector('form')).toBeNull();
     expect(screen.queryByText('Save expectation')).toBeNull();
+    for (const button of screen.queryAllByRole('button')) fireEvent.click(button);
+    await settle();
     expect(writes()).toEqual([]);
   });
 });

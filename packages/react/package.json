@@ -22,6 +22,7 @@
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "//sideEffects": "Only WorkflowCanvas is marked: it is the one module that imports CSS (React Flow's stylesheet), and a bundler told it was pure could drop that import and leave the canvas unstyled with no error. Nothing else runs at import time. Chart renderers are registered by the host calling registerChartRenderer, never by importing a module, and every other export is a component, a hook, a pure function or a declaration. Lets a host that mounts one screen, through ./manager or the root entry, drop the rest.",
   "sideEffects": [
     "./dist/WorkflowCanvas.js"
   ],
