@@ -5,12 +5,15 @@ export {
   catalogDrizzleRunner,
 } from './connection';
 export { catalogDrizzleSql } from './ddl';
+export { DrizzleCatalogDirectory } from './directory';
+export { type CatalogDrizzleRegistryOptions, DrizzleCatalogRegistry } from './registry';
 export { type CatalogDrizzleOverlayOptions, DrizzleCatalogOverlayStore } from './overlay.store';
 export {
   CATALOG_REVISION_SUBJECTS,
   type CatalogDrizzleTableOptions,
   type CatalogDrizzleTables,
   type CatalogRevisionSubject,
+  type CatalogStoredRelation,
   DEFAULT_CATALOG_TABLE_PREFIX,
   DEFAULT_OVERLAY_KEY,
   MAX_CATALOG_TABLE_PREFIX_LENGTH,

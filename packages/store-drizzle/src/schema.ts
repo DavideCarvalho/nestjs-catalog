@@ -1,5 +1,7 @@
+import type { SnapshotArchiveRef } from '@dudousxd/nestjs-catalog';
 import {
   boolean,
+  foreignKey,
   index,
   integer,
   jsonb,
@@ -171,10 +173,124 @@ export function catalogDrizzleTables(options: CatalogDrizzleTableOptions = {}) {
     updatedAt: at('updated_at').notNull(),
   });
 
-  return { savedQuery, dashboard, auditEvent, revision, overlay } as const;
+  /* -------------------------------------------------------------------------
+   * The model: what the stored registry serves and the directory reads. Same
+   * columns, types and constraint names as the MikroORM store's entities.
+   * ----------------------------------------------------------------------- */
+
+  /** One published object type. Curation edits these columns in place. */
+  const objectType = table(n('object_type'), {
+    name: varchar('name', { length: 128 }).primaryKey(),
+    ownerPrincipalId: varchar('owner_principal_id', { length: 128 }).notNull(),
+    displayName: varchar('display_name', { length: 255 }).notNull(),
+    pluralDisplayName: varchar('plural_display_name', { length: 255 }).notNull(),
+    description: text('description'),
+    icon: varchar('icon', { length: 32 }),
+    group: varchar('group', { length: 128 }).notNull().default('Ungrouped'),
+    titleProperty: varchar('title_property', { length: 128 }),
+    primaryKey: jsonb('primary_key').$type<string[]>().notNull(),
+    physicalTable: varchar('physical_table', { length: 128 }).notNull(),
+    relations: jsonb('relations').$type<CatalogStoredRelation[]>(),
+    currentSnapshotId: varchar('current_snapshot_id', { length: 128 }),
+    createdAt: at('created_at', 6).notNull(),
+    updatedAt: at('updated_at', 6).notNull(),
+  });
+
+  /** One property of a type; its id is `<type>.<property>`. Deleted with its type. */
+  const property = table(
+    n('property'),
+    {
+      id: varchar('id', { length: 300 }).primaryKey(),
+      objectTypeName: varchar('object_type_name', { length: 128 }).notNull(),
+      name: varchar('name', { length: 128 }).notNull(),
+      displayName: varchar('display_name', { length: 255 }).notNull(),
+      description: text('description'),
+      type: varchar('type', { length: 32 }).notNull(),
+      sourceColumn: varchar('source_column', { length: 255 }).notNull(),
+      physicalColumn: varchar('physical_column', { length: 128 }).notNull(),
+      nullable: boolean('nullable').notNull().default(true),
+      primary: boolean('primary').notNull().default(false),
+      hidden: boolean('hidden').notNull().default(false),
+      position: integer('position').notNull().default(0),
+      classification: varchar('classification', { length: 64 }),
+      unit: varchar('unit', { length: 64 }),
+      updatedAt: at('updated_at', 6),
+    },
+    (t) => [
+      foreignKey({
+        name: n('property_object_type_name_foreign'),
+        columns: [t.objectTypeName],
+        foreignColumns: [objectType.name],
+      }).onDelete('cascade'),
+    ],
+  );
+
+  /** One load of one type: written, then committed or dropped. */
+  const snapshot = table(
+    n('snapshot'),
+    {
+      id: varchar('id', { length: 300 }).primaryKey(),
+      typeName: varchar('type_name', { length: 128 }).notNull(),
+      snapshotId: varchar('snapshot_id', { length: 128 }).notNull(),
+      principalId: varchar('principal_id', { length: 128 }).notNull(),
+      rowCount: integer('row_count').notNull().default(0),
+      committed: boolean('committed').notNull().default(false),
+      labels: jsonb('labels').$type<Record<string, string>>(),
+      createdAt: at('created_at', 6).notNull(),
+      committedAt: at('committed_at', 6),
+      droppedAt: at('dropped_at', 6),
+      archive: jsonb('archive').$type<SnapshotArchiveRef>(),
+    },
+    (t) => [index(n('snapshot_type_name_created_at_index')).on(t.typeName, t.createdAt)],
+  );
+
+  /**
+   * An application that may write to or read from the catalog. `key_hash` is a
+   * digest, never a key; a row without one is described here and authenticates
+   * elsewhere.
+   */
+  const principal = table(n('principal'), {
+    id: varchar('id', { length: 128 }).primaryKey(),
+    displayName: varchar('display_name', { length: 255 }).notNull(),
+    keyHash: varchar('key_hash', { length: 64 }),
+    scopes: jsonb('scopes').$type<string[]>().notNull(),
+    writeTypes: jsonb('write_types').$type<string[]>().notNull(),
+    readTypes: jsonb('read_types').$type<string[]>(),
+    classifications: jsonb('classifications').$type<string[]>().notNull(),
+    active: boolean('active').notNull().default(true),
+    createdAt: at('created_at', 6).notNull(),
+    lastSeenAt: at('last_seen_at', 6),
+  });
+
+  return {
+    savedQuery,
+    dashboard,
+    auditEvent,
+    revision,
+    overlay,
+    objectType,
+    property,
+    snapshot,
+    principal,
+  } as const;
 }
 
 export type CatalogDrizzleTables = ReturnType<typeof catalogDrizzleTables>;
+
+/** A relation as the object type row stores it, in its `relations` JSON. */
+export interface CatalogStoredRelation {
+  name: string;
+  kind: string;
+  targetType: string;
+  displayName: string;
+  description?: string;
+  localKey?: string;
+  nullable: boolean;
+  hidden: boolean;
+  position: number;
+  owner: boolean;
+  inverseName?: string;
+}
 
 export const DEFAULT_OVERLAY_KEY = 'default';
 

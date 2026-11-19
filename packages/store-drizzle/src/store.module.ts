@@ -1,7 +1,9 @@
 import {
+  CATALOG_DIRECTORY,
   CATALOG_TRACE_STORE,
   CATALOG_WORKSPACE_STORE,
   CatalogAuditRecorder,
+  CatalogRegistry,
 } from '@dudousxd/nestjs-catalog';
 import {
   type DynamicModule,
@@ -11,7 +13,9 @@ import {
   type OptionalFactoryDependency,
   type Provider,
 } from '@nestjs/common';
+import { DrizzleCatalogDirectory } from './directory';
 import { DrizzleCatalogOverlayStore } from './overlay.store';
+import { DrizzleCatalogRegistry } from './registry';
 import { DrizzleCatalogTraceStore } from './trace.store';
 import { type CatalogDrizzleStoreOptions, DrizzleWorkspaceStore } from './workspace.store';
 
@@ -25,6 +29,8 @@ export interface CatalogDrizzleStoreModuleFlags {
    * events in its own tracing and nowhere else.
    */
   readonly audit?: boolean;
+  /** How long the registry serves its model before checking for changes. See `DrizzleCatalogRegistry`. */
+  readonly staleAfterMs?: number;
 }
 
 export interface CatalogDrizzleStoreAsyncOptions extends CatalogDrizzleStoreModuleFlags {
@@ -38,8 +44,9 @@ export interface CatalogDrizzleStoreAsyncOptions extends CatalogDrizzleStoreModu
 /**
  * Registers the Drizzle stores: the workspace store under
  * `CATALOG_WORKSPACE_STORE`, the trace store under `CATALOG_TRACE_STORE`, the
- * audit recorder, and the overlay store as a provider the host hands to
- * `CatalogModule`.
+ * stored registry under `CatalogRegistry` (loaded on module init), the directory
+ * under `CATALOG_DIRECTORY`, the audit recorder, and the overlay store as a
+ * provider the host hands to `CatalogModule`.
  *
  * `forRootAsync` is the usual entry: the host's database, or its transaction
  * wrapper, is itself a provider.
@@ -96,6 +103,19 @@ export class CatalogDrizzleStoreModule {
           provide: DrizzleCatalogOverlayStore,
           ...fromOptions((options) => new DrizzleCatalogOverlayStore(options)),
         },
+        {
+          provide: DrizzleCatalogRegistry,
+          ...fromOptions(
+            (options) =>
+              new DrizzleCatalogRegistry({ ...options, staleAfterMs: flags.staleAfterMs }),
+          ),
+        },
+        { provide: CatalogRegistry, useExisting: DrizzleCatalogRegistry },
+        {
+          provide: DrizzleCatalogDirectory,
+          ...fromOptions((options) => new DrizzleCatalogDirectory(options)),
+        },
+        { provide: CATALOG_DIRECTORY, useExisting: DrizzleCatalogDirectory },
         ...(flags.audit === false ? [] : [CatalogAuditRecorder]),
       ],
       exports: [
@@ -105,6 +125,10 @@ export class CatalogDrizzleStoreModule {
         DrizzleCatalogTraceStore,
         CATALOG_TRACE_STORE,
         DrizzleCatalogOverlayStore,
+        DrizzleCatalogRegistry,
+        CatalogRegistry,
+        DrizzleCatalogDirectory,
+        CATALOG_DIRECTORY,
       ],
     };
   }

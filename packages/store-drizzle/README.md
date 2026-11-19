@@ -20,7 +20,9 @@ shared contract (`test/workspace-store-contract.ts`) on a real Postgres.
 | Curation overlay | `CatalogOverlayStore` (`CatalogModule.forRoot({ overlayStore })`) | `DrizzleCatalogOverlayStore` |
 | Traces: the audit trail grouped by load, graded and paged | `CatalogTraceStore` (`CATALOG_TRACE_STORE`) | `DrizzleCatalogTraceStore` |
 | Recording catalog events into the audit table | | `CatalogAuditRecorder` (from the core package), registered unless `audit: false` |
-| Directory (`CATALOG_DIRECTORY`), stored registry, warehouse, pipeline | | Not yet. Later releases add them |
+| The model: object types, properties, relations, serving snapshot, curation | `CatalogRegistry` | `DrizzleCatalogRegistry` |
+| Applications that may reach the catalog, and the types they own | `CatalogDirectory` (`CATALOG_DIRECTORY`) | `DrizzleCatalogDirectory` |
+| Warehouse (`CATALOG_STORE`: snapshot rows, `ObjectExplorer`, lineage, queries), pipeline | | Not yet |
 
 ## Connecting: your database or your transaction
 
@@ -64,6 +66,31 @@ The module registers `DrizzleWorkspaceStore` under `CATALOG_WORKSPACE_STORE`,
 `CatalogAuditRecorder`, which writes every catalog diagnostics event into the audit
 table (pass `audit: false` to leave it out). It exports `DrizzleCatalogOverlayStore`
 as a provider.
+
+## The registry and the directory
+
+`DrizzleCatalogRegistry` serves the catalog model from the `object_type`, `property`
+and `snapshot` tables, like the MikroORM `StoredCatalogRegistry`:
+
+- Types are ordered by group, then display name; properties and relations by
+  position.
+- A type reports its newest committed snapshot.
+- `patchType` and `patchProperty` write the rows themselves, curating a relation
+  through the same patch.
+- Each replica checks a cheap watermark (row counts and newest `updated_at`) at most
+  once per `staleAfterMs` (default 1000), and reloads when another replica changed
+  the model.
+- The module loads it on init and binds it to `CatalogRegistry`. Hand that to
+  `CatalogModule.forRoot({ registry: { provide: CatalogRegistry, useExisting:
+  DrizzleCatalogRegistry } })`.
+
+Nothing in this package writes the model yet: publishing types and loading snapshots
+are the warehouse's and the pipeline's job, and both still come.
+
+`DrizzleCatalogDirectory` lists applications from the `principal` table, with the
+types each owns and whether it authenticates with a key. It never exposes the key
+hash. It has no `listPeople`; extend the class to read people from your own user
+table.
 
 ## Traces
 
