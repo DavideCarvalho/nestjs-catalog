@@ -1,5 +1,11 @@
 # @dudousxd/nestjs-catalog-dashboard
 
+## 0.37.0
+
+### Minor Changes
+
+- [#259](https://github.com/DavideCarvalho/nestjs-catalog/pull/259) [`0ea77d4`](https://github.com/DavideCarvalho/nestjs-catalog/commit/0ea77d4a373f8f937d50b36568343fbbdb8f96d4) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The console can be served as part of a host's own application. Three new `CatalogDashboardModule` options, each defaulting to today's behaviour: `screens` lists the screens to show (`model`, `objects`, `query`, `dashboards`, `workflows`, `connections`, `lineage`, `activity`, `access`, `search`), and a hidden one gets no tab, no panel and no requests; `pipeline: false` leaves the Model screen's **Loaded by** and **Load expectation** out and never requests their endpoints; `hostAuthenticates: true` shows no sign-in and never calls `/auth/me`. A 404 from `/environments` now reads as a single environment, and the picker is left out instead of failing. The page config moves from an inline script to `<path>/config.js`, loaded first in the head, with every value JSON-encoded, so the console works under `script-src 'self'`. The console path must therefore also serve `<path>/config.js`: `catalogDashboardMountPaths()` already covers it through `<path>/{*splat}`, but a host that writes its own global-prefix exclusion, or fronts the console with its own routes, has to let that path through too, or the page loads with no config. `index.html` no longer links Google Fonts; the stylesheet falls back to system fonts.
+
 ## 0.36.0
 
 ### Minor Changes

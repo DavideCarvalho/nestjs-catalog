@@ -1,5 +1,15 @@
 # @dudousxd/nestjs-catalog-react
 
+## 0.37.0
+
+### Minor Changes
+
+- [#259](https://github.com/DavideCarvalho/nestjs-catalog/pull/259) [`04a894b`](https://github.com/DavideCarvalho/nestjs-catalog/commit/04a894bd86a01a435e663fd2d83108c1c5e76eda) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - `CatalogManager` can be shown read-only and without the pipeline sections. `canEdit={false}` renders every curated field (name, description, group, plural, icon, unit, link labels) as plain text, drops the Hide/Show toggle and **Reset edits**, and issues no write; `LoadExpectationSection` takes the same `canEdit` and then shows the expectation in force without its form. `pipeline={false}` leaves out **Loaded by** and **Load expectation** and never requests their endpoints. Both default to `true`, so nothing changes for existing hosts. An edit or reset the server refuses now shows a dismissable error instead of the field silently going back to its old value. A new `@dudousxd/nestjs-catalog-react/manager` entry exports `CatalogManager` alone, and the package now declares `sideEffects` (only `WorkflowCanvas`, which imports React Flow's stylesheet, is marked), so a host that mounts only this screen no longer bundles the workflow canvas, diff viewer or code editor.
+
+- [#259](https://github.com/DavideCarvalho/nestjs-catalog/pull/259) [`c10868a`](https://github.com/DavideCarvalho/nestjs-catalog/commit/c10868a44e05b8103298173c6db321207a4de2b0) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - `ObjectExplorer` takes two new props, both optional with today's behaviour as the default. `search={false}` leaves out the search box for a host whose object endpoint does not support `search`, and the parameter is then never sent. `rowCountCap` names the most rows the host's server will count: a page whose `total` is at least that is shown as "10,000+ rows" instead of an exact-looking "10,000 rows".
+
+  The package now ships its own `LICENSE` (MIT, Davide Carvalho). The licence of the chart code vendored from bklit-ui moves from `LICENSE-bklit` to `THIRD_PARTY_NOTICES.md`, so a host's licence collector no longer lists this package under bklit's copyright.
+
 ## 0.36.0
 
 ### Minor Changes
