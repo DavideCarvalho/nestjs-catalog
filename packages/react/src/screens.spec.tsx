@@ -429,4 +429,73 @@ describe('ObjectExplorer', () => {
       expect(lastCallTo('/catalog/objects/Mvr')?.params).toMatchObject({ page: 2 }),
     );
   });
+
+  it('offers a search box by default, and sends what is typed in it', async () => {
+    const { transport, lastCallTo } = fakeTransport({
+      '/catalog': snapshot([objectType()]),
+      '/catalog/objects/Mvr': page([{ id: '1', tailNumber: 'AF-101' }]),
+    });
+
+    render(withCatalog(transport, <ObjectExplorer type="Mvr" />));
+    await screen.findByText('AF-101');
+    fireEvent.change(screen.getByLabelText('Search objects'), { target: { value: 'AF' } });
+
+    await waitFor(() =>
+      expect(lastCallTo('/catalog/objects/Mvr')?.params).toMatchObject({ search: 'AF' }),
+    );
+  });
+
+  it('leaves the search box out when the host says its server cannot search', async () => {
+    // A box the server ignores is worse than none: the unsearched first page comes back and
+    // reads as the answer to the search.
+    const { transport, calls } = fakeTransport({
+      '/catalog': snapshot([objectType()]),
+      '/catalog/objects/Mvr': page([{ id: '1', tailNumber: 'AF-101' }]),
+    });
+
+    render(withCatalog(transport, <ObjectExplorer type="Mvr" search={false} />));
+    await screen.findByText('AF-101');
+
+    expect(screen.queryByLabelText('Search objects')).toBeNull();
+    for (const call of calls.filter((each) => each.path === '/catalog/objects/Mvr')) {
+      expect(call.params).not.toHaveProperty('search');
+    }
+  });
+
+  describe('row count', () => {
+    const counted = (total: number): CatalogObjectPage => ({
+      ...page([{ id: '1', tailNumber: 'AF-101' }]),
+      meta: { total, perPage: 25, currentPage: 1, lastPage: 2, firstPage: 1 },
+    });
+
+    async function caption(total: number, rowCountCap?: number) {
+      const { transport } = fakeTransport({
+        '/catalog': snapshot([objectType()]),
+        '/catalog/objects/Mvr': counted(total),
+      });
+      render(withCatalog(transport, <ObjectExplorer type="Mvr" rowCountCap={rowCountCap} />));
+      await screen.findByText('AF-101');
+      return screen.getByText(/ rows · /).textContent;
+    }
+
+    // `toLocaleString` on both sides, so the expectation does not depend on the test machine's
+    // locale picking a comma for the thousands.
+    const n = (value: number) => value.toLocaleString();
+
+    it('shows a total at the cap as a lower bound', async () => {
+      expect(await caption(10_000, 10_000)).toContain(`${n(10_000)}+ rows`);
+    });
+
+    it('shows a total below the cap exactly', async () => {
+      const text = await caption(9_999, 10_000);
+      expect(text).toContain(`${n(9_999)} rows`);
+      expect(text).not.toContain('+');
+    });
+
+    it('shows the exact total when the host names no cap', async () => {
+      const text = await caption(10_000);
+      expect(text).toContain(`${n(10_000)} rows`);
+      expect(text).not.toContain('+');
+    });
+  });
 });

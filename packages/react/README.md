@@ -45,6 +45,8 @@ Requires a `QueryClientProvider` from `@tanstack/react-query` above it.
 - **`<ObjectExplorer />`** — one table for every type in the catalog. Columns,
   labels, alignment and units all arrive with the data, so it knows nothing about
   your domain.
+  `search={false}` leaves out the search box for a server that cannot search,
+  and `rowCountCap={10_000}` shows a count the server capped as "10,000+ rows".
 - **`<QueryConsole />`**, **`<DashboardBoard />`** — SQL over the published
   snapshots, saved queries, and cards built from them.
 - **`<GovernanceTimeline />`**, **`<TraceExplorer />`** — what happened, flat and

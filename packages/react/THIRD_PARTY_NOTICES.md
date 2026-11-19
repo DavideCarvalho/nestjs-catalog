@@ -1,3 +1,15 @@
+# Third-party notices
+
+`@dudousxd/nestjs-catalog-react` is licensed under the MIT licence in `LICENSE`, copyright Davide
+Carvalho. It also ships code vendored from the projects below, each under its own licence. That
+code keeps its original copyright, and each vendored file names its source in its header.
+
+## bklit-ui
+
+Source: https://github.com/bklit/bklit-ui. Vendored into `src/charts/` (mostly
+`src/charts/bklit/`), shipped in `dist/charts/`. Only the `./bklit` entry reaches this code.
+
+```text
 MIT License
 
 Copyright (c) 2026 uixmat
@@ -19,3 +31,4 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+```

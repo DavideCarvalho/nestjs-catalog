@@ -99,6 +99,20 @@ export interface ObjectExplorerProps {
   /** Where to send the "back" link. Omit to hide it. */
   backHref?: string;
   backLabel?: string;
+  /**
+   * Set false to leave out the search box, for a host whose object endpoint
+   * does not support `search`. Without the box nothing sends the parameter, so
+   * a server that ignores it can no longer present an unsearched page as the
+   * answer to a search.
+   */
+  search?: boolean;
+  /**
+   * The most rows the host's server will count. A page whose `total` is at
+   * least this is shown as "10,000+ rows" rather than "10,000 rows", because a
+   * capped count is a lower bound and the exact figure reads as the real size.
+   * Omit when the server counts every row.
+   */
+  rowCountCap?: number;
 }
 
 /**
@@ -138,6 +152,8 @@ export function ObjectExplorer({
   pageSize = 25,
   backHref,
   backLabel = 'Catalog',
+  search: searchable = true,
+  rowCountCap,
 }: ObjectExplorerProps) {
   const client = useCatalogClient();
   const { data: snapshot, isLoading: loadingCatalog } = useQuery({
@@ -327,10 +343,12 @@ export function ObjectExplorer({
             open={switcherOpen}
             onToggle={() => setSwitcherOpen((o) => !o)}
             onChoose={chooseType}
-            caption={tableCaption(selectedType, data)}
+            caption={tableCaption(selectedType, data, rowCountCap)}
           />
 
-          <SearchBox value={search} onChange={setSearch} what={selectedType?.pluralDisplayName} />
+          {searchable && (
+            <SearchBox value={search} onChange={setSearch} what={selectedType?.pluralDisplayName} />
+          )}
         </div>
 
         <FilterBar
@@ -406,9 +424,25 @@ export function ObjectExplorer({
  * a zero while the read is in flight: "0 rows" and "not yet answered" are
  * different facts and only one of them is worth reacting to.
  */
-function tableCaption(type: CatalogObjectTypeDef | undefined, data: CatalogObjectPage | undefined) {
-  const rows = data ? `${data.meta.total.toLocaleString()} rows` : '…';
+function tableCaption(
+  type: CatalogObjectTypeDef | undefined,
+  data: CatalogObjectPage | undefined,
+  rowCountCap?: number,
+) {
+  const rows = data ? rowCount(data.meta.total, rowCountCap) : '…';
   return `${type?.tableName} · ${rows} · ${data?.columns.length ?? 0} columns from the catalog`;
+}
+
+/**
+ * The row count as the reader should take it.
+ *
+ * A count at or above the host's cap is the cap with a plus sign: the server
+ * stopped counting there, so the true size is at least that and possibly far
+ * more. Below the cap the count is exact and shown as it is.
+ */
+function rowCount(total: number, cap?: number): string {
+  if (cap !== undefined && cap > 0 && total >= cap) return `${cap.toLocaleString()}+ rows`;
+  return `${total.toLocaleString()} rows`;
 }
 
 /** The one control that searches every text column at once. */
