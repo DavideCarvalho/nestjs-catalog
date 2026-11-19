@@ -537,6 +537,9 @@ function toDashboard(row: DashboardRow): Dashboard {
       id: String(card.id ?? `card-${index}`),
       savedQueryId: String(card.savedQueryId ?? ''),
       title: typeof card.title === 'string' ? card.title : undefined,
+      // Kept: a card's library is the board's override of the query's, and
+      // dropping it on read drew the card with the query's library instead.
+      library: typeof card.library === 'string' ? card.library : undefined,
       width: [1, 2, 3, 4].includes(Number(card.width)) ? (Number(card.width) as 1 | 2 | 3 | 4) : 2,
       position: Number(card.position ?? index),
     })),
