@@ -15,6 +15,7 @@ import {
   RotateCcw,
   Search,
   Unlink,
+  X,
 } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import { CoverageLedger } from './CoverageLedger.js';
@@ -97,8 +98,33 @@ export interface CatalogManagerProps {
   /** Heading copy, so the host can call this whatever its users call it. */
   title?: string;
   eyebrow?: string;
+  /**
+   * Defaults to a sentence that matches `canEdit`: an invitation to rename
+   * things on an editable screen, a plain description on a read-only one.
+   */
   intro?: string;
+  /**
+   * Set false where the viewer is known to be read-only. Every curated field
+   * (name, description, group, plural, icon, unit, link labels) renders as plain
+   * text, the Hide/Show toggle and **Reset edits** are not offered, and nothing
+   * on the screen issues a write. The endpoints refuse regardless; this only
+   * stops the screen offering edits that always fail. The same prop, with the
+   * same meaning, as on `PipelineConsole` and `WorkflowCanvas`.
+   */
+  canEdit?: boolean;
+  /**
+   * Set false to leave out the two sections served by the HOST's pipeline
+   * endpoints — **Loaded by** and **Load expectation** — for a host that does
+   * not mount them, or a screen that should show the model alone. Neither
+   * section is rendered and neither endpoint is requested.
+   */
+  pipeline?: boolean;
 }
+
+const EDITABLE_INTRO =
+  'Every object type the system already holds, derived from the ORM. Names, descriptions and units are yours to change — none of it touches the database.';
+const READ_ONLY_INTRO =
+  'Every object type the system already holds, derived from the ORM, with the names, descriptions and units people have given them.';
 
 export function CatalogManager({
   type: typeProp,
@@ -106,7 +132,9 @@ export function CatalogManager({
   workflowHref,
   title = 'Catalog',
   eyebrow = 'Semantic layer',
-  intro = 'Every object type the system already holds, derived from the ORM. Names, descriptions and units are yours to change — none of it touches the database.',
+  canEdit = true,
+  pipeline = true,
+  intro = canEdit ? EDITABLE_INTRO : READ_ONLY_INTRO,
 }: CatalogManagerProps) {
   const client = useCatalogClient();
   const queryClient = useQueryClient();
@@ -119,6 +147,26 @@ export function CatalogManager({
   const [selectedName, setSelectedName] = useSelectedType(typeProp);
   const [filter, setFilter] = useState('');
   const [onlyUnnamed, setOnlyUnnamed] = useState(false);
+  /**
+   * The last edit the server refused, said out loud.
+   *
+   * Edits are not applied optimistically — the snapshot changes only when the
+   * server answers — so a refused edit leaves the field showing its old value.
+   * Without this, that read as the screen quietly undoing what somebody typed.
+   */
+  const [editError, setEditError] = useState<string | null>(null);
+
+  function refused(what: string) {
+    return (error: unknown) =>
+      setEditError(
+        `${what} was not saved${error instanceof Error && error.message ? `: ${error.message}` : '.'}`,
+      );
+  }
+
+  function saved(updated: unknown) {
+    setEditError(null);
+    applyToSnapshot(updated);
+  }
 
   /** Presentation edits should feel like typing, not like saving. */
   function applyToSnapshot(updated: unknown) {
@@ -143,7 +191,8 @@ export function CatalogManager({
   const typeMutation = useMutation({
     mutationFn: ({ name, patch }: { name: string; patch: TypePatch }) =>
       client.patchType(name, patch),
-    onSuccess: applyToSnapshot,
+    onSuccess: saved,
+    onError: refused('That edit'),
   });
 
   const propertyMutation = useMutation({
@@ -156,12 +205,17 @@ export function CatalogManager({
       property: string;
       patch: PropertyPatch;
     }) => client.patchProperty(name, property, patch),
-    onSuccess: applyToSnapshot,
+    onSuccess: saved,
+    onError: refused('That edit'),
   });
 
   const resetMutation = useMutation({
     mutationFn: () => client.reset(),
-    onSuccess: (snapshot) => queryClient.setQueryData(catalogQueryKeys.snapshot, snapshot),
+    onSuccess: (snapshot) => {
+      setEditError(null);
+      queryClient.setQueryData(catalogQueryKeys.snapshot, snapshot);
+    },
+    onError: refused('The reset'),
   });
 
   const types = useMemo(() => data?.types ?? [], [data]);
@@ -251,22 +305,45 @@ export function CatalogManager({
                   <Stat label="Relations" value={data.stats.relations} />
                 </span>
               </Tooltip>
-              <button
-                type="button"
-                onClick={() => resetMutation.mutate()}
-                disabled={resetMutation.isPending}
-                className={cn(
-                  'flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs',
-                  RULE,
-                  SECONDARY,
-                  'transition-colors hover:bg-zinc-50 disabled:opacity-50 dark:hover:bg-zinc-800',
-                )}
-              >
-                <RotateCcw size={13} />
-                Reset edits
-              </button>
+              {canEdit && (
+                <button
+                  type="button"
+                  onClick={() => resetMutation.mutate()}
+                  disabled={resetMutation.isPending}
+                  className={cn(
+                    'flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs',
+                    RULE,
+                    SECONDARY,
+                    'transition-colors hover:bg-zinc-50 disabled:opacity-50 dark:hover:bg-zinc-800',
+                  )}
+                >
+                  <RotateCcw size={13} />
+                  Reset edits
+                </button>
+              )}
             </div>
           </div>
+
+          {editError && (
+            <div
+              role="alert"
+              className={cn(
+                'mt-4 flex items-start justify-between gap-3 rounded-md border px-3 py-2 text-sm',
+                'border-rose-200 bg-rose-50 text-rose-800',
+                'dark:border-rose-900 dark:bg-rose-950/40 dark:text-rose-200',
+              )}
+            >
+              <span>{editError}</span>
+              <button
+                type="button"
+                onClick={() => setEditError(null)}
+                aria-label="Dismiss"
+                className="shrink-0 rounded-sm p-0.5 hover:bg-rose-100 dark:hover:bg-rose-900"
+              >
+                <X size={14} />
+              </button>
+            </div>
+          )}
 
           <div className="mt-6">
             <CoverageLedger types={types} selected={selected?.name} onSelect={setSelectedName} />
@@ -368,6 +445,8 @@ export function CatalogManager({
               <TypeDetail
                 key={selected.name}
                 type={selected}
+                canEdit={canEdit}
+                pipeline={pipeline}
                 workflowHref={workflowHref}
                 // The whole catalog, so the detail pane can answer what points
                 // AT this type. Nothing on a type records its inbound links —
@@ -376,10 +455,15 @@ export function CatalogManager({
                 // is somewhere holding every type.
                 types={types}
                 explorerHref={explorerHref}
-                onPatchType={(patch) => typeMutation.mutate({ name: selected.name, patch })}
-                onPatchProperty={(property, patch) =>
-                  propertyMutation.mutate({ name: selected.name, property, patch })
-                }
+                // Guarded here as well as by every control being absent: a
+                // read-only screen must not be able to write even if a child
+                // forgets to honour `canEdit`.
+                onPatchType={(patch) => {
+                  if (canEdit) typeMutation.mutate({ name: selected.name, patch });
+                }}
+                onPatchProperty={(property, patch) => {
+                  if (canEdit) propertyMutation.mutate({ name: selected.name, property, patch });
+                }}
                 onNavigate={setSelectedName}
               />
             )}
@@ -470,6 +554,8 @@ interface TypeDetailProps {
   types: CatalogObjectTypeDef[];
   explorerHref?: (typeName: string) => string;
   workflowHref?: (workflowId: string) => string;
+  canEdit: boolean;
+  pipeline: boolean;
   onPatchType: (patch: TypePatch) => void;
   onPatchProperty: (property: string, patch: PropertyPatch) => void;
   onNavigate: (name: string) => void;
@@ -480,6 +566,8 @@ function TypeDetail({
   types,
   explorerHref,
   workflowHref,
+  canEdit,
+  pipeline,
   onPatchType,
   onPatchProperty,
   onNavigate,
@@ -496,6 +584,7 @@ function TypeDetail({
               label="display name"
               value={type.displayName}
               onSave={(displayName) => onPatchType({ displayName })}
+              readOnly={!canEdit}
               className="text-2xl font-semibold tracking-tight"
               inputClassName="text-2xl font-semibold tracking-tight"
             />
@@ -538,27 +627,47 @@ function TypeDetail({
           value={type.description ?? ''}
           placeholder="No one has written down what this type means yet."
           onSave={(description) => onPatchType({ description })}
+          readOnly={!canEdit}
           className={cn('text-sm leading-relaxed', SECONDARY)}
         />
       </div>
 
       <div className="mt-4 flex flex-wrap items-center gap-2">
-        <FieldChip label="Group" value={type.group} onSave={(group) => onPatchType({ group })} />
+        <FieldChip
+          label="Group"
+          value={type.group}
+          readOnly={!canEdit}
+          onSave={(group) => onPatchType({ group })}
+        />
         <FieldChip
           label="Plural"
           value={type.pluralDisplayName}
+          readOnly={!canEdit}
           onSave={(pluralDisplayName) => onPatchType({ pluralDisplayName })}
         />
-        <FieldChip label="Icon" value={type.icon ?? ''} onSave={(icon) => onPatchType({ icon })} />
+        <FieldChip
+          label="Icon"
+          value={type.icon ?? ''}
+          readOnly={!canEdit}
+          onSave={(icon) => onPatchType({ icon })}
+        />
       </div>
 
       <section className="mt-10">
         <SectionHeading
           title="Properties"
-          note="The column and its SQL type are read from the ORM. The label, description and unit are yours."
+          note={
+            canEdit
+              ? 'The column and its SQL type are read from the ORM. The label, description and unit are yours.'
+              : 'The column and its SQL type are read from the ORM. The label, description and unit were written by people.'
+          }
         />
         <div className={cn('overflow-hidden rounded-lg border', RULE, PANEL)}>
-          <PropertyTable properties={type.properties} onPatchProperty={onPatchProperty} />
+          <PropertyTable
+            properties={type.properties}
+            canEdit={canEdit}
+            onPatchProperty={onPatchProperty}
+          />
         </div>
       </section>
 
@@ -581,11 +690,13 @@ function TypeDetail({
         declaration on the screen whose whole claim is that it infers would be
         the two making opposite promises in one place. See `FlowView`.
       */}
-      <LoadedBySection
-        typeName={type.name}
-        displayName={type.displayName}
-        workflowHref={workflowHref}
-      />
+      {pipeline && (
+        <LoadedBySection
+          typeName={type.name}
+          displayName={type.displayName}
+          workflowHref={workflowHref}
+        />
+      )}
 
       {/*
         Between the properties and the links, and on this screen rather than in
@@ -594,11 +705,18 @@ function TypeDetail({
         because the state it exists to reveal (no strategy declared, so
         incremental loads are refused) is invisible everywhere else.
       */}
-      <LoadExpectationSection typeName={type.name} displayName={type.displayName} />
+      {pipeline && (
+        <LoadExpectationSection
+          typeName={type.name}
+          displayName={type.displayName}
+          canEdit={canEdit}
+        />
+      )}
 
       <LinkSection
         type={type}
         types={types}
+        canEdit={canEdit}
         onPatchProperty={onPatchProperty}
         onNavigate={onNavigate}
       />
@@ -662,11 +780,13 @@ function inboundLinks(
 function LinkSection({
   type,
   types,
+  canEdit,
   onPatchProperty,
   onNavigate,
 }: {
   type: CatalogObjectTypeDef;
   types: CatalogObjectTypeDef[];
+  canEdit: boolean;
   onPatchProperty: (property: string, patch: PropertyPatch) => void;
   onNavigate: (name: string) => void;
 }) {
@@ -677,7 +797,11 @@ function LinkSection({
     <section className="mt-10 pb-16">
       <SectionHeading
         title="Links"
-        note="Read from the foreign keys. What a link is called is yours to change; where it points is not."
+        note={
+          canEdit
+            ? 'Read from the foreign keys. What a link is called is yours to change; where it points is not.'
+            : 'Read from the foreign keys.'
+        }
       />
 
       {type.relations.length === 0 && inbound.length === 0 ? (
@@ -703,6 +827,7 @@ function LinkSection({
                     key={relation.name}
                     relation={relation}
                     targetLabel={labelFor.get(relation.targetType)}
+                    canEdit={canEdit}
                     onPatchProperty={onPatchProperty}
                     onNavigate={onNavigate}
                   />
@@ -744,9 +869,11 @@ function LinkSection({
                 is that the declaration — and therefore the label — belongs to
                 the type it was written on.
               */}
-              <p className={cn('mt-1.5 text-[11px]', MUTED)}>
-                Declared on the other type. Open it to rename the link.
-              </p>
+              {canEdit && (
+                <p className={cn('mt-1.5 text-[11px]', MUTED)}>
+                  Declared on the other type. Open it to rename the link.
+                </p>
+              )}
             </div>
           )}
         </div>
@@ -766,11 +893,13 @@ function LinkSection({
 function OutboundLink({
   relation,
   targetLabel,
+  canEdit,
   onPatchProperty,
   onNavigate,
 }: {
   relation: CatalogObjectTypeDef['relations'][number];
   targetLabel: string | undefined;
+  canEdit: boolean;
   onPatchProperty: (property: string, patch: PropertyPatch) => void;
   onNavigate: (name: string) => void;
 }) {
@@ -795,6 +924,7 @@ function OutboundLink({
           label={`label for ${relation.name}`}
           value={relation.displayName}
           onSave={(displayName) => onPatchProperty(relation.name, { displayName })}
+          readOnly={!canEdit}
           className="text-sm"
           inputClassName="text-sm"
         />
@@ -860,10 +990,12 @@ function SectionHeading({ title, note }: { title: string; note: string }) {
 function FieldChip({
   label,
   value,
+  readOnly,
   onSave,
 }: {
   label: string;
   value: string;
+  readOnly: boolean;
   onSave: (next: string) => void;
 }) {
   return (
@@ -874,6 +1006,7 @@ function FieldChip({
         value={value}
         placeholder="—"
         onSave={onSave}
+        readOnly={readOnly}
         className="text-xs"
         inputClassName="text-xs"
       />
@@ -895,9 +1028,11 @@ function FieldChip({
  */
 function PropertyTable({
   properties,
+  canEdit,
   onPatchProperty,
 }: {
   properties: CatalogObjectTypeDef['properties'];
+  canEdit: boolean;
   onPatchProperty: (property: string, patch: PropertyPatch) => void;
 }) {
   type Property = CatalogObjectTypeDef['properties'][number];
@@ -909,7 +1044,11 @@ function PropertyTable({
         header: 'Label',
         accessorFn: (p: Property) => p.displayName,
         cell: ({ row }: { row: { original: Property } }) => (
-          <PropertyLabelCell property={row.original} onPatchProperty={onPatchProperty} />
+          <PropertyLabelCell
+            property={row.original}
+            canEdit={canEdit}
+            onPatchProperty={onPatchProperty}
+          />
         ),
       },
       {
@@ -938,6 +1077,7 @@ function PropertyTable({
             value={row.original.unit ?? ''}
             placeholder="—"
             onSave={(unit) => onPatchProperty(row.original.name, { unit })}
+            readOnly={!canEdit}
             inputClassName="text-xs"
             className="text-xs"
           />
@@ -953,6 +1093,7 @@ function PropertyTable({
             value={row.original.description ?? ''}
             placeholder="—"
             onSave={(description) => onPatchProperty(row.original.name, { description })}
+            readOnly={!canEdit}
             className={cn('text-xs leading-snug', SECONDARY)}
           />
         ),
@@ -962,11 +1103,15 @@ function PropertyTable({
         header: 'Shown',
         accessorFn: (p: Property) => !p.hidden,
         cell: ({ row }: { row: { original: Property } }) => (
-          <VisibilityToggle property={row.original} onPatchProperty={onPatchProperty} />
+          <VisibilityToggle
+            property={row.original}
+            canEdit={canEdit}
+            onPatchProperty={onPatchProperty}
+          />
         ),
       },
     ],
-    [onPatchProperty],
+    [onPatchProperty, canEdit],
   );
 
   return (
@@ -998,9 +1143,11 @@ const PROPERTY_WIDTHS: Record<string, string> = {
 /** The label cell: the curated name, with the physical name and its constraints beneath. */
 function PropertyLabelCell({
   property,
+  canEdit,
   onPatchProperty,
 }: {
   property: CatalogObjectTypeDef['properties'][number];
+  canEdit: boolean;
   onPatchProperty: (property: string, patch: PropertyPatch) => void;
 }) {
   return (
@@ -1009,6 +1156,7 @@ function PropertyLabelCell({
         label={`label for ${property.name}`}
         value={property.displayName}
         onSave={(displayName) => onPatchProperty(property.name, { displayName })}
+        readOnly={!canEdit}
         inputClassName="text-sm"
       />
       <div className={cn('px-1.5 font-mono text-[10px]', MUTED)}>
@@ -1035,11 +1183,27 @@ function PropertyLabelCell({
  */
 function VisibilityToggle({
   property,
+  canEdit,
   onPatchProperty,
 }: {
   property: CatalogObjectTypeDef['properties'][number];
+  canEdit: boolean;
   onPatchProperty: (property: string, patch: PropertyPatch) => void;
 }) {
+  if (!canEdit) {
+    // The state, without the switch: the row is still dimmed when hidden, and
+    // the icon says which it is to somebody who cannot see the dimming.
+    return (
+      <span
+        role="img"
+        aria-label={`${property.displayName} is ${property.hidden ? 'hidden' : 'shown'}`}
+        className={cn('inline-flex p-1', MUTED)}
+      >
+        {property.hidden ? <EyeOff size={14} /> : <Eye size={14} />}
+      </span>
+    );
+  }
+
   return (
     <Tooltip
       content={

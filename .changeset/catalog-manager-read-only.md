@@ -1,0 +1,5 @@
+---
+"@dudousxd/nestjs-catalog-react": minor
+---
+
+`CatalogManager` can be shown read-only and without the pipeline sections. `canEdit={false}` renders every curated field (name, description, group, plural, icon, unit, link labels) as plain text, drops the Hide/Show toggle and **Reset edits**, and issues no write; `LoadExpectationSection` takes the same `canEdit` and then shows the expectation in force without its form. `pipeline={false}` leaves out **Loaded by** and **Load expectation** and never requests their endpoints. Both default to `true`, so nothing changes for existing hosts. An edit or reset the server refuses now shows a dismissable error instead of the field silently going back to its old value. A new `@dudousxd/nestjs-catalog-react/manager` entry exports `CatalogManager` alone, and the package now declares `sideEffects` (only `WorkflowCanvas`, which imports React Flow's stylesheet, is marked), so a host that mounts only this screen no longer bundles the workflow canvas, diff viewer or code editor.

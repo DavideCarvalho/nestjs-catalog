@@ -273,9 +273,19 @@ export interface LoadExpectationSectionProps {
   typeName: string;
   /** What a person calls the type. Used in the sentences, which are about the type. */
   displayName: string;
+  /**
+   * Set false where the viewer is known to be read-only. The expectation in
+   * force, its reason and where each field came from are still shown; the form
+   * that sets it is not rendered, so nothing here can issue a write.
+   */
+  canEdit?: boolean;
 }
 
-export function LoadExpectationSection({ typeName, displayName }: LoadExpectationSectionProps) {
+export function LoadExpectationSection({
+  typeName,
+  displayName,
+  canEdit = true,
+}: LoadExpectationSectionProps) {
   const client = useCatalogClient();
   const {
     data: view,
@@ -319,7 +329,7 @@ export function LoadExpectationSection({ typeName, displayName }: LoadExpectatio
         </div>
       )}
 
-      {view && <LoadExpectationBody view={view} displayName={displayName} />}
+      {view && <LoadExpectationBody view={view} displayName={displayName} canEdit={canEdit} />}
     </section>
   );
 }
@@ -327,9 +337,11 @@ export function LoadExpectationSection({ typeName, displayName }: LoadExpectatio
 function LoadExpectationBody({
   view,
   displayName,
+  canEdit,
 }: {
   view: ResolvedLoadExpectation;
   displayName: string;
+  canEdit: boolean;
 }) {
   const deletes = view.resolved.deletes;
 
@@ -352,7 +364,7 @@ function LoadExpectationBody({
           <p className="mt-1 text-xs text-amber-800 dark:text-amber-300/80">
             A full load still commits — it replaces the whole type, so deletions reconcile by
             construction. What is blocked is the incremental path, until somebody chooses a strategy
-            below and writes down why.
+            {canEdit ? ' below' : ''} and writes down why.
           </p>
         </div>
       ) : (
@@ -386,7 +398,7 @@ function LoadExpectationBody({
       )}
 
       <ProvenanceTable view={view} />
-      <ExpectationForm view={view} displayName={displayName} />
+      {canEdit && <ExpectationForm view={view} displayName={displayName} />}
     </div>
   );
 }

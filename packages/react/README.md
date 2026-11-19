@@ -37,6 +37,11 @@ Requires a `QueryClientProvider` from `@tanstack/react-query` above it.
 - **`<CatalogManager />`** — browse types by group, see every property beside the
   column it came from, and edit labels, descriptions and units inline. Edits are
   presentation-only; nothing here can reach a migration.
+  `canEdit={false}` shows the same screen read-only (no editors, no Hide/Show, no
+  **Reset edits**, no writes), and `pipeline={false}` leaves out the **Loaded by**
+  and **Load expectation** sections, which read the host's pipeline endpoints.
+  Import it from `@dudousxd/nestjs-catalog-react/manager` to pull in this screen
+  alone.
 - **`<ObjectExplorer />`** — one table for every type in the catalog. Columns,
   labels, alignment and units all arrive with the data, so it knows nothing about
   your domain.

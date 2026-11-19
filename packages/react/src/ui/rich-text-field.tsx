@@ -83,6 +83,8 @@ export interface RichTextFieldProps {
   label: string;
   placeholder?: string;
   className?: string;
+  /** Show the text and offer no editor. See `EditableField`'s `readOnly`. */
+  readOnly?: boolean;
 }
 
 export function RichTextField({
@@ -91,8 +93,21 @@ export function RichTextField({
   label,
   placeholder = '—',
   className,
+  readOnly = false,
 }: RichTextFieldProps) {
   const [editing, setEditing] = useState(false);
+
+  if (readOnly) {
+    return (
+      <div className={cn('w-full px-1.5 py-0.5 text-left', className)}>
+        {value ? (
+          <RichTextView value={value} />
+        ) : (
+          <span className="text-zinc-400 dark:text-zinc-500">{placeholder}</span>
+        )}
+      </div>
+    );
+  }
 
   if (!editing) {
     return (
