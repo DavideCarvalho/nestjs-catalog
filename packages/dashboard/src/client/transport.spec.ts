@@ -17,7 +17,7 @@
  * hardcoded prefix ignored.
  */
 import { afterEach, describe, expect, it } from 'vitest';
-import { transport } from './transport';
+import { listEnvironments, transport } from './transport';
 
 const configurable = window as { __CATALOG_API__?: string };
 
@@ -44,5 +44,35 @@ describe('transport.url', () => {
     expect(transport.url?.('/catalog/saved-queries/q-1/export.csv')).toBe(
       `${window.location.origin}/gateway/catalog-service/catalog/saved-queries/q-1/export.csv`,
     );
+  });
+});
+
+describe('listEnvironments', () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  function answer(status: number, body: unknown) {
+    globalThis.fetch = async () => new Response(JSON.stringify(body), { status });
+  }
+
+  it('returns the environments the server lists', async () => {
+    const dev = { id: 'dev', displayName: 'Dev', rank: 0, protected: false };
+    answer(200, [dev]);
+    expect(await listEnvironments()).toEqual([dev]);
+  });
+
+  it('answers a 404 as one environment, not as a failure', async () => {
+    // A host that serves no `/environments` has exactly one, which is a configuration and not an
+    // error; the picker reads `null` as "nothing to choose between".
+    answer(404, { message: 'Cannot GET /api/environments' });
+    expect(await listEnvironments()).toBeNull();
+  });
+
+  it('still fails on anything else', async () => {
+    answer(500, { message: 'boom' });
+    await expect(listEnvironments()).rejects.toThrow('boom');
   });
 });

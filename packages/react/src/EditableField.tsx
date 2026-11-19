@@ -10,6 +10,12 @@ interface EditableFieldProps {
   className?: string;
   inputClassName?: string;
   label: string;
+  /**
+   * Render the value as plain text, with no edit affordance at all — no button,
+   * no pencil, nothing a click turns into a write. For a viewer who may read the
+   * catalog but not change it.
+   */
+  readOnly?: boolean;
 }
 
 /**
@@ -27,6 +33,7 @@ export function EditableField({
   className,
   inputClassName,
   label,
+  readOnly = false,
 }: EditableFieldProps) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(value);
@@ -55,6 +62,23 @@ export function EditableField({
   function cancel() {
     setDraft(value);
     setEditing(false);
+  }
+
+  if (readOnly) {
+    return (
+      <span
+        className={cn(
+          'flex w-full items-start px-1.5 py-0.5 text-left',
+          // The same box the button draws, minus the border that only exists to
+          // be hovered, so a read-only screen lines up with an editable one.
+          className,
+        )}
+      >
+        <span className={cn(!value && 'italic text-zinc-400 dark:text-zinc-500')}>
+          {value || placeholder}
+        </span>
+      </span>
+    );
   }
 
   if (editing) {

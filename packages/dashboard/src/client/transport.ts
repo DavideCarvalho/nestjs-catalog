@@ -49,6 +49,22 @@ export function clearDevKey(): void {
 export class UnauthorizedError extends Error {}
 
 /**
+ * A response that was not ok, with its status kept.
+ *
+ * The message is still the server's own words (see `errorForResponse`); the
+ * status is there for the few callers that answer one status differently, such
+ * as a 404 from an endpoint the host does not mount.
+ */
+export class HttpError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+  }
+}
+
+/**
  * Where a call goes, and what query string it carries.
  *
  * The host decides where the API lives and injects it; hardcoding `/api` here
@@ -79,7 +95,11 @@ function buildUrl(path: string, params: Record<string, unknown> | undefined): UR
  * line is only what is left when the body carries nothing better, and a body
  * that is not JSON is still preferred over it.
  */
-async function errorForResponse(response: Response, path: string, method: string): Promise<Error> {
+async function errorForResponse(
+  response: Response,
+  path: string,
+  method: string,
+): Promise<HttpError> {
   const detail = await response.text();
   let message = `${method} ${path} → ${response.status}`;
   try {
@@ -90,7 +110,7 @@ async function errorForResponse(response: Response, path: string, method: string
   } catch {
     if (detail) message = detail;
   }
-  return new Error(message);
+  return new HttpError(message, response.status);
 }
 
 async function request<T>(
@@ -270,7 +290,19 @@ export interface CatalogEnvironmentSummary {
   protected: boolean;
 }
 
-/** The environments this deployment serves. Needs no environment of its own. */
-export function listEnvironments(): Promise<CatalogEnvironmentSummary[]> {
-  return request<CatalogEnvironmentSummary[]>('/environments');
+/**
+ * The environments this deployment serves. Needs no environment of its own.
+ *
+ * `null` when the host serves no `/environments` at all (a 404): that is a host
+ * with one environment, which is a real configuration and not a failure, so it
+ * is answered as one instead of surfacing as an error. Any other refusal still
+ * throws.
+ */
+export async function listEnvironments(): Promise<CatalogEnvironmentSummary[] | null> {
+  try {
+    return await request<CatalogEnvironmentSummary[]>('/environments');
+  } catch (error) {
+    if (error instanceof HttpError && error.status === 404) return null;
+    throw error;
+  }
 }

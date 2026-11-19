@@ -17,7 +17,7 @@ import { CHART_COLORS, type ChartRendererProps, seriesFrom } from './registry.js
  * bklit-ui (https://github.com/bklit/bklit-ui, MIT, Copyright (c) 2026 uixmat)
  * is vendored under `./bklit` rather than depended on, because it is a shadcn
  * registry — components you own, not a package you install. The full licence is
- * in LICENSE-bklit at the root of this package.
+ * in THIRD_PARTY_NOTICES.md at the root of this package.
  *
  * Registered like any other library, so a host that never selects it pays for
  * none of the visx, d3 or motion peers it needs:

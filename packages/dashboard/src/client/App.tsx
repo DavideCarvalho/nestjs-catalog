@@ -32,6 +32,19 @@ import {
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { IDENTITY_QUERY_KEY, KeyGate } from './KeyGate';
 import { TabStrip } from './TabStrip';
+import { type ConsoleScreen, readConsoleConfig } from './console-config';
+
+/**
+ * What the host chose to show, read once like `HOST_AUTHENTICATES` below and for
+ * the same reason: the server writes it into `config.js` before the bundle runs,
+ * and nothing on the page can change it afterwards.
+ */
+const CONFIG = readConsoleConfig();
+
+/** Whether the host chose to show a screen. A hidden one has no tab, no panel and no requests. */
+function shown(screen: ConsoleScreen): boolean {
+  return CONFIG.screens.has(screen);
+}
 
 /**
  * Whether the HOST already knows who this is.
@@ -46,12 +59,21 @@ import { TabStrip } from './TabStrip';
  * When the host authenticates, the gate is skipped entirely: the session cookie
  * the host minted is already on every request this SPA makes.
  */
-const HOST_AUTHENTICATES =
-  (window as { __CATALOG_HOST_AUTH__?: boolean }).__CATALOG_HOST_AUTH__ === true;
+const HOST_AUTHENTICATES = CONFIG.hostAuth;
 
-/** The gate, or nothing at all when the host owns identity. */
+/**
+ * The gate, or nothing at all when the host owns identity.
+ *
+ * Also skipped when the console may not ask `/auth/me`, because the gate is
+ * built on that call: without the endpoint it could only ever show a sign-in
+ * that has nowhere to send the credential.
+ */
 function IdentityGate({ children }: { children: React.ReactNode }) {
-  if (HOST_AUTHENTICATES) return <>{children}</>;
+  // `!CONFIG.identity` is defence in depth and has no test of its own: the
+  // server writes `identity: false` only with `hostAuth: true`, so the first
+  // half already decides. It matters only for a hand-written `config.js` that
+  // turns identity off without host authentication.
+  if (HOST_AUTHENTICATES || !CONFIG.identity) return <>{children}</>;
   return <KeyGate>{children}</KeyGate>;
 }
 import { api, getEnvironment, listEnvironments, setEnvironment, transport } from './transport';
@@ -89,6 +111,20 @@ const TABS: Array<{ id: Tab; label: string; icon: typeof Boxes }> = [
 ];
 
 /**
+ * The tabs this host shows, in the strip's order.
+ *
+ * `readConsoleConfig` guarantees at least one, so `VISIBLE_TABS[0]` is always a
+ * screen to fall back to.
+ */
+const VISIBLE_TABS = TABS.filter((tab) => shown(tab.id));
+
+/**
+ * Where an address that names nothing lands. The model screen when the host
+ * shows it, which keeps every existing console where it was.
+ */
+const DEFAULT_TAB: Tab = VISIBLE_TABS[0]?.id ?? 'model';
+
+/**
  * The one screen reached by hash and by shortcut, and never by a tab.
  *
  * Search is a route like any other — `#search` can be bookmarked, sent to
@@ -109,7 +145,7 @@ type Route = Tab | typeof SEARCH_ROUTE;
  * through to `TabsPanel`, which would then match nothing and render blank.
  */
 function isTab(value: string): value is Tab {
-  return TABS.some((tab) => tab.id === value);
+  return VISIBLE_TABS.some((tab) => tab.id === value);
 }
 
 /**
@@ -137,9 +173,12 @@ const MOVED: Record<string, Tab> = {
 
 function routeFromHash(): Route {
   const route = window.location.hash.replace('#', '').split('?')[0] ?? '';
-  if (route === SEARCH_ROUTE) return SEARCH_ROUTE;
+  if (route === SEARCH_ROUTE && shown('search')) return SEARCH_ROUTE;
   if (isTab(route)) return route;
-  return MOVED[route] ?? 'model';
+  // A moved route lands where its screen went only while the host shows that
+  // screen; otherwise it is an address naming nothing here, like any other.
+  const moved = MOVED[route];
+  return moved && isTab(moved) ? moved : DEFAULT_TAB;
 }
 
 /** The parameters after the `?`, which live in the hash rather than in `search`. */
@@ -162,6 +201,9 @@ function useConsoleIdentity() {
     queryKey: IDENTITY_QUERY_KEY,
     queryFn: () => api.me(),
     retry: false,
+    // Not asked at all when the host owns identity: the endpoint does not exist
+    // there, and asking anyway is a 404 in the network tab on every load.
+    enabled: CONFIG.identity,
   });
   const signOut = useMutation({
     mutationFn: () => api.logout(),
@@ -180,11 +222,15 @@ function useConsoleIdentity() {
  */
 function EnvironmentPicker() {
   const current = getEnvironment();
-  const { data: environments = [] } = useQuery({
+  const { data } = useQuery({
     queryKey: ['environments'],
     queryFn: () => listEnvironments(),
     staleTime: Number.POSITIVE_INFINITY,
   });
+  // `null` is a host that serves no environments endpoint: one environment,
+  // nothing to choose between, and so nothing to show.
+  if (data === null) return null;
+  const environments = data ?? [];
   const active = environments.find((environment) => environment.id === current);
 
   return (
@@ -266,7 +312,7 @@ export function App() {
     setParams(next);
   }, []);
 
-  const cameFrom = useRef<Tab>(isTab(route) ? route : 'model');
+  const cameFrom = useRef<Tab>(isTab(route) ? route : DEFAULT_TAB);
   useEffect(() => {
     if (isTab(route)) cameFrom.current = route;
   }, [route]);
@@ -297,7 +343,7 @@ export function App() {
    */
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
+      if (shown('search') && (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
         // Firefox and Chrome both aim ⌘K at the browser's own address bar, so
         // without this the console's search never opens and the URL bar does.
         event.preventDefault();
@@ -355,12 +401,12 @@ export function App() {
             <span className="mr-4 flex shrink-0 items-center gap-2 py-3 text-sm font-semibold tracking-tight">
               <span className="text-base">◈</span> Catalog
             </span>
-            <TabStrip tabs={TABS} value={route} />
+            <TabStrip tabs={VISIBLE_TABS} value={route} />
             {/* Outside the scrolling strip on purpose. Scrolling a tab strip is
                 ordinary; having the environment you are editing scroll off the
                 screen is not. */}
             <div className="flex shrink-0 items-center gap-1 pl-2">
-              <SearchLauncher active={route === SEARCH_ROUTE} />
+              {shown('search') && <SearchLauncher active={route === SEARCH_ROUTE} />}
               <EnvironmentPicker />
               <StoreBadge />
             </div>
@@ -373,7 +419,7 @@ export function App() {
               each panel the `aria-labelledby` back to its tab that a bare
               conditional cannot have. */}
           <main className="min-h-0 flex-1 overflow-hidden">
-            <TabsPanel value="model" className="h-full">
+            <ShownPanel value="model" className="h-full">
               <CatalogManager
                 title="Model"
                 eyebrow="Published by your applications"
@@ -384,7 +430,15 @@ export function App() {
                 // in which of the two you land on. This is the half a workflow's
                 // sink links to.
                 type={params.get('type') ?? undefined}
-                explorerHref={(type) => `#objects?type=${type}`}
+                // Only to screens this console shows. Defence in depth behind
+                // `isTab`, and not pinned by a test: without the gate the link
+                // would still never open a hidden screen, it would land on the
+                // first screen shown, which reads as a dead click. The same
+                // holds for the `workflowHref` and `backHref` gates below and
+                // the search screen's hrefs.
+                {...(shown('objects')
+                  ? { explorerHref: (type: string) => `#objects?type=${type}` }
+                  : {})}
                 // Every loader links to the canvas ITSELF, and the id is
                 // deliberately dropped. `WorkflowCanvas` takes no workflow id —
                 // it picks its own — so a `#workflows?workflow=<id>` here would
@@ -395,19 +449,21 @@ export function App() {
                 // and a `params.get('workflow')` on the panel below are the
                 // change; until then the rows say the graph's name and the
                 // address says where you are going, and neither lies.
-                workflowHref={() => '#workflows'}
+                {...(shown('workflows') ? { workflowHref: () => '#workflows' } : {})}
+                // The host's pipeline endpoints, which serve Loaded by and Load
+                // expectation. Off, neither section renders or is requested.
+                pipeline={CONFIG.pipeline}
               />
-            </TabsPanel>
-            <TabsPanel value="objects" className="h-full">
+            </ShownPanel>
+            <ShownPanel value="objects" className="h-full">
               <ObjectExplorer
                 // Passed rather than left to the library to sniff: the host is
                 // the one that knows where its own router keeps parameters.
                 type={params.get('type') ?? undefined}
-                backHref="#model"
-                backLabel="Model"
+                {...(shown('model') ? { backHref: '#model', backLabel: 'Model' } : {})}
               />
-            </TabsPanel>
-            <TabsPanel value="query" className="h-full">
+            </ShownPanel>
+            <ShownPanel value="query" className="h-full">
               {/* Both halves of the same agreement as `type` above: the host
                   parses its own hash and hands the id over, and takes back
                   whatever the screen opened so the address keeps naming it.
@@ -418,14 +474,14 @@ export function App() {
                 savedQueryId={params.get('savedQuery') ?? undefined}
                 onSavedQueryChange={(id) => nameInAddress('query', 'savedQuery', id)}
               />
-            </TabsPanel>
-            <TabsPanel value="dashboards" className="h-full">
+            </ShownPanel>
+            <ShownPanel value="dashboards" className="h-full">
               <DashboardBoard
                 dashboardId={params.get('dashboard') ?? undefined}
                 onDashboardChange={(id) => nameInAddress('dashboards', 'dashboard', id)}
               />
-            </TabsPanel>
-            <TabsPanel value="workflows" className="h-full">
+            </ShownPanel>
+            <ShownPanel value="workflows" className="h-full">
               {/* The other direction of the same link. A sink node knows which
                   type it commits; this is what lets it say so out loud. The
                   spelling MUST match the `params.get('type')` handed to
@@ -434,34 +490,52 @@ export function App() {
                   `App.load-links.spec.tsx` follows the link rather than reading
                   it. */}
               <WorkflowCanvas modelHref={(type) => `#model?type=${encodeURIComponent(type)}`} />
-            </TabsPanel>
-            <TabsPanel value="connections" className="h-full overflow-hidden">
+            </ShownPanel>
+            <ShownPanel value="connections" className="h-full overflow-hidden">
               <PipelineConsole />
-            </TabsPanel>
-            <TabsPanel value="lineage" className="h-full">
+            </ShownPanel>
+            <ShownPanel value="lineage" className="h-full">
               <FlowView />
-            </TabsPanel>
-            <TabsPanel value="activity" className="h-full">
+            </ShownPanel>
+            <ShownPanel value="activity" className="h-full">
               <GovernanceTimeline />
-            </TabsPanel>
-            <TabsPanel value="access" className="h-full overflow-y-auto">
+            </ShownPanel>
+            <ShownPanel value="access" className="h-full overflow-y-auto">
               <AccessConsole
                 identity={identity}
                 onSignOut={() => signOut.mutate()}
                 signOutPending={signOut.isPending}
               />
-            </TabsPanel>
+            </ShownPanel>
             {/* A panel with no tab above it. Base UI is content with that — the
                 panel matches on `value` and simply gets no `aria-labelledby`,
                 which is why the screen carries its own heading. */}
-            <TabsPanel value={SEARCH_ROUTE} className="h-full">
+            <ShownPanel value={SEARCH_ROUTE} className="h-full">
               <SearchScreen />
-            </TabsPanel>
+            </ShownPanel>
           </main>
         </Tabs>
       </IdentityGate>
     </CatalogProvider>
   );
+}
+
+/**
+ * A screen's panel, or nothing when the host hides that screen.
+ *
+ * Not rendered at all rather than rendered and unreachable: a stale `#query`
+ * address would otherwise still mount the panel, along with every request it
+ * makes, on a host that serves none of them.
+ */
+// Defence in depth behind `isTab` and `routeFromHash`, which never let a hidden
+// screen become the route, so no test reaches the `null` branch through the
+// router; it stays so that a panel can never mount without its screen shown.
+function ShownPanel({
+  value,
+  ...props
+}: { value: ConsoleScreen } & Omit<React.ComponentProps<typeof TabsPanel>, 'value'>) {
+  if (!shown(value)) return null;
+  return <TabsPanel value={value} {...props} />;
 }
 
 /**
@@ -553,9 +627,15 @@ function SearchScreen() {
   return (
     <div ref={mount} className="h-full">
       <CatalogSearch
-        explorerHref={(type) => `#objects?type=${encodeURIComponent(type)}`}
-        savedQueryHref={(id) => `#query?savedQuery=${encodeURIComponent(id)}`}
-        dashboardHref={(id) => `#dashboards?dashboard=${encodeURIComponent(id)}`}
+        {...(shown('objects')
+          ? { explorerHref: (type: string) => `#objects?type=${encodeURIComponent(type)}` }
+          : {})}
+        {...(shown('query')
+          ? { savedQueryHref: (id: string) => `#query?savedQuery=${encodeURIComponent(id)}` }
+          : {})}
+        {...(shown('dashboards')
+          ? { dashboardHref: (id: string) => `#dashboards?dashboard=${encodeURIComponent(id)}` }
+          : {})}
       />
     </div>
   );

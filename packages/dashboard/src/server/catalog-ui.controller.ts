@@ -15,11 +15,22 @@ import {
 import { DASHBOARD_AUTH } from './auth/dashboard-auth-config.js';
 import { DashboardLoginRedirectFilter } from './auth/login-redirect.exception.js';
 import { DashboardSessionRequiredFilter } from './auth/session-required.exception.js';
+import { type ResolvedConsoleOptions, resolveConsoleOptions } from './console-options.js';
 
 /** DI token carrying the UI mount base (e.g. `/catalog`). */
 export const DASHBOARD_BASE_PATH = Symbol('DASHBOARD_BASE_PATH');
 /** DI token carrying the JSON API base the SPA fetches from (e.g. `/api/catalog`). */
 export const DASHBOARD_API_PATH = Symbol('DASHBOARD_API_PATH');
+/** DI token carrying the resolved console options: screens, pipeline, host authentication. */
+export const DASHBOARD_CONSOLE = Symbol('DASHBOARD_CONSOLE');
+
+/**
+ * A value made safe to sit inside a double-quoted HTML attribute. `&` first, so
+ * the entities the second replacement writes are not escaped again.
+ */
+function attribute(value: string): string {
+  return value.replaceAll('&', '&amp;').replaceAll('"', '&quot;');
+}
 
 /** The base the SPA bundle was built with (Vite `base`); rewritten to the configured base at serve time. */
 const BUILD_BASE = '/catalog';
@@ -69,6 +80,9 @@ export class CatalogUiController {
     @Optional()
     @Inject(DASHBOARD_AUTH)
     private readonly auth: unknown = null,
+    @Optional()
+    @Inject(DASHBOARD_CONSOLE)
+    private readonly console: ResolvedConsoleOptions = resolveConsoleOptions(),
   ) {}
 
   // index.html references hash-named bundles, so it MUST NOT be cached (stale bundle = the
@@ -91,15 +105,51 @@ export class CatalogUiController {
 
   private render(source: string): string {
     // The bundle was built with Vite base `/catalog/`; rewrite asset URLs to the configured base so
-    // the SPA loads from `<base>/assets` wherever it's mounted, and tell the client its API base.
-    const html = source.replaceAll(`="${BUILD_BASE}/`, `="${this.basePath}/`);
-    // __CATALOG_BASE__ = where assets load; __CATALOG_API__ = where the SPA fetches the JSON API;
-    // __CATALOG_HOST_AUTH__ = whether the HOST authenticates, in which case the SPA must not show
-    // its own sign-in. A console mounted inside an application that already knows who you are and
-    // then asks you to log in again is not a smaller problem than one that lets anybody in.
-    const hostAuth = this.auth ? 'true' : 'false';
-    const inject = `<script>window.__CATALOG_BASE__='${this.basePath}';window.__CATALOG_API__='${this.apiBasePath}';window.__CATALOG_HOST_AUTH__=${hostAuth};</script>`;
-    return html.includes('</head>') ? html.replace('</head>', `${inject}</head>`) : inject + html;
+    // the SPA loads from `<base>/assets` wherever it's mounted.
+    // Escaped, because the base lands inside `src="..."` and `href="..."` attributes.
+    const base = attribute(this.basePath);
+    const html = source.replaceAll(`="${BUILD_BASE}/`, `="${base}/`);
+    // The page config is a script FILE, not an inline script, so a host whose
+    // Content-Security-Policy refuses inline script can serve the console from its own origin. It
+    // goes first in the head, as a classic (blocking) script, so it runs before any other script
+    // on the page, deferred module or not, and the values are on `window` when the SPA reads them.
+    const inject = `<script src="${base}/config.js"></script>`;
+    const head = /<head\b[^>]*>/i.exec(html);
+    if (!head) return inject + html;
+    const at = head.index + head[0].length;
+    return html.slice(0, at) + inject + html.slice(at);
+  }
+
+  /**
+   * The values the SPA reads at startup.
+   *
+   * __CATALOG_BASE__ = where assets load; __CATALOG_API__ = where the SPA fetches the JSON API;
+   * __CATALOG_HOST_AUTH__ = whether the HOST authenticates, in which case the SPA must not show its
+   * own sign-in (a console mounted inside an application that already knows who you are and then
+   * asks you to log in again is not a smaller problem than one that lets anybody in);
+   * __CATALOG_CONSOLE__ = which screens to show, whether the Model screen reads the pipeline
+   * endpoints, and whether the SPA may ask `/auth/me` who is calling.
+   *
+   * Every value goes through `JSON.stringify`, so a path can never close the string it sits in.
+   * Not cached by the browser: it is tiny, and it changes with the module's options.
+   */
+  @Get('config.js')
+  @Header('Content-Type', 'text/javascript; charset=utf-8')
+  @Header('Cache-Control', 'no-store, must-revalidate')
+  config(): string {
+    const hostAuth = Boolean(this.auth) || this.console.hostAuthenticates;
+    const consoleConfig = {
+      screens: this.console.screens,
+      pipeline: this.console.pipeline,
+      identity: !this.console.hostAuthenticates,
+    };
+    return [
+      `window.__CATALOG_BASE__=${JSON.stringify(this.basePath)};`,
+      `window.__CATALOG_API__=${JSON.stringify(this.apiBasePath)};`,
+      `window.__CATALOG_HOST_AUTH__=${JSON.stringify(hostAuth)};`,
+      `window.__CATALOG_CONSOLE__=${JSON.stringify(consoleConfig)};`,
+      '',
+    ].join('\n');
   }
 
   @Get('assets/:file')

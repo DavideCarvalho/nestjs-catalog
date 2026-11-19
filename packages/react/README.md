@@ -37,9 +37,16 @@ Requires a `QueryClientProvider` from `@tanstack/react-query` above it.
 - **`<CatalogManager />`** — browse types by group, see every property beside the
   column it came from, and edit labels, descriptions and units inline. Edits are
   presentation-only; nothing here can reach a migration.
+  `canEdit={false}` shows the same screen read-only (no editors, no Hide/Show, no
+  **Reset edits**, no writes), and `pipeline={false}` leaves out the **Loaded by**
+  and **Load expectation** sections, which read the host's pipeline endpoints.
+  Import it from `@dudousxd/nestjs-catalog-react/manager` to pull in this screen
+  alone.
 - **`<ObjectExplorer />`** — one table for every type in the catalog. Columns,
   labels, alignment and units all arrive with the data, so it knows nothing about
   your domain.
+  `search={false}` leaves out the search box for a server that cannot search,
+  and `rowCountCap={10_000}` shows a count the server capped as "10,000+ rows".
 - **`<QueryConsole />`**, **`<DashboardBoard />`** — SQL over the published
   snapshots, saved queries, and cards built from them.
 - **`<GovernanceTimeline />`**, **`<TraceExplorer />`** — what happened, flat and
@@ -331,8 +338,8 @@ The chart components under `src/charts/bklit/` (and
 `src/charts/components/shimmering-text.tsx`) are vendored from
 [**bklit-ui**](https://github.com/bklit/bklit-ui), Copyright (c) 2026 uixmat,
 released under the **MIT licence**. The full licence text ships with this
-package as [`LICENSE-bklit`](./LICENSE-bklit), and every vendored file carries a
-header naming its origin.
+package in [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md), and every
+vendored file carries a header naming its origin.
 
 They are vendored rather than depended on because bklit-ui is a shadcn-style
 registry — components you own, not a package you install. The only local change
@@ -342,4 +349,5 @@ upstream stays a diff rather than a merge.
 
 ## License
 
-MIT (see `LICENSE-bklit` for the vendored bklit-ui components).
+MIT, in [`LICENSE`](./LICENSE). The vendored bklit-ui components keep their own MIT
+licence, in [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md).
