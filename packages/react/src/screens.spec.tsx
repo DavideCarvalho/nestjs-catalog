@@ -492,6 +492,15 @@ describe('ObjectExplorer', () => {
       expect(text).not.toContain('+');
     });
 
+    it.each([0, -5, 2.5, Number.NaN])(
+      'ignores a cap of %s and shows the exact total',
+      async (cap) => {
+        const text = await caption(10_000, cap);
+        expect(text).toContain(`${n(10_000)} rows`);
+        expect(text).not.toContain('+');
+      },
+    );
+
     it('shows the exact total when the host names no cap', async () => {
       const text = await caption(10_000);
       expect(text).toContain(`${n(10_000)} rows`);

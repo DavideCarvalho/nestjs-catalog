@@ -338,8 +338,8 @@ The chart components under `src/charts/bklit/` (and
 `src/charts/components/shimmering-text.tsx`) are vendored from
 [**bklit-ui**](https://github.com/bklit/bklit-ui), Copyright (c) 2026 uixmat,
 released under the **MIT licence**. The full licence text ships with this
-package as [`LICENSE-bklit`](./LICENSE-bklit), and every vendored file carries a
-header naming its origin.
+package in [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md), and every
+vendored file carries a header naming its origin.
 
 They are vendored rather than depended on because bklit-ui is a shadcn-style
 registry — components you own, not a package you install. The only local change
@@ -349,4 +349,5 @@ upstream stays a diff rather than a merge.
 
 ## License
 
-MIT (see `LICENSE-bklit` for the vendored bklit-ui components).
+MIT, in [`LICENSE`](./LICENSE). The vendored bklit-ui components keep their own MIT
+licence, in [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md).

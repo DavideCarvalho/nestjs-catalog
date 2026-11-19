@@ -110,7 +110,8 @@ export interface ObjectExplorerProps {
    * The most rows the host's server will count. A page whose `total` is at
    * least this is shown as "10,000+ rows" rather than "10,000 rows", because a
    * capped count is a lower bound and the exact figure reads as the real size.
-   * Omit when the server counts every row.
+   * Omit when the server counts every row. A cap that is not a positive whole
+   * number is ignored, and the count is shown exactly.
    */
   rowCountCap?: number;
 }
@@ -441,7 +442,10 @@ function tableCaption(
  * more. Below the cap the count is exact and shown as it is.
  */
 function rowCount(total: number, cap?: number): string {
-  if (cap !== undefined && cap > 0 && total >= cap) return `${cap.toLocaleString()}+ rows`;
+  // A cap that is not a whole number of rows above zero is a host mistake, and
+  // "0+ rows" or "2.5+ rows" would say something no server meant; it is ignored.
+  if (cap !== undefined && Number.isInteger(cap) && cap > 0 && total >= cap)
+    return `${cap.toLocaleString()}+ rows`;
   return `${total.toLocaleString()} rows`;
 }
 

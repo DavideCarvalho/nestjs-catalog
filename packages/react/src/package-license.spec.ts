@@ -37,6 +37,14 @@ describe('the package licence', () => {
     expect(notices).toContain('Copyright (c) 2026 uixmat');
   });
 
+  it('points the README at the files that ship, not at the old name', () => {
+    // The README ships in the tarball, so a stale link there is a dead link in every install.
+    const readme = read('README.md');
+    expect(readme).not.toContain('LICENSE-bklit');
+    expect(readme).toContain('(./LICENSE)');
+    expect(readme).toContain('(./THIRD_PARTY_NOTICES.md)');
+  });
+
   it('publishes both files', () => {
     const files: string[] = JSON.parse(read('package.json')).files;
     expect(files).toEqual(expect.arrayContaining(['LICENSE', 'THIRD_PARTY_NOTICES.md']));
