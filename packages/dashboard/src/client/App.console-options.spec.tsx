@@ -146,6 +146,20 @@ describe('a console that shows only Model and Objects', () => {
     expect(screen.queryByText(/saved quer/i)).toBeNull();
   });
 
+  it('lands #search on the first screen shown, and never searches, when search is hidden', async () => {
+    // Search has no tab, so `isTab` does not cover it: only the gate on `#search` in
+    // `routeFromHash` keeps a bookmarked or pasted search address from becoming the route.
+    window.location.hash = '#search';
+    mount();
+
+    await loaded();
+    await settle();
+    // The search box itself, by the placeholder `CatalogSearch` gives it. The request check
+    // below is the weaker half: the screen only asks once something is typed.
+    expect(screen.queryByPlaceholderText(/whatever you remember/)).toBeNull();
+    expect(requested.filter((path) => path.startsWith('/api/catalog/search'))).toEqual([]);
+  });
+
   it('asks only for what it shows: no identity, no pipeline, no hidden screen', async () => {
     mount();
     await loaded();

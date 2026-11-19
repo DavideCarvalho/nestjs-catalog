@@ -24,6 +24,14 @@ export const DASHBOARD_API_PATH = Symbol('DASHBOARD_API_PATH');
 /** DI token carrying the resolved console options: screens, pipeline, host authentication. */
 export const DASHBOARD_CONSOLE = Symbol('DASHBOARD_CONSOLE');
 
+/**
+ * A value made safe to sit inside a double-quoted HTML attribute. `&` first, so
+ * the entities the second replacement writes are not escaped again.
+ */
+function attribute(value: string): string {
+  return value.replaceAll('&', '&amp;').replaceAll('"', '&quot;');
+}
+
 /** The base the SPA bundle was built with (Vite `base`); rewritten to the configured base at serve time. */
 const BUILD_BASE = '/catalog';
 
@@ -98,12 +106,14 @@ export class CatalogUiController {
   private render(source: string): string {
     // The bundle was built with Vite base `/catalog/`; rewrite asset URLs to the configured base so
     // the SPA loads from `<base>/assets` wherever it's mounted.
-    const html = source.replaceAll(`="${BUILD_BASE}/`, `="${this.basePath}/`);
+    // Escaped, because the base lands inside `src="..."` and `href="..."` attributes.
+    const base = attribute(this.basePath);
+    const html = source.replaceAll(`="${BUILD_BASE}/`, `="${base}/`);
     // The page config is a script FILE, not an inline script, so a host whose
     // Content-Security-Policy refuses inline script can serve the console from its own origin. It
     // goes first in the head, as a classic (blocking) script, so it runs before any other script
     // on the page, deferred module or not, and the values are on `window` when the SPA reads them.
-    const inject = `<script src="${this.basePath}/config.js"></script>`;
+    const inject = `<script src="${base}/config.js"></script>`;
     const head = /<head\b[^>]*>/i.exec(html);
     if (!head) return inject + html;
     const at = head.index + head[0].length;

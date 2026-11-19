@@ -156,6 +156,15 @@ describe('the page config', () => {
     });
   });
 
+  it('escapes a path in the page attributes, so it cannot close one', () => {
+    const ui = new CatalogUiController('/a"b&c', '/api', null, resolveConsoleOptions());
+    Reflect.set(ui, 'dir', spa);
+    const html = ui.index();
+    expect(html).toContain('<script src="/a&quot;b&amp;c/config.js"></script>');
+    expect(html).toContain('src="/a&quot;b&amp;c/assets/app-1.js"');
+    expect(html).not.toContain('/a"b');
+  });
+
   it('cannot be broken out of by a path', () => {
     // The paths used to be interpolated between single quotes; a quote in one closed the string.
     const ui = new CatalogUiController(`/a'b</script>`, '/api', null, resolveConsoleOptions());

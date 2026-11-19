@@ -69,6 +69,10 @@ const HOST_AUTHENTICATES = CONFIG.hostAuth;
  * that has nowhere to send the credential.
  */
 function IdentityGate({ children }: { children: React.ReactNode }) {
+  // `!CONFIG.identity` is defence in depth and has no test of its own: the
+  // server writes `identity: false` only with `hostAuth: true`, so the first
+  // half already decides. It matters only for a hand-written `config.js` that
+  // turns identity off without host authentication.
   if (HOST_AUTHENTICATES || !CONFIG.identity) return <>{children}</>;
   return <KeyGate>{children}</KeyGate>;
 }
@@ -426,8 +430,12 @@ export function App() {
                 // in which of the two you land on. This is the half a workflow's
                 // sink links to.
                 type={params.get('type') ?? undefined}
-                // Only to screens this console shows: a link to a hidden one
-                // would land on the default tab, which reads as a dead click.
+                // Only to screens this console shows. Defence in depth behind
+                // `isTab`, and not pinned by a test: without the gate the link
+                // would still never open a hidden screen, it would land on the
+                // first screen shown, which reads as a dead click. The same
+                // holds for the `workflowHref` and `backHref` gates below and
+                // the search screen's hrefs.
                 {...(shown('objects')
                   ? { explorerHref: (type: string) => `#objects?type=${type}` }
                   : {})}
@@ -519,6 +527,9 @@ export function App() {
  * address would otherwise still mount the panel, along with every request it
  * makes, on a host that serves none of them.
  */
+// Defence in depth behind `isTab` and `routeFromHash`, which never let a hidden
+// screen become the route, so no test reaches the `null` branch through the
+// router; it stays so that a panel can never mount without its screen shown.
 function ShownPanel({
   value,
   ...props
