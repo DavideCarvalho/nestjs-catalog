@@ -149,7 +149,10 @@ export class MySqlWorkspaceStore implements CatalogWorkspaceStore {
     if (input.cacheTtlSeconds !== undefined) {
       row.cacheTtlSeconds = input.cacheTtlSeconds;
     }
-    if (input.visualization !== undefined) {
+    // Assigned only when it differs as JSON. Postgres stores `jsonb` with its keys
+    // reordered, so an equal value read back compares unequal key by key, and
+    // reassigning it would bump `updatedAt` for an edit that changed nothing.
+    if (input.visualization !== undefined && !sameJson(input.visualization, row.visualization)) {
       row.visualization = { ...input.visualization };
     }
     if (input.shared !== undefined) row.shared = input.shared;
@@ -267,7 +270,8 @@ export class MySqlWorkspaceStore implements CatalogWorkspaceStore {
 
     if (input.name !== undefined) row.name = input.name;
     if (input.description !== undefined) row.description = input.description;
-    if (input.cards !== undefined) {
+    // See `updateSavedQuery`: unchanged JSON is not reassigned.
+    if (input.cards !== undefined && !sameJson(input.cards, row.cards)) {
       row.cards = input.cards.map((card) => ({ ...card }));
     }
     if (input.shared !== undefined) row.shared = input.shared;
@@ -482,6 +486,25 @@ export async function readRevisions(
   ];
 }
 
+/**
+ * Whether two JSON values are equal as `jsonb` stores them: key order does not
+ * matter and an `undefined` member is absent.
+ */
+function sameJson(a: unknown, b: unknown): boolean {
+  return canonicalJson(a) === canonicalJson(b);
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    const entries = Object.entries(value)
+      .filter(([, member]) => member !== undefined)
+      .sort(([x], [y]) => (x < y ? -1 : x > y ? 1 : 0));
+    return `{${entries.map(([key, member]) => `${JSON.stringify(key)}:${canonicalJson(member)}`).join(',')}}`;
+  }
+  return JSON.stringify(value ?? null);
+}
+
 function toRevision(row: RevisionRow): CatalogRevision {
   return {
     id: row.id,
@@ -537,6 +560,9 @@ function toDashboard(row: DashboardRow): Dashboard {
       id: String(card.id ?? `card-${index}`),
       savedQueryId: String(card.savedQueryId ?? ''),
       title: typeof card.title === 'string' ? card.title : undefined,
+      // Kept: a card's library is the board's override of the query's, and
+      // dropping it on read drew the card with the query's library instead.
+      library: typeof card.library === 'string' ? card.library : undefined,
       width: [1, 2, 3, 4].includes(Number(card.width)) ? (Number(card.width) as 1 | 2 | 3 | 4) : 2,
       position: Number(card.position ?? index),
     })),

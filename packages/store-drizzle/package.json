@@ -1,0 +1,59 @@
+{
+  "name": "@dudousxd/nestjs-catalog-store-drizzle",
+  "version": "0.0.0",
+  "description": "Drizzle (PostgreSQL) storage for @dudousxd/nestjs-catalog: saved queries, dashboards, revisions, the audit trail and the curation overlay, run through the host's own Drizzle database or transaction wrapper.",
+  "license": "MIT",
+  "author": "Davide Carvalho",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DavideCarvalho/nestjs-catalog.git",
+    "directory": "packages/store-drizzle"
+  },
+  "bugs": {
+    "url": "https://github.com/DavideCarvalho/nestjs-catalog/issues"
+  },
+  "keywords": [
+    "catalog",
+    "drizzle",
+    "drizzle-orm",
+    "nestjs",
+    "postgres",
+    "postgresql"
+  ],
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./sql/*": "./sql/*",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "sql"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsc -p tsconfig.json --watch"
+  },
+  "peerDependencies": {
+    "@dudousxd/nestjs-catalog": ">=0.37.0",
+    "@nestjs/common": ">=10",
+    "drizzle-orm": ">=0.44.0 <1"
+  },
+  "devDependencies": {
+    "@dudousxd/nestjs-catalog": "workspace:*",
+    "@nestjs/common": "11.2.7",
+    "@types/node": "25.9.9",
+    "@types/pg": "8.23.1",
+    "drizzle-orm": "0.45.3",
+    "pg": "8.23.1",
+    "typescript": "5.9.3"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}
