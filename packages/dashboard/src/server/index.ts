@@ -52,4 +52,12 @@ export {
   CatalogUiController,
   DASHBOARD_API_PATH,
   DASHBOARD_BASE_PATH,
+  DASHBOARD_CONSOLE,
 } from './catalog-ui.controller.js';
+export {
+  CATALOG_CONSOLE_SCREENS,
+  type CatalogConsoleOptions,
+  type CatalogConsoleScreen,
+  type ResolvedConsoleOptions,
+  resolveConsoleOptions,
+} from './console-options.js';

@@ -18,9 +18,15 @@ import {
   CatalogUiController,
   DASHBOARD_API_PATH,
   DASHBOARD_BASE_PATH,
+  DASHBOARD_CONSOLE,
 } from './catalog-ui.controller.js';
+import { type CatalogConsoleOptions, resolveConsoleOptions } from './console-options.js';
 
-export interface CatalogDashboardOptions {
+/**
+ * Includes {@link CatalogConsoleOptions}: `screens`, `pipeline` and
+ * `hostAuthenticates`, which shape what the SPA shows and asks for.
+ */
+export interface CatalogDashboardOptions extends CatalogConsoleOptions {
   /**
    * Where the console is served. Default `/catalog`.
    *
@@ -139,6 +145,15 @@ function build(
 ): DynamicModule {
   const path = normalise(options.path ?? '/catalog');
   const apiPath = normalise(options.apiPath ?? '/api/catalog-service');
+  // Resolved here, at module definition, so a misspelt screen fails the boot
+  // rather than quietly hiding a screen the host meant to show.
+  const consoleOptions = resolveConsoleOptions({
+    ...(options.screens ? { screens: options.screens } : {}),
+    ...(options.pipeline !== undefined ? { pipeline: options.pipeline } : {}),
+    ...(options.hostAuthenticates !== undefined
+      ? { hostAuthenticates: options.hostAuthenticates }
+      : {}),
+  });
 
   // The session guard, on the SPA and its assets.
   //
@@ -174,6 +189,7 @@ function build(
   const providers: Provider[] = [
     { provide: DASHBOARD_BASE_PATH, useValue: path },
     { provide: DASHBOARD_API_PATH, useValue: apiPath },
+    { provide: DASHBOARD_CONSOLE, useValue: consoleOptions },
     auth,
     // Constructed by Nest, so it must be declared here — a guard stamped by
     // `UseGuards` is still resolved from the declaring module's injector.

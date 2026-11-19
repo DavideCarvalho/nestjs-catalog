@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import type { Readable } from 'node:stream';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { CatalogUiController } from './catalog-ui.controller.js';
+import { type CatalogConsoleOptions, resolveConsoleOptions } from './console-options.js';
 
 vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs')>();
@@ -23,8 +24,16 @@ const INDEX = `<html><head><script src="/catalog/assets/app-1.js"></script></hea
 
 let spa: string;
 
-function controller(): CatalogUiController {
-  const ui = new CatalogUiController('/console', '/api/console');
+function controller(
+  auth: unknown = null,
+  options: CatalogConsoleOptions = {},
+): CatalogUiController {
+  const ui = new CatalogUiController(
+    '/console',
+    '/api/console',
+    auth,
+    resolveConsoleOptions(options),
+  );
   Reflect.set(ui, 'dir', spa);
   return ui;
 }
@@ -59,7 +68,7 @@ describe('the console page', () => {
     const again = [ui.index(), ui.index(), ui.index()];
 
     expect(first).toContain('src="/console/assets/app-1.js"');
-    expect(first).toContain("window.__CATALOG_API__='/api/console'");
+    expect(first).toContain('<script src="/console/config.js"></script>');
     for (const html of again) expect(html).toBe(first);
     expect(readsOf(join(spa, 'index.html'))).toBe(1);
   });
@@ -79,6 +88,78 @@ describe('the console page', () => {
   it('still answers 404 while the dashboard is not built', () => {
     rmSync(join(spa, 'index.html'));
     expect(() => controller().index()).toThrow(/not built/);
+  });
+});
+
+describe('the page config', () => {
+  /** Runs `config.js` the way a browser would, against a fresh object standing in for `window`. */
+  function evaluate(source: string): Record<string, unknown> {
+    const target: Record<string, unknown> = {};
+    new Function('window', source)(target);
+    return target;
+  }
+
+  it('is a script file the page loads, never an inline script', () => {
+    // A host whose Content-Security-Policy refuses inline script must still be able to serve this
+    // page: every <script> in it names a src.
+    const html = controller().index();
+    const scripts = html.match(/<script\b[^>]*>/g) ?? [];
+    expect(scripts.length).toBeGreaterThan(0);
+    for (const tag of scripts) expect(tag).toMatch(/\bsrc="/);
+    // Before the bundle, so the values are on `window` when the SPA reads them.
+    expect(html.indexOf('/console/config.js')).toBeLessThan(html.indexOf('app-1.js'));
+  });
+
+  it('carries the paths and the defaults when nothing is configured', () => {
+    expect(evaluate(controller().config())).toEqual({
+      __CATALOG_BASE__: '/console',
+      __CATALOG_API__: '/api/console',
+      __CATALOG_HOST_AUTH__: false,
+      __CATALOG_CONSOLE__: {
+        screens: [
+          'model',
+          'objects',
+          'query',
+          'dashboards',
+          'workflows',
+          'connections',
+          'lineage',
+          'activity',
+          'access',
+          'search',
+        ],
+        pipeline: true,
+        identity: true,
+      },
+    });
+  });
+
+  it('hides the sign-in, but keeps /auth/me, when the console has its own auth', () => {
+    const config = evaluate(controller({ modes: ['login'] }).config());
+    expect(config.__CATALOG_HOST_AUTH__).toBe(true);
+    expect(config.__CATALOG_CONSOLE__).toMatchObject({ identity: true });
+  });
+
+  it('carries the screens, pipeline and host authentication a host chose', () => {
+    const config = evaluate(
+      controller(null, {
+        screens: ['model', 'objects'],
+        pipeline: false,
+        hostAuthenticates: true,
+      }).config(),
+    );
+    expect(config.__CATALOG_HOST_AUTH__).toBe(true);
+    expect(config.__CATALOG_CONSOLE__).toEqual({
+      screens: ['model', 'objects'],
+      pipeline: false,
+      identity: false,
+    });
+  });
+
+  it('cannot be broken out of by a path', () => {
+    // The paths used to be interpolated between single quotes; a quote in one closed the string.
+    const ui = new CatalogUiController(`/a'b</script>`, '/api', null, resolveConsoleOptions());
+    expect(evaluate(ui.config()).__CATALOG_BASE__).toBe(`/a'b</script>`);
   });
 });
 

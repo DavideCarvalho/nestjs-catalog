@@ -72,9 +72,10 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--text);
-  /* Space Grotesk and JetBrains Mono are already linked in index.html; the
-     other consoles set exactly this pair, and the fallbacks matter because the
-     link is to Google Fonts and an air-gapped deployment will not get it. */
+  /* The other consoles set exactly this pair. Neither is loaded from anywhere:
+     the page fetches nothing from another origin, so a strict CSP and an
+     air-gapped deployment both work. A machine with the font installed uses
+     it, and every other one gets the system font after it. */
   font-family: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
   -webkit-font-smoothing: antialiased;
 }

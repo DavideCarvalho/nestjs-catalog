@@ -335,3 +335,43 @@ class HostUserDirectory {
 
 @Module({ providers: [HostUserDirectory], exports: [HostUserDirectory] })
 class HostAuthModule {}
+
+describe('CatalogDashboardModule console options (integration)', () => {
+  let app: INestApplication | undefined;
+
+  afterEach(async () => {
+    await app?.close();
+    app = undefined;
+  });
+
+  it('serves the page config at <path>/config.js, with the options the host chose', async () => {
+    app = await boot([
+      CatalogDashboardModule.forRoot({
+        path: '/console',
+        screens: ['model', 'objects'],
+        pipeline: false,
+        hostAuthenticates: true,
+      }),
+    ]);
+
+    const response = await request(app.getHttpServer())
+      .get('/console/config.js')
+      .expect(200)
+      .expect('content-type', /text\/javascript/);
+    const target: Record<string, unknown> = {};
+    new Function('window', response.text)(target);
+    expect(target.__CATALOG_HOST_AUTH__).toBe(true);
+    expect(target.__CATALOG_CONSOLE__).toEqual({
+      screens: ['model', 'objects'],
+      pipeline: false,
+      identity: false,
+    });
+  });
+
+  it('refuses a screen name it does not know before the app boots', () => {
+    expect(() =>
+      // biome-ignore lint/suspicious/noExplicitAny: a host on plain JavaScript can pass anything.
+      CatalogDashboardModule.forRoot({ screens: ['model', 'object' as any] }),
+    ).toThrow(/"object"/);
+  });
+});

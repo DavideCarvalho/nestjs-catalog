@@ -80,9 +80,42 @@ pulls it in.
 When the host authenticates, the SPA skips its own sign-in entirely — a console embedded in an
 application that already knows who you are has no business asking again.
 
+## Showing part of the console
+
+Three options shape what the SPA shows and asks for. Each defaults to today's behaviour.
+
+```ts
+CatalogDashboardModule.forRoot({
+  path: '/admin/ontology',
+  apiPath: '/api/catalog',
+  screens: ['model', 'objects'], // only these tabs; the rest get no tab, no panel, no requests
+  pipeline: false,               // Model leaves out Loaded by and Load expectation
+  hostAuthenticates: true,       // no sign-in, and no call to /auth/me
+});
+```
+
+- `screens` lists the screens to show: `model`, `objects`, `query`, `dashboards`, `workflows`,
+  `connections`, `lineage`, `activity`, `access` and `search` (the `⌘K` screen, which has no tab).
+  Default: all of them. An address naming a hidden screen lands on the first one shown. An unknown
+  name, or a list with no screen other than `search`, fails at module definition.
+- `pipeline: false` is for a host that does not mount the pipeline endpoints. The Model screen then
+  renders neither section and never requests `/pipeline/workflows` or `/pipeline/expectations/:type`.
+- `hostAuthenticates: true` is for a host that authenticates every request itself and serves no
+  `/auth/me`. Configuring `auth` already hides the sign-in, but keeps asking `/auth/me` for the
+  Access screen.
+
+Whatever the options, a host that serves no `/environments` (a 404) is read as one environment, and
+the environment picker is left out instead of failing.
+
 ## How the console is served
 
-`index.html` is rendered once (asset URLs rewritten to `path`, the API base filled in) and kept in
+The page loads nothing from another origin and runs no inline script, so it works under a strict
+Content-Security-Policy (`script-src 'self'`) and in an air-gapped deployment. The values it needs
+(asset base, API base, the options above) come from `<path>/config.js`, a small script the module
+serves and `index.html` loads first in its head. The fonts are named in the stylesheet and fall back
+to the system's; nothing is fetched from Google Fonts.
+
+`index.html` is rendered once (asset URLs rewritten to `path`, the `config.js` tag added) and kept in
 memory. Each request checks the file's mtime and size, and renders it again when they change, so a
 rebuilt bundle is picked up without a restart. It is always sent `Cache-Control: no-store`. Files
 under `assets/` are streamed from disk with a `Content-Length`; a path that is not a file is a 404.
