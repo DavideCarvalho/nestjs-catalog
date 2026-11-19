@@ -42,6 +42,7 @@ export {
   FileCatalogOverlayStore,
   InMemoryCatalogOverlayStore,
 } from './catalog.overlay-store';
+export { CatalogAuditRecorder } from './catalog.audit-recorder';
 export { CATALOG_OVERLAY_STORE } from './catalog.overlay-store.token';
 export { MikroOrmCatalogRegistry } from './catalog.registry';
 export { CatalogRegistry } from './catalog.registry.base';
