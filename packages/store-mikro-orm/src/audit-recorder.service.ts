@@ -236,19 +236,22 @@ export class MySqlCatalogTraceStore implements CatalogTraceStore {
     ]);
 
     const traces = assembleTraces(rows);
+    // A graded page that came back empty (an offset past the last trace)
+    // carries no `COUNT(*) OVER ()` row, so the total is counted on its own,
+    // over the same graded set `traceTotals` counts.
+    const gradedTotal = graded
+      ? rows.length > 0
+        ? toNumber(rows[0].total)
+        : (await this.traceTotals(query)).traces
+      : undefined;
     return {
       traces,
-      // Two truthful answers, from whichever statement was in a position to
-      // give one.
-      //
       // When grading came first, `COUNT(*) OVER ()` is evaluated before the
-      // LIMIT, so it is the real number of matching traces — but it only
-      // reaches us on a row, so an empty page carries no total and zero is all
-      // that can be claimed. When paging came first the count is its own
-      // statement over the same filter, which is strictly better: a page past
-      // the end of the list now still reports how many traces there are,
-      // instead of answering an out-of-range offset with "there are none".
-      total: graded ? (rows.length > 0 ? toNumber(rows[0].total) : 0) : (counted ?? 0),
+      // LIMIT, so it is the real number of matching traces, but it reaches us
+      // only on a row; an empty page is counted separately above. When paging
+      // came first the count is its own statement over the same filter. Either
+      // way a page past the end still reports how many traces there are.
+      total: gradedTotal ?? counted ?? 0,
       limit,
       offset,
       unlinked: unlinked.map(toAuditEvent),

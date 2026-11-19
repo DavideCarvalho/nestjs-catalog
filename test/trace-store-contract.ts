@@ -173,6 +173,36 @@ export function describeTraceStoreContract(setup: () => Promise<TraceContractSto
       expect(beyond.total).toBe(TRACES);
     });
 
+    it('reports the real total past the last page of an outcome filter too', async () => {
+      const failed = await store.listTraces({ outcome: 'failed', limit: 10 });
+      expect(failed.total).toBeGreaterThan(0);
+      const beyond = await store.listTraces({ outcome: 'failed', limit: 10, offset: 1_000_000 });
+      expect(beyond.traces).toHaveLength(0);
+      expect(beyond.total).toBe(failed.total);
+    });
+
+    it('keeps the traces with an event at or after `since`, whole', async () => {
+      // The overlapping pair is the newest data in the trail (2026-06-10), and
+      // snap-slow began before this instant: it matches on its later finish and
+      // still comes back with its start.
+      const since = '2026-06-10T09:00:05.000Z';
+      const page = await store.listTraces({ since, limit: 50 });
+      expect(page.traces.map((trace) => trace.id)).toEqual(['snap-slow']);
+      expect(page.total).toBe(1);
+      expect(page.traces[0]?.spans.map((span) => span.event)).toEqual([
+        'connector.run.started',
+        'connector.run.finished',
+      ]);
+
+      const wider = await store.listTraces({ since: '2026-06-10T09:00:00.000Z', limit: 50 });
+      expect(wider.traces.map((trace) => trace.id)).toEqual(['snap-quick', 'snap-slow']);
+      const totals = await store.traceTotals?.({ since: '2026-06-10T09:00:00.000Z' });
+      if (totals) expect(totals.traces).toBe(2);
+      // Every unlinked event is older than June 10.
+      expect(wider.unlinked).toHaveLength(0);
+      expect(wider.unlinkedTotal).toBe(0);
+    });
+
     it('counts only the traces a filter matched', async () => {
       const all = await store.listTraces({ limit: 1 });
       const filtered = await store.listTraces({ typeName: 'type_7', limit: 1 });

@@ -24,6 +24,44 @@ import { describe, expect, it } from 'vitest';
 export interface WorkspaceContractStore {
   readonly name: string;
   readonly store: CatalogWorkspaceStore;
+  /**
+   * Make every saved-query write wait on `arrive` until the returned function is
+   * called. The store's own spec installs this at the last point before the
+   * write reaches the database: MikroORM's flush, or the `UPDATE` statement.
+   * Without it the forced-interleaving case is skipped.
+   */
+  holdWrites?(arrive: () => Promise<void>): () => void;
+}
+
+/**
+ * Releases callers in pairs: the second arrival lets both through at once. A
+ * caller that waits longer than `timeoutMs` goes through alone, so a store that
+ * serialises its edits (the second blocked on a row lock and never arriving)
+ * costs this case a timeout, not a deadlock.
+ */
+export function pairGate(timeoutMs: number): {
+  arrive(): Promise<void>;
+  readonly arrivals: number;
+} {
+  let waiting: Array<() => void> = [];
+  let arrivals = 0;
+  return {
+    arrive() {
+      arrivals += 1;
+      return new Promise<void>((resolve) => {
+        waiting.push(resolve);
+        if (waiting.length >= 2) {
+          for (const release of waiting) release();
+          waiting = [];
+        } else {
+          setTimeout(resolve, timeoutMs);
+        }
+      });
+    },
+    get arrivals() {
+      return arrivals;
+    },
+  };
 }
 
 let counter = 0;
@@ -218,6 +256,33 @@ export function describeWorkspaceStoreContract(boot: () => WorkspaceContractStor
       expect(revisions.map((r) => r.body).sort()).toEqual(['SELECT 0', 'SELECT 1', 'SELECT 2']);
       const live = await store.getSavedQuery(saved.id);
       expect(live?.sql).toBe(revisions[0]?.body);
+    });
+
+    it('serialises two edits whose writes are held until both arrive', async () => {
+      const subject = boot();
+      const { store } = subject;
+      if (!subject.holdWrites || !supportsSavedQueryRevisions(store)) return;
+      const saved = await store.saveQuery({ name: unique('q'), sql: 'SELECT 0' }, 'a');
+
+      // Unlocked, both edits read version 1, are released together at the write
+      // and both claim version 2: the second fails on the revision key. Locked,
+      // the second edit waits on the row and reads version 2 once the first commits.
+      const gate = pairGate(1_000);
+      const stop = subject.holdWrites(() => gate.arrive());
+      let results: PromiseSettledResult<unknown>[];
+      try {
+        results = await Promise.allSettled([
+          store.updateSavedQuery(saved.id, { sql: 'SELECT 1' }),
+          store.updateSavedQuery(saved.id, { sql: 'SELECT 2' }),
+        ]);
+      } finally {
+        stop();
+      }
+      expect(gate.arrivals).toBeGreaterThanOrEqual(2);
+      expect(results.map((result) => result.status)).toEqual(['fulfilled', 'fulfilled']);
+      const revisions = await store.listSavedQueryRevisions(saved.id);
+      expect(revisions.map((r) => r.version)).toEqual([3, 2, 1]);
+      expect(revisions.map((r) => r.body).sort()).toEqual(['SELECT 0', 'SELECT 1', 'SELECT 2']);
     });
 
     it('answers an empty history for an id that names nothing', async () => {

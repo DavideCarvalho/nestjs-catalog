@@ -13,6 +13,7 @@ import type {
   SavedQuerySummary,
 } from '@dudousxd/nestjs-catalog';
 import { CATALOG_REVISION_LIMIT } from '@dudousxd/nestjs-catalog';
+import { LockMode } from '@mikro-orm/core';
 import type { EntityManager } from '@mikro-orm/sql';
 import { Inject, Injectable } from '@nestjs/common';
 import { CATALOG_STORE_ENTITY_MANAGER } from './context';
@@ -133,58 +134,49 @@ export class MySqlWorkspaceStore implements CatalogWorkspaceStore {
     id: string,
     input: Partial<SaveQueryInput>,
   ): Promise<SavedQuery | undefined> {
-    const em = this.em.fork();
-    const row = await em.findOne(SavedQueryRow, { id });
-    if (!row) return undefined;
+    // One transaction, with the row read FOR UPDATE. Two edits that both read
+    // version N would both write revision N + 1, and the second would fail on
+    // the revision key; locked, the second waits and reads N + 1 instead.
+    return this.em.fork().transactional(async (em) => {
+      const row = await em.findOne(SavedQueryRow, { id }, { lockMode: LockMode.PESSIMISTIC_WRITE });
+      if (!row) return undefined;
 
-    // Read before anything is assigned: this is the statement being superseded,
-    // and by the end of this method the row no longer holds it.
-    const superseded = { version: row.version, sql: row.sql, at: row.updatedAt };
-    const sqlChanged = input.sql !== undefined && input.sql !== row.sql;
+      // Read before anything is assigned: this is the statement being superseded,
+      // and by the end of this method the row no longer holds it.
+      const superseded = { version: row.version, sql: row.sql, at: row.updatedAt };
+      const sqlChanged = input.sql !== undefined && input.sql !== row.sql;
 
-    if (input.name !== undefined) row.name = input.name;
-    if (input.description !== undefined) row.description = input.description;
-    if (input.sql !== undefined) row.sql = input.sql;
-    if (input.folder !== undefined) row.folder = input.folder;
-    if (input.cacheTtlSeconds !== undefined) {
-      row.cacheTtlSeconds = input.cacheTtlSeconds;
-    }
-    // Assigned only when it differs as JSON. Postgres stores `jsonb` with its keys
-    // reordered, so an equal value read back compares unequal key by key, and
-    // reassigning it would bump `updatedAt` for an edit that changed nothing.
-    if (input.visualization !== undefined && !sameJson(input.visualization, row.visualization)) {
-      row.visualization = { ...input.visualization };
-    }
-    if (input.shared !== undefined) row.shared = input.shared;
+      assignSavedQueryInput(row, input);
 
-    if (sqlChanged) {
-      row.version = superseded.version + 1;
-      // The one being replaced, first. A query that predates this table has
-      // never had a revision written for it, and the only moment its live SQL is
-      // still readable is this one — after the assignment above it is gone for
-      // good. `recordRevision` leaves an already-recorded version alone, so on
-      // every subsequent edit this call is a no-op.
-      await recordRevision(em, {
-        subject: 'saved-query',
-        subjectId: row.id,
-        version: superseded.version,
-        body: superseded.sql,
-        authoredBy: row.createdBy,
-        authoredAt: superseded.at,
-      });
-      await recordRevision(em, {
-        subject: 'saved-query',
-        subjectId: row.id,
-        version: row.version,
-        body: row.sql,
-        authoredBy: row.createdBy,
-        authoredAt: new Date(),
-      });
-    }
+      if (sqlChanged) {
+        row.version = superseded.version + 1;
+        // The one being replaced, first. A query that predates this table has
+        // never had a revision written for it, and the only moment its live SQL is
+        // still readable is this one — after the assignment above it is gone for
+        // good. `recordRevision` leaves an already-recorded version alone, so on
+        // every subsequent edit this call is a no-op.
+        await recordRevision(em, {
+          subject: 'saved-query',
+          subjectId: row.id,
+          version: superseded.version,
+          body: superseded.sql,
+          authoredBy: row.createdBy,
+          authoredAt: superseded.at,
+        });
+        await recordRevision(em, {
+          subject: 'saved-query',
+          subjectId: row.id,
+          version: row.version,
+          body: row.sql,
+          authoredBy: row.createdBy,
+          authoredAt: new Date(),
+        });
+      }
 
-    await em.flush();
-    if (sqlChanged) await pruneRevisions(em, 'saved-query', row.id);
-    return toSavedQuery(row);
+      await em.flush();
+      if (sqlChanged) await pruneRevisions(em, 'saved-query', row.id);
+      return toSavedQuery(row);
+    });
   }
 
   listSavedQueryRevisions(id: string): Promise<CatalogRevision[]> {
@@ -484,6 +476,24 @@ export async function readRevisions(
       authoredAt: live.authoredAt.toISOString(),
     },
   ];
+}
+
+/** Copies the fields an edit names onto the row. MikroORM's unit of work writes only what changed. */
+function assignSavedQueryInput(row: SavedQueryRow, input: Partial<SaveQueryInput>): void {
+  if (input.name !== undefined) row.name = input.name;
+  if (input.description !== undefined) row.description = input.description;
+  if (input.sql !== undefined) row.sql = input.sql;
+  if (input.folder !== undefined) row.folder = input.folder;
+  if (input.cacheTtlSeconds !== undefined) {
+    row.cacheTtlSeconds = input.cacheTtlSeconds;
+  }
+  // Assigned only when it differs as JSON. Postgres stores `jsonb` with its keys
+  // reordered, so an equal value read back compares unequal key by key, and
+  // reassigning it would bump `updatedAt` for an edit that changed nothing.
+  if (input.visualization !== undefined && !sameJson(input.visualization, row.visualization)) {
+    row.visualization = { ...input.visualization };
+  }
+  if (input.shared !== undefined) row.shared = input.shared;
 }
 
 /**

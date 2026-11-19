@@ -76,6 +76,9 @@ function entityManager(store: Tables): EntityManager {
 
   const fake = {
     fork: () => fake,
+    // The callback runs on the same fake: this spec models one connection, so a
+    // transaction is the work itself. Locking is the database cases' business.
+    transactional: <T>(work: (em: unknown) => Promise<T>) => work(fake),
 
     findOne: (entity: unknown, where: Record<string, unknown>) => {
       const id = String(where.id);
